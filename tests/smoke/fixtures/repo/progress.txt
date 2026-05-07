@@ -1,0 +1,1 @@
+[it=0] smoke.bootstrap — fixture seeded with one prior iteration line so the v1.1 reviewer briefing can prove it includes the progress.txt tail block.

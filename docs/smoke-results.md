@@ -1,7 +1,7 @@
 # Smoke harness — what it proves, what it doesn't
 
 The smoke harness lives at `tests/smoke/run-smoke.ts` and runs in under a
-second. It exists to prove the wiring of the rebuilt loop is correct without
+second. It exists to prove the wiring of the v1.1 loop is correct without
 ever calling Claude or starting a container.
 
 ## How to run
@@ -12,77 +12,103 @@ npm run smoke
 
 Exits 0 on PASS, 1 on assertion failure, 2 on uncaught error.
 
+## Mode
+
+The smoke runs in exactly one mode now: **runLoop**. It imports `runLoop`
+from `src/loop/index.ts` and drives it directly. The legacy "standalone"
+fallback (which drove `pickNextEligibleStory + markDone` against prd.json)
+has been deleted as of FIX-4 — if `runLoop` cannot be imported or throws
+during the run, the smoke FAILS. There is no fallback.
+
+The startup banner reflects this:
+
+```
+[smoke] mode=runLoop (production loop)
+```
+
 ## What the smoke proves
 
-- **Contracts compile.** Every production module the smoke imports
-  (`src/types.ts`, `src/state/`, `src/verdicts/`) ships its declared exports
-  and the smoke's strict-TS imports resolve.
-- **Verdict parsing works end-to-end.** The mock sandbox emits assistant text
-  containing a JSON payload terminated by a bare-word marker (`STORY_COMPLETE`,
-  `ALL_CLEAR`). Track B's `parseVerdict` is run against the real Zod schemas;
-  any drift between `src/types.ts` and `src/verdicts/schemas.ts` surfaces here.
-- **State mutates atomically.** `pickNextEligibleStory` claims `smoke.1`,
-  then `markDone` flips it to `done` and appends to `progress.txt`. The
-  assertions reread `prd.json` from disk to catch any in-memory-only mutation.
-- **Locks are released.** No `prd.json.lock` directory survives the run.
-- **Single-instance gate works.** The harness wraps the run in
-  `withSingleInstance`; if a second copy of the smoke ran concurrently it
-  would hit `ELOCKED` rather than corrupt state.
-- **Ship path converges.** A green-path run produces at least one commit on
-  the fixture branch, fires `gh issue close 999`, and records the agent call
-  order `implementer -> reviewer`.
+- **`runLoop` is the production entry point.** The Opus reviewer's MEDIUM
+  #20 concern — that a green smoke could be consistent with the loop being
+  completely broken — is closed: a green smoke now means v1.1's actual
+  `runLoop` shipped smoke.1 from `ready-for-agent` to `done`.
+- **Test seams resolve cleanly.** Every `_*` injection point on
+  `RunLoopOptions` (`_agentRunner`, `_runPlanner`, `_listReadyIssues`,
+  `_listInProgressIssues`, `_transitionLabel`, `_isIssueDone`,
+  `_fetchIssueBody`, `_withSingleInstance`, `_createSandbox`,
+  `_commentOnIssue`) is exercised end-to-end. Type drift on any seam fails
+  the strict-TS compile.
+- **Label state machine fires in order.** `claimViaLabel(999)` is invoked
+  exactly once at iteration start; `markDoneViaLabel(999, ...)` is invoked
+  exactly once with a non-empty summary at ship time;
+  `quarantineViaLabel` is never invoked on the green path. All three are
+  observed via a `gh` PATH stub that records argv to JSONL.
+- **Planner runs ONCE per loop wake-up (Fix #2).** Counted explicitly via
+  the `_runPlanner` seam — the loop must not re-call the planner per
+  iteration.
+- **Prompt-cache locality holds.** The implementer briefing and the
+  reviewer briefing both embed the issue body verbatim at the SAME byte
+  offset (`String.prototype.indexOf` is identical for both). Drift in
+  `formatIssueBlock` or in either role's prefix would break this.
+- **`progress.txt` accumulates.** The driver appends an `[it=N] ...` line
+  after every implementer commit-landing event, and the assertion checks
+  the file post-run. The reviewer's briefing also receives the
+  progress-tail block (when one exists pre-iteration — the fixture seeds
+  one bootstrap line so the contract is exercised).
+- **Single-instance lock acquires + releases.** The smoke's
+  `_withSingleInstance` seam is a no-op wrapper that still threads the lock
+  callback through, and the post-run check confirms no `.sandcastle.lock`
+  / `prd.json.lock` directory survives.
+- **Iteration accounting.** `runLoop` returns exactly one
+  `IterationResult` with `outcome === "shipped"` and `iterationsUsed: 1`.
 
 ## What the smoke does NOT prove
 
-- **Real Claude inference.** The mock returns canned text. Bugs in the
-  prompt templates, model selection, or sandcastle's `claudeCode()` agent
-  provider will not be caught here.
-- **Real Docker / Podman / Vercel sandboxing.** The mock `SandboxProvider`
-  is a `bind-mount` shape with a no-op `exec()`. Container startup, mount
-  semantics, UID/GID alignment — all out of scope.
-- **Postgres migrations / Track E recovery ladder.** The default smoke runs
-  the green path. The mock supports a `failureMode: "implementer-halts"` flag
-  to exercise the recovery branch, but no smoke variant invokes it yet.
-- **GitHub CLI behavior.** A `gh` PATH stub captures argv to a JSONL log;
-  the real `gh issue close` is never invoked.
+- **Real Claude inference.** Every per-role agent call goes through the
+  `_agentRunner` seam, which returns canned assistant text. Bugs in prompt
+  templates, model selection, or `claudeCode()` provider plumbing do not
+  surface here.
+- **Real Docker / Podman / Vercel sandboxing.** `_createSandbox` returns a
+  stub `Sandbox` whose `run()` throws. Container startup, mount semantics,
+  UID/GID alignment, worktree provisioning — all out of scope. (See
+  `npm run smoke:integration` follow-up below.)
+- **Real Postgres migrations.** `applyMigrationsBetween` short-circuits when
+  `preSha === postSha`; the smoke fixture stays SQL-free so the call is a
+  no-op. Real migration auto-apply (drizzle dispatch, psql classification)
+  needs the integration smoke.
+- **Track E recovery ladder.** Default smoke runs the green path. The mock
+  supports a `failureMode: "implementer-halts"` flag to exercise the
+  recovery branch; no smoke variant exercises it yet.
+- **Real `gh` CLI behavior.** A `gh` PATH stub captures argv to a JSONL
+  log; real `gh issue edit / close / comment` is never invoked. The stub
+  exits 0 with empty stdout, so error paths in `gh.ts` aren't exercised.
+
+## Concrete bugs the rewired smoke catches
+
+The standalone smoke that shipped before FIX-4 would have been GREEN
+against any of these regressions; the new runLoop-driven smoke catches all
+of them:
+
+1. Planner being called per-iteration instead of once per wake-up.
+2. `claimViaLabel` being skipped (e.g. a refactor that bypasses the label
+   transition and relies on prd.json status).
+3. `markDoneViaLabel` calling `closeIssue` without a `--comment` summary.
+4. The reviewer briefing dropping the issue body or shifting its byte
+   offset relative to the implementer briefing (prompt-cache prefix break).
+5. `runLoop` returning `[]` instead of one shipped result (queue-drain bug).
+6. The startup recovery sweep failing to no-op on an empty in-progress list.
 
 ## Follow-up: integration smoke
 
 A separate `npm run smoke:integration` (not yet wired) should:
 
-1. Run against a real Docker sandbox using `noSandbox()` is not enough —
-   needs `docker()` with a tiny throwaway image.
+1. Run against a real Docker sandbox using `docker()` with a tiny throwaway
+   image.
 2. Use a fresh GitHub repo with a single dummy issue.
 3. Drive a real Claude call (Haiku) for the implementer to keep cost low.
+4. Apply at least one drizzle migration end-to-end against a throwaway
+   Postgres.
 
-File a follow-up issue when the loop integration is stable enough to support
+File a follow-up issue when the v1.1 surface is stable enough to support
 it. Until then, the unit smoke + manual single-story rehearsal is the only
 gate before overnight runs.
-
-## Modes
-
-`run-smoke.ts` runs in one of two modes depending on what Track C has shipped:
-
-- **standalone** (default fallback): when `src/loop/index.ts` is missing or
-  doesn't export `runLoop`, the harness drives the mock directly through
-  `pickNextEligibleStory -> mock.runAgent(implementer) -> mock.runAgent(reviewer)
-  -> markDone -> closeIssue`. Validates everything except the loop's own
-  iteration accounting and quarantine bookkeeping.
-- **runLoop**: when Track C exports
-  `runLoop({ config, runAgent }): Promise<unknown>` from
-  `src/loop/index.ts`, the harness invokes that directly and the standalone
-  driver is bypassed. The same assertions apply — they're decoupled from the
-  driver path.
-
-The mode is logged at the start of the run.
-
-## Coordination requests
-
-- **Track C (loop):** please expose a `runAgent` (or `sandboxFactory`)
-  parameter on `runLoop` so the smoke can inject the mock without monkey-
-  patching the module graph. See the `RunLoopShape` interface in
-  `tests/smoke/run-smoke.ts`.
-- **Track D (state):** `markDone` is currently imported from
-  `src/state/prd.ts` directly because it isn't re-exported from
-  `src/state/index.ts`. Consider adding it to the barrel for consistency
-  with `claimStory` / `pickNextEligibleStory`.

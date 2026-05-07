@@ -1,23 +1,22 @@
 /**
- * Mock sandbox for the smoke harness.
+ * Mock sandbox for the smoke harness (v1.1 wiring).
  *
- * Two layers:
+ * The smoke now drives the production `runLoop` directly. To do that without
+ * spinning up Docker we feed runLoop:
  *
- *   1. A `BindMountSandboxProvider`-shaped object so it slots into anywhere
- *      `@ai-hero/sandcastle` expects a SandboxProvider. The `exec()` method is
- *      a no-op stub that returns exitCode 0 with empty stdout/stderr — no
- *      Docker, no real shell side-effects. File operations (`copyFileIn`,
- *      `copyFileOut`) are also no-ops.
+ *   1. `_createSandbox` — returns a `Sandbox`-shaped stub (branch, worktreePath,
+ *      no-op run/close/interactive/asyncDispose). The loop creates ONE of these
+ *      and threads it into runIteration. Iteration code never reads from the
+ *      sandbox itself when an `_agentRunner` is supplied; the stub's `run()`
+ *      throws if anyone forgets to wire the runner.
  *
- *   2. A higher-level `runAgent(role, opts)` API that returns canned
- *      `SandboxRunResult`-shaped objects keyed off the agent role. This is what
- *      Track C's `runLoop` should call (via injected `sandbox` factory) instead
- *      of the real sandcastle `run()`. The loop never sees `claude` — every
- *      role-call returns a deterministic verdict.
+ *   2. `runAgent` — higher-level shim invoked through `_agentRunner` for every
+ *      per-role agent step. Returns canned assistant text + commits keyed off
+ *      the role. Each call is recorded so `expectations.ts` can assert order
+ *      AND prompt content.
  *
- * Each call is recorded so `expectations.ts` can assert order. The mock also
- * supports failure-mode flags ("implementer-halts" / "reviewer-blocks") so
- * future smoke variants can exercise recovery without rewriting fixtures.
+ * Failure-mode flags are retained so future smoke variants can exercise the
+ * recovery branch without rewriting fixtures.
  */
 
 import type {
@@ -25,12 +24,19 @@ import type {
   BindMountCreateOptions,
   BindMountSandboxHandle,
   ExecResult,
+  Sandbox,
+  SandboxRunOptions,
+  SandboxRunResult,
+  SandboxInteractiveOptions,
+  SandboxInteractiveResult,
+  CloseResult,
 } from "@ai-hero/sandcastle";
 
 // ---------------------------------------------------------------------------
 // Types — mirror the load-bearing slice of @ai-hero/sandcastle SandboxRunResult
-// without importing the heavy module surface. Track C is free to consume the
-// real type when wiring; this slice is what the smoke needs to assert against.
+// without importing the heavy module surface. The runLoop's `_agentRunner`
+// seam declares its own minimal output shape (`{ stdout, commits,
+// completionSignal }`) which this mock satisfies 1:1.
 // ---------------------------------------------------------------------------
 
 export type AgentRole =
@@ -38,7 +44,7 @@ export type AgentRole =
   | "reviewer"
   | "fixer"
   | "recovery"
-  | "reviewer-final";
+  | "final-reviewer";
 
 export interface MockRunOptions {
   readonly role: AgentRole;
@@ -51,14 +57,8 @@ export interface MockRunResult {
   readonly stdout: string;
   /** Commits produced by this run. Stubbed SHAs, deterministic per role. */
   readonly commits: readonly { sha: string }[];
-  /** The branch name the loop's run was bound to. */
-  readonly branch: string;
   /** Completion signal that fired (mirrors sandcastle SandboxRunResult). */
   readonly completionSignal: string | undefined;
-  /** Iteration count — single canned iteration. */
-  readonly iterations: readonly { sessionId?: string }[];
-  /** Stub log path — never written to. */
-  readonly logFilePath: undefined;
 }
 
 export interface MockCallRecord {
@@ -79,10 +79,14 @@ export interface MockSandboxOptions {
   readonly branch?: string;
   /** Override the canned commit SHA prefix. */
   readonly commitShaPrefix?: string;
+  /** Worktree path the Sandbox stub reports — defaults to the repoRoot the loop already knows about. */
+  readonly worktreePath?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Canned-output assembly
+// Canned output assembly — per-role assistant text with a JSON envelope that
+// validates against Track B's Zod schemas. The marker on the last non-empty
+// line is what the loop's strict marker-extractor keys off.
 // ---------------------------------------------------------------------------
 
 const STORY_ID = "smoke.1";
@@ -95,10 +99,6 @@ interface CannedOutput {
 }
 
 function canned(role: AgentRole, mode: FailureMode): CannedOutput {
-  // Each block ends with a bare-word marker on its own line — Track B's
-  // strict extractor matches `^\s*MARKER\s*$`. We embed the load-bearing
-  // structured payload as a JSON object inside the assistant text so
-  // parseVerdict() (if Track C uses it) finds something Zod-valid.
   switch (role) {
     case "implementer": {
       if (mode === "implementer-halts") {
@@ -111,7 +111,6 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
           certificationPresent: false,
           marker: "HALT",
           haltReason: "smoke: simulated halt",
-          // V1-A 7-question rubric (HALT marker permits soft fields):
           storyType: "backend-only",
           e2eRequired: false,
           testCommandUsed: null,
@@ -140,7 +139,7 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
         uiTouched: false,
         certificationPresent: true,
         marker: "STORY_COMPLETE",
-        // V1-A 7-question rubric — backend-only smoke story, e2e not required:
+        // V1-A 7-question rubric — backend-only smoke story, e2e not required.
         storyType: "backend-only",
         e2eRequired: false,
         testCommandUsed: null,
@@ -163,7 +162,7 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
     }
 
     case "reviewer":
-    case "reviewer-final": {
+    case "final-reviewer": {
       if (mode === "reviewer-blocks-then-fixer-fixes" && role === "reviewer") {
         const payload = JSON.stringify({
           marker: "HAS_BLOCKERS",
@@ -247,9 +246,16 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
 // ---------------------------------------------------------------------------
 
 export interface MockSandbox {
-  /** SandboxProvider the loop hands to sandcastle when it does want to run something. */
+  /** SandboxProvider the loop hands to sandcastle when it creates a sandbox handle. */
   readonly provider: BindMountSandboxProvider;
-  /** Higher-level shim Track C calls instead of sandcastle's run() per agent step. */
+  /**
+   * Sandcastle-shaped Sandbox stub. The smoke wires this into runLoop via
+   * `_createSandbox` so the loop doesn't have to call the real createSandbox
+   * (which would need Docker). The stub's `run()` throws — the loop should
+   * always go through `_agentRunner` instead.
+   */
+  buildSandboxStub(branchOverride?: string, worktreePathOverride?: string): Sandbox;
+  /** Higher-level shim invoked via runLoop's `_agentRunner` test seam. */
   runAgent(opts: MockRunOptions): Promise<MockRunResult>;
   /** Ordered log of every runAgent invocation. */
   readonly calls: readonly MockCallRecord[];
@@ -271,9 +277,8 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
 
   // ---- BindMountSandboxProvider stub -------------------------------------
   // The smoke harness never spawns containers; every method is a tight no-op
-  // returning predictable empty results. If the loop accidentally tries to
-  // exec() anything, we'll still succeed with exitCode 0 — but the call won't
-  // produce side-effects on the real filesystem.
+  // returning predictable empty results. This exists so a future test can
+  // also drive the real createSandbox path without losing the no-op shape.
 
   const noopHandle = (
     createOpts: BindMountCreateOptions,
@@ -310,13 +315,10 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
     const result: MockRunResult = {
       stdout: out.stdout,
       commits: out.producesCommit ? [{ sha }] : [],
-      branch,
       completionSignal:
         out.marker === "STORY_COMPLETE" || out.marker === "RECOVERY_COMPLETE"
           ? "<promise>COMPLETE</promise>"
           : undefined,
-      iterations: [{ sessionId: `smoke-${opts.role}-${commitCounter}` }],
-      logFilePath: undefined,
     };
     callsMutable.push({
       role: opts.role,
@@ -328,8 +330,38 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
     return result;
   };
 
+  // ---- Sandbox stub for runLoop._createSandbox ---------------------------
+  const buildSandboxStub = (
+    branchOverride?: string,
+    worktreePathOverride?: string,
+  ): Sandbox => {
+    const stubBranch = branchOverride ?? branch;
+    const stubWorktreePath =
+      worktreePathOverride ?? options.worktreePath ?? "/tmp/sandcastle-smoke-stub";
+    const stub: Sandbox = {
+      branch: stubBranch,
+      worktreePath: stubWorktreePath,
+      run: async (_o: SandboxRunOptions): Promise<SandboxRunResult> => {
+        // The loop should always be using _agentRunner — reaching here means
+        // someone forgot to wire the seam. Fail loudly so the smoke surfaces it.
+        throw new Error(
+          "MockSandbox stub.run() invoked: _agentRunner test seam missing or not threaded.",
+        );
+      },
+      interactive: async (
+        _o: SandboxInteractiveOptions,
+      ): Promise<SandboxInteractiveResult> => {
+        throw new Error("MockSandbox stub.interactive() not supported.");
+      },
+      close: async (): Promise<CloseResult> => ({}),
+      [Symbol.asyncDispose]: async (): Promise<void> => undefined,
+    };
+    return stub;
+  };
+
   return {
     provider,
+    buildSandboxStub,
     runAgent,
     get calls(): readonly MockCallRecord[] {
       return callsMutable;

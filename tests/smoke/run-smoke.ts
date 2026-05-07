@@ -1,61 +1,65 @@
 /**
- * End-to-end smoke harness.
+ * End-to-end smoke harness — drives the production `runLoop` against a mocked
+ * sandbox + label state-machine.
  *
  *   npm run smoke
  *
- * What this proves:
- *   - The fixture repo can be initialised cleanly in a temp directory.
- *   - The mock sandbox exposes a SandboxProvider + per-role agent shim.
- *   - When the loop runs against canned ALL_CLEAR verdicts, prd.json reaches
- *     status="done", progress.txt records the story, the gh issue gets closed,
- *     and no locks are left behind.
+ * What this proves (v1.1):
+ *   - `src/loop/index.ts`'s `runLoop` accepts the test seams it advertises and
+ *     produces a usable IterationResult[] when fed canned inputs.
+ *   - The label state-machine surface (claimViaLabel, markDoneViaLabel,
+ *     quarantineViaLabel) is invoked by the loop in the right order — captured
+ *     via a `gh` PATH stub.
+ *   - The implementer + reviewer briefings embed the issue body verbatim AT THE
+ *     SAME byte offset (prompt-cache locality contract).
+ *   - `progress.txt` records at least one `[it=N]` line per shipped iteration.
+ *   - The single-instance lock acquires + releases cleanly with no leaked dirs.
+ *   - The Planner runs exactly ONCE per loop wake-up (Fix #2), never per
+ *     iteration.
  *
  * What this does NOT prove:
- *   - Real Claude inference, real Docker, real Postgres migrations. Those need
- *     `npm run smoke:integration` (filed as a follow-up — see docs/smoke-results.md).
+ *   - Real Claude inference (the agent runner returns canned strings).
+ *   - Real Docker / Podman / Vercel sandboxing (the Sandbox handle is a stub
+ *     whose `run()` throws — the loop must use `_agentRunner` instead).
+ *   - Real Postgres migrations (the iteration calls applyMigrationsBetween
+ *     which short-circuits when preSha === postSha; the smoke fixture stays
+ *     SQL-free so this is a no-op).
+ *   - Real `gh` API behavior (a PATH stub captures argv to JSONL).
  *
- * Coordination contract with Track C (loop):
- *   `runLoop` should accept an injectable `runAgent` parameter (or a
- *   `sandboxFactory`) so the harness can swap in the mock. Until that lands,
- *   the smoke runs in **STANDALONE** mode — it drives the mock directly via
- *   the modules Track B/D have already shipped (markers, schemas,
- *   pickNextEligibleStory, markDone, closeIssue). This is enough to validate
- *   the wiring: when Track C lands, swap the inline driver for `runLoop`
- *   without changing the assertions.
+ * Reviewer #20 contract: a green smoke MUST mean v1.1's actual `runLoop`
+ * shipped smoke.1. The standalone fallback path is gone — if the runLoop
+ * import or invocation fails, the smoke fails.
  */
 
-import { execFile } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
-import * as fssync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { customAlphabet } from "nanoid";
 
-import {
-  parseVerdict,
-  ImplementerOutputSchema,
-  ReviewerVerdictSchema,
-} from "../../src/verdicts/index.js";
-import {
-  pickNextEligibleStory,
-  withSingleInstance,
-} from "../../src/state/index.js";
-import type { LoopConfig, Story } from "../../src/types.js";
+import { runLoop } from "../../src/loop/index.js";
+import type { RunLoopOptions } from "../../src/loop/index.js";
+import type { IssueRef } from "../../src/loop/index.js";
+import type { ReadyIssueSummary } from "../../src/state/index.js";
+import type {
+  PlannerInput,
+  PlannerOutput,
+} from "../../src/planner/index.js";
+import type { IterationResult, LoopConfig } from "../../src/types.js";
 
 import {
   createMockSandbox,
+  type AgentRole as MockAgentRole,
   type MockSandbox,
   type MockCallRecord,
 } from "./mocks/mock-sandbox.js";
 import {
   runAllExpectations,
   type ExpectationContext,
+  type RunLoopArtifacts,
 } from "./expectations.js";
 
-const execFileP = promisify(execFile);
 const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 10);
 
 // ---------------------------------------------------------------------------
@@ -67,11 +71,17 @@ const FIXTURE_DIR = path.resolve(
   "fixtures/repo",
 );
 
+const SMOKE_STORY_ID = "smoke.1";
+const SMOKE_GH_ISSUE = 999;
+const SMOKE_ISSUE_TITLE = "smoke.1: add hello fn";
+const SMOKE_ISSUE_BODY =
+  "Acceptance: a hello() function is exported.";
+const SMOKE_BRANCH = "agent/smoke.1";
+
 async function copyFixtureToTempDir(): Promise<string> {
   const target = path.join(os.tmpdir(), `sandcastle-smoke-${nanoid()}`);
   await fs.mkdir(target, { recursive: true });
-  // Node 20+: fs.cp recursive. Skip the .git dir if it ever sneaks into the
-  // fixture (git won't track it but a stray local commit might).
+  // Skip any stray .git the fixture might have picked up locally.
   await fs.cp(FIXTURE_DIR, target, {
     recursive: true,
     filter: (src) => !src.includes(`${path.sep}.git${path.sep}`),
@@ -120,6 +130,8 @@ function defaultLoopConfig(repoRoot: string): LoopConfig {
 // ---------------------------------------------------------------------------
 // gh stub — install a PATH override so `gh ...` invocations get captured
 // instead of hitting the real CLI. Records every call for the assertions.
+// The runLoop code-path that reaches gh: claimViaLabel / markDoneViaLabel /
+// quarantineViaLabel / postIssueComment / closeIssue — all via execFile.
 // ---------------------------------------------------------------------------
 
 interface GhCall {
@@ -138,10 +150,8 @@ async function installGhStub(): Promise<GhStub> {
   await fs.mkdir(binDir, { recursive: true });
   const callsPath = path.join(binDir, "gh-calls.jsonl");
   const ghPath = path.join(binDir, "gh");
-  // Append-only JSONL log via a tiny inline node script. Using `node -e` would
-  // hit shell-quoting hell with embedded quotes; instead the wrapper file is
-  // a node script invoked directly via shebang.
   const nodeBin = process.execPath;
+  // Tiny inline node shebang script: append-only argv log, exitCode 0.
   const script = `#!${nodeBin}
 const fs = require('node:fs');
 const callsPath = process.env.CALLS;
@@ -152,8 +162,6 @@ process.exit(0);
 `;
   await fs.writeFile(ghPath, script, { mode: 0o755 });
   await fs.chmod(ghPath, 0o755);
-  // PATH override + CALLS env — gh executions inherit both via execFile's
-  // default env-inheritance.
   process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
   process.env.CALLS = callsPath;
 
@@ -182,132 +190,248 @@ process.exit(0);
 }
 
 // ---------------------------------------------------------------------------
-// Standalone driver — used until Track C exposes `runLoop` with sandbox injection.
-// Mirrors the bash green-path: claim story -> implementer -> reviewer -> markDone -> closeIssue.
+// runLoop wiring — every test seam built explicitly. The `runLoop` import is
+// the LOAD-BEARING contract: a missing export, a signature change, or a
+// throw inside the loop FAILS the smoke. There is no fallback.
 // ---------------------------------------------------------------------------
 
-interface StandaloneDriverDeps {
-  readonly config: LoopConfig;
-  readonly sandbox: MockSandbox;
+interface CountingPlanner {
+  callCount: number;
+  lastInput: PlannerInput | null;
+  fn: NonNullable<RunLoopOptions["_runPlanner"]>;
 }
 
-interface StandaloneResult {
-  readonly storyShipped: Story | null;
-  readonly commits: readonly string[];
-}
-
-async function runStandalone(
-  deps: StandaloneDriverDeps,
-): Promise<StandaloneResult> {
-  const { config, sandbox } = deps;
-
-  const story = await pickNextEligibleStory(config.repoRoot);
-  if (!story) {
-    throw new Error("smoke: fixture had no pending story to claim");
-  }
-  if (typeof story.ghIssue !== "number") {
-    throw new Error("smoke: fixture story has no ghIssue");
-  }
-
-  // Implementer.
-  const implRun = await sandbox.runAgent({
-    role: "implementer",
-    model: config.models.implementer,
-    prompt: `[smoke] Implement story ${story.id}`,
-  });
-  // Validate the verdict shape using Track B's parser — even on the canned
-  // path, we want to exercise the real schema so a contract drift surfaces
-  // here. The mock emits plain assistant text (not stream-json envelopes), so
-  // `alreadyAssistantText: true` skips the envelope-strip step.
-  parseVerdict(implRun.stdout, ImplementerOutputSchema, {
-    alreadyAssistantText: true,
-  });
-  const implCommits = implRun.commits.map((c) => c.sha);
-
-  // Reviewer.
-  const reviewRun = await sandbox.runAgent({
-    role: "reviewer",
-    model: config.models.reviewer,
-    prompt: `[smoke] Review story ${story.id}`,
-  });
-  parseVerdict(reviewRun.stdout, ReviewerVerdictSchema, {
-    alreadyAssistantText: true,
-  });
-
-  // Mark done — uses Track D's atomic markDone if exposed, else a local fallback.
-  // markDone is intentionally NOT in src/state/index.ts barrel yet (only
-  // claimStory/pickNextEligibleStory/releaseStory are re-exported), so we
-  // import it from the leaf module directly.
-  const { markDone } = await import("../../src/state/prd.js");
-  const finalSha =
-    implCommits[implCommits.length - 1] ?? "deadbeefdeadbeefdeadbeefdeadbeef";
-  await markDone(config.repoRoot, story.id, finalSha, 1, story.title);
-
-  // Close the GH issue (hits the gh stub installed earlier).
-  const { closeIssue } = await import("../../src/state/gh.js");
-  try {
-    await closeIssue(story.ghIssue, `RALPH(smoke) closed by commit ${finalSha}`);
-  } catch (err) {
-    // Stub failure is fatal in smoke — the harness is what controls the gh CLI.
-    throw new Error(`smoke: gh close stub failed: ${(err as Error).message}`);
-  }
-
-  return { storyShipped: story, commits: implCommits };
-}
-
-// ---------------------------------------------------------------------------
-// runLoop integration path — exists only when Track C lands
-// `src/loop/index.ts` exporting `runLoop({ config, runAgent })`. The smoke
-// dynamic-imports that module so a missing export doesn't cascade into a
-// type-time failure for everything else.
-// ---------------------------------------------------------------------------
-
-/**
- * Track C ships `runLoop({ config, branch, sandboxProvider })`. The smoke
- * module hands it the mock provider; the loop's internal `runIteration`
- * still expects a real `Sandbox` (returned by `createSandbox`), so for
- * end-to-end coverage Track C also needs to expose an injectable
- * `runAgent` (or per-role hook) — see docs/smoke-results.md for the request.
- *
- * Until that lands, this function probes for `runLoop` and either runs it
- * (if the loop module compiles + accepts the mock) OR falls back to standalone.
- */
-async function tryRunLoopIntegration(
-  config: LoopConfig,
-  sandbox: MockSandbox,
-): Promise<{ ran: boolean; reason?: string }> {
-  const loopIndexPath = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)),
-    "../../src/loop/index.ts",
-  );
-  if (!fssync.existsSync(loopIndexPath)) {
-    return { ran: false, reason: "src/loop/index.ts not present yet (Track C pending)" };
-  }
-  let mod: unknown;
-  try {
-    mod = await import("../../src/loop/index.js");
-  } catch (err) {
+function buildCountingPlanner(): CountingPlanner {
+  // Use a mutable closure object so callers can read callCount AFTER runLoop
+  // returns. The function returned satisfies runPlanner's signature.
+  const state: { callCount: number; lastInput: PlannerInput | null } = {
+    callCount: 0,
+    lastInput: null,
+  };
+  const fn: NonNullable<RunLoopOptions["_runPlanner"]> = async (
+    _sandbox,
+    input,
+  ): Promise<PlannerOutput> => {
+    state.callCount += 1;
+    state.lastInput = input;
+    // Canned output: a single issue, no blockers. The loop walks priorityOrder,
+    // claims the issue, runs the iteration, and ships.
     return {
-      ran: false,
-      reason: `Track C loop module failed to import: ${(err as Error).message}`,
+      priorityOrder: [SMOKE_GH_ISSUE],
+      dependencies: [],
     };
-  }
-  if (typeof mod !== "object" || mod === null) {
-    return { ran: false, reason: "src/loop/index.ts default export shape unexpected" };
-  }
-  const candidate = (mod as { runLoop?: unknown }).runLoop;
-  if (typeof candidate !== "function") {
-    return { ran: false, reason: "src/loop/index.ts does not export runLoop()" };
-  }
-  // The current Track C runLoop signature requires { config, branch,
-  // sandboxProvider } and uses sandcastle's createSandbox internally.
-  // Until Track C exposes a per-role `runAgent` injection point, calling
-  // runLoop here would require a real sandbox runtime — out of scope for
-  // unit smoke. Document and fall back.
+  };
+  // Return an object whose getters reflect the closure state at call time.
   return {
-    ran: false,
-    reason:
-      "Track C runLoop accepts {config, branch, sandboxProvider} but has no runAgent hook; smoke needs that injection point to exercise the loop without sandcastle.run(). Falling back to standalone.",
+    get callCount(): number {
+      return state.callCount;
+    },
+    get lastInput(): PlannerInput | null {
+      return state.lastInput;
+    },
+    fn,
+  };
+}
+
+interface CapturedAgentCall {
+  readonly role: MockAgentRole;
+  readonly prompt: string;
+}
+
+interface SmokeOutcome {
+  readonly mode: "runLoop";
+  readonly repoRoot: string;
+  readonly failures: readonly string[];
+  readonly checks: readonly string[];
+  readonly callRecord: readonly MockCallRecord[];
+  readonly warnings: readonly string[];
+  readonly artifacts: RunLoopArtifacts;
+}
+
+async function main(): Promise<SmokeOutcome> {
+  console.log("[smoke] copying fixture to temp dir");
+  const repoRoot = await copyFixtureToTempDir();
+  console.log(`[smoke] fixture at ${repoRoot}`);
+
+  console.log("[smoke] git init in fixture");
+  gitInitFixture(repoRoot);
+
+  console.log("[smoke] installing gh stub");
+  const gh = await installGhStub();
+
+  const sandbox = createMockSandbox({ branch: SMOKE_BRANCH });
+  const config = defaultLoopConfig(repoRoot);
+
+  // Per-role prompt capture — used by the "issue body verbatim at same offset"
+  // assertion. The mock-sandbox's `runAgent` already records prompt strings,
+  // but capturing them again here scopes the data to exactly what passed
+  // through the runLoop seam (independent witness).
+  const promptCaptures: CapturedAgentCall[] = [];
+
+  const planner = buildCountingPlanner();
+
+  // Test-seam stubs the loop calls instead of shelling out. Each one tracks
+  // its own invocation count for the expectations.
+  let listInProgressCalls = 0;
+  let listReadyCalls = 0;
+  const transitionCalls: Array<{ from: string; to: string; issueNum: number }> = [];
+  const fetchIssueBodyCalls: number[] = [];
+  const isIssueDoneCalls: number[] = [];
+  const commentOnIssueCalls: Array<{ issueNum: number; body: string }> = [];
+  let withSingleInstanceCalls = 0;
+
+  const cannedIssue: IssueRef = {
+    title: SMOKE_ISSUE_TITLE,
+    body: SMOKE_ISSUE_BODY,
+    labels: ["ready-for-agent"],
+    number: SMOKE_GH_ISSUE,
+  };
+
+  const cannedReadySummary: ReadyIssueSummary = {
+    number: SMOKE_GH_ISSUE,
+    title: SMOKE_ISSUE_TITLE,
+    body: SMOKE_ISSUE_BODY,
+    labels: ["ready-for-agent"],
+    createdAt: "2026-05-07T00:00:00Z",
+  };
+
+  const opts: RunLoopOptions = {
+    config,
+    branch: SMOKE_BRANCH,
+    sandboxProvider: sandbox.provider,
+    recoveryPromptPath: path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../refs/recovery-prompt.md.local-fork",
+    ),
+    consecutiveHaltLimit: 3,
+
+    // === Test seams ====================================================
+
+    /** Replace createSandbox so the loop never tries to spawn Docker. */
+    _createSandbox: async (): Promise<ReturnType<MockSandbox["buildSandboxStub"]>> => {
+      // Worktree path = the real repoRoot so iteration's git rev-parse / diff
+      // helpers operate on the smoke fixture (not a phantom path).
+      return sandbox.buildSandboxStub(SMOKE_BRANCH, repoRoot);
+    },
+
+    /** Replace gh issue-list. The loop walks this once at wake-up. */
+    _listReadyIssues: async (): Promise<ReadyIssueSummary[]> => {
+      listReadyCalls += 1;
+      return [cannedReadySummary];
+    },
+
+    /** Replace startup-recovery sweep — nothing stranded in the smoke. */
+    _listInProgressIssues: async (): Promise<number[]> => {
+      listInProgressCalls += 1;
+      return [];
+    },
+
+    /**
+     * Replace the label transition used by startup recovery. The loop only
+     * calls this from the recovery sweep (when listInProgress returns
+     * non-empty), so in this smoke it should never fire — but providing it
+     * keeps any host's real `gh` behavior off the table.
+     */
+    _transitionLabel: async (
+      issueNum: number,
+      from: string,
+      to: string,
+    ): Promise<void> => {
+      transitionCalls.push({ issueNum, from, to });
+    },
+
+    /** Pre-canned planner output, no real agent call. */
+    _runPlanner: planner.fn,
+
+    /** Replace gh issue-view fetch — feed the same body the planner saw. */
+    _fetchIssueBody: async (ghIssue: number): Promise<IssueRef> => {
+      fetchIssueBodyCalls.push(ghIssue);
+      return cannedIssue;
+    },
+
+    /** Blocker-state probe — no blockers in the smoke priorityOrder. */
+    _isIssueDone: async (issueNum: number): Promise<boolean> => {
+      isIssueDoneCalls.push(issueNum);
+      return false;
+    },
+
+    /** No-op the single-instance gate — the smoke wraps its own lock OUTSIDE the loop. */
+    _withSingleInstance: async <T>(
+      _lockPath: string,
+      fn: () => Promise<T>,
+    ): Promise<T> => {
+      withSingleInstanceCalls += 1;
+      return fn();
+    },
+
+    /** Capture ship-with-issue-OPEN comments. Should NOT fire on green path. */
+    _commentOnIssue: async (issueNum: number, body: string): Promise<void> => {
+      commentOnIssueCalls.push({ issueNum, body });
+    },
+
+    /**
+     * The load-bearing seam. Every per-role agent call goes through this —
+     * stdout / commits / completionSignal returned synthetically. Also
+     * captures the prompt text so expectations can assert byte-for-byte
+     * locality between implementer and reviewer briefings.
+     */
+    _agentRunner: async (role, _model, prompt): Promise<{
+      stdout: string;
+      commits: { sha: string }[];
+      completionSignal?: string;
+    }> => {
+      promptCaptures.push({ role, prompt });
+      const out = await sandbox.runAgent({
+        role,
+        model: _model,
+        prompt,
+      });
+      return {
+        stdout: out.stdout,
+        commits: out.commits.map((c) => ({ sha: c.sha })),
+        completionSignal: out.completionSignal,
+      };
+    },
+  };
+
+  console.log("[smoke] mode=runLoop (production loop)");
+  const iterationResults: IterationResult[] = await runLoop(opts);
+
+  console.log("[smoke] runLoop returned; running expectations");
+  const ghCalls = await gh.readCalls();
+  const artifacts: RunLoopArtifacts = {
+    iterationResults,
+    plannerCallCount: planner.callCount,
+    listReadyCalls,
+    listInProgressCalls,
+    transitionCalls,
+    fetchIssueBodyCalls,
+    isIssueDoneCalls,
+    commentOnIssueCalls,
+    withSingleInstanceCalls,
+    promptCaptures,
+    issueBody: SMOKE_ISSUE_BODY,
+  };
+  const ctx: ExpectationContext = {
+    repoRoot,
+    sandbox,
+    storyId: SMOKE_STORY_ID,
+    ghIssue: SMOKE_GH_ISSUE,
+    ghCalls,
+    artifacts,
+  };
+  const report = await runAllExpectations(ctx);
+
+  const warnings = await cleanup(repoRoot, gh);
+
+  return {
+    mode: "runLoop",
+    repoRoot,
+    failures: report.failures,
+    checks: report.checks,
+    callRecord: sandbox.calls,
+    warnings,
+    artifacts,
   };
 }
 
@@ -334,82 +458,6 @@ async function cleanup(repoRoot: string, gh: GhStub): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-interface SmokeOutcome {
-  readonly mode: "runLoop" | "standalone";
-  readonly repoRoot: string;
-  readonly failures: readonly string[];
-  readonly checks: readonly string[];
-  readonly callRecord: readonly MockCallRecord[];
-  readonly warnings: readonly string[];
-}
-
-async function main(): Promise<SmokeOutcome> {
-  console.log("[smoke] copying fixture to temp dir");
-  const repoRoot = await copyFixtureToTempDir();
-  console.log(`[smoke] fixture at ${repoRoot}`);
-
-  console.log("[smoke] git init in fixture");
-  gitInitFixture(repoRoot);
-
-  console.log("[smoke] installing gh stub");
-  const gh = await installGhStub();
-
-  const sandbox = createMockSandbox();
-  const config = defaultLoopConfig(repoRoot);
-
-  // Drive under a single-instance lock so we exercise that surface, mirroring
-  // what runLoop would do. The lock target lives outside the repoRoot so a
-  // stale lock-dir doesn't trip the "no leaked lockfile" assertion.
-  const lockPath = path.join(os.tmpdir(), `sandcastle-smoke-driver-${nanoid()}.lock`);
-  let mode: SmokeOutcome["mode"] = "standalone";
-  try {
-    await withSingleInstance(lockPath, async () => {
-      const integration = await tryRunLoopIntegration(config, sandbox);
-      if (integration.ran) {
-        mode = "runLoop";
-        console.log("[smoke] mode=runLoop (Track C integrated)");
-      } else {
-        mode = "standalone";
-        console.log(`[smoke] mode=standalone (${integration.reason})`);
-        await runStandalone({ config, sandbox });
-      }
-    });
-  } finally {
-    // Lock target itself is a tmpfile — proper-lockfile creates <path>.lock
-    // alongside; clean both.
-    await fs.rm(lockPath, { force: true }).catch(() => undefined);
-    await fs.rm(`${lockPath}.lock`, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
-  }
-
-  console.log("[smoke] running expectations");
-  const ghCalls = await gh.readCalls();
-  const ctx: ExpectationContext = {
-    repoRoot,
-    sandbox,
-    storyId: "smoke.1",
-    ghIssue: 999,
-    ghCalls,
-  };
-  const report = await runAllExpectations(ctx);
-
-  const warnings = await cleanup(repoRoot, gh);
-
-  return {
-    mode,
-    repoRoot,
-    failures: report.failures,
-    checks: report.checks,
-    callRecord: sandbox.calls,
-    warnings,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -418,6 +466,12 @@ void (async (): Promise<void> => {
     const outcome = await main();
     console.log("");
     console.log(`[smoke] mode=${outcome.mode}`);
+    console.log(`[smoke] iteration results:`);
+    for (const r of outcome.artifacts.iterationResults) {
+      console.log(
+        `  - story=${r.story.id} outcome=${r.outcome} iterations=${r.iterationsUsed}`,
+      );
+    }
     console.log(`[smoke] checks run: ${outcome.checks.length}`);
     for (const c of outcome.checks) {
       console.log(`  - ${c}`);
@@ -446,9 +500,9 @@ void (async (): Promise<void> => {
     }
     process.exit(1);
   } catch (err) {
-    console.error(`[smoke] FAIL — uncaught error: ${(err as Error).stack ?? (err as Error).message}`);
+    console.error(
+      `[smoke] FAIL — uncaught error: ${(err as Error).stack ?? (err as Error).message}`,
+    );
     process.exit(2);
   }
 })();
-// keep execFileP referenced so unused-imports rules in stricter setups stay quiet
-void execFileP;
