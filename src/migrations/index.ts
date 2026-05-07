@@ -1,0 +1,20 @@
+/**
+ * Migrations track barrel — re-exports the drizzle migration auto-applier
+ * surface. Track C imports from here; nothing else should reach into the
+ * leaf module directly.
+ */
+
+export {
+  applyMigrationsBetween,
+  classifyPsqlErrors,
+  isDrizzleMigrationPath,
+  splitSqlStatements,
+  BENIGN_ALREADY_EXISTS_REGEX,
+} from "./drizzle-applier.js";
+
+export type {
+  ApplyMigrationsOptions,
+  ApplyMigrationsResult,
+  ExecRunner,
+  MigrationRealError,
+} from "./drizzle-applier.js";

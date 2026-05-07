@@ -1,0 +1,10 @@
+{
+  "stories": [
+    {
+      "id": "smoke.1",
+      "title": "add hello() function",
+      "status": "pending",
+      "ghIssue": 999
+    }
+  ]
+}

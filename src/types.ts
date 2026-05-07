@@ -6,7 +6,12 @@
  * Every load-bearing verdict in the loop is a typed object, never free-text grep.
  */
 
-export type StoryStatus = "pending" | "in_progress" | "done" | "quarantined";
+export type StoryStatus =
+  | "pending"
+  | "in_progress"
+  | "done"
+  | "quarantined"
+  | "needs_human";
 
 export interface Story {
   id: string;
@@ -16,6 +21,23 @@ export interface Story {
   attempts?: number;
   quarantinedAt?: string;
   quarantineReason?: string;
+  /**
+   * Bash-driver compatibility: the hostname (or other identifier) of the
+   * worker that currently holds the story. Optional — older prd.json files
+   * predate this field.
+   */
+  claimedBy?: string;
+  /**
+   * ISO-8601 timestamp recorded when the story was claimed. Optional for the
+   * same reason as `claimedBy`.
+   */
+  claimedAt?: string;
+  /**
+   * IDs of stories that must reach `status === "done"` before this story is
+   * eligible to be picked. Bash driver populated this; the TS port now honors
+   * it in pickNextEligibleStory.
+   */
+  blockedBy?: string[];
 }
 
 export interface PrdState {
@@ -68,7 +90,7 @@ export interface IterationContext {
 
 export interface IterationResult {
   story: Story;
-  outcome: "shipped" | "quarantined" | "halted" | "circuit_break";
+  outcome: "shipped" | "skipped" | "quarantined" | "halted" | "circuit_break";
   iterationsUsed: number;
   finalCommitSha?: string;
   haltReason?: string;

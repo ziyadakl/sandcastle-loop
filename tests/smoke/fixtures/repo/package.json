@@ -1,0 +1,12 @@
+{
+  "name": "smoke-target",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fake target repo used by tests/smoke/run-smoke.ts. Real loop never runs against this in production.",
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "node --test"
+  }
+}
