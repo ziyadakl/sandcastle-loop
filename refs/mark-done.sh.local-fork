@@ -1,0 +1,40 @@
+#!/bin/bash
+# mark-done.sh — mark a story as done in prd.json. Called by the implementer
+# after the commit + GH issue close.
+#
+# Usage: mark-done.sh <story_id>
+# Exit 0: marked done
+# Exit 1: bad usage
+# Exit 2: prd.json missing or story id not found
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PRD_JSON="$REPO_ROOT/prd.json"
+STORY_ID="$1"
+
+[ -z "$STORY_ID" ] && { echo "Usage: $0 <story_id>" >&2; exit 1; }
+[ -f "$PRD_JSON" ] || { echo "prd.json not found at $PRD_JSON" >&2; exit 2; }
+
+exec 200>"$PRD_JSON.lock"
+flock -x 200
+
+# Verify story exists
+EXISTS=$(jq --arg id "$STORY_ID" '.stories | any(.id == $id)' "$PRD_JSON")
+if [ "$EXISTS" != "true" ]; then
+  flock -u 200
+  echo "story id '$STORY_ID' not found in prd.json" >&2
+  exit 2
+fi
+
+TMP=$(mktemp)
+jq --arg id "$STORY_ID" '
+  .stories |= map(
+    if .id == $id then
+      .status = "done" | .claimed_by = null | .claimed_at = null
+    else . end
+  )
+' "$PRD_JSON" > "$TMP" && mv "$TMP" "$PRD_JSON"
+
+flock -u 200
+echo "story $STORY_ID marked done"

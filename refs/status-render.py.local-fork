@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""status-render.py — surfaces step markers as a status block that updates
+in place. Reads stdin, writes stderr.
+
+Cross-platform (macOS + Linux). Status-only: agent text passthrough is dropped;
+only the block is shown. The block is redrawn at every step transition AND
+every TICK_SECONDS (default 30) so the elapsed-time line keeps ticking even
+during long silent gaps.
+
+Usage: <text-stream> | status-render.py "<Label>" <epoch-start>
+
+Reads the following env vars for additional block content (set by afk-ralph.sh):
+  RALPH_ITER_NUM       e.g. "4"
+  RALPH_ITER_TOTAL     e.g. "12"
+  RALPH_STORY_ID       e.g. "7.8"
+  RALPH_GH_ISSUE       e.g. "43"
+  RALPH_TITLE          e.g. "inline-rename a merchant from the transactions list"
+
+Reads ./prd.json (relative to CWD) on every render to compute backlog progress.
+"""
+
+import sys
+import re
+import select
+import time
+import os
+import json
+
+LABEL = sys.argv[1]
+START_EPOCH = int(sys.argv[2])
+TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "30"))
+
+ITERATION_NUM = os.environ.get("RALPH_ITER_NUM", "?")
+ITERATION_TOTAL = os.environ.get("RALPH_ITER_TOTAL", "?")
+STORY_ID = os.environ.get("RALPH_STORY_ID", "")
+GH_ISSUE = os.environ.get("RALPH_GH_ISSUE", "")
+STORY_TITLE = os.environ.get("RALPH_TITLE", "")
+
+STEPS_BY_AGENT = {
+    "Implementer": [
+        "Pick story", "Write failing test", "Write code (GREEN)",
+        "Typecheck", "Unit tests", "E2e", "Migration",
+        "Append progress", "Commit",
+    ],
+    "Reviewer": ["Review"],
+    "Fixer": ["Judge findings", "Apply fixes", "Verify", "Commit"],
+}
+
+agent = LABEL.split(" ", 1)[0]
+STEPS = STEPS_BY_AGENT.get(agent, [])
+TOTAL = len(STEPS)
+
+current = 0
+skipped = {}
+last_block_lines = 0
+
+MARKER_RE = re.compile(r'^\[STEP\s+(\d+)/(\d+)\]\s+(.+)$')
+SKIP_RE = re.compile(r'^SKIP\s*[—\-]?\s*(.*)$')
+
+
+def elapsed():
+    secs = int(time.time()) - START_EPOCH
+    return f"{secs // 60}m {secs % 60:02d}s"
+
+
+def prd_progress():
+    try:
+        with open("prd.json") as f:
+            data = json.load(f)
+        stories = data.get("stories", [])
+        total = len(stories)
+        done = sum(1 for s in stories if s.get("status") == "done")
+        if total == 0:
+            return "0", "0", "0.0%"
+        pct = round(100.0 * done / total, 1)
+        return str(done), str(total), f"{pct}%"
+    except Exception:
+        return "?", "?", "?%"
+
+
+def render_block():
+    global last_block_lines
+    if last_block_lines > 0:
+        sys.stderr.write(f"\x1b[{last_block_lines}A")
+        sys.stderr.write("\x1b[J")
+
+    done, total, pct = prd_progress()
+    outer = "=" * 46
+    inner = "─" * 60
+
+    lines = []
+    lines.append("  " + outer)
+    lines.append(f"  {elapsed()} · {LABEL}")
+    lines.append("")
+    lines.append(f"  Iteration {ITERATION_NUM} / {ITERATION_TOTAL}       PRD: {done}/{total} done [{pct}]")
+    lines.append("  " + outer)
+    if STORY_ID:
+        if GH_ISSUE:
+            lines.append(f"  Story {STORY_ID} (issue #{GH_ISSUE})")
+        else:
+            lines.append(f"  Story {STORY_ID}")
+        if STORY_TITLE:
+            lines.append(f"  {STORY_TITLE}")
+    lines.append("  " + inner)
+    for i, desc in enumerate(STEPS):
+        n = i + 1
+        if n in skipped:
+            lines.append(f"   ⊘ {n}/{TOTAL}. {desc}  (skipped: {skipped[n]})")
+        elif n < current:
+            lines.append(f"   ✓ {n}/{TOTAL}. {desc}")
+        elif n == current:
+            lines.append(f"   ▶ {n}/{TOTAL}. {desc}")
+        else:
+            lines.append(f"   ☐ {n}/{TOTAL}. {desc}")
+    lines.append("  " + inner)
+
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.stderr.flush()
+    last_block_lines = len(lines)
+
+
+def process_line(line):
+    global current
+    line = line.rstrip("\r\n")
+    m = MARKER_RE.match(line)
+    if not m:
+        return False
+    n = int(m.group(1))
+    desc = m.group(3)
+
+    skip_m = SKIP_RE.match(desc)
+    if skip_m:
+        reason = (skip_m.group(1) or "").strip() or "not applicable"
+        skipped[n] = reason
+        if current <= n:
+            current = n + 1
+        return True
+
+    current = n
+    return True
+
+
+def main():
+    global current
+    while True:
+        ready, _, _ = select.select([sys.stdin], [], [], TICK_SECONDS)
+        if not ready:
+            if 0 < current <= TOTAL:
+                render_block()
+            continue
+        line = sys.stdin.readline()
+        if not line:
+            break
+        if process_line(line):
+            render_block()
+
+    if 0 < current <= TOTAL:
+        current = TOTAL + 1
+        render_block()
+
+
+if __name__ == "__main__":
+    main()

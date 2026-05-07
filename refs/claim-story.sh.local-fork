@@ -1,0 +1,53 @@
+#!/bin/bash
+# claim-story.sh — atomically claim the next pending unblocked story from prd.json.
+# Uses flock so multiple parallel loops (e.g. across worktrees) can't double-claim.
+#
+# Prints to stdout: <story_id>|<gh_issue>|<title>
+# Exit 0: story claimed
+# Exit 1: no claimable story (all done, or all remaining are blocked)
+# Exit 2: prd.json missing or malformed
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PRD_JSON="$REPO_ROOT/prd.json"
+CLAIM_HOLDER="${CLAIM_HOLDER:-$(hostname)-$$}"
+
+[ -f "$PRD_JSON" ] || { echo "prd.json not found at $PRD_JSON" >&2; exit 2; }
+
+LOCK_FILE="$PRD_JSON.lock"
+exec 200>"$LOCK_FILE"
+flock -x 200
+
+# Pick first pending story whose blocked_by IDs are all marked done.
+NEXT=$(jq -r '
+  . as $root
+  | .stories
+  | map(select(.status == "pending"))
+  | map(select(
+      .blocked_by | length == 0 or
+      all(. as $bid | $root.stories | any(.id == $bid and .status == "done"))
+    ))
+  | first
+  | if . then "\(.id)|\(.gh_issue)|\(.title)" else empty end
+' "$PRD_JSON")
+
+if [ -z "$NEXT" ]; then
+  flock -u 200
+  exit 1
+fi
+
+STORY_ID="${NEXT%%|*}"
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+TMP=$(mktemp)
+jq --arg id "$STORY_ID" --arg holder "$CLAIM_HOLDER" --arg now "$NOW" '
+  .stories |= map(
+    if .id == $id then
+      .status = "in_progress" | .claimed_by = $holder | .claimed_at = $now
+    else . end
+  )
+' "$PRD_JSON" > "$TMP" && mv "$TMP" "$PRD_JSON"
+
+flock -u 200
+echo "$NEXT"

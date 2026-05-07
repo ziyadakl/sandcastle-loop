@@ -1,0 +1,835 @@
+#!/bin/bash
+# afk-ralph.sh — autonomous overnight loop with two-agent review + model escalation.
+# Backlog source: prd.json (Matt Pocock pattern). Stories are GitHub issues.
+#
+# Prerequisites (operator responsibility — the loop never touches these):
+#   1. Playwright's webServer config (or equivalent) handles dev-server lifecycle.
+#      The loop NEVER starts/stops/restarts servers.
+#   2. The .env file exists at the worktree root (sourced by the implementer).
+#   3. PreToolUse hooks at .claude/hooks/ralph-{stop,bash}-triggers.sh are installed.
+#   4. prd.json exists at repo root with stories[] array. Each story has a gh_issue.
+#   5. `gh` CLI is authenticated (`gh auth status` succeeds).
+#
+# Usage: bash scripts/ralph/afk-ralph.sh <iterations>
+# Exit codes: 0 PRD complete (no claimable stories), 1 HALT/circuit-breaker, 2 max-iterations reached.
+
+set -e
+
+if [ -z "$1" ]; then
+  echo "Usage: $0 <iterations>"
+  exit 1
+fi
+
+ITERATIONS=$1
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+BRANCH=$(git branch --show-current)
+if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+  echo "ABORT: refusing to run on $BRANCH. Checkout a feature branch first."
+  exit 1
+fi
+
+[ -f "$REPO_ROOT/prd.json" ] || { echo "ABORT: prd.json missing at repo root."; exit 1; }
+command -v gh >/dev/null || { echo "ABORT: gh CLI not installed."; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "ABORT: gh CLI not authenticated."; exit 1; }
+
+LOOP_ID="${LOOP_ID:-$(hostname)-$(basename $REPO_ROOT)-$$}"
+export CLAIM_HOLDER="$LOOP_ID"
+
+echo "Branch: $BRANCH"
+echo "Iterations: $ITERATIONS"
+echo "Loop ID: $LOOP_ID"
+
+# Startup recovery: if no other afk-ralph.sh is currently running, this is the
+# only loop on the host — any story still at status='in_progress' is stranded
+# from a prior run that died (timeout, kill, crash). Reset those to 'pending'
+# so the new run can re-claim them. Quarantined ('needs_human') stories are
+# left alone — they need human attention. Skipped if other loops are live, to
+# avoid trampling a parallel worktree's claim.
+OTHER_LOOPS=$(pgrep -f "afk-ralph\.sh" 2>/dev/null | grep -v "^$$" | wc -l)
+if [ "$OTHER_LOOPS" -eq 0 ]; then
+  TMP_PRD=$(mktemp)
+  flock -x "$REPO_ROOT/prd.json.lock" -c "jq '
+    .stories |= map(
+      if .status == \"in_progress\"
+      then .status = \"pending\" | del(.claimed_by) | del(.claimed_at)
+      else . end
+    )
+  ' '$REPO_ROOT/prd.json' > '$TMP_PRD' && mv '$TMP_PRD' '$REPO_ROOT/prd.json'" || {
+    echo "FATAL: startup-recovery flock failed (lock busy, jq error, or unwritable tempfile)."
+    echo "       Refusing to proceed — possibly-stranded in_progress stories were NOT reset."
+    rm -f "$TMP_PRD"
+    exit 1
+  }
+  RESET_COUNT=$(jq -r '[.stories[] | select(.status == "pending")] | length' "$REPO_ROOT/prd.json" 2>/dev/null || echo "?")
+  echo "Startup recovery: stranded in_progress stories reset to pending. Total pending: $RESET_COUNT"
+fi
+
+STREAM_TEXT='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+
+# === Agent invocations ===
+# Per-agent timeouts: implementer 20m, reviewer 10m, fixer 15m, recovery 30m.
+# File ordering inside each prompt puts ROCK-STABLE inputs first (prompt.md
+# never changes within a run, recovery-prompt.md never changes) so Anthropic's
+# automatic prompt caching can hit the longest possible prefix across iterations.
+
+run_implementer() {
+  local i=$1
+  local story_id=$2
+  local gh_issue=$3
+  timeout 1200 claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model claude-sonnet-4-6 "@scripts/ralph/prompt.md @progress.txt @/tmp/ralph-issue-$gh_issue.md
+
+ITERATION: $i
+STORY_ID: $story_id
+GH_ISSUE: $gh_issue
+
+The issue spec is pre-loaded above as @/tmp/ralph-issue-$gh_issue.md — do NOT call 'gh issue view' yourself, work from that file."
+}
+
+run_reviewer() {
+  local i=$1
+  local last_sha=$2
+  local gh_issue=$3
+  local model="${4:-claude-haiku-4-5}"
+  local spec_requires_pw="${RALPH_SPEC_REQUIRES_PW:-unknown}"
+  local commit_touched_ui="${RALPH_COMMIT_TOUCHED_UI:-unknown}"
+  local e2e_log="/tmp/ralph-e2e-it$i.log"
+  local e2e_attach=""
+  [ -f "$e2e_log" ] && e2e_attach=" @$e2e_log"
+  MAX_THINKING_TOKENS=4096 timeout 600 claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model "$model" "@/tmp/ralph-issue-$gh_issue.md$e2e_attach
+
+Use the superpowers:requesting-code-review skill to review commit $last_sha on branch $BRANCH (iteration $i, GitHub issue #$gh_issue). The issue spec is pre-loaded above as @/tmp/ralph-issue-$gh_issue.md — do NOT call 'gh issue view' yourself, work from that file. Check both spec fit (does the diff implement the issue's acceptance criteria?) and code quality.
+
+DRIVER GROUND TRUTH (authoritative, can't be overridden by implementer self-attestation):
+- SPEC_REQUIRES_PLAYWRIGHT=$spec_requires_pw — driver pre-grepped issue spec for 'playwright test'
+- COMMIT_TOUCHED_UI=$commit_touched_ui — driver post-commit git-diff'd for .tsx/.jsx/.vue under apps/
+
+If COMMIT_TOUCHED_UI=yes, the commit modified UI surface files — the certification's first checkbox MUST be [x] regardless of what the implementer self-attests. If COMMIT_TOUCHED_UI=no AND SPEC_REQUIRES_PLAYWRIGHT=no, the story is genuinely backend-only and N/A on e2e.
+
+Use this 4-tier classification per concern:
+  🔴 HARD — must fix, story can't ship: real bug, broken test, missing required behavior, security issue, data-loss risk.
+  🟠 MEDIUM — should fix: subtle logic bug that won't fail tests, missing error handling on a likely-failure path, real measurable perf concern, unsafe assumption that could break in production.
+  🟡 SOFT / cosmetic — DO NOT flag, skip silently: variable naming, formatting, comment phrasing, 'prefer this pattern', minor refactor opportunity, documentation polish. Only mention if you have nothing else to say.
+  🟢 CLEAR — no concerns.
+
+CRITICAL — execution-evidence check (do this FIRST, before reviewing code quality): if the issue spec's Acceptance section contains a 'playwright test' command, the implementer was required to run it and save output to /tmp/ralph-e2e-it$i.log. Verify ALL of:
+  1. Does /tmp/ralph-e2e-it$i.log exist and contain a playwright summary line (e.g. 'N passed' or 'N failed')? Run: ls -la /tmp/ralph-e2e-it$i.log && cat /tmp/ralph-e2e-it$i.log
+  2. Does git show $last_sha --stat | head -30 include the e2e summary in the commit body?
+  3. Does the last line of progress.txt include 'e2e: ...' with a summary?
+  4. **Did the test actually reach its assertion?** Search the playwright log for any of these bail signals — the test exited 'passed' but never exercised the feature:
+     - 'redirect' / 'redirected to /login' / 'Sign in' / '401' / 'Unauthorized'
+     - 'skipped' / 'test.skip' / 'fixme' / 'pending'
+     - 'blocked' / 'auth blocked' / 'auth path failed' / 'auth path blocked'
+     - 'pending human apply' / 'migration not applied' / 'pre-existing'
+     - a '1 passed' / '2 passed' summary with NO specific test-name detail visible above it (just the summary line standing alone with no '✓ TestName' line)
+  5. **Did the test name in the log match the story?** The story spec describes a specific behavior (e.g. 'click Accept on a suggestion to open a prefilled dialog'). The playwright output should include a test name and assertion lines that match that behavior. If the log shows 'passed' but the test name doesn't relate to what the story spec asks for, the test didn't exercise the right feature.
+  6. **Does the commit message rationalize a partial test?** Search the commit body for phrasings like 'pre-existing', 'auth blocked', 'pending human apply', 'symbolic test', 'will fully exercise once'. These are RED FLAGS — the implementer is admitting the test didn't actually verify the feature. That's 🔴 HARD.
+
+If the answer to (1) is no AND the spec required playwright, emit: '🔴 HARD: implementer did not run the spec's playwright command — no /tmp/ralph-e2e-it$i.log artifact'.
+If the log exists but shows any test as 'failed', emit: '🔴 HARD: e2e tests failed — <paste failing test name>'.
+If ANY of the bail signals in (4) are present (and the test isn't legitimately about an auth flow / 401 page itself), emit: '🔴 HARD: e2e ran but did not exercise the feature — bailed at <signal>. Story is NOT verified.'
+If the commit body matches (6), emit: '🔴 HARD: implementer rationalized a non-exercising test as a pass. <paste the rationalizing phrase>.'
+Code-quality reasoning ('fix looks correct', 'right API used') is NOT a substitute for execution evidence — call this out as 🔴 HARD if it's all you see.
+
+7. **STRUCTURAL CERTIFICATION CHECK — non-negotiable.** The commit body MUST contain a block delimited by '--- e2e verification certification ---' and '--- end certification ---'. Run: git show $last_sha | grep -A 12 -i 'e2e verification certification'. Verify:
+   a. The block exists. If absent, emit '🔴 HARD: commit body is missing the e2e verification certification block. Implementer skipped the structural certification.'
+   b. **Compare against driver ground truth.** The first checkbox 'story-type: this is a UI story requiring playwright' must be [x] if EITHER (SPEC_REQUIRES_PLAYWRIGHT=yes) OR (COMMIT_TOUCHED_UI=yes). If COMMIT_TOUCHED_UI=yes AND first checkbox is [ ], emit '🔴 HARD: implementer self-certified non-UI but driver-side git-diff shows the commit modified .tsx/.jsx files. UI escape hatch is being abused. List the specific UI files touched and require certification or HALT.' If SPEC_REQUIRES_PLAYWRIGHT=yes AND first checkbox is [ ], emit '🔴 HARD: spec contains a playwright command but implementer marked non-UI.' If both ground truths are no AND first checkbox is [ ], the e2e checkboxes are N/A and you should NOT block on them.
+   c. If the first checkbox is `[x]` (or `[X]` / `[ x]` — accept any case/whitespace variant), then EVERY OTHER checkbox in the block MUST also be checked (`[x]` / `[X]` / etc, not `[ ]`). If ANY remaining checkbox is unchecked, emit '🔴 HARD: implementer left checkbox <quote it> unchecked but committed anyway. The implementer admitted the feature was not verified end-to-end. This is the exact rubber-stamp failure mode the certification exists to prevent.'
+   d. **Evidence quote — STRICT verification.** Find the 'evidence (quote the exact assertion line from the playwright log here):' line. The quoted line MUST satisfy ALL of:
+      • Non-empty AND not the literal placeholder '<paste line>' or '<the quoted line>'.
+      • Starts with '✓' / '✔' / 'PASS' / 'PASSED' (a passing-test marker from playwright's reporter), OR contains 'expect(' (an explicit assertion call), OR contains the test description text from the test file.
+      • Actually appears in /tmp/ralph-e2e-it$i.log — run: grep -F \"<the quoted line>\" /tmp/ralph-e2e-it$i.log
+      • Is NOT one of these forbidden generic lines: 'Running N tests', 'using N worker', 'Workers:', 'Slow test file', '[chromium]' alone (without a leading ✓), a bare URL line, 'passed' / 'failed' / 'all green' on its own.
+      If ANY of the above fails, emit '🔴 HARD: certification evidence is fabricated, generic, or doesn't prove the test reached its assertion. <paste the offending line and the rule it violated>.'
+   e. **Cross-check certification vs bail signals.** If all checkboxes are `[x]` BUT the playwright log shows the bail signals from check (4), that's '🔴 HARD: certification claims feature was verified but playwright log shows the test bailed. Implementer falsified the certification.' Note: legitimate auth-flow tests (testing the /login page itself) WILL contain 'Sign in' / '401' — if SPEC_REQUIRES_PLAYWRIGHT=yes AND the story spec is explicitly about auth, treat those tokens as legitimate; otherwise treat as bail.
+
+8. **OUTPUT-SUPPRESSION CHECK.** The implementer is required to run the playwright command from the spec EXACTLY as written. Search the commit body, progress.txt, and the diff for evidence of filtering — patterns like '| grep -v', '| sed', '| awk', '--reporter=dot' (when spec doesn't ask for it), '--quiet', '> /dev/null', '2>/dev/null' applied to the playwright invocation. If any are present, emit '🔴 HARD: implementer filtered the playwright output before tee, suppressing the bail signals the reviewer needs. <paste the filter command>. Re-run the spec's command verbatim.'
+
+The certification block is structural; you cannot rubber-stamp it by reading prose. Always run the explicit grep / git show commands above. SPEC_REQUIRES_PLAYWRIGHT is driver-attested ground truth; the implementer's checkbox cannot override it.
+
+If the spec has no playwright command, the implementer should have emitted '[STEP 6/9] SKIP — non-UI story'; that is acceptable.
+
+First, output the line: [STEP 1/1] Review (this is required — the loop driver uses it to render status). Then do the review. End with one of:
+  - ALL_CLEAR — no 🔴 or 🟠 concerns. (🟡 cosmetic is fine; do not block on cosmetic issues.)
+  - HAS_BLOCKERS — at least one 🔴 or 🟠 concern that genuinely needs a fix.
+
+The marker MUST be on its own line at the end of your output, with no surrounding text. Do NOT write 'Verdict: HAS_BLOCKERS' or 'Final: ALL_CLEAR' — write the marker as a bare word on a line by itself, as the LAST non-empty line of your response. Example correct ending: '...analysis complete.\n\nHAS_BLOCKERS\n'. The driver extracts the verdict from the LAST line that exactly matches the marker name (whitespace-only allowed). Free-text mentions of the marker words elsewhere in your output are tolerated but only the bare-line marker counts."
+}
+
+run_fixer() {
+  local i=$1
+  local attempt=$2
+  local last_sha=$3
+  local gh_issue=$4
+  local model_flag="--model claude-sonnet-4-6"
+  if [ "$attempt" = "2" ]; then
+    model_flag="--model claude-opus-4-7"
+  fi
+  timeout 900 claude -p --output-format stream-json --verbose --dangerously-skip-permissions $model_flag "Use the superpowers:receiving-code-review skill to judge the most recent code review on commit $last_sha (iteration $i, fix attempt $attempt, GitHub issue #$gh_issue). Fix every 🔴 HARD finding (must-fix bugs / blockers) and every 🟠 MEDIUM finding (real concerns that won't fail tests but matter). Skip 🟡 SOFT / cosmetic findings entirely — DO NOT touch variable names, formatting, comment phrasing, or 'prefer this pattern' suggestions. Run typecheck and tests after fixes, then commit explicitly with prefix 'RALPH(it=$i fix=$attempt issue=$gh_issue): '. Emit these step markers on their own lines as you go (the loop driver renders them as a status block): [STEP 1/4] Judge findings, [STEP 2/4] Apply fixes, [STEP 3/4] Verify, [STEP 4/4] Commit. End with one of: FIXED or BLOCKED.
+
+The marker MUST be on its own line at the end of your output, with no surrounding text. Do NOT write 'Verdict: FIXED' or 'Final: BLOCKED' — write the marker as a bare word on a line by itself, as the LAST non-empty line of your response. Example correct ending: '...commit landed.\n\nFIXED\n'. The driver extracts the verdict from the LAST line that exactly matches the marker name (whitespace-only allowed). Free-text mentions of the marker words elsewhere in your output are tolerated but only the bare-line marker counts."
+}
+
+run_recovery() {
+  local i=$1 story_id=$2 gh_issue=$3 model=$4 briefing_file=$5
+  timeout 1800 claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model "$model" "@scripts/ralph/recovery-prompt.md @scripts/ralph/prompt.md @/tmp/ralph-issue-$gh_issue.md @$briefing_file
+
+ITERATION: $i
+STORY_ID: $story_id
+GH_ISSUE: $gh_issue
+RECOVERY_MODEL: $model
+
+The issue spec, recovery instructions, and briefing are all pre-loaded above. Read them and act per the recovery-prompt.md instructions. End with RECOVERY_COMPLETE or <promise>HALT</promise>."
+}
+
+# === Stream-output helpers (HALT detection scoped to assistant text) ===
+
+# Returns 0 if <promise>HALT</promise> is emitted at line-start in the agent's
+# own assistant text (not inside tool_results that quote a hook script verbatim,
+# AND not inside reasoning text that quotes the sentinel — e.g. "I considered
+# emitting <promise>HALT</promise> but decided not to"). The recovery prompt
+# instructs agents to emit the sentinel on its own line as their final marker;
+# anchoring at line-start excludes inline references.
+halt_emitted() {
+  local stream_out=$1
+  local last_marker
+  last_marker=$(echo "$stream_out" | grep '^{' | \
+    jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | \
+    awk '
+      /^[[:space:]]*<promise>HALT<\/promise>[[:space:]]*$/ { last = "HALT" }
+      /^[[:space:]]*RECOVERY_COMPLETE[[:space:]]*$/        { last = "RECOVERY_COMPLETE" }
+      /^[[:space:]]*FIXED[[:space:]]*$/                    { last = "FIXED" }
+      /^[[:space:]]*BLOCKED[[:space:]]*$/                  { last = "BLOCKED" }
+      /^[[:space:]]*ALL_CLEAR[[:space:]]*$/                { last = "ALL_CLEAR" }
+      /^[[:space:]]*HAS_BLOCKERS[[:space:]]*$/             { last = "HAS_BLOCKERS" }
+      END { print last }
+    ')
+  [ "$last_marker" = "HALT" ]
+}
+
+# Print the explanation paragraph that follows a line-start HALT promise — used
+# for the quarantine reason field. Falls back to "(no reason given)" if nothing
+# useful follows. Captures any text on the same line after the promise (e.g.
+# "<promise>HALT</promise> reason: ...") plus all subsequent lines, joined.
+extract_halt_reason() {
+  local stream_out=$1
+  local reason
+  reason=$(echo "$stream_out" | grep '^{' | \
+    jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | \
+    awk '/^<promise>HALT<\/promise>/{flag=1; sub(/^<promise>HALT<\/promise>/, ""); if ($0 ~ /[^[:space:]]/) print; next} flag {print}' | \
+    tr '\n' ' ' | sed 's/  */ /g; s/^ //' | cut -c1-300)
+  echo "${reason:-(no reason given)}"
+}
+
+# Print the agent's assistant text from a captured stream-json blob.
+# Used to surface reviewer/fixer verdicts into the run log.
+print_agent_text() {
+  local stream_out=$1
+  local label=$2
+  echo ""
+  echo "=== $label assistant text ==="
+  echo "$stream_out" | grep '^{' | \
+    jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null
+  echo "=== end $label assistant text ==="
+  echo ""
+}
+
+# === prd.json mutators (atomic via flock) ===
+
+# Quarantine a story: mark needs_human, attach diagnostics, clear claim.
+# Uses env-var passthrough into jq (jq's `env.VAR` syntax) so that a reason
+# string containing single quotes, backticks, or other shell metacharacters
+# can't break the quarantine call. Lock acquired via subshell + fd 200 instead
+# of `flock -c "..."` for the same reason — no inner shell to escape into.
+quarantine_story() {
+  local story_id=$1 reason=$2 attempts=${3:-3}
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local tmp
+  tmp=$(mktemp)
+  (
+    flock -x 200
+    STORY_ID="$story_id" REASON="$reason" ATTEMPTS="$attempts" NOW="$now" \
+    jq '
+      .stories |= map(if .id == env.STORY_ID then
+        .status = "needs_human"
+        | .quarantined_at = env.NOW
+        | .last_error = env.REASON
+        | .attempts = (env.ATTEMPTS | tonumber)
+        | del(.claimed_by) | del(.claimed_at)
+      else . end)
+    ' "$REPO_ROOT/prd.json" > "$tmp" && mv "$tmp" "$REPO_ROOT/prd.json"
+  ) 200>"$REPO_ROOT/prd.json.lock"
+  local jq_rc=$?
+  if [ $jq_rc -ne 0 ]; then
+    echo "WARN: quarantine_story for $story_id failed (rc=$jq_rc). prd.json may be unchanged." >&2
+  fi
+  echo "Quarantined story $story_id: $reason"
+  rm -f "$tmp"
+}
+
+# === Recovery briefing: short markdown summary for the recovery agent ===
+
+build_briefing() {
+  local i=$1 story_id=$2 gh_issue=$3 pre_sha=$4 prior_rc=$5 prior_who=$6 prior_log=$7
+  local last_step="(none captured)"
+  if [ -f "$prior_log" ]; then
+    local extracted
+    extracted=$(grep -oE '\[STEP [0-9]+/[0-9]+[^]]*\]' "$prior_log" 2>/dev/null | tail -1)
+    [ -n "$extracted" ] && last_step="$extracted"
+  fi
+  local commits uncommitted
+  commits=$(git log --oneline "${pre_sha}..HEAD" 2>/dev/null || echo "(none)")
+  [ -z "$commits" ] && commits="(none)"
+  uncommitted=$(git status -s 2>/dev/null || echo "(clean)")
+  [ -z "$uncommitted" ] && uncommitted="(clean)"
+
+  cat <<EOF
+# Recovery briefing — iteration $i, story $story_id (gh issue #$gh_issue)
+
+The previous **$prior_who** agent exited non-zero (rc=$prior_rc). That's most often a hit timeout (implementer 20m, reviewer 10m, fixer 15m) but can also be a crash, OOM kill, or unrecoverable hook block.
+
+## What's already there
+
+- Commits made this iteration (from PRE_SHA \`${pre_sha:0:8}\` to HEAD):
+
+\`\`\`
+$commits
+\`\`\`
+
+- Uncommitted files:
+
+\`\`\`
+$uncommitted
+\`\`\`
+
+- Last \`[STEP X/9]\` marker the previous agent emitted: $last_step
+
+## What you do next
+
+Read \`scripts/ralph/recovery-prompt.md\` (pre-loaded). tldr: run the spec's acceptance tests. If they pass, commit any pending work and exit cleanly with \`RECOVERY_COMPLETE\` — the loop driver will mark the story done and close the GH issue itself. If the tests fail, finish the work using what's already here as scaffolding, then commit and exit \`RECOVERY_COMPLETE\`. Only emit \`<promise>HALT</promise>\` for real external blockers. Do NOT call \`mark-done.sh\` or \`gh issue close\` yourself.
+EOF
+}
+
+# === Circuit breaker: open a GH issue with diagnostics + un-quarantine commands ===
+
+trip_circuit_breaker() {
+  local trigger_story=$1
+  local quarantined_diag
+  quarantined_diag=$(jq -r '[.stories[] | select(.status == "needs_human") | "- " + .id + " (gh #" + (.gh_issue|tostring) + "): " + (.last_error // "no reason recorded")] | join("\n")' "$REPO_ROOT/prd.json" 2>/dev/null || echo "(none)")
+  local quarantined_ids
+  quarantined_ids=$(jq -r '[.stories[] | select(.status == "needs_human") | .id] | join(" ")' "$REPO_ROOT/prd.json" 2>/dev/null || echo "")
+
+  local body
+  body=$(cat <<MD
+The autonomous ralph loop tripped its circuit breaker after **3 consecutive stories failed their full retry ladder** (Sonnet implementer → Sonnet recovery → Opus recovery, all non-zero exit).
+
+This is a strong signal something is systemically wrong (Anthropic API down, dev server died, credentials expired, missing env, etc.) rather than the individual stories being individually hard.
+
+## Stories at \`status=needs_human\`
+
+$quarantined_diag
+
+## Trigger
+
+Third consecutive ladder failure was: **$trigger_story**.
+
+## To resume after investigating
+
+1. Diagnose the root cause from \`ralph-overnight-*.log\`. The last several iterations should show the same kind of failure repeating.
+
+2. Re-pending the failed stories (one-liner — adjust IDs as needed):
+
+\`\`\`bash
+cd $REPO_ROOT
+for id in $quarantined_ids; do
+  jq --arg id "\$id" '.stories |= map(if .id == \$id then .status = "pending" | del(.last_error, .quarantined_at, .attempts) else . end)' prd.json > /tmp/p.json && mv /tmp/p.json prd.json
+done
+\`\`\`
+
+3. Kick a new run:
+
+\`\`\`bash
+nohup bash scripts/ralph/afk-ralph.sh 12 > ralph-overnight-N.log 2>&1 & disown
+\`\`\`
+
+The startup-recovery rule resets stranded \`in_progress\` stories automatically; you only need step 2 for stories already at \`needs_human\`.
+
+## Logs
+
+Iteration logs are in \`ralph-overnight-*.log\` files at the repo root. Look at the last few iterations for the failure pattern.
+MD
+)
+
+  gh issue create --title "ralph: circuit breaker tripped — 3 consecutive ladder failures" \
+    --label "ralph:halt" \
+    --body "$body" 2>&1 | tail -3 || echo "WARN: gh issue create failed; circuit-breaker info preserved in this log."
+}
+
+# === Stream wrapper: invoke a function via timeout/claude, render status, check rc ===
+
+run_with_status() {
+  local label=$1; shift
+  local outfile errfile
+  outfile=$(mktemp); errfile=$(mktemp)
+  local start_epoch=$(date +%s)
+  set +e
+  "$@" </dev/null 2>"$errfile" \
+    | grep --line-buffered '^{' \
+    | tee "$outfile" \
+    | jq --unbuffered -rj "$STREAM_TEXT" \
+    | tee >(python3 "$REPO_ROOT/scripts/ralph/status-render.py" "$label" "$start_epoch" >&2)
+  local rc=${PIPESTATUS[0]}
+  set -e
+  if [ $rc -ne 0 ] && [ -s "$outfile" ] && \
+     grep -q '"type":"result"' "$outfile" && \
+     grep -q '"subtype":"success"' "$outfile" && \
+     grep -q '"is_error":false' "$outfile"; then
+    echo "" >&2
+    echo "NOTE: $label exited $rc but emitted result=success — treating as success." >&2
+    rc=0
+  fi
+  if [ $rc -ne 0 ]; then
+    echo "" >&2
+    echo "ERROR: $label exited with code $rc" >&2
+    [ -s "$errfile" ] && { echo "=== stderr ===" >&2; cat "$errfile" >&2; }
+    if [ -s "$outfile" ]; then
+      echo "=== last 40 lines of assistant text (base64 screenshots stripped) ===" >&2
+      # Show extracted assistant text + structural envelope lines, NOT raw
+      # stream-json — tool_results often contain base64-encoded screenshots
+      # that produce 70KB+ blob dumps unreadable to the operator. The jq
+      # extracts assistant-typed text; the grep keeps lightweight envelope
+      # lines (result/error metadata) without the body. Lines >500 chars
+      # (typical base64 indicator) get truncated with a marker.
+      grep '^{' "$outfile" | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | tail -40 >&2
+      echo "=== exit envelope ===" >&2
+      grep -E '"type":"result"|"is_error":true|"subtype":"error"' "$outfile" 2>/dev/null | tail -3 | cut -c1-500 >&2
+    fi
+  fi
+  cat "$outfile"
+  rm -f "$outfile" "$errfile"
+  return $rc
+}
+
+# === Main loop ===
+
+# Counts stories whose full retry ladder (implementer → Sonnet recovery →
+# Opus recovery) all hit non-zero exit. HALT and successful recovery reset to 0.
+# Threshold of 3 trips the circuit breaker.
+CONSECUTIVE_FAILURES=0
+
+# Counts consecutive HALT emissions (deliberate signals, not retry failures).
+# A misbehaving Sonnet that emits HALT for every story would silently drain
+# the queue without bumping CONSECUTIVE_FAILURES — this counter catches that.
+# Threshold of 3 trips the same circuit breaker.
+CONSECUTIVE_HALTS=0
+
+for ((i=1; i<=ITERATIONS; i++)); do
+  echo ""
+
+  # Atomically claim next pending unblocked story.
+  CLAIM_RAW=$(bash "$REPO_ROOT/scripts/ralph/claim-story.sh") || {
+    rc=$?
+    if [ $rc -eq 1 ]; then
+      echo "No claimable stories remaining (all done or blocked). PRD complete after $((i-1)) iterations."
+      exit 0
+    fi
+    echo "claim-story.sh failed (rc=$rc). Stopping."
+    exit 1
+  }
+  STORY_ID="${CLAIM_RAW%%|*}"
+  REST="${CLAIM_RAW#*|}"
+  GH_ISSUE="${REST%%|*}"
+  TITLE="${REST#*|}"
+  echo "Claimed story $STORY_ID (gh issue #$GH_ISSUE): $TITLE"
+
+  # Status-render.py reads these env vars to render a richer status block
+  # (iteration counter, PRD progress %, story title). Exported so they
+  # inherit into the python subprocess spawned by run_with_status.
+  export RALPH_ITER_NUM="$i"
+  export RALPH_ITER_TOTAL="$ITERATIONS"
+  export RALPH_STORY_ID="$STORY_ID"
+  export RALPH_GH_ISSUE="$GH_ISSUE"
+  export RALPH_TITLE="$TITLE"
+
+  # Pre-fetch the GitHub issue body so the implementer/reviewer don't have to call gh issue view themselves.
+  ISSUE_FILE="/tmp/ralph-issue-$GH_ISSUE.md"
+  gh issue view "$GH_ISSUE" --json title,body --jq '"# " + .title + "\n\n" + .body' > "$ISSUE_FILE" || {
+    echo "WARN: gh issue view #$GH_ISSUE failed; proceeding without pre-fetched spec."
+    : > "$ISSUE_FILE"
+  }
+
+  # Driver-side detection: does this spec require playwright? Pre-grep the issue
+  # for the literal string 'playwright test'. The reviewer treats this as
+  # ground truth for whether the implementer's "non-UI story" certification
+  # checkbox is being abused as an escape hatch.
+  if grep -qE 'playwright test' "$ISSUE_FILE" 2>/dev/null; then
+    export RALPH_SPEC_REQUIRES_PW="yes"
+  else
+    export RALPH_SPEC_REQUIRES_PW="no"
+  fi
+  echo "Driver detection: SPEC_REQUIRES_PLAYWRIGHT=$RALPH_SPEC_REQUIRES_PW"
+
+  PRE_SHA=$(git log -1 --format=%H 2>/dev/null || echo "")
+  IMPL_LOG=$(mktemp /tmp/ralph-impl-it$i.XXXXXX.log)
+
+  IMPL_RC=0
+  IMPL_OUT=$(run_with_status "Implementer (it=$i)" run_implementer "$i" "$STORY_ID" "$GH_ISSUE") || IMPL_RC=$?
+  echo "$IMPL_OUT" > "$IMPL_LOG"
+
+  # === Implementer non-zero exit: retry ladder ===
+  # Sonnet recovery → Opus recovery → quarantine. HALT respected at any layer.
+  if [ $IMPL_RC -ne 0 ]; then
+    echo "Implementer rc=$IMPL_RC for $STORY_ID. Spawning Sonnet recovery."
+    BRIEF=$(mktemp /tmp/ralph-brief-it$i.XXXXXX.md)
+    build_briefing "$i" "$STORY_ID" "$GH_ISSUE" "$PRE_SHA" "$IMPL_RC" "implementer" "$IMPL_LOG" > "$BRIEF"
+
+    REC_RC=0
+    REC_OUT=$(run_with_status "Recovery-Sonnet (it=$i)" run_recovery "$i" "$STORY_ID" "$GH_ISSUE" "claude-sonnet-4-6" "$BRIEF") || REC_RC=$?
+
+    # Sentinel: set to 1 by either Sonnet or Opus recovery success-with-commit
+    # branches. When set, control falls through past the remaining recovery
+    # ladder and into the post-impl-success block (UI detection, migration
+    # auto-apply, reviewer/fixer loop) so recovery commits get the same gating
+    # as implementer commits.
+    RECOVERY_COMMITTED=0
+
+    if [ $REC_RC -eq 0 ] && ! halt_emitted "$REC_OUT"; then
+      POST_SHA=$(git log -1 --format=%H 2>/dev/null || echo "$PRE_SHA")
+      if [ "$POST_SHA" != "$PRE_SHA" ]; then
+        echo "Sonnet recovery succeeded with new commit at $POST_SHA. Routing through reviewer/fixer cycle..."
+        rm -f "$BRIEF" "$IMPL_LOG"
+        RECOVERY_COMMITTED=1
+        # Fall through (no continue) — control resumes at the post-impl-success
+        # block below, which handles UI detection, migration auto-apply, and
+        # the reviewer/fixer loop. Recovery commits get the same gating as
+        # implementer commits.
+      else
+        echo "Sonnet recovery succeeded but no new commit. Story stays in_progress for human attention."
+        rm -f "$BRIEF" "$IMPL_LOG"
+        continue
+      fi
+    fi
+
+    if [ $RECOVERY_COMMITTED -eq 0 ] && halt_emitted "$REC_OUT"; then
+      reason=$(extract_halt_reason "$REC_OUT")
+      echo "Sonnet recovery emitted HALT for $STORY_ID. Quarantining (deliberate)."
+      quarantine_story "$STORY_ID" "Sonnet recovery HALT: $reason" 1
+      rm -f "$BRIEF" "$IMPL_LOG"
+      CONSECUTIVE_HALTS=$((CONSECUTIVE_HALTS + 1))
+      if [ $CONSECUTIVE_HALTS -ge 3 ]; then
+        echo "HALT-rate breaker tripped after $CONSECUTIVE_HALTS consecutive HALTs (queue would otherwise drain silently)."
+        trip_circuit_breaker "$STORY_ID"
+        exit 1
+      fi
+      continue
+    fi
+
+    if [ $RECOVERY_COMMITTED -eq 0 ]; then
+      # Sonnet recovery failed without HALT — escalate to Opus.
+      echo "Sonnet recovery rc=$REC_RC. Escalating to Opus."
+      BRIEF2=$(mktemp /tmp/ralph-brief2-it$i.XXXXXX.md)
+      # Capture Sonnet recovery's stream-json to a tempfile so the Opus briefing
+      # references the previous-agent log Opus actually needs (Sonnet recovery's
+      # output), not the implementer's log.
+      REC_LOG=$(mktemp /tmp/ralph-rec-it$i.XXXXXX.log)
+      echo "$REC_OUT" > "$REC_LOG"
+      build_briefing "$i" "$STORY_ID" "$GH_ISSUE" "$PRE_SHA" "$REC_RC" "implementer-then-sonnet-recovery" "$REC_LOG" > "$BRIEF2"
+
+      OPUS_RC=0
+      OPUS_OUT=$(run_with_status "Recovery-Opus (it=$i)" run_recovery "$i" "$STORY_ID" "$GH_ISSUE" "claude-opus-4-7" "$BRIEF2") || OPUS_RC=$?
+
+      if [ $OPUS_RC -eq 0 ] && ! halt_emitted "$OPUS_OUT"; then
+        POST_SHA=$(git log -1 --format=%H 2>/dev/null || echo "$PRE_SHA")
+        if [ "$POST_SHA" != "$PRE_SHA" ]; then
+          echo "Opus recovery succeeded with new commit at $POST_SHA. Routing through reviewer/fixer cycle..."
+          rm -f "$BRIEF" "$BRIEF2" "$IMPL_LOG" "$REC_LOG"
+          RECOVERY_COMMITTED=1
+          # Fall through (no continue) — control resumes at the post-impl-success
+          # block below, which handles UI detection, migration auto-apply, and
+          # the reviewer/fixer loop. Recovery commits get the same gating as
+          # implementer commits.
+        else
+          echo "Opus recovery succeeded but no new commit. Story stays in_progress for human attention."
+          rm -f "$BRIEF" "$BRIEF2" "$IMPL_LOG" "$REC_LOG"
+          continue
+        fi
+      fi
+    fi
+
+    if [ $RECOVERY_COMMITTED -eq 0 ] && halt_emitted "$OPUS_OUT"; then
+      reason=$(extract_halt_reason "$OPUS_OUT")
+      echo "Opus recovery emitted HALT for $STORY_ID. Quarantining (deliberate)."
+      quarantine_story "$STORY_ID" "Opus recovery HALT: $reason" 2
+      rm -f "$BRIEF" "$BRIEF2" "$IMPL_LOG" "${REC_LOG:-}"
+      CONSECUTIVE_HALTS=$((CONSECUTIVE_HALTS + 1))
+      if [ $CONSECUTIVE_HALTS -ge 3 ]; then
+        echo "HALT-rate breaker tripped after $CONSECUTIVE_HALTS consecutive HALTs (queue would otherwise drain silently)."
+        trip_circuit_breaker "$STORY_ID"
+        exit 1
+      fi
+      continue
+    fi
+
+    if [ $RECOVERY_COMMITTED -eq 0 ]; then
+      # Both recoveries failed without HALT — quarantine and bump circuit-breaker counter.
+      echo "Full retry ladder exhausted for $STORY_ID."
+      quarantine_story "$STORY_ID" "ladder-exhausted: impl rc=$IMPL_RC, sonnet-rec rc=$REC_RC, opus-rec rc=$OPUS_RC" 3
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+      rm -f "$BRIEF" "$BRIEF2" "$IMPL_LOG" "${REC_LOG:-}"
+
+      if [ $CONSECUTIVE_FAILURES -ge 3 ]; then
+        echo "Circuit breaker tripped after $CONSECUTIVE_FAILURES consecutive ladder failures."
+        trip_circuit_breaker "$STORY_ID"
+        exit 1
+      fi
+      continue
+    fi
+  fi
+
+  # === Implementer succeeded (rc=0) ===
+  # Reset both consecutive counters; check whether a commit landed.
+  CONSECUTIVE_FAILURES=0
+  CONSECUTIVE_HALTS=0
+  rm -f "$IMPL_LOG"
+
+  POST_SHA=$(git log -1 --format=%H 2>/dev/null || echo "")
+  if [ "$POST_SHA" != "$PRE_SHA" ]; then
+    : # commit landed — fall through to migration auto-apply, then review
+  else
+    # No commit — distinguish a real implementer halt from a verification-only iter.
+    if halt_emitted "$IMPL_OUT"; then
+      reason=$(extract_halt_reason "$IMPL_OUT")
+      echo "Implementer halted at iteration $i for $STORY_ID. Quarantining (deliberate)."
+      quarantine_story "$STORY_ID" "implementer HALT: $reason" 1
+      CONSECUTIVE_HALTS=$((CONSECUTIVE_HALTS + 1))
+      if [ $CONSECUTIVE_HALTS -ge 3 ]; then
+        echo "HALT-rate breaker tripped after $CONSECUTIVE_HALTS consecutive HALTs (queue would otherwise drain silently)."
+        trip_circuit_breaker "$STORY_ID"
+        exit 1
+      fi
+      continue
+    fi
+    echo "No new commit from implementer for story $STORY_ID. Skipping review."
+    continue
+  fi
+
+  # === Post-commit migration auto-apply (NEW migrations from THIS commit only) ===
+  # Scoped to git-diff so we don't accidentally re-apply non-idempotent prior
+  # migrations (e.g. RENAME COLUMN). The implementer may have already applied
+  # via MIGRATION_BLOCK; we re-apply idempotently as a backstop.
+  NEW_MIGRATIONS=$(git diff --name-only --diff-filter=A "$PRE_SHA" "$POST_SHA" -- 'packages/db/migrations/*.sql' 2>/dev/null | grep -v '/meta/' || true)
+  if [ -n "$NEW_MIGRATIONS" ]; then
+    PG_URL_RAW=$(grep '^POSTGRES_URL=' "$REPO_ROOT/.env" | head -1 | cut -d'"' -f2)
+    PG_URL_CLEAN=$(printf '%s' "$PG_URL_RAW" | sed -E 's/[?&]workaround=[^&]*//; s/[?&]+$//')
+    MIG_FAILED=0
+    while IFS= read -r mig; do
+      [ -z "$mig" ] && continue
+      MIG_LOG=$(mktemp "/tmp/ralph-mig-it$i-$(basename "$mig" .sql).XXXXXX.log")
+      echo "Auto-applying new migration: $mig"
+      psql "$PG_URL_CLEAN" -X -f "$REPO_ROOT/$mig" > "$MIG_LOG" 2>&1
+      # psql exits 0 even with ON_ERROR_STOP=0 (default). Detect real failures
+      # by counting ERROR lines that AREN'T benign idempotency collisions.
+      # Filter ONLY structural-collision benign errors (CREATE X where X exists).
+      # Anchored to PostgreSQL's exact phrasing — `relation/type/etc "..." already exists`.
+      # The previous loose `already exists|duplicate (key|object)` filter false-classified
+      # real INSERT conflicts (e.g. `duplicate key value violates unique constraint`) as benign.
+      NON_BENIGN_ERRORS=$(grep -E '^ERROR:|^psql:[^:]+:[0-9]+: ERROR:' "$MIG_LOG" 2>/dev/null \
+        | grep -vE 'ERROR: +(relation|type|extension|index|constraint|table|schema|column|sequence|function|trigger|policy|view|materialized view|operator|aggregate|domain|role|user|database|tablespace) "[^"]*" already exists' \
+        | wc -l)
+      if [ "$NON_BENIGN_ERRORS" -eq 0 ]; then
+        echo "  → migration $mig applied (or all-benign collisions)."
+        rm -f "$MIG_LOG"
+      else
+        echo "ERROR: migration $mig failed with non-benign errors:"
+        grep -E '^ERROR:|^psql:[^:]+:[0-9]+: ERROR:' "$MIG_LOG" | head -5
+        echo "(full log: $MIG_LOG)"
+        quarantine_story "$STORY_ID" "post-commit-migration-failed: $(basename "$mig") — non-benign errors, see $MIG_LOG" 1
+        MIG_FAILED=1
+        break
+      fi
+    done <<< "$NEW_MIGRATIONS"
+    if [ "$MIG_FAILED" -eq 1 ]; then
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+      if [ $CONSECUTIVE_FAILURES -ge 3 ]; then
+        echo "Circuit breaker tripped after $CONSECUTIVE_FAILURES consecutive failures."
+        trip_circuit_breaker "$STORY_ID"
+        exit 1
+      fi
+      continue
+    fi
+  fi
+
+  # === Reviewer (Haiku 4.5 default) with single-step Opus retry on failure ===
+  # Fixer ladder: Sonnet attempt 1, Opus attempt 2. Same-tier retry is documented
+  # anti-pattern (arxiv 2505.24726 + every production loop) — every retry changes tier.
+  # mark-done.sh + gh issue close happen HERE (driver-side) only after ALL_CLEAR or FIXED;
+  # nothing is marked done until the reviewer/fixer cycle is satisfied.
+  ITERATION_FINALIZED=0
+  for attempt in 1 2; do
+    echo "Review attempt $attempt"
+
+    # === Driver-side UI detection (post-commit, mechanical) ===
+    # Recomputed at the top of each attempt because the fixer between attempts
+    # may have changed the UI footprint of the diff. The reviewer uses this as
+    # ground truth — implementer's self-attested "non-UI story" checkbox cannot
+    # override a mechanical git-diff fact.
+    UI_FILES_TOUCHED=$(git diff --name-only --diff-filter=AM "$PRE_SHA" "$POST_SHA" -- \
+      'apps/*/src/**/*.tsx' 'apps/*/src/**/*.jsx' 'apps/*/src/**/*.vue' \
+      'apps/*/**/*.tsx' 'apps/*/**/*.jsx' 'apps/*/**/*.vue' \
+      'packages/ui/src/**/*.tsx' 'packages/ui/src/**/*.jsx' 'packages/ui/src/**/*.vue' \
+      2>/dev/null | head -20)
+    if [ -n "$UI_FILES_TOUCHED" ]; then
+      export RALPH_COMMIT_TOUCHED_UI="yes"
+      UI_COUNT=$(echo "$UI_FILES_TOUCHED" | wc -l)
+      UI_SAMPLE=$(echo "$UI_FILES_TOUCHED" | head -3 | tr '\n' ',' | sed 's/,$//')
+      echo "Driver detection: COMMIT_TOUCHED_UI=yes ($UI_COUNT files: $UI_SAMPLE${UI_COUNT:+...})"
+    else
+      export RALPH_COMMIT_TOUCHED_UI="no"
+      echo "Driver detection: COMMIT_TOUCHED_UI=no"
+    fi
+
+    REV_RC=0
+    REVIEW_OUT=$(run_with_status "Reviewer (it=$i a=$attempt)" run_reviewer "$i" "$POST_SHA" "$GH_ISSUE") || REV_RC=$?
+
+    if [ $REV_RC -ne 0 ]; then
+      echo "Reviewer rc=$REV_RC at attempt $attempt. Respawning with Opus."
+      REV_RC=0
+      REVIEW_OUT=$(run_with_status "Reviewer-Opus (it=$i a=$attempt)" run_reviewer "$i" "$POST_SHA" "$GH_ISSUE" "claude-opus-4-7") || REV_RC=$?
+      if [ $REV_RC -ne 0 ]; then
+        echo "Reviewer ladder (Haiku + Opus) failed for $STORY_ID."
+        quarantine_story "$STORY_ID" "reviewer-ladder-exhausted: opus rc=$REV_RC" 2
+        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        if [ $CONSECUTIVE_FAILURES -ge 3 ]; then
+          echo "Circuit breaker tripped after $CONSECUTIVE_FAILURES consecutive ladder failures."
+          trip_circuit_breaker "$STORY_ID"
+          exit 1
+        fi
+        continue 2
+      fi
+    fi
+
+    print_agent_text "$REVIEW_OUT" "Reviewer (it=$i a=$attempt)"
+
+    # Extract the LAST ALL_CLEAR/HAS_BLOCKERS marker from ASSISTANT TEXT ONLY.
+    # Cannot grep $REVIEW_OUT directly — the captured stream-json includes the
+    # user prompt sent to the reviewer, which contains the literal string
+    # "ALL_CLEAR or HAS_BLOCKERS" as instructions. Greping the raw stream would
+    # match the prompt every time, falsely treating HAS_BLOCKERS verdicts as
+    # ALL_CLEAR. Pipe through jq to scope to assistant text, then take the LAST
+    # marker (in case the reviewer mentioned both during reasoning).
+    # Marker MUST be the last non-empty line of assistant text. Tolerates
+    # surrounding markdown punctuation (**ALL_CLEAR**, ### HAS_BLOCKERS, etc.)
+    # but rejects mid-reasoning markers — agent can mention ALL_CLEAR early
+    # then revise to HAS_BLOCKERS in prose; if the marker isn't the literal
+    # last non-empty line, we default to HAS_BLOCKERS (safe-fail).
+    REVIEW_VERDICT=$(echo "$REVIEW_OUT" | grep '^{' | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | awk '
+      { if ($0 !~ /^[[:space:]]*$/) last = $0 }
+      END {
+        if (match(last, /^[[:space:][:punct:]]*ALL_CLEAR[[:space:][:punct:]]*$/)) print "ALL_CLEAR"
+        else if (match(last, /^[[:space:][:punct:]]*HAS_BLOCKERS[[:space:][:punct:]]*$/)) print "HAS_BLOCKERS"
+      }
+    ')
+    echo "Reviewer verdict: ${REVIEW_VERDICT:-(none — defaulting to HAS_BLOCKERS)}"
+
+    if [ "$REVIEW_VERDICT" = "ALL_CLEAR" ]; then
+      echo "Review clear at attempt $attempt. Marking $STORY_ID done and closing issue #$GH_ISSUE."
+      bash "$REPO_ROOT/scripts/ralph/mark-done.sh" "$STORY_ID" || { echo "ERROR: mark-done.sh failed for $STORY_ID. Stopping for human attention."; exit 1; }
+      gh issue close "$GH_ISSUE" -c "RALPH(it=$i) closed by commit $POST_SHA" || echo "WARN: gh issue close failed for #$GH_ISSUE (continuing — prd.json is source of truth)."
+      CONSECUTIVE_FAILURES=0
+      CONSECUTIVE_HALTS=0
+      ITERATION_FINALIZED=1
+      break
+    fi
+
+    FIXER_OUT=$(run_with_status "Fixer (it=$i a=$attempt)" run_fixer "$i" "$attempt" "$POST_SHA" "$GH_ISSUE") || { echo "Fixer failed at iteration $i attempt $attempt. Stopping."; exit 1; }
+    print_agent_text "$FIXER_OUT" "Fixer (it=$i a=$attempt)"
+    POST_SHA=$(git log -1 --format=%H 2>/dev/null || echo "$POST_SHA")
+
+    # Same scoping fix as the reviewer verdict — fixer prompt mentions both
+    # "FIXED or BLOCKED" so raw-stream grep would always match FIXED.
+    # Same last-non-empty-line discipline as the reviewer verdict.
+    FIXER_VERDICT=$(echo "$FIXER_OUT" | grep '^{' | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | awk '
+      { if ($0 !~ /^[[:space:]]*$/) last = $0 }
+      END {
+        if (match(last, /^[[:space:][:punct:]]*FIXED[[:space:][:punct:]]*$/))   print "FIXED"
+        else if (match(last, /^[[:space:][:punct:]]*BLOCKED[[:space:][:punct:]]*$/)) print "BLOCKED"
+      }
+    ')
+    echo "Fixer verdict: ${FIXER_VERDICT:-(none — defaulting to BLOCKED)}"
+
+    if [ "$attempt" = "2" ] && [ "$FIXER_VERDICT" != "FIXED" ]; then
+      echo "Fix-cap exhausted at iteration $i. Marking $STORY_ID done and posting reviewer concerns to issue #$GH_ISSUE (left OPEN for human review)."
+      bash "$REPO_ROOT/scripts/ralph/mark-done.sh" "$STORY_ID" || echo "WARN: mark-done.sh failed for $STORY_ID."
+      CONCERNS=$(echo "$REVIEW_OUT" | grep '^{' | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | tail -200)
+      # Pipe the body via stdin (--body-file -) so we don't fence the reviewer's
+      # output with ```; Haiku's review text often contains its own ``` fences,
+      # which would close an outer fence early and mangle the GitHub comment.
+      {
+        echo "RALPH(it=$i) shipped this story but the reviewer's unresolved concerns weren't cleared after $attempt fixer attempts. Issue left OPEN for human review."
+        echo ""
+        echo "--- Reviewer findings ---"
+        echo ""
+        echo "${CONCERNS:-(no review output captured)}"
+        echo ""
+        echo "--- End reviewer findings ---"
+      } | gh issue comment "$GH_ISSUE" --body-file - || echo "WARN: gh issue comment failed for #$GH_ISSUE."
+      CONSECUTIVE_FAILURES=0
+      CONSECUTIVE_HALTS=0
+      ITERATION_FINALIZED=1
+      break
+    fi
+  done
+
+  # === Attempt-2 FIXED case (H5 fix) ===
+  # If attempt=2's fixer returned FIXED, the for-loop ended naturally without
+  # finalizing (no ALL_CLEAR break, no fix-cap-exhausted break). Run a final
+  # reviewer pass to verify the fixer's claim before marking done.
+  if [ "$ITERATION_FINALIZED" -eq 0 ]; then
+    echo "Attempt-2 fixer reported FIXED — running final reviewer pass to verify."
+    REV_RC=0
+    REVIEW_OUT=$(run_with_status "Reviewer-Final (it=$i)" run_reviewer "$i" "$POST_SHA" "$GH_ISSUE") || REV_RC=$?
+    if [ $REV_RC -ne 0 ]; then
+      echo "Final reviewer rc=$REV_RC. Respawning with Opus."
+      REV_RC=0
+      REVIEW_OUT=$(run_with_status "Reviewer-Final-Opus (it=$i)" run_reviewer "$i" "$POST_SHA" "$GH_ISSUE" "claude-opus-4-7") || REV_RC=$?
+    fi
+    print_agent_text "$REVIEW_OUT" "Reviewer-Final (it=$i)"
+    # Same last-non-empty-line discipline as the in-loop reviewer verdict.
+    REVIEW_VERDICT=$(echo "$REVIEW_OUT" | grep '^{' | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | awk '
+      { if ($0 !~ /^[[:space:]]*$/) last = $0 }
+      END {
+        if (match(last, /^[[:space:][:punct:]]*ALL_CLEAR[[:space:][:punct:]]*$/)) print "ALL_CLEAR"
+        else if (match(last, /^[[:space:][:punct:]]*HAS_BLOCKERS[[:space:][:punct:]]*$/)) print "HAS_BLOCKERS"
+      }
+    ')
+    echo "Final reviewer verdict: ${REVIEW_VERDICT:-(none — defaulting to HAS_BLOCKERS)}"
+
+    if [ "$REVIEW_VERDICT" = "ALL_CLEAR" ]; then
+      echo "Final review clear. Marking $STORY_ID done and closing issue #$GH_ISSUE."
+      bash "$REPO_ROOT/scripts/ralph/mark-done.sh" "$STORY_ID" || { echo "ERROR: mark-done.sh failed for $STORY_ID after final review. Stopping for human attention."; exit 1; }
+      gh issue close "$GH_ISSUE" -c "RALPH(it=$i) closed by commit $POST_SHA after final-review pass" || echo "WARN: gh issue close failed for #$GH_ISSUE."
+      CONSECUTIVE_FAILURES=0
+      CONSECUTIVE_HALTS=0
+    else
+      echo "Final review still HAS_BLOCKERS after attempt-2 fixer's FIXED claim. Marking done and posting concerns to issue #$GH_ISSUE (left OPEN for human review)."
+      bash "$REPO_ROOT/scripts/ralph/mark-done.sh" "$STORY_ID" || echo "WARN: mark-done.sh failed for $STORY_ID."
+      CONCERNS=$(echo "$REVIEW_OUT" | grep '^{' | jq -r 'select(.type == "assistant").message.content[]? | select(.type == "text").text // empty' 2>/dev/null | tail -200)
+      {
+        echo "RALPH(it=$i) shipped this story but the final reviewer pass (after attempt-2 fixer claimed FIXED) still flagged HAS_BLOCKERS. Issue left OPEN for human review."
+        echo ""
+        echo "--- Final reviewer findings ---"
+        echo ""
+        echo "${CONCERNS:-(no review output captured)}"
+        echo ""
+        echo "--- End reviewer findings ---"
+      } | gh issue comment "$GH_ISSUE" --body-file - || echo "WARN: gh issue comment failed for #$GH_ISSUE."
+      CONSECUTIVE_FAILURES=0
+      CONSECUTIVE_HALTS=0
+    fi
+  fi
+done
+
+echo "Reached max iterations ($ITERATIONS). Stopping."
+exit 2
