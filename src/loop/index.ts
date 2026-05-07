@@ -4,7 +4,11 @@
  */
 export { runLoop } from "./run.js";
 export type { RunLoopOptions } from "./run.js";
-export { runIteration } from "./iteration.js";
+export {
+  runIteration,
+  fetchIssueBody,
+  getDiffLineCount,
+} from "./iteration.js";
 export type {
   RunIterationArgs,
   IterationOutcome,
@@ -15,6 +19,7 @@ export {
   runReviewer,
   runFixer,
   runFinalReviewer,
+  reviewerEffortForDiffSize,
 } from "./agents.js";
 export type {
   ImplementerCallArgs,
@@ -31,4 +36,7 @@ export {
   buildReviewerBriefing,
   buildFixerBriefing,
   buildRecoveryBriefing,
+  formatIssueBlock,
+  _resetImplementerTemplateCache,
 } from "./briefing.js";
+export type { IssueRef } from "./briefing.js";

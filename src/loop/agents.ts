@@ -3,11 +3,13 @@
  * and the underlying `sandbox.run()` Sandcastle call. Each wrapper:
  *   1. Picks the right model (claude-haiku-4-5 / claude-sonnet-4-6 / claude-opus-4-7)
  *      based on `config.models.<role>`.
- *   2. Sets the right effort tier (`high` for reviewer/fixer; default for
- *      implementer because reasoning-heavy reviews benefit more than
- *      generative implementation).
+ *   2. Sets the right effort tier — reviewer effort scales with diff size
+ *      (V1-B refactor: <100 lines=low, 100-499=medium, 500+=high), Opus retries
+ *      use `xhigh` (which the underlying CLI accepts even though Sandcastle's
+ *      stale `.d.ts` types don't list it — see the cast below).
  *   3. Wraps the run in an AbortSignal-based timeout (per-agent, from
- *      `config.agentTimeouts`).
+ *      `config.agentTimeouts`) AND passes a per-role `idleTimeoutSeconds` so
+ *      Sandcastle's native idle-watchdog also fires (defense in depth).
  *   4. Sets `completionSignal` to the markers Track B's `extractMarker`
  *      recognizes — so the agent exits early when it emits a verdict.
  *   5. Calls Track B's strict `extractMarker` + `parseVerdict` to produce a
@@ -20,10 +22,10 @@
  * sandcastle version exposes `Output.object`, switching the reviewer/fixer
  * runs to it is a localized change to this file.
  *
- * Note re: recovery — Track E (`runRecoveryLadder`) owns the Sonnet→Opus
- * recovery ladder including its own sandbox.run plumbing. We don't expose
- * a runRecoveryAgent here because Track E already does it correctly with
- * its own log-isolation + marker-extract logic.
+ * Note re: recovery — Track E (`runRecoveryDiagnosisOrEscalate`) owns the
+ * Sonnet→Opus recovery ladder including its own sandbox.run plumbing. We
+ * don't expose a runRecoveryAgent here because Track E already does it
+ * correctly with its own log-isolation + marker-extract logic.
  */
 import { claudeCode } from "@ai-hero/sandcastle";
 import type {
@@ -63,6 +65,38 @@ const COMPLETION_SIGNALS = {
 } as const;
 
 /**
+ * The full effort tier set we actually use, including `xhigh`. Sandcastle's
+ * pinned `.d.ts` types only list `low|medium|high|max`, but the underlying
+ * Claude Code CLI accepts `xhigh` for Opus 4.7 (per
+ * https://platform.claude.com/docs/en/build-with-claude/effort). We cast
+ * `as never` at the call site rather than widening the global type — the
+ * cast is intentionally local and commented so a future Sandcastle bump
+ * with refreshed types can drop it cleanly.
+ */
+type EffortTier = "low" | "medium" | "high" | "max" | "xhigh";
+
+/**
+ * Reviewer effort scaling rule. Pure function so callers (and tests) can
+ * verify the bucket boundaries without invoking the agent.
+ *
+ * Rationale: a reviewer reasoning over a 30-line diff doesn't benefit from
+ * the same token budget as one reviewing a 600-line diff. Scaling the
+ * `effort` tier with the actual diff size saves tokens on small stories
+ * (most of them) without starving the rare large refactor.
+ *
+ *   < 100 insertions+deletions  → "low"     (small story / single fix)
+ *   100 – 499                   → "medium"  (typical feature)
+ *   500+                        → "high"    (large refactor, full reasoning)
+ */
+export function reviewerEffortForDiffSize(
+  diffLineCount: number,
+): "low" | "medium" | "high" {
+  if (diffLineCount < 100) return "low";
+  if (diffLineCount < 500) return "medium";
+  return "high";
+}
+
+/**
  * Smoke-test injection seam (Bonus Fix). When this is provided to one of the
  * agent wrappers, it replaces the underlying `sandbox.run()` call so a smoke
  * harness can supply canned outputs without spinning up Docker. Track F has
@@ -89,12 +123,14 @@ interface RunAgentArgs {
   sandbox: Sandbox;
   prompt: string;
   model: ModelTier;
-  effort?: "low" | "medium" | "high" | "max";
+  effort?: EffortTier;
   /** Single-shot agents (reviewer/fixer/final-reviewer) use 1; implementer can iterate. */
   maxIterations: number;
   completionSignal: string | string[];
   /** Per-agent timeout in ms — abort signal fires at this point. */
   timeoutMs: number;
+  /** Per-agent idle timeout in seconds — Sandcastle's native idle watchdog. */
+  idleTimeoutSeconds: number;
   /** Display name (logged). */
   name: string;
   /** Role tag for the optional smoke runner. */
@@ -150,13 +186,17 @@ async function runAgent(args: RunAgentArgs): Promise<SandboxRunResult> {
     ac.abort(new Error(`agent ${args.name} timed out after ${args.timeoutMs}ms`));
   }, args.timeoutMs);
 
+  // sandcastle types are stale; CLI accepts xhigh per
+  // https://platform.claude.com/docs/en/build-with-claude/effort
+  const effortOption = args.effort
+    ? { effort: args.effort as never }
+    : {};
   const opts: SandboxRunOptions = {
-    agent: claudeCode(MODEL_IDS[args.model], {
-      ...(args.effort ? { effort: args.effort } : {}),
-    }),
+    agent: claudeCode(MODEL_IDS[args.model], effortOption),
     prompt: args.prompt,
     maxIterations: args.maxIterations,
     completionSignal: args.completionSignal,
+    idleTimeoutSeconds: args.idleTimeoutSeconds,
     name: args.name,
     signal: ac.signal,
   };
@@ -168,6 +208,11 @@ async function runAgent(args: RunAgentArgs): Promise<SandboxRunResult> {
   }
 }
 
+/** Convert the LoopConfig agentTimeouts (ms) to seconds for Sandcastle. */
+function msToSec(ms: number): number {
+  return Math.max(1, Math.round(ms / 1000));
+}
+
 // ---- Implementer -----------------------------------------------------------
 
 export interface ImplementerCallArgs {
@@ -176,6 +221,11 @@ export interface ImplementerCallArgs {
   config: LoopConfig;
   iterationNum: number;
   story: { id: string; ghIssue: number };
+  /**
+   * If true, this is the Opus retry — escalate model to opus and effort to
+   * `xhigh` (sandcastle types stale; CLI accepts it).
+   */
+  escalated?: boolean;
   /** Smoke seam — bypasses sandbox.run when provided. @internal */
   _agentRunner?: AgentRunner;
 }
@@ -204,16 +254,23 @@ export interface ImplementerResult {
 export async function runImplementer(
   args: ImplementerCallArgs,
 ): Promise<ImplementerResult> {
+  const escalated = args.escalated === true;
+  const model: ModelTier = escalated ? "opus" : args.config.models.implementer;
   const result = await runAgent({
     sandbox: args.sandbox,
     prompt: args.prompt,
-    model: args.config.models.implementer,
-    // No `effort: high` — implementation is generative, not reasoning-heavy;
-    // the reviewer is the gate that benefits from the reasoning budget.
+    model,
+    // No effort by default for implementer (generative, not reasoning-heavy).
+    // On the Opus retry, push to `xhigh` — the V1-B ladder uses the
+    // CLI-supported tier even though sandcastle's stale types don't list it.
+    ...(escalated ? { effort: "xhigh" as EffortTier } : {}),
     maxIterations: 5,
     completionSignal: [...COMPLETION_SIGNALS.implementer],
     timeoutMs: args.config.agentTimeouts.implementer,
-    name: `Implementer (it=${args.iterationNum})`,
+    idleTimeoutSeconds: msToSec(args.config.agentTimeouts.implementer),
+    name: escalated
+      ? `Implementer-Opus (it=${args.iterationNum})`
+      : `Implementer (it=${args.iterationNum})`,
     role: "implementer",
     runner: args._agentRunner,
   });
@@ -252,6 +309,12 @@ export interface ReviewerCallArgs {
    * afk-ralph.sh:697 and :796).
    */
   escalated?: boolean;
+  /**
+   * Diff line count (insertions + deletions between preSha and the current
+   * head). Drives the reviewer effort scaling (low/medium/high). Default is
+   * 0 (smallest bucket → "low") if the caller can't compute it.
+   */
+  diffLineCount?: number;
   /** Smoke seam — bypasses sandbox.run when provided. @internal */
   _agentRunner?: AgentRunner;
 }
@@ -265,22 +328,32 @@ export interface ReviewerResult {
 
 /**
  * Reviewer — single-shot agent, returns ALL_CLEAR / HAS_BLOCKERS.
- * `effort: "high"` because review is reasoning-heavy and the bash version
- * runs it with `MAX_THINKING_TOKENS=4096`.
+ *
+ * Effort scales with diff size (V1-B refactor): small diffs use `low`,
+ * mid-sized use `medium`, large refactors use `high`. This trades a tiny bit
+ * of nuance on small reviews for substantially fewer tokens on the typical
+ * iteration. See reviewerEffortForDiffSize for the bucket boundaries.
+ *
+ * The Opus escalation path (rc≠0 first attempt) bumps effort to `xhigh`.
  */
 export async function runReviewer(
   args: ReviewerCallArgs,
 ): Promise<ReviewerResult> {
-  const model: ModelTier = args.escalated ? "opus" : args.config.models.reviewer;
+  const escalated = args.escalated === true;
+  const model: ModelTier = escalated ? "opus" : args.config.models.reviewer;
+  const effort: EffortTier = escalated
+    ? "xhigh"
+    : reviewerEffortForDiffSize(args.diffLineCount ?? 0);
   const result = await runAgent({
     sandbox: args.sandbox,
     prompt: args.prompt,
     model,
-    effort: "high",
+    effort,
     maxIterations: 1,
     completionSignal: [...COMPLETION_SIGNALS.reviewer],
     timeoutMs: args.config.agentTimeouts.reviewer,
-    name: args.escalated
+    idleTimeoutSeconds: msToSec(args.config.agentTimeouts.reviewer),
+    name: escalated
       ? `Reviewer-Opus (it=${args.iterationNum} a=${args.attempt})`
       : `Reviewer (it=${args.iterationNum} a=${args.attempt})`,
     role: "reviewer",
@@ -323,20 +396,24 @@ export interface FixerResult {
  * Fixer — single-shot agent, returns FIXED / BLOCKED.
  * Per bash `run_fixer()`, attempt 2 escalates to Opus regardless of
  * config.models.fixer (the "always change tier on retry" anti-pattern fix).
+ * Attempt-2 also bumps effort to `xhigh` (V1-B).
  */
 export async function runFixer(args: FixerCallArgs): Promise<FixerResult> {
   // Attempt-2 escalation: bash hardcodes claude-opus-4-7 on attempt 2,
   // overriding config.models.fixer. We keep the same behavior: tier
   // escalation matters more than config consistency for retry-ladder soundness.
-  const model: ModelTier = args.attempt === 2 ? "opus" : args.config.models.fixer;
+  const isOpusRetry = args.attempt === 2;
+  const model: ModelTier = isOpusRetry ? "opus" : args.config.models.fixer;
+  const effort: EffortTier = isOpusRetry ? "xhigh" : "high";
   const result = await runAgent({
     sandbox: args.sandbox,
     prompt: args.prompt,
     model,
-    effort: "high",
+    effort,
     maxIterations: 1,
     completionSignal: [...COMPLETION_SIGNALS.fixer],
     timeoutMs: args.config.agentTimeouts.fixer,
+    idleTimeoutSeconds: msToSec(args.config.agentTimeouts.fixer),
     name: `Fixer (it=${args.iterationNum} a=${args.attempt})`,
     role: "fixer",
     runner: args._agentRunner,
@@ -365,6 +442,12 @@ export interface FinalReviewerCallArgs {
   iterationNum: number;
   /** True after a non-zero rc — escalate to opus. */
   escalated?: boolean;
+  /**
+   * Diff line count between preSha and the post-attempt-2 commit (used only
+   * when `escalated === false`). Final-pass review reuses the same diff-size
+   * effort scaling as runReviewer.
+   */
+  diffLineCount?: number;
   /** Smoke seam — bypasses sandbox.run when provided. @internal */
   _agentRunner?: AgentRunner;
 }
@@ -373,20 +456,30 @@ export interface FinalReviewerCallArgs {
  * Final-pass reviewer — runs after attempt-2 fixer's FIXED claim to verify.
  * Same shape as runReviewer but distinguishable in logs (matches bash
  * "Reviewer-Final" naming at afk-ralph.sh:792).
+ *
+ * Always uses `xhigh` effort: by construction the final pass only runs on
+ * stories that have already eaten two reviewer/fixer rounds, so the diff is
+ * "trustworthy enough to ship?" — that question deserves the full budget.
+ * The escalated path additionally bumps the model tier to Opus.
  */
 export async function runFinalReviewer(
   args: FinalReviewerCallArgs,
 ): Promise<ReviewerResult> {
-  const model: ModelTier = args.escalated ? "opus" : args.config.models.reviewer;
+  const escalated = args.escalated === true;
+  const model: ModelTier = escalated ? "opus" : args.config.models.reviewer;
   const result = await runAgent({
     sandbox: args.sandbox,
     prompt: args.prompt,
     model,
-    effort: "high",
+    // Final pass: full reasoning budget (xhigh) regardless of diff size —
+    // sandcastle types are stale; CLI accepts xhigh per
+    // https://platform.claude.com/docs/en/build-with-claude/effort
+    effort: "xhigh",
     maxIterations: 1,
     completionSignal: [...COMPLETION_SIGNALS.reviewer],
     timeoutMs: args.config.agentTimeouts.reviewer,
-    name: args.escalated
+    idleTimeoutSeconds: msToSec(args.config.agentTimeouts.reviewer),
+    name: escalated
       ? `Reviewer-Final-Opus (it=${args.iterationNum})`
       : `Reviewer-Final (it=${args.iterationNum})`,
     role: "final-reviewer",

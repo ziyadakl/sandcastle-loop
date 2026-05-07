@@ -12,6 +12,23 @@ export {
   quarantineStoryInPrd,
 } from "./prd.js";
 
-export { transitionLabel, closeIssue, getIssueBody } from "./gh.js";
+export {
+  transitionLabel,
+  closeIssue,
+  getIssueBody,
+  // V1 label-state-machine surface.
+  listReadyIssues,
+  claimViaLabel,
+  markDoneViaLabel,
+  quarantineViaLabel,
+  postIssueComment,
+  getPriorityFromLabels,
+  LABEL_READY,
+  LABEL_IN_PROGRESS,
+  LABEL_DONE,
+  LABEL_NEEDS_HUMAN,
+  LABEL_QUARANTINE_ALIAS,
+} from "./gh.js";
+export type { ReadyIssueSummary } from "./gh.js";
 
 export { withPrdLock, withSingleInstance } from "./locks.js";

@@ -238,62 +238,265 @@ describe("extractMarker (strict)", () => {
 // ---------------------------------------------------------------------------
 
 describe("ImplementerOutputSchema", () => {
-  it("parses a valid STORY_COMPLETE payload", () => {
-    const payload = {
+  // -------------------------------------------------------------------------
+  // Fixture builders — keep tests focused on the rule under test, not on
+  // boilerplate. `validUiStoryComplete()` returns a payload that satisfies
+  // every cross-field rule; tests then mutate one field to exercise one rule.
+  // -------------------------------------------------------------------------
+
+  /**
+   * A fully-valid STORY_COMPLETE payload for a UI story whose spec required
+   * playwright. Every one of the 7 certification fields is filled and
+   * consistent. Tests mutate this fixture to exercise individual rules.
+   */
+  function validUiStoryComplete() {
+    return {
       storyId: "s-101",
       ghIssue: 42,
       commitSha: "abc1234",
-      e2eRan: true,
       e2eVerdict: "passed" as const,
       uiTouched: true,
       certificationPresent: true,
       marker: "STORY_COMPLETE" as const,
+      // 7-question certification — all consistent for STORY_COMPLETE.
+      storyType: "ui" as const,
+      e2eRequired: true,
+      e2eActuallyRan: true,
+      testCommandUsed: "pnpm playwright test specs/accept-suggestion.spec.ts",
+      e2eAssertionLine:
+        "✓ accept-suggestion › clicking Accept opens prefilled dialog",
+      outputNotFiltered: true,
+      testReachedFeature: true,
     };
-    const parsed = ImplementerOutputSchema.parse(payload);
-    expect(parsed.marker).toBe("STORY_COMPLETE");
-    expect(parsed.commitSha).toBe("abc1234");
-  });
+  }
 
-  it("parses a HALT payload with haltReason", () => {
-    const payload = {
+  /**
+   * A fully-valid HALT payload. HALT is the explicit escape hatch: soft
+   * fields (`testCommandUsed`, `e2eAssertionLine`) may be null and the
+   * `e2eRequired ⇒ e2eActuallyRan` rule does not apply.
+   */
+  function validHalt() {
+    return {
       storyId: "s-101",
       ghIssue: 42,
-      e2eRan: false,
       e2eVerdict: "halted" as const,
       uiTouched: false,
       certificationPresent: false,
       marker: "HALT" as const,
       haltReason: "spec contradicts itself",
+      storyType: "ui" as const,
+      e2eRequired: true,
+      e2eActuallyRan: false,
+      testCommandUsed: null,
+      e2eAssertionLine: null,
+      outputNotFiltered: true,
+      testReachedFeature: false,
     };
-    expect(ImplementerOutputSchema.parse(payload).haltReason).toBe(
+  }
+
+  // -------------------------------------------------------------------------
+  // Happy paths
+  // -------------------------------------------------------------------------
+
+  it("parses a valid STORY_COMPLETE payload with all 7 certification fields", () => {
+    const parsed = ImplementerOutputSchema.parse(validUiStoryComplete());
+    expect(parsed.marker).toBe("STORY_COMPLETE");
+    expect(parsed.commitSha).toBe("abc1234");
+    // Verify the 7 fields round-trip intact — the parser must not silently
+    // drop or default any of them.
+    expect(parsed.storyType).toBe("ui");
+    expect(parsed.e2eRequired).toBe(true);
+    expect(parsed.e2eActuallyRan).toBe(true);
+    expect(parsed.testCommandUsed).toBe(
+      "pnpm playwright test specs/accept-suggestion.spec.ts",
+    );
+    expect(parsed.e2eAssertionLine).toBe(
+      "✓ accept-suggestion › clicking Accept opens prefilled dialog",
+    );
+    expect(parsed.outputNotFiltered).toBe(true);
+    expect(parsed.testReachedFeature).toBe(true);
+  });
+
+  it("parses a backend-only STORY_COMPLETE with e2eRequired=false", () => {
+    // Backend stories don't require playwright. testCommandUsed and
+    // e2eAssertionLine may be null; e2eActuallyRan may be false.
+    const parsed = ImplementerOutputSchema.parse({
+      ...validUiStoryComplete(),
+      storyType: "backend-only" as const,
+      e2eRequired: false,
+      e2eActuallyRan: false,
+      testCommandUsed: null,
+      e2eAssertionLine: null,
+      uiTouched: false,
+      testReachedFeature: false,
+    });
+    expect(parsed.storyType).toBe("backend-only");
+    expect(parsed.testCommandUsed).toBeNull();
+  });
+
+  it("parses a HALT payload with haltReason", () => {
+    expect(ImplementerOutputSchema.parse(validHalt()).haltReason).toBe(
       "spec contradicts itself",
     );
   });
 
   it("rejects an invalid e2eVerdict", () => {
-    const bad = {
-      storyId: "s-1",
-      ghIssue: 1,
-      e2eRan: true,
-      e2eVerdict: "kinda-passed",
-      uiTouched: true,
-      certificationPresent: true,
-      marker: "STORY_COMPLETE",
-    };
-    expect(() => ImplementerOutputSchema.parse(bad)).toThrow();
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eVerdict: "kinda-passed",
+      }),
+    ).toThrow();
   });
 
   it("rejects a negative ghIssue", () => {
-    const bad = {
-      storyId: "s-1",
-      ghIssue: -1,
-      e2eRan: false,
-      e2eVerdict: "skipped",
-      uiTouched: false,
-      certificationPresent: false,
-      marker: "HALT",
-    };
-    expect(() => ImplementerOutputSchema.parse(bad)).toThrow();
+    expect(() =>
+      ImplementerOutputSchema.parse({ ...validHalt(), ghIssue: -1 }),
+    ).toThrow();
+  });
+
+  // -------------------------------------------------------------------------
+  // 7-question certification — required-field enforcement
+  // -------------------------------------------------------------------------
+
+  it("rejects payload missing any of the 7 certification fields (no silent default)", () => {
+    // Each of the 7 questions is required. Iterate over every field and
+    // assert that omitting it makes the parse fail loud — never silently
+    // fall back to a default. This is the central anti-rubber-stamp guard.
+    const fields = [
+      "storyType",
+      "e2eRequired",
+      "e2eActuallyRan",
+      "testCommandUsed",
+      "e2eAssertionLine",
+      "outputNotFiltered",
+      "testReachedFeature",
+    ] as const;
+
+    for (const f of fields) {
+      const payload: Record<string, unknown> = { ...validUiStoryComplete() };
+      delete payload[f];
+      expect(
+        () => ImplementerOutputSchema.parse(payload),
+        `expected schema to reject payload missing required field ${f}`,
+      ).toThrow();
+    }
+  });
+
+  it("rejects an invalid storyType enum value", () => {
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        storyType: "frontend",
+      }),
+    ).toThrow();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-field rule 1: e2eRequired=true ⇒ testCommandUsed non-null AND
+  //                    e2eActuallyRan=true (unless marker=HALT)
+  // -------------------------------------------------------------------------
+
+  it("REJECTS STORY_COMPLETE when e2eRequired=true but e2eActuallyRan=false", () => {
+    // This is the canonical rubber-stamp attempt: spec mandates playwright,
+    // implementer skipped the test, claims success anyway. The schema must
+    // reject this BEFORE it reaches the reviewer.
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eActuallyRan: false,
+      }),
+    ).toThrow();
+  });
+
+  it("REJECTS STORY_COMPLETE when e2eRequired=true but testCommandUsed is null", () => {
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        testCommandUsed: null,
+      }),
+    ).toThrow();
+  });
+
+  it("ACCEPTS HALT when e2eRequired=true but e2eActuallyRan=false (escape hatch)", () => {
+    // HALT is the implementer's "I gave up" signal. The strict cross-field
+    // rules don't apply because the implementer is admitting they could not
+    // verify the feature. Soft fields may be null.
+    const parsed = ImplementerOutputSchema.parse(validHalt());
+    expect(parsed.marker).toBe("HALT");
+    expect(parsed.testCommandUsed).toBeNull();
+    expect(parsed.e2eAssertionLine).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-field rule 2: e2eActuallyRan=true ⇒ e2eAssertionLine non-empty AND
+  //                    not generic (preamble / bare URL)
+  // -------------------------------------------------------------------------
+
+  it("REJECTS the generic 'Running 3 tests' assertion line", () => {
+    // The bash reviewer rejects this exact pattern as fabricated evidence.
+    // Encoding it in the schema means a rubber-stamp attempt that quotes the
+    // playwright preamble line fails at parse time.
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eAssertionLine: "Running 3 tests using 1 worker",
+      }),
+    ).toThrow();
+  });
+
+  it("REJECTS 'Running 1 test' (singular) — case-insensitive preamble match", () => {
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eAssertionLine: "running 1 test",
+      }),
+    ).toThrow();
+  });
+
+  it("REJECTS a bare URL line as the assertion quote", () => {
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eAssertionLine: "http://localhost:3000/dashboard",
+      }),
+    ).toThrow();
+  });
+
+  it("REJECTS e2eAssertionLine=null when e2eActuallyRan=true", () => {
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        e2eAssertionLine: null,
+      }),
+    ).toThrow();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-field rule 3: outputNotFiltered=false ⇒ marker=HALT
+  // -------------------------------------------------------------------------
+
+  it("REJECTS STORY_COMPLETE when outputNotFiltered=false (auto-HALT rule)", () => {
+    // The implementer admitted piping playwright through a filter (grep -v,
+    // 2>/dev/null, etc.) before tee. Filtered output cannot be trusted by
+    // the reviewer, so the verdict is auto-HALT — STORY_COMPLETE here is a
+    // schema error, not a reviewer judgement call.
+    expect(() =>
+      ImplementerOutputSchema.parse({
+        ...validUiStoryComplete(),
+        outputNotFiltered: false,
+      }),
+    ).toThrow();
+  });
+
+  it("ACCEPTS HALT when outputNotFiltered=false (the auto-HALT path)", () => {
+    const parsed = ImplementerOutputSchema.parse({
+      ...validHalt(),
+      outputNotFiltered: false,
+      haltReason: "filtered playwright output, re-running with raw tee",
+    });
+    expect(parsed.marker).toBe("HALT");
+    expect(parsed.outputNotFiltered).toBe(false);
   });
 });
 
@@ -386,15 +589,24 @@ describe("RecoveryDecisionSchema", () => {
 
 describe("parseVerdict", () => {
   it("parses an implementer verdict embedded in stream-json output", () => {
+    // Includes the full 7-question certification — the schema rejects
+    // payloads missing any of these fields, so parseVerdict must surface a
+    // complete, consistent payload to the loop driver.
     const payload = {
       storyId: "s-101",
       ghIssue: 42,
       commitSha: "cafe1234",
-      e2eRan: true,
       e2eVerdict: "passed",
       uiTouched: true,
       certificationPresent: true,
       marker: "STORY_COMPLETE",
+      storyType: "ui",
+      e2eRequired: true,
+      e2eActuallyRan: true,
+      testCommandUsed: "pnpm playwright test specs/foo.spec.ts",
+      e2eAssertionLine: "✓ foo › opens dialog when Accept clicked",
+      outputNotFiltered: true,
+      testReachedFeature: true,
     };
     const text =
       "I finished the story. Here is the structured verdict:\n\n" +
@@ -433,11 +645,20 @@ describe("parseVerdict", () => {
     const broken = {
       storyId: "s-1",
       ghIssue: "not-a-number", // wrong type
-      e2eRan: true,
       e2eVerdict: "passed",
       uiTouched: true,
       certificationPresent: true,
       marker: "STORY_COMPLETE",
+      // Even with the 7-question fields filled in correctly, the bad
+      // ghIssue type must surface as a VerdictParseError — never silently
+      // coerced.
+      storyType: "ui",
+      e2eRequired: true,
+      e2eActuallyRan: true,
+      testCommandUsed: "pnpm playwright test specs/foo.spec.ts",
+      e2eAssertionLine: "✓ foo › works",
+      outputNotFiltered: true,
+      testReachedFeature: true,
     };
     const text = JSON.stringify(broken);
     expect(() =>

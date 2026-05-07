@@ -14,46 +14,91 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // --- Mock node:child_process BEFORE importing the modules under test. -----
 // We capture every execFile invocation so tests can assert call shape.
+//
+// `vi.hoisted` is required: vitest hoists `vi.mock` calls above any
+// non-hoisted module-scope declarations, which would put the references in
+// TDZ at factory-evaluation time. Hoisting the shared state alongside the
+// mock keeps both at the top of the module.
 type ExecFileCall = { file: string; args: string[] };
-const ghCalls: ExecFileCall[] = [];
+
+const { ghCalls, mockState } = vi.hoisted(() => {
+  const ghCalls: ExecFileCall[] = [];
+  const mockState: {
+    resolver:
+      | ((args: string[]) => string | { stdout: string; stderr?: string })
+      | null;
+  } = { resolver: null };
+  return { ghCalls, mockState };
+});
 
 vi.mock("node:child_process", async () => {
   const actual =
     await vi.importActual<typeof import("node:child_process")>(
       "node:child_process",
     );
+  const { promisify } = await import("node:util");
+  // execFile signature is overloaded: (file, args, options, cb) is the form
+  // promisify(execFile) uses. We honor that.
+  const mockExecFile = (
+    file: string,
+    args: string[],
+    _options: unknown,
+    cb: (
+      err: Error | null,
+      stdout: string,
+      stderr: string,
+    ) => void,
+  ) => {
+    ghCalls.push({ file, args: [...args] });
+    let stdout = "";
+    let stderr = "";
+    if (mockState.resolver) {
+      const resolved = mockState.resolver(args);
+      if (typeof resolved === "string") {
+        stdout = resolved;
+      } else {
+        stdout = resolved.stdout;
+        stderr = resolved.stderr ?? "";
+      }
+    }
+    cb(null, stdout, stderr);
+    return undefined as unknown as ReturnType<typeof actual.execFile>;
+  };
+  // Real `execFile` carries a `util.promisify.custom` symbol that makes
+  // `promisify(execFile)` resolve to `{stdout, stderr}` instead of just the
+  // second cb arg. Without copying that here, our replacement loses the
+  // custom resolver and `runGh`'s destructuring receives the raw stdout
+  // string. Mirror the contract of the real `execFile` exactly.
+  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] = (
+    file: string,
+    args: string[],
+    options?: unknown,
+  ) =>
+    new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      mockExecFile(file, args, options, (err, stdout, stderr) => {
+        if (err) reject(err);
+        else resolve({ stdout, stderr });
+      });
+    });
   return {
     ...actual,
-    // execFile signature is overloaded: (file, args, options, cb) is the form
-    // promisify(execFile) uses. We honor that.
-    execFile: (
-      file: string,
-      args: string[],
-      _options: unknown,
-      cb: (
-        err: Error | null,
-        stdout: string,
-        stderr: string,
-      ) => void,
-    ) => {
-      ghCalls.push({ file, args: [...args] });
-      // Default success — individual tests can override stdout below by
-      // peeking at args[0] etc. Default empty stdout/stderr is fine for the
-      // label/close paths that don't read output.
-      cb(null, "", "");
-      return undefined as unknown as ReturnType<typeof actual.execFile>;
-    },
+    execFile: mockExecFile,
   };
 });
 
 // Now safe to import — these pull in child_process via execFile/promisify.
 import {
   claimStory,
+  claimViaLabel,
   closeIssue,
+  getPriorityFromLabels,
+  listReadyIssues,
   loadPrd,
   markDone,
+  markDoneViaLabel,
   pickNextEligibleStory,
   quarantineStoryInPrd,
+  quarantineViaLabel,
   transitionLabel,
   withPrdLock,
 } from "../src/state/index.js";
@@ -82,6 +127,7 @@ async function writePrd(state: PrdState): Promise<void> {
 
 beforeEach(async () => {
   ghCalls.length = 0;
+  mockState.resolver = null;
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-state-test-"));
   await writePrd(SEED_PRD);
 });
@@ -414,5 +460,254 @@ describe("withPrdLock", () => {
     await withPrdLock(tmpDir, async () => {
       // ok
     });
+  });
+});
+
+// --- V1 label-state-machine helpers ---------------------------------------
+
+describe("getPriorityFromLabels", () => {
+  it("returns 'high' when priority:high is present", () => {
+    expect(getPriorityFromLabels(["priority:high", "ready-for-agent"])).toBe(
+      "high",
+    );
+  });
+
+  it("returns 'medium' when priority:medium is present", () => {
+    expect(getPriorityFromLabels(["priority:medium"])).toBe("medium");
+  });
+
+  it("returns 'low' when only priority:low is present", () => {
+    expect(getPriorityFromLabels(["priority:low", "ready-for-agent"])).toBe(
+      "low",
+    );
+  });
+
+  it("defaults to 'medium' when no priority label is present", () => {
+    expect(getPriorityFromLabels(["ready-for-agent", "bug"])).toBe("medium");
+  });
+
+  it("defaults to 'medium' for an empty label set", () => {
+    expect(getPriorityFromLabels([])).toBe("medium");
+  });
+
+  it("picks the highest precedence when multiple priority labels are present", () => {
+    // Shouldn't happen in practice, but if both are set we resolve to the
+    // strictly highest (high > medium > low).
+    expect(
+      getPriorityFromLabels(["priority:low", "priority:high"]),
+    ).toBe("high");
+    expect(
+      getPriorityFromLabels(["priority:medium", "priority:low"]),
+    ).toBe("medium");
+  });
+});
+
+describe("listReadyIssues", () => {
+  it("queries the right gh argv and returns parsed, sorted issues", async () => {
+    // Three issues, intentionally out-of-order so we can assert sort.
+    // Expected order after sort:
+    //   1. #11 priority:high (highest priority wins)
+    //   2. #12 priority:medium, older createdAt
+    //   3. #13 unlabeled (defaults medium), newer createdAt
+    //   4. #14 priority:low (lowest)
+    const canned = [
+      {
+        number: 13,
+        title: "C - default medium, newest",
+        body: "c-body",
+        labels: [{ name: "ready-for-agent" }],
+        createdAt: "2025-01-03T00:00:00Z",
+      },
+      {
+        number: 14,
+        title: "D - low",
+        body: "d-body",
+        labels: [{ name: "ready-for-agent" }, { name: "priority:low" }],
+        createdAt: "2025-01-01T00:00:00Z",
+      },
+      {
+        number: 11,
+        title: "A - high",
+        body: "a-body",
+        labels: [{ name: "ready-for-agent" }, { name: "priority:high" }],
+        createdAt: "2025-01-04T00:00:00Z",
+      },
+      {
+        number: 12,
+        title: "B - medium, oldest",
+        body: "b-body",
+        labels: [
+          { name: "ready-for-agent" },
+          { name: "priority:medium" },
+        ],
+        createdAt: "2025-01-02T00:00:00Z",
+      },
+    ];
+    mockState.resolver = () => JSON.stringify(canned);
+
+    const out = await listReadyIssues();
+
+    // Argv shape — exact, in order.
+    expect(ghCalls).toHaveLength(1);
+    expect(ghCalls[0]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--label",
+        "ready-for-agent",
+        "--json",
+        "number,title,body,labels,createdAt",
+        "--limit",
+        "100",
+      ],
+    });
+
+    // Sort: priority desc, then createdAt asc.
+    expect(out.map((r) => r.number)).toEqual([11, 12, 13, 14]);
+    // Labels are flattened to string[] (no {name} wrapping leaks out).
+    expect(out[0]?.labels).toEqual(["ready-for-agent", "priority:high"]);
+    // Body / title / createdAt round-trip.
+    expect(out[0]?.title).toBe("A - high");
+    expect(out[0]?.body).toBe("a-body");
+    expect(out[0]?.createdAt).toBe("2025-01-04T00:00:00Z");
+  });
+
+  it("returns [] when gh returns an empty JSON array", async () => {
+    mockState.resolver = () => "[]";
+    const out = await listReadyIssues();
+    expect(out).toEqual([]);
+  });
+
+  it("ties broken by createdAt ascending within the same priority bucket", async () => {
+    const canned = [
+      {
+        number: 22,
+        title: "newer",
+        body: "",
+        labels: [{ name: "priority:high" }],
+        createdAt: "2025-02-01T00:00:00Z",
+      },
+      {
+        number: 21,
+        title: "older",
+        body: "",
+        labels: [{ name: "priority:high" }],
+        createdAt: "2025-01-01T00:00:00Z",
+      },
+    ];
+    mockState.resolver = () => JSON.stringify(canned);
+    const out = await listReadyIssues();
+    expect(out.map((r) => r.number)).toEqual([21, 22]);
+  });
+});
+
+describe("claimViaLabel", () => {
+  it("delegates to transitionLabel(ready-for-agent -> in-progress) with correct argv", async () => {
+    await claimViaLabel(77);
+    expect(ghCalls).toHaveLength(1);
+    expect(ghCalls[0]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "edit",
+        "77",
+        "--add-label",
+        "in-progress",
+        "--remove-label",
+        "ready-for-agent",
+      ],
+    });
+  });
+
+  it("rejects non-positive issue numbers", async () => {
+    await expect(claimViaLabel(0)).rejects.toThrow(/invalid/);
+    await expect(claimViaLabel(-3)).rejects.toThrow(/invalid/);
+    await expect(claimViaLabel(1.5)).rejects.toThrow(/invalid/);
+  });
+});
+
+describe("markDoneViaLabel", () => {
+  it("transitions in-progress->done THEN closes with the summary as a comment", async () => {
+    await markDoneViaLabel(88, "shipped in iteration 4");
+
+    // Two gh calls, in the right order.
+    expect(ghCalls).toHaveLength(2);
+
+    // 1) Label transition: add done, remove in-progress.
+    expect(ghCalls[0]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "edit",
+        "88",
+        "--add-label",
+        "done",
+        "--remove-label",
+        "in-progress",
+      ],
+    });
+
+    // 2) Close with comment.
+    expect(ghCalls[1]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "close",
+        "88",
+        "--comment",
+        "shipped in iteration 4",
+      ],
+    });
+  });
+
+  it("rejects invalid issue numbers without making any gh call", async () => {
+    await expect(markDoneViaLabel(0, "x")).rejects.toThrow(/invalid/);
+    expect(ghCalls).toHaveLength(0);
+  });
+});
+
+describe("quarantineViaLabel", () => {
+  it("transitions in-progress->needs-human, posts a comment, does NOT close", async () => {
+    await quarantineViaLabel(55, "ladder-exhausted; verifier still failing");
+
+    // Exactly two gh invocations: label edit + comment. No `issue close`.
+    expect(ghCalls).toHaveLength(2);
+
+    expect(ghCalls[0]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "edit",
+        "55",
+        "--add-label",
+        "needs-human",
+        "--remove-label",
+        "in-progress",
+      ],
+    });
+
+    expect(ghCalls[1]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "comment",
+        "55",
+        "--body",
+        "ladder-exhausted; verifier still failing",
+      ],
+    });
+
+    // Belt + braces: no gh call should be `issue close`.
+    for (const c of ghCalls) {
+      expect(c.args[0] === "issue" && c.args[1] === "close").toBe(false);
+    }
+  });
+
+  it("rejects invalid issue numbers without making any gh call", async () => {
+    await expect(quarantineViaLabel(-1, "nope")).rejects.toThrow(/invalid/);
+    expect(ghCalls).toHaveLength(0);
   });
 });

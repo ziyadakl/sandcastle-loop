@@ -9,7 +9,7 @@
  *   CLAIM(none)-> NO_STORY  (caller stops the outer loop)
  *   CLAIM      -> CAPTURE_PRE_SHA (driver-side `git rev-parse HEAD`)
  *   CAPTURE    -> IMPLEMENT (runImplementer)
- *   IMPLEMENT(error)        -> RECOVERY      (Track E runRecoveryLadder)
+ *   IMPLEMENT(error)        -> RECOVERY      (Track E runRecoveryDiagnosisOrEscalate)
  *   IMPLEMENT(HALT,no_commit) -> QUARANTINE  (deliberate HALT — no recovery,
  *                                             attempts:1, recovery is for
  *                                             timeouts/crashes only)
@@ -61,6 +61,7 @@ import {
   buildImplementerBriefing,
   buildReviewerBriefing,
   buildFixerBriefing,
+  type IssueRef,
 } from "./briefing.js";
 
 // Track D — backlog state. Routed through the barrel per Fix #8.
@@ -68,11 +69,16 @@ import {
   pickNextEligibleStory,
   markDone,
   closeIssue,
-  getIssueBody,
 } from "../state/index.js";
 
-// Track E — recovery + quarantine via the barrel.
-import { runRecoveryLadder, quarantineStory } from "../recovery/index.js";
+// Track E — V1-D refactor: the multi-step recovery ladder is replaced by the
+// new diagnosis-first ladder, exposed as runRecoveryDiagnosisOrEscalate. Same
+// call signature as the legacy runRecoveryLadder; the semantics differ inside
+// V1-D but the integration point here is unchanged.
+import {
+  runRecoveryDiagnosisOrEscalate,
+  quarantineStory,
+} from "../recovery/index.js";
 
 // Track F — drizzle migration auto-applier via the barrel.
 import { applyMigrationsBetween } from "../migrations/index.js";
@@ -118,6 +124,12 @@ export interface RunIterationArgs {
    * @internal
    */
   _agentRunner?: AgentRunner;
+  /**
+   * Test seam: replace the default `gh issue view` issue-fetcher. Production
+   * calls `fetchIssueBody` (defined below) which shells out to `gh`.
+   * @internal
+   */
+  _fetchIssueBody?: (ghIssue: number) => Promise<IssueRef>;
 }
 
 /**
@@ -134,6 +146,56 @@ export type IterationOutcome = IterationResult | { type: "no_story" };
  */
 function specRequiresPlaywright(issueBody: string): boolean {
   return /playwright test/.test(issueBody);
+}
+
+/**
+ * V1-B refactor — pre-fetch the GH issue title + body + labels + number in
+ * ONE call at iteration start. The result is embedded VERBATIM at the same
+ * position in all three agent prompts (implementer, reviewer, fixer) for
+ * prompt-cache locality across the iteration.
+ *
+ * Defined locally in `loop/` rather than added to `state/` because this is a
+ * driver-only concern: the state module's `getIssueBody` returns a single
+ * string body (used elsewhere); the driver wants the full snapshot here.
+ */
+export async function fetchIssueBody(ghIssue: number): Promise<IssueRef> {
+  if (!Number.isInteger(ghIssue) || ghIssue <= 0) {
+    // Defensive — story.ghIssue can be 0/undefined for legacy prd.json
+    // entries, in which case the caller substitutes an empty IssueRef.
+    return { title: "", body: "", labels: [], number: ghIssue };
+  }
+  const { stdout } = await execFileP(
+    "gh",
+    ["issue", "view", String(ghIssue), "--json", "title,body,labels,number"],
+    { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+  );
+  // gh returns either the requested fields as JSON or fails non-zero. Parse
+  // defensively — labels are objects with .name, but we only need the names.
+  type GhLabel = { name?: string };
+  type GhView = {
+    title?: string;
+    body?: string;
+    labels?: GhLabel[];
+    number?: number;
+  };
+  let parsed: GhView;
+  try {
+    parsed = JSON.parse(stdout) as GhView;
+  } catch (err) {
+    throw new Error(
+      `fetchIssueBody(${ghIssue}): gh returned non-JSON output: ${(err as Error).message}`,
+    );
+  }
+  return {
+    title: typeof parsed.title === "string" ? parsed.title : "",
+    body: typeof parsed.body === "string" ? parsed.body : "",
+    labels: Array.isArray(parsed.labels)
+      ? parsed.labels
+          .map((l) => (typeof l?.name === "string" ? l.name : ""))
+          .filter((n) => n.length > 0)
+      : [],
+    number: typeof parsed.number === "number" ? parsed.number : ghIssue,
+  };
 }
 
 /**
@@ -191,30 +253,69 @@ async function gitDiffTouchedUi(
   return stdout.trim().length > 0;
 }
 
+/**
+ * V1-B refactor — total insertions+deletions between two SHAs. Drives the
+ * reviewer's effort scaling (small diff → low effort; large diff → high).
+ * Parses `git diff --shortstat`'s "N insertions(+), M deletions(-)" trailer.
+ *
+ * Returns 0 when the two SHAs match (no diff) or when shortstat returns no
+ * recognizable trailer (e.g. only a binary-file change).
+ */
+export async function getDiffLineCount(
+  repoRoot: string,
+  preSha: string,
+  postSha: string,
+): Promise<number> {
+  if (preSha === postSha) return 0;
+  const { stdout } = await execFileP(
+    "git",
+    ["diff", "--shortstat", `${preSha}..${postSha}`],
+    {
+      cwd: repoRoot,
+      timeout: 30_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  // Sample shortstat output: " 3 files changed, 47 insertions(+), 8 deletions(-)"
+  const insMatch = /(\d+)\s+insertion/.exec(stdout);
+  const delMatch = /(\d+)\s+deletion/.exec(stdout);
+  const ins = insMatch ? Number(insMatch[1]) : 0;
+  const del = delMatch ? Number(delMatch[1]) : 0;
+  return ins + del;
+}
+
 export async function runIteration(
   args: RunIterationArgs,
 ): Promise<IterationOutcome> {
   const repoRoot = args.config.repoRoot;
   const commentPoster = args._commentOnIssue ?? defaultCommentPoster();
+  const fetchIssue = args._fetchIssueBody ?? fetchIssueBody;
 
   // === Step 1: claim ==========================================================
   const story = await pickNextEligibleStory(repoRoot);
   if (!story) return { type: "no_story" };
 
   const ghIssue = story.ghIssue ?? 0;
-  // Best-effort issue body fetch. If gh fails (network, auth), we run with
-  // an empty spec — the implementer can still call `gh issue view` itself.
-  let issueBody = "";
+  // V1-B refactor — pre-fetch the issue snapshot ONCE, embed verbatim at the
+  // SAME position in all three agent prompts. If gh fails (network, auth) we
+  // fall back to an empty snapshot rather than 3x the failure cost.
+  let issue: IssueRef;
   try {
-    issueBody = await getIssueBody(ghIssue);
+    issue = await fetchIssue(ghIssue);
   } catch (err) {
     process.stderr.write(
-      `WARN: getIssueBody(${ghIssue}) failed; proceeding without pre-fetched spec: ${
+      `WARN: fetchIssueBody(${ghIssue}) failed; proceeding with empty spec: ${
         (err as Error).message
       }\n`,
     );
+    issue = {
+      title: story.title,
+      body: "",
+      labels: [],
+      number: ghIssue,
+    };
   }
-  const specReqPw = specRequiresPlaywright(issueBody);
+  const specReqPw = specRequiresPlaywright(issue.body);
 
   // Fix #4 — capture preSha BEFORE the implementer runs so we can diff
   // commits-this-iteration for migrations + UI ground truth.
@@ -238,7 +339,7 @@ export async function runIteration(
     ghIssue,
     iterationNum: args.iterationNum,
     iterationTotal: args.iterationTotal,
-    issueBody,
+    issue,
   });
 
   const ctx: IterationContext = {
@@ -315,7 +416,7 @@ export async function runIteration(
 
   // === Implementer ERROR path: recovery ladder ===============================
   if (implementerError) {
-    const recovery = await runRecoveryLadder(
+    const recovery = await runRecoveryDiagnosisOrEscalate(
       args.sandbox,
       ctx,
       {
@@ -324,6 +425,7 @@ export async function runIteration(
       },
       {
         promptTemplatePath: args.recoveryPromptPath,
+        idleTimeoutSeconds: msToSec(args.config.agentTimeouts.recovery),
       },
     );
 
@@ -379,6 +481,16 @@ export async function runIteration(
     commitTouchedUi = false;
   }
 
+  // V1-B — total diff size feeds the reviewer effort scaling. Best-effort.
+  let diffLineCount = 0;
+  try {
+    diffLineCount = await getDiffLineCount(repoRoot, preSha, postSha);
+  } catch (err) {
+    process.stderr.write(
+      `WARN: getDiffLineCount failed (treating as 0 lines → low effort): ${errorMessage(err)}\n`,
+    );
+  }
+
   // Fix #3 — auto-apply drizzle migrations between preSha and postSha. Real
   // errors quarantine the story and skip the reviewer (mirrors bash:648).
   const migQuarantined = await runMigrationsOrQuarantine(
@@ -400,7 +512,7 @@ export async function runIteration(
       ghIssue,
       iterationNum: args.iterationNum,
       iterationTotal: args.iterationTotal,
-      issueBody,
+      issue,
       lastSha: lastCommitSha,
       branch: args.sandbox.branch,
       specRequiresPlaywright: specReqPw,
@@ -415,6 +527,7 @@ export async function runIteration(
         config: args.config,
         iterationNum: args.iterationNum,
         attempt,
+        diffLineCount,
         _agentRunner: args._agentRunner,
       });
     } catch (firstErr) {
@@ -430,6 +543,7 @@ export async function runIteration(
           iterationNum: args.iterationNum,
           attempt,
           escalated: true,
+          diffLineCount,
           _agentRunner: args._agentRunner,
         });
       } catch (secondErr) {
@@ -473,7 +587,7 @@ export async function runIteration(
       ghIssue,
       iterationNum: args.iterationNum,
       iterationTotal: args.iterationTotal,
-      issueBody,
+      issue,
       attempt,
       lastSha: lastCommitSha,
       prevReviewerText: lastReviewerText,
@@ -524,6 +638,15 @@ export async function runIteration(
       } catch (err) {
         process.stderr.write(
           `WARN: post-fixer gitDiffTouchedUi failed: ${errorMessage(err)}\n`,
+        );
+      }
+      // V1-B — refresh diff size after fixer commits land too. Long fix
+      // chains can grow the diff into a higher reviewer-effort bucket.
+      try {
+        diffLineCount = await getDiffLineCount(repoRoot, preSha, postSha);
+      } catch (err) {
+        process.stderr.write(
+          `WARN: post-fixer getDiffLineCount failed: ${errorMessage(err)}\n`,
         );
       }
       const migQ = await runMigrationsOrQuarantine(
@@ -584,7 +707,7 @@ export async function runIteration(
     ghIssue,
     iterationNum: args.iterationNum,
     iterationTotal: args.iterationTotal,
-    issueBody,
+    issue,
     lastSha: lastCommitSha,
     branch: args.sandbox.branch,
     specRequiresPlaywright: specReqPw,
@@ -598,6 +721,7 @@ export async function runIteration(
       prompt: finalPrompt,
       config: args.config,
       iterationNum: args.iterationNum,
+      diffLineCount,
       _agentRunner: args._agentRunner,
     });
   } catch {
@@ -608,6 +732,7 @@ export async function runIteration(
         config: args.config,
         iterationNum: args.iterationNum,
         escalated: true,
+        diffLineCount,
         _agentRunner: args._agentRunner,
       });
     } catch {
@@ -793,6 +918,11 @@ function errorMessage(err: unknown): string {
   return String(err);
 }
 
+/** Convert ms (LoopConfig) → seconds (Sandcastle's idleTimeoutSeconds). */
+function msToSec(ms: number): number {
+  return Math.max(1, Math.round(ms / 1000));
+}
+
 interface ShipOpenCommentArgs {
   iterationNum: number;
   attempts: number;
@@ -840,4 +970,3 @@ function defaultCommentPoster(): (issueNum: number, body: string) => Promise<voi
     );
   };
 }
-

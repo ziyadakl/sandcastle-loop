@@ -105,12 +105,19 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
         const payload = JSON.stringify({
           storyId: STORY_ID,
           ghIssue: GH_ISSUE,
-          e2eRan: false,
+          e2eActuallyRan: false,
           e2eVerdict: "halted",
           uiTouched: false,
           certificationPresent: false,
           marker: "HALT",
           haltReason: "smoke: simulated halt",
+          // V1-A 7-question rubric (HALT marker permits soft fields):
+          storyType: "backend-only",
+          e2eRequired: false,
+          testCommandUsed: null,
+          e2eAssertionLine: null,
+          outputNotFiltered: true,
+          testReachedFeature: false,
         });
         return {
           stdout: [
@@ -128,11 +135,18 @@ function canned(role: AgentRole, mode: FailureMode): CannedOutput {
         storyId: STORY_ID,
         ghIssue: GH_ISSUE,
         commitSha: "deadbeefcafefeedfacefeedbabe000000000001",
-        e2eRan: true,
-        e2eVerdict: "passed",
+        e2eActuallyRan: false,
+        e2eVerdict: "skipped",
         uiTouched: false,
         certificationPresent: true,
         marker: "STORY_COMPLETE",
+        // V1-A 7-question rubric — backend-only smoke story, e2e not required:
+        storyType: "backend-only",
+        e2eRequired: false,
+        testCommandUsed: null,
+        e2eAssertionLine: null,
+        outputNotFiltered: true,
+        testReachedFeature: true,
       });
       return {
         stdout: [

@@ -34,6 +34,7 @@ import type { Sandbox } from "@ai-hero/sandcastle";
 import type { IterationResult, LoopConfig } from "../types.js";
 import { runIteration } from "./iteration.js";
 import type { AgentRunner } from "./iteration.js";
+import type { IssueRef } from "./briefing.js";
 
 /**
  * Sandbox factory abstraction — production code uses `createSandbox()`,
@@ -94,6 +95,12 @@ export interface RunLoopOptions {
    * @internal
    */
   _agentRunner?: AgentRunner;
+  /**
+   * Test-only: override the GH issue-fetcher used at iteration start. When
+   * omitted, runIteration shells out via `gh issue view --json title,body,labels,number`.
+   * @internal
+   */
+  _fetchIssueBody?: (ghIssue: number) => Promise<IssueRef>;
 }
 
 export async function runLoop(
@@ -127,6 +134,7 @@ export async function runLoop(
       recoveryPromptPath: opts.recoveryPromptPath,
       _commentOnIssue: opts._commentOnIssue,
       _agentRunner: opts._agentRunner,
+      _fetchIssueBody: opts._fetchIssueBody,
     });
 
     if ("type" in outcome && outcome.type === "no_story") {

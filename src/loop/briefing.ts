@@ -6,18 +6,41 @@
  * Exposes pure string-builders. No I/O at module load time so unit tests can
  * call without mocking the filesystem. The implementer template is read from
  * disk lazily and cached, but tests pass an explicit `template` to bypass.
+ *
+ * Prompt-cache discipline (V1-B refactor):
+ *   The pre-fetched issue spec block is embedded VERBATIM at the SAME position
+ *   (the very top, before any role-specific content) in all three agent
+ *   prompts (implementer, reviewer, fixer). This is load-bearing for prompt
+ *   cache hits across the three calls in one iteration — same prefix → cache
+ *   hit on the second and third agent invocation.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Story } from "../types.js";
+
+/**
+ * Driver-fetched GitHub issue snapshot. The driver pre-fetches this once at
+ * iteration start (via the loop's `fetchIssueBody`) and threads it into all
+ * three agent briefings.
+ */
+export interface IssueRef {
+  title: string;
+  body: string;
+  labels: string[];
+  number: number;
+}
 
 export interface BriefingArgs {
   story: Story;
   ghIssue: number;
   iterationNum: number;
   iterationTotal: number;
-  /** Pre-fetched issue body markdown (driver responsibility, like bash ISSUE_FILE). */
-  issueBody: string;
+  /**
+   * Pre-fetched issue snapshot (driver responsibility). Embedded verbatim at
+   * the SAME position in implementer / reviewer / fixer prompts — this is the
+   * shared cache prefix.
+   */
+  issue: IssueRef;
   /**
    * Optional: when this briefing is for a fixer, the prior reviewer's verdict
    * text gets attached so the fixer has the concerns inline (no re-fetch).
@@ -89,9 +112,31 @@ function substitute(template: string, vars: Record<string, string>): string {
 }
 
 /**
+ * The shared issue-spec block. EXACT same string is emitted at the SAME
+ * position (the top) of every agent prompt for prompt-cache locality. Do not
+ * vary whitespace, header text, or field ordering between callers — the
+ * prefix tokens are what hash to the cache key.
+ */
+export function formatIssueBlock(issue: IssueRef): string {
+  const labels = issue.labels.length > 0 ? issue.labels.join(", ") : "(none)";
+  return [
+    "=== Issue spec (pre-fetched by driver — do NOT call `gh issue view`) ===",
+    `Issue #${issue.number}: ${issue.title}`,
+    `Labels: ${labels}`,
+    "",
+    issue.body,
+    "=== End issue spec ===",
+  ].join("\n");
+}
+
+/**
  * Build the implementer prompt — analogue of bash `run_implementer()`.
- * Header references the issue body and progress log; the template body
- * follows. Step markers and certification block live in the template.
+ *
+ * Layout (top → bottom):
+ *   1. Issue block (shared cache prefix — IDENTICAL across all three roles)
+ *   2. Iteration metadata header
+ *   3. Implementer template body (the 9-step flow + certification block)
+ *   4. The 7-question structural certification check (V1-A schema fields)
  */
 export function buildImplementerBriefing(args: BriefingArgs): string {
   const template = args.implementerTemplate ?? loadImplementerTemplate();
@@ -101,17 +146,66 @@ export function buildImplementerBriefing(args: BriefingArgs): string {
     GH_ISSUE: String(args.ghIssue),
   });
 
-  const header = [
+  const issueBlock = formatIssueBlock(args.issue);
+  const meta = [
     `ITERATION: ${args.iterationNum}`,
     `STORY_ID: ${args.story.id}`,
     `GH_ISSUE: ${args.ghIssue}`,
-    "",
-    "=== Issue spec (pre-fetched by driver — do NOT call `gh issue view`) ===",
-    args.issueBody,
-    "=== End issue spec ===",
   ].join("\n");
 
-  return `${body}\n\n${header}`;
+  return `${issueBlock}\n\n${meta}\n\n${body}\n\n${buildSevenQuestionBlock()}`;
+}
+
+/**
+ * V1-A wiring — the seven structured-output questions the implementer MUST
+ * answer in its final JSON envelope before emitting STORY_COMPLETE. Each
+ * question is phrased as an imperative and references driver-computed ground
+ * truth so the agent can't fabricate an answer that contradicts the diff.
+ *
+ * Field names match V1-A's ImplementerOutput extension (storyType, e2eRequired,
+ * e2eActuallyRan, testCommandUsed, e2eAssertionLine, outputNotFiltered,
+ * testReachedFeature). Driver-side ground truth (SPEC_REQUIRES_PLAYWRIGHT)
+ * flows in via the implementer-prompt placeholder substitution; the driver
+ * recomputes commitTouchedUi from `git diff` post-commit.
+ */
+function buildSevenQuestionBlock(): string {
+  return `=== STRUCTURAL CERTIFICATION CHECK — answer all 7 questions ===
+
+Before emitting STORY_COMPLETE you MUST answer these 7 questions in your final
+structured output (the JSON envelope). The driver pre-computed some of them
+from the spec; if your answer contradicts the driver's ground truth, you are
+wrong and the reviewer WILL reject the commit.
+
+1) storyType: classify as "ui" | "backend" | "infra" | "docs" — based on the
+   issue spec and what files your diff touched. UI stories require playwright
+   per STEP 6/9.
+
+2) e2eRequired: true|false — did the spec REQUIRE a playwright test? The
+   driver pre-computed this by grepping the issue body for "playwright test";
+   if you got it wrong, you're wrong.
+
+3) e2eActuallyRan: true|false — did you actually invoke the playwright command
+   in this iteration (regardless of pass/fail)? If e2eRequired is true and
+   this is false, you have NOT completed the story.
+
+4) testCommandUsed: the EXACT shell command you ran for the e2e (or the empty
+   string if e2eActuallyRan=false). Verbatim — no paraphrasing.
+
+5) e2eAssertionLine: a line from /tmp/ralph-e2e-it{N}.log that PROVES the
+   test reached its assertion (must start with ✓ / ✔ / PASS, contain
+   "expect(", or be the test description text). Empty string if no e2e ran.
+
+6) outputNotFiltered: true|false — did you run playwright | tee WITHOUT
+   inserting any grep/sed/awk/--quiet/--reporter=dot/redirection that would
+   suppress bail signals? Filtering output is a prompt-following failure.
+
+7) testReachedFeature: true|false — did the test exercise the user-facing
+   behavior described in the story (NOT auth state, login redirect, or
+   pre-condition setup)? "1 passed" with no specific test detail = false.
+
+These 7 fields are REQUIRED by the V1-A ImplementerOutput schema; the parser
+will reject the envelope if any are missing.
+=== End structural certification check ===`;
 }
 
 /**
@@ -120,17 +214,19 @@ export function buildImplementerBriefing(args: BriefingArgs): string {
  * and attaches the e2e log when present. The full review rubric (4-tier
  * classification, certification structural check) is reproduced verbatim
  * to match the bash version's behavior — no shorthand, no abbreviation.
+ *
+ * The issue block is emitted FIRST (verbatim, identical to the implementer's
+ * prefix) so the prompt-cache hits across calls.
  */
 export function buildReviewerBriefing(args: ReviewerBriefingArgs): string {
+  const issueBlock = formatIssueBlock(args.issue);
   const specReqPw = args.specRequiresPlaywright ? "yes" : "no";
   const uiTouched = args.commitTouchedUi ? "yes" : "no";
   const e2eAttachment = args.e2eLog
     ? `\n=== Playwright e2e log (/tmp/ralph-e2e-it${args.iterationNum}.log) ===\n${args.e2eLog}\n=== End e2e log ===\n`
     : "";
 
-  return `=== Issue spec (pre-fetched) ===
-${args.issueBody}
-=== End issue spec ===
+  return `${issueBlock}
 ${e2eAttachment}
 Use the superpowers:requesting-code-review skill to review commit ${args.lastSha} on branch ${args.branch} (iteration ${args.iterationNum}, GitHub issue #${args.ghIssue}). The issue spec is pre-loaded above — do NOT call 'gh issue view' yourself, work from that text. Check both spec fit (does the diff implement the issue's acceptance criteria?) and code quality.
 
@@ -165,13 +261,18 @@ The marker MUST be on its own line at the end of your output, with no surroundin
 /**
  * Build the fixer prompt — analogue of bash `run_fixer()`. Includes the
  * prior reviewer's text inline so the fixer doesn't need to re-fetch.
+ *
+ * The issue block is emitted FIRST (verbatim, identical to the implementer's
+ * and reviewer's prefix) so the prompt-cache hits across calls.
  */
 export function buildFixerBriefing(args: FixerBriefingArgs): string {
+  const issueBlock = formatIssueBlock(args.issue);
   const reviewerSection = args.prevReviewerText
     ? `\n=== Prior reviewer findings ===\n${args.prevReviewerText}\n=== End prior reviewer findings ===\n`
     : "";
 
-  return `${reviewerSection}
+  return `${issueBlock}
+${reviewerSection}
 Use the superpowers:receiving-code-review skill to judge the most recent code review on commit ${args.lastSha} (iteration ${args.iterationNum}, fix attempt ${args.attempt}, GitHub issue #${args.ghIssue}). Fix every HARD finding (must-fix bugs / blockers) and every MEDIUM finding (real concerns that won't fail tests but matter). Skip SOFT / cosmetic findings entirely — DO NOT touch variable names, formatting, comment phrasing, or 'prefer this pattern' suggestions.
 
 Run typecheck and tests after fixes, then commit explicitly with prefix 'RALPH(it=${args.iterationNum} fix=${args.attempt} issue=${args.ghIssue}): '.

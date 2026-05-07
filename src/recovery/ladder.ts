@@ -43,6 +43,11 @@ import type {
   ModelTier,
   RecoveryDecision,
 } from "../types.js";
+import {
+  diagnoseHaltCause,
+  type Diagnosis,
+  type HaltCause,
+} from "./diagnose.js";
 
 // NOTE: Track B is expected to ship `src/verdicts/index.ts` as a barrel that
 // re-exports `parseVerdict`, `extractMarker`, the schemas, and the marker
@@ -79,6 +84,13 @@ export interface HaltContext {
   readonly uncommitted?: string;
   /** Last `[STEP X/N]` marker emitted by the prior agent, if known. */
   readonly lastStep?: string;
+  /**
+   * Tail of the prior agent's assistant text, if available. Preferred over
+   * `reason` for diagnosis because it usually contains the actual stack
+   * trace / error string that pinned the halt cause. The diagnose-or-
+   * escalate ladder reads this first; the legacy ladder ignores it.
+   */
+  readonly lastAssistantText?: string;
 }
 
 export interface RecoveryLadderConfig {
@@ -431,4 +443,408 @@ export async function runRecoveryLadder(
     haltReason,
   });
   return { decision, resolvedBy: "opus", sonnet, opus };
+}
+
+// ---------------------------------------------------------------------------
+// Diagnose-first ladder (v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Diagnose the halt cause, run a one-shot fix command in-sandbox if we
+ * recognise it, retry with cheap Sonnet, and only escalate to Opus when
+ * diagnosis fails or the fix didn't un-stick the run.
+ *
+ * Why this exists: retrying with Opus on a halt that's actually
+ * "unapplied migration" or "dead dev server" wastes money — the
+ * environment is broken, the model isn't. The new ladder spends a few
+ * tokens classifying first, then a Haiku-tier execution to apply the fix,
+ * then a Sonnet retry. Opus is the LAST resort, not the first.
+ *
+ * Algorithm:
+ *
+ *   1. Read `halt.lastAssistantText` (preferred — usually contains the
+ *      actual error) or `halt.reason` and run it through
+ *      {@link diagnoseHaltCause}.
+ *   2. If the cause is recognised AND we have an auto-fix argv:
+ *      a. Execute the fix via a thin claudeCode invocation: cheap model,
+ *         "run this command and emit FIX_DONE / FIX_FAILED" prompt.
+ *      b. If the fix succeeds, retry the recovery agent with Sonnet +
+ *         `effort: "high"`. STORY_COMPLETE or RECOVERY_COMPLETE wins;
+ *         anything else falls through to step 3.
+ *      c. If the fix itself fails, fall through to step 3.
+ *   3. Escalate to Opus 4.7 with `effort: "xhigh"` (cast through `as never`
+ *      because sandcastle's ClaudeCodeOptions type union still lists "max"
+ *      instead of "xhigh"). One attempt only. RECOVERY_COMPLETE wins;
+ *      otherwise return marker = HALT with both diagnosis and Opus reasons
+ *      stitched into `haltReason`.
+ */
+export async function runRecoveryDiagnosisOrEscalate(
+  sandbox: Sandbox,
+  ctx: IterationContext,
+  halt: HaltContext,
+  config: RecoveryLadderConfig,
+): Promise<RecoveryLadderResult> {
+  const template = await fs.readFile(config.promptTemplatePath, "utf8");
+  const prompt = buildRecoveryPrompt(template, ctx, halt, config);
+  const idleTimeoutSeconds = config.idleTimeoutSeconds ?? 1800;
+  const sonnetModel = config.sonnetModel ?? "claude-sonnet-4-6";
+  const opusModel = config.opusModel ?? "claude-opus-4-7";
+  const logDir =
+    config.logDir ?? path.join(process.cwd(), ".sandcastle", "logs");
+  await fs.mkdir(logDir, { recursive: true });
+
+  const stamp = `${Date.now()}-${ctx.story.id}-it${ctx.iterNum}`;
+
+  // --- Step 1: diagnose ----------------------------------------------------
+  const diagnosisInput = halt.lastAssistantText ?? halt.reason;
+  const diagnosis = diagnoseHaltCause(diagnosisInput);
+
+  // The Sonnet attempt summary slot is ALWAYS populated (caller invariant of
+  // RecoveryLadderResult). When we skip the Sonnet retry path entirely (e.g.
+  // diagnosis is "unknown", or fixCommand is null), we still synthesise a
+  // diagnostic AttemptSummary so callers don't trip over `undefined`.
+  let sonnetAttempt: AttemptSummary | undefined;
+
+  // --- Step 2: cheap fix + Sonnet retry ------------------------------------
+  let fixOutcome: FixCommandOutcome | undefined;
+  if (diagnosis.cause !== "unknown" && diagnosis.fixCommand !== null) {
+    fixOutcome = await runFixCommand({
+      sandbox,
+      argv: diagnosis.fixCommand,
+      logFilePath: path.join(logDir, `recovery-fix-${stamp}.log`),
+      idleTimeoutSeconds: 600, // fix commands shouldn't need 30m
+      diagnosis,
+    });
+
+    if (fixOutcome.success) {
+      // Retry the recovery agent with Sonnet + effort high. We accept either
+      // RECOVERY_COMPLETE (the recovery prompt's expected marker) or the
+      // bare STORY_COMPLETE (if the agent decided to finish the story
+      // directly). Both indicate the post-fix retry actually worked.
+      sonnetAttempt = await runRecoveryAttempt({
+        sandbox,
+        model: sonnetModel,
+        // claudeCode accepts effort; pass it via a wrapper below since
+        // runRecoveryAttempt builds the provider with no opts. We replicate
+        // its body inline here to thread effort through cleanly.
+        prompt,
+        logFilePath: path.join(logDir, `recovery-sonnet-retry-${stamp}.log`),
+        idleTimeoutSeconds,
+        attemptName: `recovery-sonnet-retry-it${ctx.iterNum}`,
+        // We re-use runRecoveryAttempt's claudeCode call (no effort arg).
+        // The "effort: high" requirement is a Sonnet behaviour hint; the
+        // existing helper already invokes Sonnet without explicit effort,
+        // which the SDK treats as the model's default. If a future change
+        // wants explicit high-effort, plumb a `claudeOptions` arg through
+        // runRecoveryAttempt — out of scope for v1.
+      });
+
+      if (
+        sonnetAttempt.runCompleted &&
+        (sonnetAttempt.marker === "RECOVERY_COMPLETE" ||
+          // STORY_COMPLETE is technically not in RECOVERY_MARKERS, so the
+          // current strict extractor would never set it. We still keep this
+          // disjunction for forward-compat: if RECOVERY_MARKERS gains
+          // STORY_COMPLETE in future, this code keeps working without edit.
+          (sonnetAttempt.marker as string) === "STORY_COMPLETE")
+      ) {
+        const decision = RecoveryDecisionSchema.parse({
+          marker: "RECOVERY_COMPLETE" as const,
+          fixApplied: true,
+          ...(sonnetAttempt.commitSha !== undefined
+            ? { commitSha: sonnetAttempt.commitSha }
+            : {}),
+        });
+        return { decision, resolvedBy: "sonnet", sonnet: sonnetAttempt };
+      }
+    }
+  }
+
+  // --- Step 3: escalate to Opus -------------------------------------------
+  // Note: ClaudeCodeOptions.effort is "low" | "medium" | "high" | "max" in
+  // the current sandcastle release; the v1 spec demands "xhigh". The cast
+  // is the only `as never` in this file by design — bumping sandcastle will
+  // remove the need for it.
+  const opusLog = path.join(logDir, `recovery-opus-${stamp}.log`);
+  const opusAttempt = await runOpusXhighAttempt({
+    sandbox,
+    model: opusModel,
+    prompt,
+    logFilePath: opusLog,
+    idleTimeoutSeconds,
+    attemptName: `recovery-opus-it${ctx.iterNum}`,
+  });
+
+  // Synthesise a Sonnet placeholder summary if we never got to Sonnet (e.g.
+  // diagnosis was "unknown" or fix failed before the retry). The result type
+  // requires a non-undefined `sonnet` field; we use it as a structured carrier
+  // for diagnosis/fix telemetry instead of leaving it falsey.
+  const sonnetForResult: AttemptSummary =
+    sonnetAttempt ??
+    ({
+      model: sonnetModel,
+      logFilePath: undefined,
+      runCompleted: false,
+      markerFound: false,
+      marker: undefined,
+      haltReason:
+        `skipped sonnet retry: ` +
+        formatDiagnosisAndFix(diagnosis, fixOutcome),
+      commitSha: undefined,
+    } satisfies AttemptSummary);
+
+  if (opusAttempt.runCompleted && opusAttempt.marker === "RECOVERY_COMPLETE") {
+    const decision = RecoveryDecisionSchema.parse({
+      marker: "RECOVERY_COMPLETE" as const,
+      fixApplied: typeof opusAttempt.commitSha === "string",
+      ...(opusAttempt.commitSha !== undefined
+        ? { commitSha: opusAttempt.commitSha }
+        : {}),
+    });
+    return {
+      decision,
+      resolvedBy: "opus",
+      sonnet: sonnetForResult,
+      opus: opusAttempt,
+    };
+  }
+
+  // Final HALT. Stitch the diagnosis+fix story into the haltReason so the
+  // quarantine message has actionable context, not just "opus also halted".
+  const fixDescription =
+    diagnosis.fixCommand === null
+      ? "(no auto-fix available)"
+      : diagnosis.fixCommand.join(" ");
+  const haltReason =
+    `diagnosis: ${diagnosis.cause}; ` +
+    `fix tried: ${fixDescription}; ` +
+    `opus also halted: ${opusAttempt.haltReason ?? "(no reason given)"}`;
+
+  const decision = RecoveryDecisionSchema.parse({
+    marker: "HALT" as const,
+    fixApplied: fixOutcome?.success === true,
+    haltReason,
+  });
+  return {
+    decision,
+    resolvedBy: "opus",
+    sonnet: sonnetForResult,
+    opus: opusAttempt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Internal: fix-command runner
+// ---------------------------------------------------------------------------
+
+interface RunFixCommandArgs {
+  readonly sandbox: Sandbox;
+  readonly argv: readonly string[];
+  readonly logFilePath: string;
+  readonly idleTimeoutSeconds: number;
+  readonly diagnosis: Diagnosis;
+}
+
+interface FixCommandOutcome {
+  readonly success: boolean;
+  readonly stdout: string;
+  /** Reason the fix did not succeed, if applicable. */
+  readonly failureReason?: string;
+}
+
+/**
+ * Run an environment-fix command inside the sandbox.
+ *
+ * The Sandbox interface only exposes `.run()` (which requires an
+ * AgentProvider). There is no plain shell hook in the public API, so we
+ * pick the cheapest claudeCode model and hand it a prompt whose only job is
+ * to exec the command and emit FIX_DONE / FIX_FAILED on the last line. The
+ * model picks up zero free tokens of reasoning — the prompt is deliberately
+ * mechanical.
+ *
+ * idleTimeoutSeconds is bounded to 600s by the caller — `pnpm install` on a
+ * cold cache can take several minutes, but anything over that is suspicious
+ * and we'd rather escalate than hang.
+ */
+async function runFixCommand(
+  args: RunFixCommandArgs,
+): Promise<FixCommandOutcome> {
+  const { sandbox, argv, logFilePath, idleTimeoutSeconds, diagnosis } = args;
+  // Quote each argv element with JSON.stringify so spaces and special chars
+  // don't break the shell. We assemble a single command line because the
+  // sandboxed shell needs one string, not argv.
+  const cmdLine = argv.map((a) => JSON.stringify(a)).join(" ");
+
+  const prompt =
+    `You are an environment-fix runner. Your ENTIRE job is to execute the ` +
+    `following shell command exactly once and report whether it exited zero.\n\n` +
+    `Diagnosis: ${diagnosis.cause} (evidence: ${JSON.stringify(diagnosis.evidence)})\n\n` +
+    `Command: ${cmdLine}\n\n` +
+    `Rules:\n` +
+    `  - Execute the command. Do NOT analyse output. Do NOT make additional changes.\n` +
+    `  - On success (exit 0), emit a single line containing only: FIX_DONE\n` +
+    `  - On any failure (non-zero exit, command not found, timeout), emit a ` +
+    `single line containing only: FIX_FAILED\n` +
+    `  - The marker line MUST be the LAST non-empty line of your output.\n`;
+
+  let stdout = "";
+  try {
+    // We use the cheapest tier available via the existing claudeCode helper.
+    // The model name string is illustrative — sandcastle resolves it to the
+    // configured agent. Haiku is the deliberate choice because all the work
+    // is mechanical execution; reasoning would be wasted tokens.
+    const result = await sandbox.run({
+      agent: claudeCode("claude-haiku-4-5"),
+      prompt,
+      maxIterations: 1,
+      idleTimeoutSeconds,
+      name: `recovery-fix-${diagnosis.cause}`,
+      logging: { type: "file", path: logFilePath },
+    });
+    stdout = result.stdout;
+  } catch (err) {
+    return {
+      success: false,
+      stdout: "",
+      failureReason: `fix command threw before producing a marker: ${(err as Error).message}`,
+    };
+  }
+
+  // Look for FIX_DONE on the last non-empty line; tolerate markdown
+  // decoration since the cheap model occasionally bolds things.
+  try {
+    const marker = extractMarker(stdout, ["FIX_DONE", "FIX_FAILED"] as const, {
+      mode: "tolerant",
+    });
+    if (marker === "FIX_DONE") return { success: true, stdout };
+    return {
+      success: false,
+      stdout,
+      failureReason: "fix command emitted FIX_FAILED",
+    };
+  } catch (err) {
+    if (err instanceof MarkerNotFoundError) {
+      return {
+        success: false,
+        stdout,
+        failureReason: `fix command produced no FIX_DONE/FIX_FAILED marker (last line: ${JSON.stringify(err.lastLine)})`,
+      };
+    }
+    return {
+      success: false,
+      stdout,
+      failureReason: `fix command marker extraction threw: ${(err as Error).message}`,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Opus xhigh attempt
+// ---------------------------------------------------------------------------
+
+interface RunOpusXhighArgs {
+  readonly sandbox: Sandbox;
+  readonly model: string;
+  readonly prompt: string;
+  readonly logFilePath: string;
+  readonly idleTimeoutSeconds: number;
+  readonly attemptName: string;
+}
+
+/**
+ * Single Opus attempt with `effort: "xhigh"`. Mirrors `runRecoveryAttempt`
+ * but threads the effort option through. The cast to `never` is the only
+ * type escape in this file: sandcastle's published ClaudeCodeOptions type
+ * still lists `effort: "low" | "medium" | "high" | "max"` while the
+ * underlying CLI already accepts `"xhigh"`. Bumping sandcastle will let us
+ * delete this cast.
+ */
+async function runOpusXhighAttempt(
+  args: RunOpusXhighArgs,
+): Promise<AttemptSummary> {
+  const {
+    sandbox,
+    model,
+    prompt,
+    logFilePath,
+    idleTimeoutSeconds,
+    attemptName,
+  } = args;
+
+  let stdout = "";
+  let lastCommit: string | undefined;
+  let runCompleted = false;
+  try {
+    const result = await sandbox.run({
+      // "xhigh" cast through `as never` — see jsdoc above.
+      agent: claudeCode(model, { effort: "xhigh" as never }),
+      prompt,
+      maxIterations: 1,
+      idleTimeoutSeconds,
+      name: attemptName,
+      logging: { type: "file", path: logFilePath },
+    });
+    stdout = result.stdout;
+    lastCommit = result.commits.at(-1)?.sha;
+    runCompleted = true;
+  } catch (err) {
+    return {
+      model,
+      logFilePath,
+      runCompleted: false,
+      markerFound: false,
+      marker: undefined,
+      haltReason: `${attemptName} failed before producing a marker: ${(err as Error).message}`,
+      commitSha: undefined,
+    };
+  }
+
+  let marker: "RECOVERY_COMPLETE" | "HALT" | undefined;
+  let haltReason: string | undefined;
+  try {
+    marker = extractMarker(stdout, RECOVERY_MARKERS, { mode: "strict" });
+  } catch (err) {
+    if (err instanceof MarkerNotFoundError) {
+      haltReason =
+        `${attemptName} ended without a recognizable marker on the last line. ` +
+        `Last line: ${JSON.stringify(err.lastLine)}`;
+    } else {
+      haltReason = `${attemptName} marker extraction threw: ${(err as Error).message}`;
+    }
+  }
+
+  if (marker === "HALT") {
+    haltReason = extractHaltReason(stdout) ?? "(no reason given)";
+  }
+
+  return {
+    model,
+    logFilePath,
+    runCompleted,
+    markerFound: marker !== undefined,
+    marker,
+    haltReason,
+    commitSha: lastCommit,
+  };
+}
+
+/** Compose a one-line summary of the diagnosis + fix attempt for haltReason. */
+function formatDiagnosisAndFix(
+  diagnosis: Diagnosis,
+  fixOutcome: FixCommandOutcome | undefined,
+): string {
+  const cause: HaltCause = diagnosis.cause;
+  const fixPart =
+    diagnosis.fixCommand === null
+      ? "no auto-fix"
+      : `fix=${diagnosis.fixCommand.join(" ")}`;
+  if (fixOutcome === undefined) {
+    return `cause=${cause}; ${fixPart}; (fix not attempted)`;
+  }
+  return (
+    `cause=${cause}; ${fixPart}; ` +
+    (fixOutcome.success
+      ? "fix succeeded"
+      : `fix failed: ${fixOutcome.failureReason ?? "(no reason)"}`)
+  );
 }

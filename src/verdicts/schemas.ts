@@ -31,23 +31,159 @@ export const ConcernSchema = z.object({
 });
 
 /**
- * Implementer verdict object. Mirrors {@link ImplementerOutput} in src/types.ts.
- * The implementer emits this as a JSON object inside an XML tag (per the
- * sandcastle Output.object pattern when we run with maxIterations === 1) OR as
- * a plain JSON object in the assistant text whose terminal marker line then
- * confirms the verdict. Either way Zod validates the shape.
+ * Story-type enum mirroring {@link import("../types.js").StoryType}.
+ *
+ * Exported so callers (planner, driver, persistence layer) can import it
+ * without re-deriving from a string literal union.
  */
-export const ImplementerOutputSchema = z.object({
+export const StoryTypeSchema = z.enum(["ui", "backend-only", "infra"]);
+
+/**
+ * Patterns for the e2e assertion-line check (question 5). The implementer
+ * MUST quote a line that proves the test reached its assertion. These are
+ * the known rubber-stamp evasions:
+ *   - `Running 3 tests` / `Running 1 test using 1 worker` — playwright's
+ *     preamble line, present in every run regardless of outcome.
+ *   - bare URL — `http://localhost:3000/foo` on its own, no assertion proof.
+ *
+ * The reference fork's reviewer rejects these explicitly
+ * (`refs/afk-ralph.sh.local-fork` line ~143). We encode the same rule here
+ * so a rubber-stamp attempt fails at parse time, before it can reach
+ * the reviewer.
+ */
+const RUNNING_PREAMBLE_RE = /^\s*Running\s+\d+\s+tests?\b/i;
+const BARE_URL_RE = /^\s*https?:\/\/\S+\s*$/i;
+
+/** Rejected assertion-line predicate: returns true when the quote is generic. */
+function isGenericAssertionLine(line: string): boolean {
+  if (line.trim().length === 0) return true;
+  if (RUNNING_PREAMBLE_RE.test(line)) return true;
+  if (BARE_URL_RE.test(line)) return true;
+  return false;
+}
+
+/**
+ * Base shape of the implementer verdict before cross-field refinement. Kept
+ * as a separate object schema so refinements can be layered on cleanly and
+ * the inferred type matches {@link ImplementerOutput} 1:1 (the `Equals`
+ * assertion at the bottom of this file enforces the match).
+ */
+const ImplementerOutputBaseSchema = z.object({
+  // ---- existing fields (preserved) ----
   storyId: z.string().min(1),
   ghIssue: z.number().int().nonnegative(),
   commitSha: z.string().min(1).optional(),
-  e2eRan: z.boolean(),
   e2eVerdict: z.enum(["passed", "failed", "skipped", "halted"]),
   uiTouched: z.boolean(),
   certificationPresent: z.boolean(),
   marker: z.enum(["STORY_COMPLETE", "HALT", "RECOVERY_COMPLETE"]),
   haltReason: z.string().optional(),
+
+  // ---- 7-question structural certification (NEW, all required) ----
+  storyType: StoryTypeSchema,
+  e2eRequired: z.boolean(),
+  e2eActuallyRan: z.boolean(),
+  testCommandUsed: z.string().min(1).nullable(),
+  e2eAssertionLine: z.string().min(1).nullable(),
+  outputNotFiltered: z.boolean(),
+  testReachedFeature: z.boolean(),
 });
+
+/**
+ * Implementer verdict object. Mirrors {@link ImplementerOutput} in src/types.ts.
+ *
+ * The 7-question structural certification is encoded as required fields, and
+ * cross-field validation enforces the rules the bash reference fork's reviewer
+ * applies post-hoc — so a rubber-stamp attempt fails at PARSE time, before it
+ * can reach the reviewer or be committed:
+ *
+ *   1. STORY_COMPLETE + `e2eRequired === true` ⇒ `testCommandUsed` MUST be
+ *      non-null AND `e2eActuallyRan` MUST be true. Skipping the test or
+ *      omitting the command is a hard rejection.
+ *   2. STORY_COMPLETE + `e2eActuallyRan === true` ⇒ `e2eAssertionLine` MUST
+ *      be non-empty AND MUST NOT match the generic preamble (`Running N
+ *      tests`) or a bare URL pattern.
+ *   3. `outputNotFiltered === false` ⇒ marker MUST be HALT. Filtered output
+ *      is auto-HALT — the reviewer cannot trust filtered evidence so the
+ *      implementer is required to admit defeat.
+ *   4. HALT marker is the escape hatch: the soft fields (`testCommandUsed`,
+ *      `e2eAssertionLine`) may be null even when `e2eRequired === true`,
+ *      because the implementer is admitting they couldn't run / verify.
+ *      `haltReason` SHOULD be present on HALT.
+ */
+export const ImplementerOutputSchema = ImplementerOutputBaseSchema.superRefine(
+  (val, ctx) => {
+    const isHalt = val.marker === "HALT";
+
+    // Rule 3: filtered output ⇒ auto-HALT.
+    // Even if every other field looks good, an admission that the output was
+    // filtered means the verdict is untrustworthy and MUST be HALT.
+    if (val.outputNotFiltered === false && !isHalt) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["marker"],
+        message:
+          "outputNotFiltered=false (implementer admitted filtering playwright " +
+          "output before tee) requires marker=HALT — filtered evidence cannot " +
+          "be trusted, so the verdict is auto-HALT.",
+      });
+    }
+
+    // Rules 1-2 only bite on the STORY_COMPLETE / RECOVERY_COMPLETE path.
+    // HALT is the explicit escape hatch ("I gave up") and lets soft fields
+    // be null, so we skip the strict checks below when the marker is HALT.
+    if (isHalt) return;
+
+    // Rule 1: e2eRequired ⇒ testCommandUsed non-null AND e2eActuallyRan.
+    if (val.e2eRequired) {
+      if (val.testCommandUsed === null) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["testCommandUsed"],
+          message:
+            "e2eRequired=true but testCommandUsed is null. Either run the " +
+            "spec's playwright command (and record it here verbatim) or " +
+            "switch the marker to HALT.",
+        });
+      }
+      if (val.e2eActuallyRan === false) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["e2eActuallyRan"],
+          message:
+            "e2eRequired=true but e2eActuallyRan=false. The spec mandates " +
+            "playwright; a STORY_COMPLETE verdict requires the test to have " +
+            "actually executed. Switch the marker to HALT if you couldn't " +
+            "run it.",
+        });
+      }
+    }
+
+    // Rule 2: e2eActuallyRan ⇒ e2eAssertionLine non-empty AND not generic.
+    if (val.e2eActuallyRan) {
+      if (val.e2eAssertionLine === null) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["e2eAssertionLine"],
+          message:
+            "e2eActuallyRan=true but e2eAssertionLine is null. Quote the " +
+            "exact assertion line from the playwright log that proves the " +
+            "test reached its assertion.",
+        });
+      } else if (isGenericAssertionLine(val.e2eAssertionLine)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["e2eAssertionLine"],
+          message:
+            "e2eAssertionLine is generic (matches the playwright preamble " +
+            "'Running N tests' or a bare URL). Quote a line that starts " +
+            "with ✓ / ✔ / PASS, contains 'expect(', or contains the test " +
+            "description text — anything that PROVES the assertion ran.",
+        });
+      }
+    }
+  },
+);
 
 /** Reviewer verdict object. Mirrors {@link ReviewerVerdict} in src/types.ts. */
 export const ReviewerVerdictSchema = z.object({
