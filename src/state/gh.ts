@@ -6,6 +6,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { z } from "zod";
 
 const execFileP = promisify(execFile);
 
@@ -40,9 +41,17 @@ async function runGh(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Ru
 }
 
 /**
- * Move a label on an issue. If `from === "*"`, only adds the new label (no
- * removal). Otherwise removes `from` and adds `to` in the same `gh issue edit`
- * call. Errors propagate — Track C decides whether label drift is fatal.
+ * Move a label on an issue.
+ *
+ * - When `from` is a concrete label, the call is a single `gh issue edit`
+ *   that adds `to` and removes `from` atomically.
+ * - When `from === "*"`, the function first fetches the issue's current
+ *   labels via `gh issue view --json labels`, removes every label that
+ *   appears in `STATUS_LABELS` (one `gh issue edit --remove-label` per
+ *   match), then adds `to`. This guarantees the issue ends up in exactly
+ *   one status label without clobbering non-status labels (priority:*, etc).
+ *
+ * Errors propagate — Track C decides whether label drift is fatal.
  */
 export async function transitionLabel(
   issueNum: number,
@@ -55,10 +64,33 @@ export async function transitionLabel(
   if (!to) {
     throw new Error("transitionLabel: 'to' label must be non-empty");
   }
-  const args: string[] = ["issue", "edit", String(issueNum), "--add-label", to];
-  if (from !== "*") {
-    args.push("--remove-label", from);
+  if (from === "*") {
+    // Strip every known status label currently on the issue, preserving
+    // non-status labels (priority:*, kind:*, etc), then add `to`.
+    const current = await fetchIssueLabels(issueNum);
+    for (const label of current) {
+      if (isStatusLabel(label) && label !== to) {
+        await runGh([
+          "issue",
+          "edit",
+          String(issueNum),
+          "--remove-label",
+          label,
+        ]);
+      }
+    }
+    await runGh(["issue", "edit", String(issueNum), "--add-label", to]);
+    return;
   }
+  const args: string[] = [
+    "issue",
+    "edit",
+    String(issueNum),
+    "--add-label",
+    to,
+    "--remove-label",
+    from,
+  ];
   await runGh(args);
 }
 
@@ -119,8 +151,55 @@ export const LABEL_READY = "ready-for-agent";
 export const LABEL_IN_PROGRESS = "in-progress";
 export const LABEL_DONE = "done";
 export const LABEL_NEEDS_HUMAN = "needs-human";
-/** Legacy synonym for `needs-human`; readers should accept either. */
-export const LABEL_QUARANTINE_ALIAS = "quarantine";
+/**
+ * Legacy synonym for `needs-human` — older bash drivers and a not-yet-
+ * fixed call site (`quarantineStoryInPrd` in src/state/prd.ts) still write
+ * this spelling. Readers MUST accept both `"needs-human"` and `"quarantine"`
+ * as meaning "this issue is quarantined". New writes go to LABEL_NEEDS_HUMAN.
+ */
+export const LABEL_QUARANTINE_LEGACY = "quarantine";
+/**
+ * Back-compat alias retained for callers that still import the original
+ * name. Kept identical to LABEL_QUARANTINE_LEGACY.
+ */
+export const LABEL_QUARANTINE_ALIAS = LABEL_QUARANTINE_LEGACY;
+
+/**
+ * The full set of v1 status labels — exactly one of these should be
+ * present on any open work item. `transitionLabel(num, "*", X)` strips
+ * every label in this list before adding `X`, so non-status labels
+ * (priority:*, kind:*, etc) are preserved verbatim.
+ *
+ * Includes both `"needs-human"` (canonical) and `"quarantine"` (legacy
+ * synonym) so a transition correctly clears whichever spelling the issue
+ * happens to carry.
+ */
+export const STATUS_LABELS = [
+  "ready-for-agent",
+  "in-progress",
+  "done",
+  "needs-human",
+  "quarantine",
+] as const;
+
+const STATUS_LABEL_SET: ReadonlySet<string> = new Set(STATUS_LABELS);
+
+/**
+ * True iff `label` is one of the v1 status labels — used by
+ * `transitionLabel("*", X)` to decide which existing labels to strip.
+ */
+export function isStatusLabel(label: string): boolean {
+  return STATUS_LABEL_SET.has(label);
+}
+
+/**
+ * True iff `label` denotes "this issue is quarantined / needs a human".
+ * Accepts both the canonical `"needs-human"` and the legacy `"quarantine"`
+ * spellings; case-sensitive (GH labels are case-sensitive in practice).
+ */
+export function isQuarantineLabel(label: string): boolean {
+  return label === LABEL_NEEDS_HUMAN || label === LABEL_QUARANTINE_LEGACY;
+}
 
 export interface ReadyIssueSummary {
   number: number;
@@ -311,4 +390,116 @@ export async function postIssueComment(
     throw new Error(`postIssueComment: invalid issueNum '${issueNum}'`);
   }
   await runGh(["issue", "comment", String(issueNum), "--body", body]);
+}
+
+// ---------------------------------------------------------------------------
+// Recovery / introspection helpers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the label names currently on an issue. Returns `[]` if the issue
+ * has no labels or if `gh` returns empty stdout (e.g. mocked in tests).
+ *
+ * Used internally by `transitionLabel("*", X)` to decide which status
+ * labels to strip; not exported because callers should reach for
+ * `listIssuesByLabel` or fold the labels into a list query instead of
+ * doing N point-fetches.
+ */
+async function fetchIssueLabels(issueNum: number): Promise<string[]> {
+  const { stdout } = await runGh([
+    "issue",
+    "view",
+    String(issueNum),
+    "--json",
+    "labels",
+  ]);
+  const trimmed = stdout.trim();
+  if (trimmed === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(
+      `fetchIssueLabels(${issueNum}): failed to parse gh output as JSON: ${
+        (err as Error).message
+      }`,
+    );
+  }
+  // `gh issue view --json labels` returns `{ "labels": [{ "name": "...", ... }] }`.
+  const shape = z.object({
+    labels: z.array(z.object({ name: z.string() })),
+  });
+  const result = shape.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `fetchIssueLabels(${issueNum}): unexpected gh output shape: ${result.error.message}`,
+    );
+  }
+  return result.data.labels.map((l) => l.name);
+}
+
+/** Public shape returned by `listIssuesByLabel`. */
+export interface LabelledIssueSummary {
+  number: number;
+  title: string;
+  labels: string[];
+}
+
+const LabelledIssueRow = z.object({
+  number: z.number().int(),
+  title: z.string(),
+  labels: z.array(z.object({ name: z.string() })),
+});
+const LabelledIssueRows = z.array(LabelledIssueRow);
+
+/**
+ * List open issues that carry `label`, sorted by issue number ascending
+ * (deterministic for tests). Caps at 100 results — startup-recovery never
+ * needs more than the head of the queue.
+ *
+ * Used by the loop driver's startup-recovery path to find issues that were
+ * left labelled `in-progress` by a previous (crashed) run and need to be
+ * reset to `ready-for-agent`.
+ */
+export async function listIssuesByLabel(
+  label: string,
+): Promise<LabelledIssueSummary[]> {
+  if (typeof label !== "string" || label === "") {
+    throw new Error("listIssuesByLabel: 'label' must be a non-empty string");
+  }
+  const { stdout } = await runGh([
+    "issue",
+    "list",
+    "--label",
+    label,
+    "--state",
+    "open",
+    "--json",
+    "number,title,labels",
+    "--limit",
+    "100",
+  ]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout || "[]");
+  } catch (err) {
+    throw new Error(
+      `listIssuesByLabel(${label}): failed to parse gh output as JSON: ${
+        (err as Error).message
+      }`,
+    );
+  }
+  const result = LabelledIssueRows.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `listIssuesByLabel(${label}): unexpected gh output shape: ${result.error.message}`,
+    );
+  }
+  const summaries: LabelledIssueSummary[] = result.data.map((row) => ({
+    number: row.number,
+    title: row.title,
+    labels: row.labels.map((l) => l.name),
+  }));
+  summaries.sort((a, b) => a.number - b.number);
+  return summaries;
 }

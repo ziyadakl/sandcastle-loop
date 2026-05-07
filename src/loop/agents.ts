@@ -440,14 +440,13 @@ export interface FinalReviewerCallArgs {
   prompt: string;
   config: LoopConfig;
   iterationNum: number;
-  /** True after a non-zero rc — escalate to opus. */
-  escalated?: boolean;
   /**
-   * Diff line count between preSha and the post-attempt-2 commit (used only
-   * when `escalated === false`). Final-pass review reuses the same diff-size
-   * effort scaling as runReviewer.
+   * True after a non-zero rc — bumps the per-iteration retry surface so the
+   * caller can distinguish the first vs. fallback final-pass attempt in logs.
+   * Both paths now use Opus 4.7 + xhigh — the user's spec requires the
+   * final pass to ALWAYS be Opus xhigh (Fix #9).
    */
-  diffLineCount?: number;
+  escalated?: boolean;
   /** Smoke seam — bypasses sandbox.run when provided. @internal */
   _agentRunner?: AgentRunner;
 }
@@ -457,20 +456,21 @@ export interface FinalReviewerCallArgs {
  * Same shape as runReviewer but distinguishable in logs (matches bash
  * "Reviewer-Final" naming at afk-ralph.sh:792).
  *
- * Always uses `xhigh` effort: by construction the final pass only runs on
- * stories that have already eaten two reviewer/fixer rounds, so the diff is
- * "trustworthy enough to ship?" — that question deserves the full budget.
- * The escalated path additionally bumps the model tier to Opus.
+ * Fix #9: the final pass is ALWAYS Opus 4.7 + xhigh. The user's spec said:
+ * regular review pass = Sonnet effort-scaled; final pass after fixer = Opus
+ * 4.7 xhigh. Diff size is no longer a parameter (the previous diffLineCount
+ * branch was dead code — final pass is unconditionally xhigh). The model is
+ * hardcoded here rather than read from config.models.reviewer because the
+ * final pass is a verifier-of-last-resort whose tier is non-negotiable.
  */
 export async function runFinalReviewer(
   args: FinalReviewerCallArgs,
 ): Promise<ReviewerResult> {
   const escalated = args.escalated === true;
-  const model: ModelTier = escalated ? "opus" : args.config.models.reviewer;
   const result = await runAgent({
     sandbox: args.sandbox,
     prompt: args.prompt,
-    model,
+    model: "opus",
     // Final pass: full reasoning budget (xhigh) regardless of diff size —
     // sandcastle types are stale; CLI accepts xhigh per
     // https://platform.claude.com/docs/en/build-with-claude/effort
@@ -480,8 +480,8 @@ export async function runFinalReviewer(
     timeoutMs: args.config.agentTimeouts.reviewer,
     idleTimeoutSeconds: msToSec(args.config.agentTimeouts.reviewer),
     name: escalated
-      ? `Reviewer-Final-Opus (it=${args.iterationNum})`
-      : `Reviewer-Final (it=${args.iterationNum})`,
+      ? `Reviewer-Final-Opus-Retry (it=${args.iterationNum})`
+      : `Reviewer-Final-Opus (it=${args.iterationNum})`,
     role: "final-reviewer",
     runner: args._agentRunner,
   });

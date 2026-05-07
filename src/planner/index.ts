@@ -7,6 +7,7 @@ export {
   runPlanner,
   buildPlannerPrompt,
   PlannerOutputSchema,
+  buildPlannerOutputSchema,
   PlannerError,
 } from "./planner.js";
 export type {

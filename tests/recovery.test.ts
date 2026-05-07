@@ -317,9 +317,61 @@ describe("diagnoseHaltCause", () => {
     expect(d.fixCommand).toEqual(["pnpm", "db:migrate"]);
   });
 
+  // Fix #15 — broaden migration-unapplied coverage to the surface forms
+  // Drizzle 0.30+, mixed-case Error, and Postgres SQLSTATE all emit.
+  it("matches Drizzle 0.30+ formatted error → migration-unapplied", () => {
+    const d = diagnoseHaltCause(
+      'PostgresError: relation "users" does not exist',
+    );
+    expect(d.cause).toBe("migration-unapplied");
+    expect(d.fixCommand).toEqual(["pnpm", "db:migrate"]);
+  });
+
+  it("matches Postgres SQLSTATE-prefixed error (42P01) → migration-unapplied", () => {
+    const d = diagnoseHaltCause(
+      '42P01: relation "users" does not exist',
+    );
+    expect(d.cause).toBe("migration-unapplied");
+    expect(d.fixCommand).toEqual(["pnpm", "db:migrate"]);
+  });
+
+  it("matches mixed-case `Error:` prefix → migration-unapplied", () => {
+    const d = diagnoseHaltCause(
+      'Error: relation "users" does not exist',
+    );
+    expect(d.cause).toBe("migration-unapplied");
+    expect(d.fixCommand).toEqual(["pnpm", "db:migrate"]);
+  });
+
   it("matches Cannot find module → deps-missing", () => {
     const d = diagnoseHaltCause(
       "Error: Cannot find module 'react'\n  at ...",
+    );
+    expect(d.cause).toBe("deps-missing");
+    expect(d.fixCommand).toEqual(["pnpm", "install"]);
+  });
+
+  // Fix #16 — broaden deps-missing coverage to Node 20+ ESM error formats.
+  it("matches ERR_MODULE_NOT_FOUND with 'Cannot find package' → deps-missing", () => {
+    const d = diagnoseHaltCause(
+      "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'foo' " +
+        "imported from /app/index.mjs",
+    );
+    expect(d.cause).toBe("deps-missing");
+    expect(d.fixCommand).toEqual(["pnpm", "install"]);
+  });
+
+  it("matches 'Cannot find module ... imported from ...' → deps-missing", () => {
+    const d = diagnoseHaltCause(
+      "Cannot find module './local' imported from /path/file.js",
+    );
+    expect(d.cause).toBe("deps-missing");
+    expect(d.fixCommand).toEqual(["pnpm", "install"]);
+  });
+
+  it("matches standalone ERR_MODULE_NOT_FOUND code marker → deps-missing", () => {
+    const d = diagnoseHaltCause(
+      "node:internal/process/esm_loader: ERR_MODULE_NOT_FOUND",
     );
     expect(d.cause).toBe("deps-missing");
     expect(d.fixCommand).toEqual(["pnpm", "install"]);
@@ -389,11 +441,11 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
     expect(result.decision.commitSha).toBe("feedface");
   });
 
-  it("missing migration → diagnoses + runs pnpm db:migrate + Sonnet retry succeeds", async () => {
+  it("missing migration → diagnoses + runs pnpm db:migrate via execFile + Sonnet retry succeeds", async () => {
     const { sandbox, calls } = makeMockSandbox([
-      // Fix runner (Haiku) — emits FIX_DONE on its own line
-      { stdout: "$ pnpm db:migrate\nDone in 0.5s\n\nFIX_DONE\n" },
-      // Sonnet retry — emits RECOVERY_COMPLETE
+      // Sonnet retry — emits RECOVERY_COMPLETE. The fix command no longer
+      // runs through the agent; it runs through the injected execFile stub
+      // (see _execFileP below).
       {
         stdout: "ran the failing test, all green\n\nRECOVERY_COMPLETE\n",
         commits: [{ sha: "5577cafe" }],
@@ -401,6 +453,24 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
     ]);
     const tmpLogDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "ralph-log-"),
+    );
+
+    // execFile stub: records the argv it was asked to run and resolves with
+    // a non-empty stdout to signal success.
+    const execCalls: Array<{
+      file: string;
+      argv: string[];
+      cwd: string;
+    }> = [];
+    const fakeExec = vi.fn(
+      async (
+        file: string,
+        argv: string[],
+        opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
+      ) => {
+        execCalls.push({ file, argv, cwd: opts.cwd });
+        return { stdout: "Done in 0.5s\n", stderr: "" };
+      },
     );
 
     const result = await runRecoveryDiagnosisOrEscalate(
@@ -412,23 +482,30 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
           'PostgresError: relation "users" does not exist at line 1',
       },
       { promptTemplatePath: promptPath, logDir: tmpLogDir },
+      { _execFileP: fakeExec },
     );
 
-    expect(calls).toHaveLength(2);
-    expect(calls[0]!.model).toBe("claude-haiku-4-5");
-    expect(calls[0]!.prompt).toContain('"pnpm" "db:migrate"');
-    expect(calls[1]!.model).toBe("claude-sonnet-4-6");
+    // Only one sandbox.run call (the Sonnet retry). The fix command
+    // ran via execFile, not via the agent layer.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.model).toBe("claude-sonnet-4-6");
+
+    // execFile was called once with `pnpm db:migrate` against the
+    // sandbox's worktree.
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]!.file).toBe("pnpm");
+    expect(execCalls[0]!.argv).toEqual(["db:migrate"]);
+    expect(execCalls[0]!.cwd).toBe("/fake/worktree");
+
     expect(result.resolvedBy).toBe("sonnet");
     expect(result.decision.marker).toBe("RECOVERY_COMPLETE");
     expect(result.decision.fixApplied).toBe(true);
     expect(result.decision.commitSha).toBe("5577cafe");
   });
 
-  it("missing module → diagnoses + runs pnpm install + Sonnet retry succeeds", async () => {
+  it("missing module → diagnoses + runs pnpm install via execFile + Sonnet retry succeeds", async () => {
     const { sandbox, calls } = makeMockSandbox([
-      // Fix runner: pnpm install
-      { stdout: "Progress: resolved 100, downloaded 100\n\nFIX_DONE\n" },
-      // Sonnet retry
+      // Sonnet retry only — the fix is execFile, not an agent run.
       {
         stdout: "imports resolve now, tests pass\n\nRECOVERY_COMPLETE\n",
         commits: [{ sha: "deadc0de" }],
@@ -436,6 +513,17 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
     ]);
     const tmpLogDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "ralph-log-"),
+    );
+
+    const execCalls: Array<{ file: string; argv: string[] }> = [];
+    const fakeExec = vi.fn(
+      async (file: string, argv: string[]) => {
+        execCalls.push({ file, argv });
+        return {
+          stdout: "Progress: resolved 100, downloaded 100\n",
+          stderr: "",
+        };
+      },
     );
 
     const result = await runRecoveryDiagnosisOrEscalate(
@@ -446,10 +534,14 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
         lastAssistantText: "Error: Cannot find module 'react'\n  at ...",
       },
       { promptTemplatePath: promptPath, logDir: tmpLogDir },
+      { _execFileP: fakeExec },
     );
 
-    expect(calls).toHaveLength(2);
-    expect(calls[0]!.prompt).toContain('"pnpm" "install"');
+    // One sandbox.run call (Sonnet retry); execFile carried the fix.
+    expect(calls).toHaveLength(1);
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]!.file).toBe("pnpm");
+    expect(execCalls[0]!.argv).toEqual(["install"]);
     expect(result.resolvedBy).toBe("sonnet");
     expect(result.decision.marker).toBe("RECOVERY_COMPLETE");
     expect(result.decision.fixApplied).toBe(true);
@@ -484,11 +576,10 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
     expect(result.decision.marker).toBe("RECOVERY_COMPLETE");
   });
 
-  it("diagnosis but fix command FAILS → escalates to Opus after the fix attempt", async () => {
+  it("diagnosis but fix execFile FAILS (non-zero exit) → escalates to Opus after the fix attempt", async () => {
     const { sandbox, calls } = makeMockSandbox([
-      // Fix runner emits FIX_FAILED
-      { stdout: "$ pnpm install\nERR_PNPM_FETCH_FAILED\n\nFIX_FAILED\n" },
-      // Opus rescues
+      // Opus rescues — the fix runs via execFile (and fails), so the only
+      // agent call is the Opus escalation.
       {
         stdout: "fixed the registry config\n\nRECOVERY_COMPLETE\n",
         commits: [{ sha: "abad1dea" }],
@@ -498,22 +589,37 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
       path.join(os.tmpdir(), "ralph-log-"),
     );
 
+    // Stub execFile to reject as if the binary exited non-zero. Mirrors
+    // node's child_process behaviour: error carries `code` (numeric exit),
+    // `stdout`, and `stderr`.
+    const fakeExec = vi.fn(async () => {
+      const err = new Error("Command failed: pnpm install") as Error & {
+        code: number;
+        stdout: string;
+        stderr: string;
+      };
+      err.code = 1;
+      err.stdout = "";
+      err.stderr = "ERR_PNPM_FETCH_FAILED\n";
+      throw err;
+    });
+
     const result = await runRecoveryDiagnosisOrEscalate(
       sandbox,
       CTX,
       {
         ...HALT,
-        lastAssistantText:
-          "boot error: Cannot find module 'react'",
+        lastAssistantText: "boot error: Cannot find module 'react'",
       },
       { promptTemplatePath: promptPath, logDir: tmpLogDir },
+      { _execFileP: fakeExec },
     );
 
-    // Fix runs (Haiku), then Opus directly — Sonnet retry is skipped because
-    // the fix itself didn't succeed.
-    expect(calls).toHaveLength(2);
-    expect(calls[0]!.model).toBe("claude-haiku-4-5");
-    expect(calls[1]!.model).toBe("claude-opus-4-7");
+    // execFile ran once (and failed), then Opus directly — Sonnet retry is
+    // skipped because the fix itself didn't succeed.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.model).toBe("claude-opus-4-7");
+    expect(fakeExec).toHaveBeenCalledTimes(1);
     expect(result.resolvedBy).toBe("opus");
     expect(result.decision.marker).toBe("RECOVERY_COMPLETE");
     expect(result.sonnet.runCompleted).toBe(false);
@@ -522,8 +628,6 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
 
   it("diagnosis + fix runs + Sonnet retry HALTs + Opus also HALTs → final HALT mentions both", async () => {
     const { sandbox, calls } = makeMockSandbox([
-      // Fix runner — succeeds
-      { stdout: "ok\n\nFIX_DONE\n" },
       // Sonnet retry — HALTs
       {
         stdout:
@@ -539,6 +643,12 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
       path.join(os.tmpdir(), "ralph-log-"),
     );
 
+    // Fix command succeeds (exit 0).
+    const fakeExec = vi.fn(async () => ({
+      stdout: "ok\n",
+      stderr: "",
+    }));
+
     const result = await runRecoveryDiagnosisOrEscalate(
       sandbox,
       CTX,
@@ -548,9 +658,12 @@ describe("runRecoveryDiagnosisOrEscalate", () => {
           'pg error: relation "users" does not exist',
       },
       { promptTemplatePath: promptPath, logDir: tmpLogDir },
+      { _execFileP: fakeExec },
     );
 
-    expect(calls).toHaveLength(3);
+    // execFile ran once (the fix), then Sonnet retry, then Opus.
+    expect(calls).toHaveLength(2);
+    expect(fakeExec).toHaveBeenCalledTimes(1);
     expect(result.decision.marker).toBe("HALT");
     expect(result.decision.fixApplied).toBe(true); // fix DID succeed even though final state is HALT
     expect(result.decision.haltReason).toContain("diagnosis: migration-unapplied");

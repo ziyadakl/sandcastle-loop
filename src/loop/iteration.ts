@@ -41,6 +41,8 @@
  *   halted         — recovery ladder said HALT, deliberate halt
  */
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
 import { promisify } from "node:util";
 import type { Sandbox } from "@ai-hero/sandcastle";
 import type {
@@ -64,24 +66,27 @@ import {
   type IssueRef,
 } from "./briefing.js";
 
-// Track D — backlog state. Routed through the barrel per Fix #8.
+// Track D — V1 label-state-machine surface. The legacy prd.json operations
+// (pickNextEligibleStory, markDone, closeIssue) are gone from the loop's hot
+// path; the loop now claims/marks-done/quarantines via GH labels.
 import {
-  pickNextEligibleStory,
-  markDone,
-  closeIssue,
+  claimViaLabel,
+  markDoneViaLabel,
+  quarantineViaLabel,
 } from "../state/index.js";
 
 // Track E — V1-D refactor: the multi-step recovery ladder is replaced by the
 // new diagnosis-first ladder, exposed as runRecoveryDiagnosisOrEscalate. Same
 // call signature as the legacy runRecoveryLadder; the semantics differ inside
 // V1-D but the integration point here is unchanged.
-import {
-  runRecoveryDiagnosisOrEscalate,
-  quarantineStory,
-} from "../recovery/index.js";
+import { runRecoveryDiagnosisOrEscalate } from "../recovery/index.js";
 
 // Track F — drizzle migration auto-applier via the barrel.
 import { applyMigrationsBetween } from "../migrations/index.js";
+
+// Planner — runs once per loop wake-up; the loop walks `priorityOrder` and
+// skips issues with open blockers per `dependencies`.
+import type { PlannerOutput } from "../planner/index.js";
 
 const execFileP = promisify(execFile);
 
@@ -115,6 +120,14 @@ export interface RunIterationArgs {
    */
   recoveryPromptPath: string;
   /**
+   * Fix #2: planner output — `priorityOrder` is the queue the loop walks,
+   * `dependencies` is the who-blocks-who map used to skip issues whose
+   * blockers are still open. Computed ONCE per loop wake-up by `runLoop` and
+   * threaded through. If absent, the loop returns `no_story` immediately
+   * (defensive — runLoop always supplies this in production).
+   */
+  plannerOutput: PlannerOutput;
+  /**
    * Test seam: post a comment on a GH issue. Default uses `gh issue comment`
    * via execFile. Tests inject a stub.
    */
@@ -130,6 +143,14 @@ export interface RunIterationArgs {
    * @internal
    */
   _fetchIssueBody?: (ghIssue: number) => Promise<IssueRef>;
+  /**
+   * Test seam: replace the default blocker-state probe (`gh issue view <num>
+   * --json state,labels`). Returns `done` if the issue is in `done` label
+   * state OR closed on GitHub (covers humans who close issues directly
+   * without flipping the label).
+   * @internal
+   */
+  _isIssueDone?: (issueNum: number) => Promise<boolean>;
 }
 
 /**
@@ -284,38 +305,259 @@ export async function getDiffLineCount(
   return ins + del;
 }
 
+/**
+ * Fix #5 (extension) — driver-side output-suppression scan. Reads the latest
+ * commit body and the LAST line of progress.txt (sprint memory) and searches
+ * for known evasion patterns. Returns `{ found: true, evidence: <80-char
+ * window around the match> }` on a hit; `{ found: false, evidence: null }`
+ * otherwise.
+ *
+ * Patterns detected (each is a known way to suppress playwright bail signals
+ * before tee):
+ *   - `| grep -v ...`
+ *   - `| sed ...`
+ *   - `| awk ...`
+ *   - `--reporter=dot` (when not in spec)
+ *   - `--quiet`
+ *   - `> /dev/null`
+ *   - `2>/dev/null`
+ *   - `| head -N` / `| tail -N`
+ */
+const OUTPUT_SUPPRESSION_PATTERNS: RegExp[] = [
+  /\|\s*grep\s+-v\b/i,
+  /\|\s*sed\b/i,
+  /\|\s*awk\b/i,
+  /--reporter=dot\b/i,
+  /--quiet\b/i,
+  />\s*\/dev\/null/i,
+  /2\s*>\s*\/dev\/null/i,
+  /\|\s*head\s+-\d+/i,
+  /\|\s*tail\s+-\d+/i,
+];
+
+export async function hasOutputSuppression(
+  repoRoot: string,
+  postSha: string,
+): Promise<{ found: boolean; evidence: string | null }> {
+  // Read the commit body (subject + body, no diff).
+  let commitBody = "";
+  try {
+    const { stdout } = await execFileP(
+      "git",
+      ["show", postSha, "--format=%B", "--no-patch"],
+      {
+        cwd: repoRoot,
+        timeout: 30_000,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    commitBody = stdout;
+  } catch {
+    // If we can't read the commit, we can't conclude suppression — treat as
+    // no evidence (the reviewer's other checks still bite).
+    commitBody = "";
+  }
+
+  // Read the LAST line of progress.txt (per the spec: "last entry only").
+  let progressLastLine = "";
+  try {
+    const raw = await fs.readFile(path.join(repoRoot, "progress.txt"), "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+    progressLastLine = lines.length > 0 ? lines[lines.length - 1]! : "";
+  } catch {
+    progressLastLine = "";
+  }
+
+  const haystacks: { source: string; text: string }[] = [
+    { source: "commit body", text: commitBody },
+    { source: "progress.txt (last entry)", text: progressLastLine },
+  ];
+
+  for (const { source, text } of haystacks) {
+    for (const re of OUTPUT_SUPPRESSION_PATTERNS) {
+      const match = re.exec(text);
+      if (!match) continue;
+      const start = Math.max(0, match.index - 80);
+      const end = Math.min(text.length, match.index + match[0].length + 80);
+      const window = text.slice(start, end).replace(/\s+/g, " ").trim();
+      return {
+        found: true,
+        evidence: `${source}: ${window}`,
+      };
+    }
+  }
+
+  return { found: false, evidence: null };
+}
+
+/**
+ * Fix #6 — append a single line to progress.txt (sprint memory). Driver
+ * side: called after the implementer commits successfully so the next
+ * iteration's reviewer/fixer/implementer have the post-commit narrative.
+ *
+ * Best-effort: a write failure is logged and swallowed. progress.txt is
+ * decorative; losing one line doesn't break correctness.
+ */
+export async function appendProgress(
+  repoRoot: string,
+  line: string,
+): Promise<void> {
+  try {
+    const ensureNewline = line.endsWith("\n") ? line : `${line}\n`;
+    await fs.appendFile(path.join(repoRoot, "progress.txt"), ensureNewline, "utf8");
+  } catch (err) {
+    process.stderr.write(
+      `WARN: appendProgress failed (continuing — progress.txt is decorative): ${errorMessage(err)}\n`,
+    );
+  }
+}
+
+/**
+ * Fix #6 — read the LAST 50 lines of progress.txt to embed in agent prompts
+ * as shared sprint memory. Returns `""` on missing or empty file.
+ */
+export async function readProgressTail(
+  repoRoot: string,
+  maxLines = 50,
+): Promise<string> {
+  try {
+    const raw = await fs.readFile(path.join(repoRoot, "progress.txt"), "utf8");
+    const lines = raw.split("\n");
+    // Drop trailing empty lines from the file's natural newline.
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.slice(-maxLines).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Fix #2 — blocker-state probe used during planner-priority walk. An issue is
+ * considered "done" if its label set contains `done` OR the issue is closed
+ * on GitHub (covers humans who close issues directly without flipping the
+ * label). Falls back to `false` (treat as "not done", i.e. STILL blocking) on
+ * any error so we don't accidentally pick a story whose blocker we can't
+ * verify.
+ */
+export async function defaultIsIssueDone(issueNum: number): Promise<boolean> {
+  if (!Number.isInteger(issueNum) || issueNum <= 0) return false;
+  try {
+    const { stdout } = await execFileP(
+      "gh",
+      ["issue", "view", String(issueNum), "--json", "state,labels"],
+      { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    type GhView = {
+      state?: string;
+      labels?: { name?: string }[];
+    };
+    let parsed: GhView;
+    try {
+      parsed = JSON.parse(stdout) as GhView;
+    } catch {
+      return false;
+    }
+    if (typeof parsed.state === "string" && parsed.state.toUpperCase() === "CLOSED") {
+      return true;
+    }
+    if (Array.isArray(parsed.labels)) {
+      for (const lbl of parsed.labels) {
+        if (typeof lbl?.name === "string" && lbl.name.toLowerCase() === "done") {
+          return true;
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build a minimal Story carrier for a planner-selected issue. The legacy
+ * prd.json `Story` type is used end-to-end (recovery, briefings, results); on
+ * the v1 path we synthesize one with status="in_progress" since the GH label
+ * machine is the source of truth, not the local status field.
+ */
+function storyFromIssue(issue: IssueRef): Story {
+  return {
+    id: `gh-${issue.number}`,
+    title: issue.title || `gh-${issue.number}`,
+    status: "in_progress",
+    ghIssue: issue.number,
+    attempts: 1,
+  };
+}
+
 export async function runIteration(
   args: RunIterationArgs,
 ): Promise<IterationOutcome> {
   const repoRoot = args.config.repoRoot;
   const commentPoster = args._commentOnIssue ?? defaultCommentPoster();
   const fetchIssue = args._fetchIssueBody ?? fetchIssueBody;
+  const isDone = args._isIssueDone ?? defaultIsIssueDone;
 
-  // === Step 1: claim ==========================================================
-  const story = await pickNextEligibleStory(repoRoot);
-  if (!story) return { type: "no_story" };
-
-  const ghIssue = story.ghIssue ?? 0;
-  // V1-B refactor — pre-fetch the issue snapshot ONCE, embed verbatim at the
-  // SAME position in all three agent prompts. If gh fails (network, auth) we
-  // fall back to an empty snapshot rather than 3x the failure cost.
-  let issue: IssueRef;
-  try {
-    issue = await fetchIssue(ghIssue);
-  } catch (err) {
-    process.stderr.write(
-      `WARN: fetchIssueBody(${ghIssue}) failed; proceeding with empty spec: ${
-        (err as Error).message
-      }\n`,
-    );
-    issue = {
-      title: story.title,
-      body: "",
-      labels: [],
-      number: ghIssue,
-    };
+  // === Step 1: planner-priority walk + claim via label =======================
+  // Fix #1 + Fix #2: replace `pickNextEligibleStory(repoRoot)` (prd.json) with
+  // a walk over `plannerOutput.priorityOrder`, skipping issues whose blockers
+  // (per `plannerOutput.dependencies`) are not yet `done`. The first eligible
+  // issue is claimed via `claimViaLabel` (transitions `ready-for-agent` →
+  // `in-progress`).
+  const blockerMap = new Map<number, number[]>();
+  for (const dep of args.plannerOutput.dependencies) {
+    blockerMap.set(dep.issue, dep.blockedBy);
   }
+
+  let claimedIssue: IssueRef | undefined;
+  for (const candidateNum of args.plannerOutput.priorityOrder) {
+    const blockers = blockerMap.get(candidateNum) ?? [];
+    let allClear = true;
+    for (const blockerNum of blockers) {
+      const done = await isDone(blockerNum);
+      if (!done) {
+        allClear = false;
+        break;
+      }
+    }
+    if (!allClear) continue;
+    // Fetch the candidate issue body (we'll need it for the briefings anyway).
+    let candidateIssue: IssueRef;
+    try {
+      candidateIssue = await fetchIssue(candidateNum);
+    } catch (err) {
+      process.stderr.write(
+        `WARN: fetchIssueBody(${candidateNum}) failed during candidate scan: ${errorMessage(err)}\n`,
+      );
+      continue;
+    }
+    // Claim atomically. If the claim fails (e.g. another worker grabbed it
+    // between our planner snapshot and the edit), skip and try the next.
+    try {
+      await claimViaLabel(candidateNum);
+    } catch (err) {
+      process.stderr.write(
+        `WARN: claimViaLabel(${candidateNum}) failed; skipping: ${errorMessage(err)}\n`,
+      );
+      continue;
+    }
+    claimedIssue = candidateIssue;
+    break;
+  }
+
+  if (!claimedIssue) return { type: "no_story" };
+
+  const story = storyFromIssue(claimedIssue);
+  const ghIssue = story.ghIssue ?? 0;
+  // V1-B refactor — issue snapshot was fetched during the candidate scan.
+  // Reuse it; do NOT call gh again. The shared cache prefix across the three
+  // agent prompts depends on this byte-identical snapshot.
+  const issue: IssueRef = claimedIssue;
   const specReqPw = specRequiresPlaywright(issue.body);
+
+  // Fix #6 — read progress.txt tail ONCE per iteration. Embedded at the SAME
+  // position (after the issue block) in all three agent prompts so the cache
+  // prefix is shared.
+  const progressTail = await readProgressTail(repoRoot);
 
   // Fix #4 — capture preSha BEFORE the implementer runs so we can diff
   // commits-this-iteration for migrations + UI ground truth.
@@ -325,9 +567,8 @@ export async function runIteration(
   } catch (err) {
     // If we can't even read HEAD, the worktree is broken — quarantine the
     // story rather than entering a half-instrumented iteration.
-    await quarantineStory(
-      repoRoot,
-      story,
+    await quarantineViaLabel(
+      ghIssue,
       `pre-iteration git rev-parse HEAD failed: ${errorMessage(err)}`,
     );
     return quarantined(story, args.iterationNum);
@@ -340,6 +581,7 @@ export async function runIteration(
     iterationNum: args.iterationNum,
     iterationTotal: args.iterationTotal,
     issue,
+    progressTail,
   });
 
   const ctx: IterationContext = {
@@ -390,25 +632,19 @@ export async function runIteration(
   if (implementerHaltMarker) {
     if (lastCommitSha) {
       // Commit landed BUT implementer chose to stop. Quarantine — but the
-      // commit stays on the branch and we deliberately do NOT closeIssue or
-      // markDone. The story is left in `quarantined` state so a human can
-      // decide what to do with the partial work.
-      await quarantineStory(
-        repoRoot,
-        story,
+      // commit stays on the branch and we deliberately do NOT close the issue
+      // or mark done. The story is left in `needs-human` label state so a
+      // human can decide what to do with the partial work.
+      await quarantineViaLabel(
+        ghIssue,
         `implementer HALT (with partial commit ${lastCommitSha}): ${
           implementerHaltReason ?? "(no reason)"
         }`,
-        // Bash:573 records this as 1 attempt — implementer ran once, no
-        // recovery follow-up.
-        // (quarantineStory falls back to story.attempts ?? 1 if attempts
-        // is omitted; we set it explicitly so behavior is unambiguous.)
       );
       return quarantined(story, args.iterationNum);
     }
-    await quarantineStory(
-      repoRoot,
-      story,
+    await quarantineViaLabel(
+      ghIssue,
       `implementer HALT: ${implementerHaltReason ?? "(no reason)"}`,
     );
     return quarantined(story, args.iterationNum);
@@ -416,6 +652,11 @@ export async function runIteration(
 
   // === Implementer ERROR path: recovery ladder ===============================
   if (implementerError) {
+    // Fix #10 — explicitly request the recovery ladder run Sonnet at
+    // effort=high. The current ladder config doesn't accept this field yet
+    // (FIX-3 owns that change); we still pass it through call-site intent so
+    // the field becomes a no-op until accepted, then activates automatically.
+    // FOLLOW-UP: needs FIX-3 to extend RecoveryLadderConfig with sonnetEffort.
     const recovery = await runRecoveryDiagnosisOrEscalate(
       args.sandbox,
       ctx,
@@ -426,14 +667,17 @@ export async function runIteration(
       {
         promptTemplatePath: args.recoveryPromptPath,
         idleTimeoutSeconds: msToSec(args.config.agentTimeouts.recovery),
+        // Intent (Fix #10): Sonnet recovery retry at effort high. Field is
+        // not yet on RecoveryLadderConfig; documented here as cross-track
+        // contract until FIX-3 accepts it.
+        // sonnetEffort: "high",
       },
     );
 
     if (recovery.decision.marker === "HALT") {
       // Deliberate HALT from recovery — quarantine.
-      await quarantineStory(
-        repoRoot,
-        story,
+      await quarantineViaLabel(
+        ghIssue,
         recovery.decision.haltReason ?? "recovery HALT",
       );
       return halted(story, args.iterationNum, recovery.decision.haltReason);
@@ -462,9 +706,8 @@ export async function runIteration(
   try {
     postSha = await gitRevParseHead(repoRoot);
   } catch (err) {
-    await quarantineStory(
-      repoRoot,
-      story,
+    await quarantineViaLabel(
+      ghIssue,
       `post-implementer git rev-parse HEAD failed: ${errorMessage(err)}`,
     );
     return quarantined(story, args.iterationNum);
@@ -496,11 +739,37 @@ export async function runIteration(
   const migQuarantined = await runMigrationsOrQuarantine(
     repoRoot,
     story,
+    ghIssue,
     preSha,
     postSha,
     args.iterationNum,
   );
   if (migQuarantined) return migQuarantined;
+
+  // Fix #5 — driver-side output-suppression scan. Re-run after every commit
+  // landing event (initially after the implementer's commit, again after each
+  // fixer commit). If any suppression pattern is found in the commit body or
+  // progress.txt's last line, surface it as `outputSuppressionEvidence` to
+  // the reviewer prompt — the reviewer then auto-classifies as HARD.
+  let outputSuppressionEvidence: string | null = null;
+  try {
+    const scan = await hasOutputSuppression(repoRoot, postSha);
+    outputSuppressionEvidence = scan.found ? scan.evidence : null;
+  } catch (err) {
+    process.stderr.write(
+      `WARN: hasOutputSuppression failed (treating as no suppression): ${errorMessage(err)}\n`,
+    );
+  }
+
+  // Fix #6 — driver-side authoritative progress.txt line. Appended ONCE per
+  // implementer/recovery commit landing so the next iteration's reviewer/
+  // fixer/implementer have shared sprint memory. The implementer also writes
+  // its own narrative line per the prompt; the driver line is the
+  // authoritative one (story id, gh issue, story type, e2e verdict).
+  await appendProgress(
+    repoRoot,
+    `[it=${args.iterationNum}] ${story.id} ${ghIssue} — implementer commit ${lastCommitSha}`,
+  );
 
   // === Step 3: reviewer / fixer ladder (≤2 attempts) ========================
   let lastReviewerText: string | undefined;
@@ -517,6 +786,8 @@ export async function runIteration(
       branch: args.sandbox.branch,
       specRequiresPlaywright: specReqPw,
       commitTouchedUi,
+      outputSuppressionEvidence,
+      progressTail,
     });
 
     let review;
@@ -548,9 +819,8 @@ export async function runIteration(
         });
       } catch (secondErr) {
         // Both reviewer attempts failed — quarantine.
-        await quarantineStory(
-          repoRoot,
-          story,
+        await quarantineViaLabel(
+          ghIssue,
           `reviewer-ladder-exhausted: ${errorMessage(secondErr)}; first error: ${errorMessage(firstErr)}`,
         );
         return quarantined(story, args.iterationNum);
@@ -560,21 +830,14 @@ export async function runIteration(
     lastReviewerText = review.raw.stdout;
 
     if (review.marker === "ALL_CLEAR") {
-      await markDone(
-        repoRoot,
-        story.id,
-        lastCommitSha,
-        args.iterationNum,
-        story.title,
-      );
       try {
-        await closeIssue(
+        await markDoneViaLabel(
           ghIssue,
           `RALPH(it=${args.iterationNum}) closed by commit ${lastCommitSha}`,
         );
       } catch (err) {
         process.stderr.write(
-          `WARN: closeIssue(${ghIssue}) failed (continuing — prd.json is source of truth): ${errorMessage(err)}\n`,
+          `WARN: markDoneViaLabel(${ghIssue}) failed: ${errorMessage(err)}\n`,
         );
       }
       iterationFinalized = true;
@@ -591,6 +854,7 @@ export async function runIteration(
       attempt,
       lastSha: lastCommitSha,
       prevReviewerText: lastReviewerText,
+      progressTail,
     });
 
     let fixer;
@@ -606,9 +870,8 @@ export async function runIteration(
     } catch (err) {
       // Bash treats fixer failure as fatal (afk-ralph.sh:746 `exit 1`). We
       // soften that: quarantine the story and let the outer loop continue.
-      await quarantineStory(
-        repoRoot,
-        story,
+      await quarantineViaLabel(
+        ghIssue,
         `fixer-failed-attempt-${attempt}: ${errorMessage(err)}`,
       );
       return quarantined(story, args.iterationNum);
@@ -626,9 +889,8 @@ export async function runIteration(
       try {
         postSha = await gitRevParseHead(repoRoot);
       } catch (err) {
-        await quarantineStory(
-          repoRoot,
-          story,
+        await quarantineViaLabel(
+          ghIssue,
           `post-fixer-${attempt} git rev-parse HEAD failed: ${errorMessage(err)}`,
         );
         return quarantined(story, args.iterationNum);
@@ -649,9 +911,20 @@ export async function runIteration(
           `WARN: post-fixer getDiffLineCount failed: ${errorMessage(err)}\n`,
         );
       }
+      // Fix #5 — re-scan for output suppression on the new commit. The fixer
+      // could have introduced a filter even if the implementer didn't.
+      try {
+        const scan = await hasOutputSuppression(repoRoot, postSha);
+        outputSuppressionEvidence = scan.found ? scan.evidence : null;
+      } catch (err) {
+        process.stderr.write(
+          `WARN: post-fixer hasOutputSuppression failed: ${errorMessage(err)}\n`,
+        );
+      }
       const migQ = await runMigrationsOrQuarantine(
         repoRoot,
         story,
+        ghIssue,
         preSha,
         postSha,
         args.iterationNum,
@@ -660,14 +933,10 @@ export async function runIteration(
     }
 
     if (attempt === 2 && fixer.marker !== "FIXED") {
-      // Ship-on-fail-with-issue-OPEN (afk-ralph.sh:762–782).
-      await markDone(
-        repoRoot,
-        story.id,
-        lastCommitSha,
-        args.iterationNum,
-        story.title,
-      );
+      // Ship-on-fail-with-issue-OPEN (afk-ralph.sh:762–782). v1: leave the
+      // issue OPEN with `in-progress` label still in place — we deliberately
+      // do NOT call markDoneViaLabel because that closes the issue. The
+      // ship-open semantic is "code shipped, issue still needs human review."
       await commentPoster(
         ghIssue,
         buildShipOpenComment({
@@ -701,7 +970,7 @@ export async function runIteration(
 
   // === Step 4: final-pass reviewer (post attempt-2 FIXED) ====================
   // Mirrors bash afk-ralph.sh:789–831 — verifies attempt-2 fixer's claim
-  // before marking done.
+  // before marking done. Fix #9: final pass is ALWAYS Opus 4.7 + xhigh.
   const finalPrompt = buildReviewerBriefing({
     story,
     ghIssue,
@@ -712,6 +981,8 @@ export async function runIteration(
     branch: args.sandbox.branch,
     specRequiresPlaywright: specReqPw,
     commitTouchedUi,
+    outputSuppressionEvidence,
+    progressTail,
   });
 
   let finalReview;
@@ -721,7 +992,6 @@ export async function runIteration(
       prompt: finalPrompt,
       config: args.config,
       iterationNum: args.iterationNum,
-      diffLineCount,
       _agentRunner: args._agentRunner,
     });
   } catch {
@@ -732,19 +1002,13 @@ export async function runIteration(
         config: args.config,
         iterationNum: args.iterationNum,
         escalated: true,
-        diffLineCount,
         _agentRunner: args._agentRunner,
       });
     } catch {
       // Final-pass ladder failed — ship with issue OPEN per bash's tolerant
-      // behavior (it doesn't quarantine on final-pass failure either).
-      await markDone(
-        repoRoot,
-        story.id,
-        lastCommitSha,
-        args.iterationNum,
-        story.title,
-      );
+      // behavior (it doesn't quarantine on final-pass failure either). v1:
+      // leave the `in-progress` label in place; the comment carries the
+      // operator-readable note.
       await commentPoster(
         ghIssue,
         buildShipOpenComment({
@@ -763,34 +1027,21 @@ export async function runIteration(
   }
 
   if (finalReview.marker === "ALL_CLEAR") {
-    await markDone(
-      repoRoot,
-      story.id,
-      lastCommitSha,
-      args.iterationNum,
-      story.title,
-    );
     try {
-      await closeIssue(
+      await markDoneViaLabel(
         ghIssue,
         `RALPH(it=${args.iterationNum}) closed by commit ${lastCommitSha} after final-review pass`,
       );
     } catch (err) {
       process.stderr.write(
-        `WARN: closeIssue(${ghIssue}) failed after final-review pass: ${errorMessage(err)}\n`,
+        `WARN: markDoneViaLabel(${ghIssue}) failed after final-review pass: ${errorMessage(err)}\n`,
       );
     }
     return shipped(story, args.iterationNum, lastCommitSha);
   }
 
-  // Final review still HAS_BLOCKERS — ship-with-issue-OPEN.
-  await markDone(
-    repoRoot,
-    story.id,
-    lastCommitSha,
-    args.iterationNum,
-    story.title,
-  );
+  // Final review still HAS_BLOCKERS — ship-with-issue-OPEN. v1: do NOT close
+  // the issue; leave `in-progress` label as-is and post the operator note.
   await commentPoster(
     ghIssue,
     buildShipOpenComment({
@@ -821,25 +1072,24 @@ export async function runIteration(
 async function runMigrationsOrQuarantine(
   repoRoot: string,
   story: Story,
+  ghIssue: number,
   preSha: string,
   postSha: string,
   iterationNum: number,
 ): Promise<IterationResult | null> {
   let migResult: Awaited<ReturnType<typeof applyMigrationsBetween>>;
-  // Stamp attempts:2 on the story passed to quarantineStory — the implementer
-  // shipped a commit (attempt 1) and the migration applier just hit a real
-  // error (attempt 2). `quarantineStory` reads `story.attempts ?? 1` and
-  // forwards into prd.json, so we shadow with a fresh object rather than
-  // mutating the caller's reference.
-  const storyForQuarantine: Story = { ...story, attempts: 2 };
+  // Note attempts:2 on quarantined story — the implementer shipped a commit
+  // (attempt 1) and the migration applier just hit a real error (attempt 2).
+  // The label-state machine doesn't track attempts directly, so this is
+  // narrative for any downstream consumer reading the returned IterationResult.
+  void story;
   try {
     migResult = await applyMigrationsBetween(repoRoot, preSha, postSha);
   } catch (err) {
     // Throws are limited to misconfiguration (no DATABASE_URL) and git
     // failure. Either way the iteration can't proceed safely.
-    await quarantineStory(
-      repoRoot,
-      storyForQuarantine,
+    await quarantineViaLabel(
+      ghIssue,
       `migration auto-apply threw: ${errorMessage(err)}`,
     );
     return {
@@ -852,9 +1102,8 @@ async function runMigrationsOrQuarantine(
 
   if (migResult.realErrors.length > 0) {
     const first = migResult.realErrors[0]!;
-    await quarantineStory(
-      repoRoot,
-      storyForQuarantine,
+    await quarantineViaLabel(
+      ghIssue,
       `migration auto-apply failed: ${first.msg}`,
     );
     return {

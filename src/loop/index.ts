@@ -8,6 +8,10 @@ export {
   runIteration,
   fetchIssueBody,
   getDiffLineCount,
+  hasOutputSuppression,
+  appendProgress,
+  readProgressTail,
+  defaultIsIssueDone,
 } from "./iteration.js";
 export type {
   RunIterationArgs,
@@ -37,6 +41,7 @@ export {
   buildFixerBriefing,
   buildRecoveryBriefing,
   formatIssueBlock,
+  formatProgressBlock,
   _resetImplementerTemplateCache,
 } from "./briefing.js";
 export type { IssueRef } from "./briefing.js";

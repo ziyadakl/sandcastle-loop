@@ -287,3 +287,113 @@ describe("runPlanner — error handling", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test 6 — Fix #11: cross-field validation
+//
+// The planner's `<plan>` JSON must:
+//   - have NO duplicates in priorityOrder
+//   - only reference issue numbers that appeared in the input
+//   - cover every input issue (priorityOrder is a permutation of the input set)
+//   - reference only in-priorityOrder issues in `dependencies[i].issue`
+//
+// `dependencies[i].blockedBy` is intentionally NOT membership-checked: the
+// loop checks blocker state at run-time, which means a blocker pointing at
+// an already-closed issue must remain representable here.
+// ---------------------------------------------------------------------------
+
+describe("runPlanner — cross-field validation (Fix #11)", () => {
+  const TWO_ISSUES: PlannerInput = {
+    openIssues: [
+      {
+        number: 5,
+        title: "first",
+        body: "",
+        labels: ["ready-for-agent"],
+        createdAt: "2026-04-01T00:00:00Z",
+      },
+      {
+        number: 9,
+        title: "second",
+        body: "",
+        labels: ["ready-for-agent"],
+        createdAt: "2026-04-02T00:00:00Z",
+      },
+    ],
+  };
+
+  it("rejects priorityOrder containing duplicates", async () => {
+    const bad = streamJson(
+      `<plan>${JSON.stringify({
+        priorityOrder: [5, 5, 5],
+        dependencies: [],
+      })}</plan>`,
+    );
+    const { sandbox } = mockSandboxWithStdout(bad);
+    await expect(runPlanner(sandbox, TWO_ISSUES)).rejects.toBeInstanceOf(
+      PlannerError,
+    );
+  });
+
+  it("rejects priorityOrder containing an issue not in the input", async () => {
+    // Input has 5 and 9; planner emitted [42] which is not in the input.
+    const bad = streamJson(
+      `<plan>${JSON.stringify({
+        priorityOrder: [42],
+        dependencies: [],
+      })}</plan>`,
+    );
+    const { sandbox } = mockSandboxWithStdout(bad);
+    await expect(runPlanner(sandbox, TWO_ISSUES)).rejects.toBeInstanceOf(
+      PlannerError,
+    );
+  });
+
+  it("rejects priorityOrder that misses an input issue (not a permutation)", async () => {
+    // Input has 5 and 9; planner emitted only [5]. Permutation check fails.
+    const bad = streamJson(
+      `<plan>${JSON.stringify({
+        priorityOrder: [5],
+        dependencies: [],
+      })}</plan>`,
+    );
+    const { sandbox } = mockSandboxWithStdout(bad);
+    await expect(runPlanner(sandbox, TWO_ISSUES)).rejects.toBeInstanceOf(
+      PlannerError,
+    );
+  });
+
+  it("rejects dependencies[i].issue pointing at an issue not in priorityOrder", async () => {
+    const bad = streamJson(
+      `<plan>${JSON.stringify({
+        priorityOrder: [5, 9],
+        // 999 isn't in priorityOrder → reject.
+        dependencies: [{ issue: 999, blockedBy: [5] }],
+      })}</plan>`,
+    );
+    const { sandbox } = mockSandboxWithStdout(bad);
+    await expect(runPlanner(sandbox, TWO_ISSUES)).rejects.toBeInstanceOf(
+      PlannerError,
+    );
+  });
+
+  it("ACCEPTS blockedBy entries that are NOT in priorityOrder (closed-blocker case)", async () => {
+    // The loop checks blocker state at run-time; a blocker referring to an
+    // already-closed (and therefore not-in-input) issue must still validate
+    // here. Otherwise the schema would force the planner to drop legitimate
+    // historical dependency edges every time an upstream closes.
+    const ok = streamJson(
+      `<plan>${JSON.stringify({
+        priorityOrder: [5, 9],
+        // 100 is NOT in priorityOrder, but is permitted in blockedBy.
+        dependencies: [{ issue: 9, blockedBy: [5, 100] }],
+      })}</plan>`,
+    );
+    const { sandbox } = mockSandboxWithStdout(ok);
+    const result = await runPlanner(sandbox, TWO_ISSUES);
+    expect(result.priorityOrder).toEqual([5, 9]);
+    expect(result.dependencies).toEqual([
+      { issue: 9, blockedBy: [5, 100] },
+    ]);
+  });
+});

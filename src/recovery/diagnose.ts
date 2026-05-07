@@ -84,23 +84,40 @@ const RULES: readonly DiagnosisRule[] = [
   },
 
   // Migration unapplied — Postgres surface form. Drizzle/Prisma/raw pg all
-  // bubble this up identically. The relation name is captured but unused;
-  // we keep the regex tight to avoid matching prose like
-  // "the relation between X and Y does not exist".
+  // bubble this up identically. We accept several leading prefixes:
+  //   * bare:                relation "users" does not exist
+  //   * lowercase prefix:    error: relation users does not exist
+  //   * mixed-case prefix:   Error: relation "users" does not exist
+  //   * Drizzle 0.30+:       PostgresError: relation "users" does not exist
+  //   * Postgres SQLSTATE:   42P01: relation "users" does not exist
+  // The leading word is matched case-insensitively (via inline `(?i:...)`
+  // through the `i`-flagged alternation), but the SQL phrase
+  // `relation ... does not exist` is matched case-sensitively because pg
+  // never varies that surface form. The relation name is captured but
+  // unused; we keep it tight to avoid matching prose like "the relation
+  // between X and Y does not exist".
   {
     cause: "migration-unapplied",
-    pattern: /relation "[^"]+" does not exist|error: relation .+ does not exist/,
+    pattern:
+      /relation "[^"]+" does not exist|(?:error|Error|PostgresError|42P01):\s+relation .+ does not exist/,
     fixCommand: ["pnpm", "db:migrate"],
     confidence: "high",
   },
 
-  // Deps missing — Node module resolution failure. Two surface forms:
-  //   * CommonJS:  Cannot find module 'react'
-  //   * ESM:       Cannot find package 'react' imported from ...
-  // Both indicate `pnpm install` is the right move.
+  // Deps missing — Node module resolution failure. Surface forms covered:
+  //   * CommonJS:        Cannot find module 'react'
+  //   * ESM (CJS-style): Cannot find package 'react'
+  //   * Node 20+ ESM:    Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'foo'
+  //   * Imported-from:   Cannot find module './local' imported from /path/file.js
+  //   * Standalone code: ERR_MODULE_NOT_FOUND  (sometimes appears alone in
+  //                      shorter stack output without the surrounding sentence)
+  // All indicate `pnpm install` is the right move (the imported-from form is
+  // usually a missing dep too — a missing local file would have surfaced as a
+  // build-time error long before runtime).
   {
     cause: "deps-missing",
-    pattern: /Cannot find module '[^']+'|Cannot find package '[^']+'/,
+    pattern:
+      /Cannot find module '[^']+'|Cannot find package '[^']+'|ERR_MODULE_NOT_FOUND/,
     fixCommand: ["pnpm", "install"],
     confidence: "high",
   },

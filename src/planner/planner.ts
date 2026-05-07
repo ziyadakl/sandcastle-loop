@@ -36,7 +36,15 @@ import { parseVerdict, VerdictParseError } from "../verdicts/index.js";
 // Schema — the load-bearing contract with the loop
 // ---------------------------------------------------------------------------
 
-export const PlannerOutputSchema = z.object({
+/**
+ * Internal raw shape — pre-cross-field-validation. Exported as
+ * {@link PlannerOutputSchema} below with a {@link buildPlannerOutputSchema}
+ * helper so callers that know the input issue numbers can ALSO assert that
+ * `priorityOrder` is a permutation of the input set. The default export is
+ * the input-agnostic schema (still rejects internal duplicates / dangling
+ * dependency references) so existing call sites keep working.
+ */
+const PlannerOutputBaseSchema = z.object({
   /**
    * Issue numbers in the order the loop should attempt them. The loop walks
    * this list, skips any issue whose blockers are still open (per
@@ -48,6 +56,15 @@ export const PlannerOutputSchema = z.object({
    * #A, #B, #C". An empty `blockedBy` array means the issue has no blockers
    * but is still listed (e.g. the planner enumerates every issue for
    * traceability). Issues with NO blockers may be omitted entirely.
+   *
+   * Blocker numbers in `blockedBy` may be ANY positive integer — they are
+   * NOT required to appear in `priorityOrder`. Rationale: the loop checks
+   * each blocker's actual state (open / closed / done) at run-time, which
+   * means a blocker referencing an already-closed issue (a perfectly normal
+   * case after an issue has been completed in a prior loop wake-up) MUST
+   * still be representable here. The planner can't easily tell from the
+   * input list whether a missing-from-input issue is closed or just absent;
+   * we relax this rule and let the loop do the closed-check at run-time.
    */
   dependencies: z.array(
     z.object({
@@ -57,7 +74,123 @@ export const PlannerOutputSchema = z.object({
   ),
 });
 
+/**
+ * Input-agnostic schema. Enforces:
+ *
+ *   - `priorityOrder` has no duplicates.
+ *   - Every entry in `dependencies[i].issue` exists in `priorityOrder`
+ *     (the planner cannot block an issue it didn't priority-order).
+ *
+ * It does NOT enforce that `priorityOrder` is a permutation of the input
+ * issue numbers — that requires knowing the input. Callers with input
+ * context should use {@link buildPlannerOutputSchema} instead.
+ */
+export const PlannerOutputSchema = PlannerOutputBaseSchema.superRefine(
+  (val, ctx) => {
+    // 1. priorityOrder duplicate check.
+    const seen = new Set<number>();
+    for (let i = 0; i < val.priorityOrder.length; i++) {
+      const n = val.priorityOrder[i]!;
+      if (seen.has(n)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["priorityOrder", i],
+          message: `priorityOrder contains duplicate issue #${n}`,
+        });
+      }
+      seen.add(n);
+    }
+
+    // 2. Every dependencies[i].issue must appear in priorityOrder.
+    for (let i = 0; i < val.dependencies.length; i++) {
+      const dep = val.dependencies[i]!;
+      if (!seen.has(dep.issue)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["dependencies", i, "issue"],
+          message:
+            `dependencies[${i}].issue references #${dep.issue} which is ` +
+            `not in priorityOrder`,
+        });
+      }
+      // blockedBy: intentionally NOT membership-checked — see schema docstring.
+    }
+  },
+);
+
 export type PlannerOutput = z.infer<typeof PlannerOutputSchema>;
+
+/**
+ * Build a stricter schema that ALSO asserts:
+ *
+ *   - Every entry in `priorityOrder` exists in `inputIssueNumbers`
+ *     (the planner cannot priority-order an issue it wasn't given).
+ *   - `priorityOrder` is a permutation of `inputIssueNumbers`
+ *     (no missing input issues; together with the duplicate check on
+ *     priorityOrder this means exact-set equality).
+ *
+ * Callers that have access to the input issue list (i.e. the loop driver
+ * post-fetch) should validate the agent's output against THIS schema; the
+ * input-agnostic {@link PlannerOutputSchema} stays for general use.
+ */
+export function buildPlannerOutputSchema(
+  inputIssueNumbers: readonly number[],
+): z.ZodType<PlannerOutput> {
+  const inputSet = new Set(inputIssueNumbers);
+  return PlannerOutputBaseSchema.superRefine((val, ctx) => {
+    // Re-run the input-agnostic checks first so callers using this schema
+    // get the same diagnostic precision as the default schema.
+    const seen = new Set<number>();
+    for (let i = 0; i < val.priorityOrder.length; i++) {
+      const n = val.priorityOrder[i]!;
+      if (seen.has(n)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["priorityOrder", i],
+          message: `priorityOrder contains duplicate issue #${n}`,
+        });
+      }
+      seen.add(n);
+
+      // Membership check.
+      if (!inputSet.has(n)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["priorityOrder", i],
+          message:
+            `priorityOrder contains #${n} which was not in the input ` +
+            `issue list`,
+        });
+      }
+    }
+
+    // Permutation check: every input issue must appear in priorityOrder.
+    for (const n of inputSet) {
+      if (!seen.has(n)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["priorityOrder"],
+          message:
+            `priorityOrder is missing input issue #${n} (must be a ` +
+            `permutation of the input list)`,
+        });
+      }
+    }
+
+    for (let i = 0; i < val.dependencies.length; i++) {
+      const dep = val.dependencies[i]!;
+      if (!seen.has(dep.issue)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["dependencies", i, "issue"],
+          message:
+            `dependencies[${i}].issue references #${dep.issue} which is ` +
+            `not in priorityOrder`,
+        });
+      }
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Public input / config / error
@@ -238,13 +371,21 @@ export async function runPlanner(
   // (i.e. plain stdout), we retry as already-extracted text.
   const rawText = result.stdout;
 
+  // Build an input-aware schema so we additionally enforce:
+  //   - priorityOrder is a permutation of input.openIssues numbers
+  //   - every priorityOrder entry exists in the input
+  // (The duplicate / dependency-membership checks live in the schema too.)
+  const inputAwareSchema = buildPlannerOutputSchema(
+    input.openIssues.map((i) => i.number),
+  );
+
   try {
-    return parseVerdict(rawText, PlannerOutputSchema, { jsonTag: "plan" });
+    return parseVerdict(rawText, inputAwareSchema, { jsonTag: "plan" });
   } catch (err) {
     if (err instanceof VerdictParseError) {
       // Fallback path: maybe stdout is plain text (not stream-json envelopes).
       try {
-        return parseVerdict(rawText, PlannerOutputSchema, {
+        return parseVerdict(rawText, inputAwareSchema, {
           jsonTag: "plan",
           alreadyAssistantText: true,
         });

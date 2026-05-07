@@ -92,6 +92,8 @@ import {
   claimViaLabel,
   closeIssue,
   getPriorityFromLabels,
+  isQuarantineLabel,
+  listIssuesByLabel,
   listReadyIssues,
   loadPrd,
   markDone,
@@ -99,6 +101,7 @@ import {
   pickNextEligibleStory,
   quarantineStoryInPrd,
   quarantineViaLabel,
+  STATUS_LABELS,
   transitionLabel,
   withPrdLock,
 } from "../src/state/index.js";
@@ -353,17 +356,28 @@ describe("quarantineStoryInPrd", () => {
       before - 1000,
     );
 
-    // GH transition was add-only (from === "*").
-    expect(ghCalls).toHaveLength(1);
+    // GH transition for `from === "*"`: view labels first (none, since the
+    // resolver wasn't set), then add the quarantine label. No status labels
+    // exist on the issue in this fixture, so no --remove-label calls happen.
+    // The first call is the view, the second is the add.
+    expect(ghCalls).toHaveLength(2);
     expect(ghCalls[0]?.args).toEqual([
+      "issue",
+      "view",
+      "102",
+      "--json",
+      "labels",
+    ]);
+    expect(ghCalls[1]?.args).toEqual([
       "issue",
       "edit",
       "102",
       "--add-label",
       "quarantine",
     ]);
-    // No --remove-label arg should be present.
-    expect(ghCalls[0]?.args).not.toContain("--remove-label");
+    // The add call must not also remove a label — strips happen in their
+    // own gh invocations.
+    expect(ghCalls[1]?.args).not.toContain("--remove-label");
   });
 
   it("handles reason strings with shell metacharacters safely (no jq-injection equivalent)", async () => {
@@ -396,10 +410,156 @@ describe("transitionLabel", () => {
     ]);
   });
 
-  it("only adds when from is '*'", async () => {
+  it("when from is '*' and the issue has no labels, view + add only (no removes)", async () => {
+    // Resolver is null in beforeEach, so `gh issue view` returns "".
     await transitionLabel(42, "*", "quarantine");
-    expect(ghCalls[0]?.args).not.toContain("--remove-label");
-    expect(ghCalls[0]?.args).toContain("--add-label");
+    // 1) view, 2) add. No removes.
+    expect(ghCalls).toHaveLength(2);
+    expect(ghCalls[0]?.args).toEqual([
+      "issue",
+      "view",
+      "42",
+      "--json",
+      "labels",
+    ]);
+    expect(ghCalls[1]?.args).toEqual([
+      "issue",
+      "edit",
+      "42",
+      "--add-label",
+      "quarantine",
+    ]);
+  });
+
+  it("when from is '*', strips every existing status label before adding the new one", async () => {
+    // Issue currently has in-progress + done + ready-for-agent (all status
+    // labels). All three should be stripped, then needs-human added.
+    mockState.resolver = (args) => {
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({
+          labels: [
+            { name: "ready-for-agent" },
+            { name: "in-progress" },
+            { name: "done" },
+          ],
+        });
+      }
+      return "";
+    };
+
+    await transitionLabel(42, "*", "needs-human");
+
+    // 1 view + 3 removes + 1 add = 5 calls.
+    expect(ghCalls).toHaveLength(5);
+    expect(ghCalls[0]?.args).toEqual([
+      "issue",
+      "view",
+      "42",
+      "--json",
+      "labels",
+    ]);
+
+    // The three removes (order matches input order from the view response).
+    const removeCalls = ghCalls
+      .slice(1, 4)
+      .map((c) => c.args.slice(-2)); // last two argv tokens are ["--remove-label", X]
+    expect(removeCalls).toEqual([
+      ["--remove-label", "ready-for-agent"],
+      ["--remove-label", "in-progress"],
+      ["--remove-label", "done"],
+    ]);
+    for (const c of ghCalls.slice(1, 4)) {
+      expect(c.args[0]).toBe("issue");
+      expect(c.args[1]).toBe("edit");
+      expect(c.args[2]).toBe("42");
+      expect(c.args).not.toContain("--add-label");
+    }
+
+    // Final add.
+    expect(ghCalls[4]?.args).toEqual([
+      "issue",
+      "edit",
+      "42",
+      "--add-label",
+      "needs-human",
+    ]);
+  });
+
+  it("when from is '*', preserves non-status labels (priority:*, etc) and only strips status labels", async () => {
+    // Issue has ["in-progress", "priority:high"]. After transitionLabel(*,
+    // needs-human) it should keep priority:high, drop in-progress, gain
+    // needs-human. We assert this via the gh argv shape: priority:high
+    // should NEVER appear in any --remove-label call.
+    mockState.resolver = (args) => {
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({
+          labels: [
+            { name: "in-progress" },
+            { name: "priority:high" },
+          ],
+        });
+      }
+      return "";
+    };
+
+    await transitionLabel(42, "*", "needs-human");
+
+    // view + 1 remove (in-progress only) + 1 add = 3 calls.
+    expect(ghCalls).toHaveLength(3);
+
+    // The single remove targets in-progress, NOT priority:high.
+    expect(ghCalls[1]?.args).toEqual([
+      "issue",
+      "edit",
+      "42",
+      "--remove-label",
+      "in-progress",
+    ]);
+
+    // priority:high must never appear as a --remove-label target across any
+    // call.
+    for (const c of ghCalls) {
+      const idx = c.args.indexOf("--remove-label");
+      if (idx !== -1) {
+        expect(c.args[idx + 1]).not.toBe("priority:high");
+      }
+    }
+
+    // Final add: needs-human.
+    expect(ghCalls[2]?.args).toEqual([
+      "issue",
+      "edit",
+      "42",
+      "--add-label",
+      "needs-human",
+    ]);
+  });
+
+  it("when from is '*' and the target label is already on the issue, does NOT redundantly strip it", async () => {
+    // Edge case: target == an existing status label. We don't want to strip
+    // and re-add (that'd create a brief window with no status label).
+    mockState.resolver = (args) => {
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({
+          labels: [{ name: "needs-human" }, { name: "priority:low" }],
+        });
+      }
+      return "";
+    };
+
+    await transitionLabel(42, "*", "needs-human");
+
+    // view + add only — needs-human is not stripped because it equals `to`.
+    // Add is still issued (idempotent on gh's side).
+    expect(ghCalls).toHaveLength(2);
+    expect(ghCalls[0]?.args[1]).toBe("view");
+    expect(ghCalls[1]?.args).toEqual([
+      "issue",
+      "edit",
+      "42",
+      "--add-label",
+      "needs-human",
+    ]);
   });
 
   it("rejects non-positive issue numbers", async () => {
@@ -709,5 +869,138 @@ describe("quarantineViaLabel", () => {
   it("rejects invalid issue numbers without making any gh call", async () => {
     await expect(quarantineViaLabel(-1, "nope")).rejects.toThrow(/invalid/);
     expect(ghCalls).toHaveLength(0);
+  });
+});
+
+// --- Fix #12: isQuarantineLabel + STATUS_LABELS ---------------------------
+
+describe("isQuarantineLabel", () => {
+  it("returns true for the canonical 'needs-human' spelling", () => {
+    expect(isQuarantineLabel("needs-human")).toBe(true);
+  });
+
+  it("returns true for the legacy 'quarantine' spelling", () => {
+    expect(isQuarantineLabel("quarantine")).toBe(true);
+  });
+
+  it("returns false for any other label", () => {
+    for (const lbl of [
+      "in-progress",
+      "ready-for-agent",
+      "done",
+      "priority:high",
+      "Needs-Human", // case-sensitive — GH labels are too
+      "QUARANTINE",
+      "",
+      "needs_human", // underscore variant is the prd.json status, not a GH label
+    ]) {
+      expect(isQuarantineLabel(lbl)).toBe(false);
+    }
+  });
+});
+
+describe("STATUS_LABELS", () => {
+  it("contains exactly the v1 status labels (canonical + legacy quarantine)", () => {
+    // Order is load-bearing for transitionLabel('*', X)'s strip pass — keep
+    // this in sync with src/state/gh.ts.
+    expect([...STATUS_LABELS]).toEqual([
+      "ready-for-agent",
+      "in-progress",
+      "done",
+      "needs-human",
+      "quarantine",
+    ]);
+  });
+});
+
+// --- Fix bonus: listIssuesByLabel -----------------------------------------
+
+describe("listIssuesByLabel", () => {
+  it("invokes gh with the right argv, parses, and sorts by issue number ascending", async () => {
+    // Three issues, intentionally out-of-order. listIssuesByLabel must sort
+    // ascending by `number` for deterministic recovery.
+    const canned = [
+      {
+        number: 17,
+        title: "third",
+        labels: [{ name: "in-progress" }, { name: "priority:medium" }],
+      },
+      {
+        number: 5,
+        title: "first",
+        labels: [{ name: "in-progress" }],
+      },
+      {
+        number: 11,
+        title: "second",
+        labels: [{ name: "in-progress" }, { name: "priority:high" }],
+      },
+    ];
+    mockState.resolver = () => JSON.stringify(canned);
+
+    const out = await listIssuesByLabel("in-progress");
+
+    // Argv shape: list --label <X> --state open --json number,title,labels --limit 100.
+    expect(ghCalls).toHaveLength(1);
+    expect(ghCalls[0]).toEqual({
+      file: "gh",
+      args: [
+        "issue",
+        "list",
+        "--label",
+        "in-progress",
+        "--state",
+        "open",
+        "--json",
+        "number,title,labels",
+        "--limit",
+        "100",
+      ],
+    });
+
+    // Sorted ascending by number.
+    expect(out.map((r) => r.number)).toEqual([5, 11, 17]);
+
+    // Shape: labels flattened to string[], no { name } leakage.
+    expect(out[0]).toEqual({
+      number: 5,
+      title: "first",
+      labels: ["in-progress"],
+    });
+    expect(out[1]).toEqual({
+      number: 11,
+      title: "second",
+      labels: ["in-progress", "priority:high"],
+    });
+    expect(out[2]).toEqual({
+      number: 17,
+      title: "third",
+      labels: ["in-progress", "priority:medium"],
+    });
+  });
+
+  it("returns [] when gh returns an empty JSON array", async () => {
+    mockState.resolver = () => "[]";
+    const out = await listIssuesByLabel("in-progress");
+    expect(out).toEqual([]);
+  });
+
+  it("returns [] when gh returns empty stdout", async () => {
+    mockState.resolver = () => "";
+    const out = await listIssuesByLabel("in-progress");
+    expect(out).toEqual([]);
+  });
+
+  it("rejects an empty label string without making any gh call", async () => {
+    await expect(listIssuesByLabel("")).rejects.toThrow(/non-empty/);
+    expect(ghCalls).toHaveLength(0);
+  });
+
+  it("throws on output whose shape doesn't match the Zod schema", async () => {
+    mockState.resolver = () =>
+      JSON.stringify([{ number: "not a number", title: "x", labels: [] }]);
+    await expect(listIssuesByLabel("in-progress")).rejects.toThrow(
+      /unexpected gh output shape/,
+    );
   });
 });

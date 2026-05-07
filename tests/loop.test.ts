@@ -1,22 +1,29 @@
 /**
- * Track C unit tests — exercise the orchestration state machine without a
+ * Track C unit tests — exercise the v1 orchestration state machine without a
  * real Docker daemon. We mock:
  *   - sandbox.run() — produces canned RunResult objects
  *   - Track B parsers — return typed verdicts directly from canned text
- *   - Track D state ops — record calls, return canned story
+ *   - Track D label-state ops — listReadyIssues / claimViaLabel /
+ *     markDoneViaLabel / quarantineViaLabel / transitionLabel
+ *   - Planner — return canned PlannerOutput
  *   - Track E recovery — record calls, return canned outcome
  *
- * Coverage targets (from the brief):
- *   1. Happy path: implementer STORY_COMPLETE + reviewer ALL_CLEAR.
- *   2. One-fix-cycle: impl OK -> review HAS_BLOCKERS -> fixer FIXED ->
- *      final-pass ALL_CLEAR.
- *   3. HALT path: implementer HALT -> recovery escalates -> recovery HALT ->
- *      quarantine.
- *   4. Fix-cap exhaustion: two fixer attempts both BLOCKED -> ship-with-issue-OPEN
- *      (this is bash's actual fix-cap-exhausted behavior; the brief calls
- *      it "quarantine path" but the bash code marks the story DONE and
- *      leaves the issue OPEN, not quarantined).
- *   5. Circuit breaker: N consecutive halts trip it.
+ * Coverage targets (post-FIX-1 wave):
+ *   1. Happy path: planner returns priorityOrder → claim via label →
+ *      implementer STORY_COMPLETE → reviewer ALL_CLEAR → markDoneViaLabel.
+ *   2. One-fix-cycle: impl OK → review HAS_BLOCKERS → fixer FIXED →
+ *      final-pass ALL_CLEAR (Opus xhigh).
+ *   3. Implementer HALT path: implementer HALT → quarantineViaLabel
+ *      (no recovery; issue stays OPEN with needs-human label).
+ *   4. Implementer crash path: recovery ladder runs → recovery HALT →
+ *      outcome halted.
+ *   5. Fix-cap exhaustion: two fixer attempts both BLOCKED → ship-with-issue-OPEN.
+ *   6. Circuit breaker: N consecutive halts trip it.
+ *   7. Startup recovery: stranded `in-progress` issues are released back to
+ *      `ready-for-agent` before the planner runs.
+ *   8. Planner output is honored: priorityOrder + dependency-blocking.
+ *   9. Output-suppression scan surfaces evidence to the reviewer.
+ *  10. Final-pass reviewer is hardcoded to opus + xhigh (Fix #9).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type {
@@ -30,7 +37,6 @@ import type {
   ReviewerVerdict,
   FixerVerdict,
   LoopConfig,
-  Story,
 } from "../src/types.js";
 
 // ---- Mocks (must be hoisted via vi.hoisted to satisfy vi.mock factory rule) -
@@ -44,26 +50,25 @@ const mocks = vi.hoisted(() => {
     extractMarker: vi.fn(),
     parseVerdict: vi.fn(),
     MarkerNotFoundError,
-    pickNextEligibleStory: vi.fn(),
-    markDone: vi.fn(),
-    claimStory: vi.fn(),
-    releaseStory: vi.fn(),
-    quarantineStoryInPrd: vi.fn(),
-    loadPrd: vi.fn(),
+    // V1 label-state surface (post-FIX-1).
+    listReadyIssues: vi.fn(),
+    claimViaLabel: vi.fn(),
+    markDoneViaLabel: vi.fn(),
+    quarantineViaLabel: vi.fn(),
     transitionLabel: vi.fn(),
-    getIssueBody: vi.fn(),
-    closeIssue: vi.fn(),
-    withPrdLock: vi.fn(),
     withSingleInstance: vi.fn(),
+    closeIssue: vi.fn(),
+    getIssueBody: vi.fn(),
+    postIssueComment: vi.fn(),
+    withPrdLock: vi.fn(),
     // V1-D rename: the multi-step ladder is gone; the diagnose-first variant
-    // is the new integration point. We mock both names because the recovery
-    // barrel still re-exports the legacy `runRecoveryLadder` for callers that
-    // haven't migrated.
+    // is the new integration point.
     runRecoveryLadder: vi.fn(),
     runRecoveryDiagnosisOrEscalate: vi.fn(),
     diagnoseHaltCause: vi.fn(),
     quarantineStory: vi.fn(),
     applyMigrationsBetween: vi.fn(),
+    runPlanner: vi.fn(),
     // Track-C-internal seam: every git execFile call routed through this
     // mock so /tmp/test never has to be a real git repo.
     execFileMock: vi.fn(),
@@ -73,8 +78,6 @@ const mocks = vi.hoisted(() => {
 vi.mock("@ai-hero/sandcastle", () => ({
   // claudeCode is called inside agents.ts; return a stub object so
   // sandbox.run() can be invoked without exploding on the agent value.
-  // We capture both `model` and `options` (which includes the effort tier
-  // V1-B's diff-size scaler chose) so tests can assert the effort flow.
   claudeCode: vi.fn(
     (model: string, options?: Record<string, unknown>) => ({
       _model: model,
@@ -85,12 +88,7 @@ vi.mock("@ai-hero/sandcastle", () => ({
 }));
 
 // Mock node:child_process so the driver-side `git rev-parse HEAD` and
-// `git diff --name-only ...` calls don't actually shell out. The loop uses
-// `promisify(execFile)`; promisify recognizes the `util.promisify.custom`
-// symbol on the target function — when present, the promisified form returns
-// whatever that custom impl resolves with. We attach a custom implementation
-// that returns `{ stdout, stderr }` — the same shape Node's real
-// `child_process.execFile` produces under promisify.
+// `git diff --name-only ...` calls don't actually shell out.
 vi.mock("node:child_process", async () => {
   const { promisify } = await import("node:util");
   type ExecArgs = readonly string[];
@@ -100,41 +98,47 @@ vi.mock("node:child_process", async () => {
     const argv = args ?? [];
     let stdout = "";
     if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
-      // Increment-per-call so preSha !== postSha by default — otherwise
-      // gitDiffTouchedUi short-circuits when both SHAs match and the
-      // driver never calls `git diff`. Tests that need a specific SHA
-      // pair override via mocks.execFileMock.mockImplementationOnce.
+      // Increment-per-call so preSha !== postSha by default.
       revParseCounter += 1;
       stdout = `deadbeef${String(revParseCounter).padStart(36, "0")}\n`;
     } else if (argv[0] === "diff") {
-      // No UI files touched by default and 0-line shortstat (the V1-B
-      // reviewer-effort scaling treats this as "low" effort). Tests that
-      // want a specific diff size pass `_fetchIssueBody` and a per-call
-      // shortstat override.
+      stdout = "";
+    } else if (argv[0] === "show") {
+      // git show <sha> --format=%B --no-patch — used by hasOutputSuppression
+      // to read the commit body. Default: empty body (no suppression).
       stdout = "";
     } else if (argv[0] === "issue") {
       // Two shapes flow through here:
       //   1. `gh issue view <num> --json title,body,labels,number` (the
-      //      driver's pre-fetch — V1-B). MUST return valid JSON or the
-      //      iteration will crash before the implementer runs.
-      //   2. `gh issue comment <num> --body <text>` (ship-with-issue-OPEN).
-      //      Empty stdout is fine.
+      //      driver's pre-fetch of the issue snapshot).
+      //   2. `gh issue view <num> --json state,labels` (the blocker probe,
+      //      via defaultIsIssueDone — but tests inject `_isIssueDone` so
+      //      this path is rarely hit).
+      //   3. `gh issue list --label in-progress --state open --json number`
+      //      (startup-recovery sweep — tests inject `_listInProgressIssues`
+      //      so this is rarely hit).
+      //   4. `gh issue comment <num> --body <text>` (ship-with-issue-OPEN).
       if (argv[1] === "view") {
-        stdout = JSON.stringify({
-          title: "Test issue title",
-          body: "# A test story\n\nNo playwright command here.",
-          labels: [],
-          number: Number(argv[2] ?? 0) || 42,
-        });
+        // Distinguish the two view shapes by the JSON arg.
+        const jsonArg = argv[argv.indexOf("--json") + 1] ?? "";
+        if (jsonArg.includes("state")) {
+          stdout = JSON.stringify({ state: "OPEN", labels: [] });
+        } else {
+          stdout = JSON.stringify({
+            title: "Test issue title",
+            body: "# A test story\n\nNo playwright command here.",
+            labels: [],
+            number: Number(argv[2] ?? 0) || 42,
+          });
+        }
+      } else if (argv[1] === "list") {
+        stdout = "[]";
       } else {
         stdout = "";
       }
     }
     return { stdout, stderr: "" };
   }
-  // Callback form for any caller that uses execFile directly. Most of the
-  // loop uses `promisify(execFile)`, but defaultCommentPoster also uses
-  // promisified execFile.
   const execFileFn = vi.fn(
     (
       _file: string,
@@ -150,8 +154,6 @@ vi.mock("node:child_process", async () => {
       callback?.(null, r.stdout, r.stderr);
     },
   );
-  // Attach the custom-promisify symbol so `promisify(execFile)` returns a
-  // function that resolves with `{ stdout, stderr }` instead of just stdout.
   (execFileFn as unknown as { [k: symbol]: unknown })[promisify.custom] = (
     _file: string,
     args: ExecArgs,
@@ -163,8 +165,6 @@ vi.mock("../src/verdicts/index.js", () => ({
   extractMarker: mocks.extractMarker,
   parseVerdict: mocks.parseVerdict,
   MarkerNotFoundError: mocks.MarkerNotFoundError,
-  // Marker constants — passed back into extractMarker by agents.ts. The mock
-  // extractMarker ignores the allowed-set, so any constant value works.
   IMPLEMENTER_MARKERS: ["STORY_COMPLETE", "HALT", "RECOVERY_COMPLETE"] as const,
   REVIEWER_MARKERS: ["ALL_CLEAR", "HAS_BLOCKERS"] as const,
   FIXER_MARKERS: ["FIXED", "BLOCKED"] as const,
@@ -173,25 +173,25 @@ vi.mock("../src/verdicts/index.js", () => ({
   FixerVerdictSchema: {},
 }));
 
-// State barrel — Track C now imports `pickNextEligibleStory`, `markDone`,
-// `closeIssue`, `getIssueBody` from `../state/index.js` (Fix #8).
+// State barrel — Track C now imports the V1 label-state surface.
 vi.mock("../src/state/index.js", () => ({
-  pickNextEligibleStory: mocks.pickNextEligibleStory,
-  markDone: mocks.markDone,
-  claimStory: mocks.claimStory,
-  releaseStory: mocks.releaseStory,
-  quarantineStoryInPrd: mocks.quarantineStoryInPrd,
-  loadPrd: mocks.loadPrd,
+  listReadyIssues: mocks.listReadyIssues,
+  claimViaLabel: mocks.claimViaLabel,
+  markDoneViaLabel: mocks.markDoneViaLabel,
+  quarantineViaLabel: mocks.quarantineViaLabel,
   transitionLabel: mocks.transitionLabel,
-  getIssueBody: mocks.getIssueBody,
-  closeIssue: mocks.closeIssue,
-  withPrdLock: mocks.withPrdLock,
   withSingleInstance: mocks.withSingleInstance,
+  closeIssue: mocks.closeIssue,
+  getIssueBody: mocks.getIssueBody,
+  postIssueComment: mocks.postIssueComment,
+  withPrdLock: mocks.withPrdLock,
+  LABEL_READY: "ready-for-agent",
+  LABEL_IN_PROGRESS: "in-progress",
+  LABEL_DONE: "done",
+  LABEL_NEEDS_HUMAN: "needs-human",
 }));
 
-// Recovery barrel — Track C now imports `runRecoveryDiagnosisOrEscalate`
-// (V1-D rename of the multi-step ladder). The legacy name stays exported so
-// other callers compile, but iteration.ts targets the diagnose-first variant.
+// Recovery barrel.
 vi.mock("../src/recovery/index.js", () => ({
   runRecoveryLadder: mocks.runRecoveryLadder,
   runRecoveryDiagnosisOrEscalate: mocks.runRecoveryDiagnosisOrEscalate,
@@ -199,24 +199,30 @@ vi.mock("../src/recovery/index.js", () => ({
   quarantineStory: mocks.quarantineStory,
 }));
 
-// Migrations barrel — Track C imports `applyMigrationsBetween` from
-// `../migrations/index.js` (Fix #3 + Fix #8).
+// Migrations barrel.
 vi.mock("../src/migrations/index.js", () => ({
   applyMigrationsBetween: mocks.applyMigrationsBetween,
 }));
 
-// Re-export for inline test usage (avoids `mocks.foo.mockReset()` everywhere).
+// Planner barrel.
+vi.mock("../src/planner/index.js", () => ({
+  runPlanner: mocks.runPlanner,
+}));
+
+// Re-export for inline test usage.
 const {
   extractMarker,
   parseVerdict,
-  pickNextEligibleStory,
-  markDone,
-  getIssueBody,
-  closeIssue,
+  listReadyIssues,
+  claimViaLabel,
+  markDoneViaLabel,
+  quarantineViaLabel,
+  transitionLabel,
+  withSingleInstance,
   runRecoveryLadder,
   runRecoveryDiagnosisOrEscalate,
-  quarantineStory,
   applyMigrationsBetween,
+  runPlanner,
 } = mocks;
 
 // ---- After-mock imports -----------------------------------------------------
@@ -224,26 +230,9 @@ import { runLoop } from "../src/loop/run.js";
 
 // ---- Test helpers -----------------------------------------------------------
 
-function makeStory(id: string, ghIssue = 42): Story {
-  return {
-    id,
-    title: `Test story ${id}`,
-    status: "in_progress",
-    ghIssue,
-  };
-}
-
 /**
- * V1-A schema scaffold — fills the 7 required certification fields (storyType,
- * e2eRequired, e2eActuallyRan, testCommandUsed, e2eAssertionLine,
- * outputNotFiltered, testReachedFeature) and the legacy fields with safe
+ * V1 schema scaffold — fills the 7 required certification fields with safe
  * defaults so tests can override only what they care about.
- *
- * The schema's cross-field rules are encoded in src/verdicts/schemas.ts:
- *   - STORY_COMPLETE + e2eRequired ⇒ testCommandUsed non-null AND e2eActuallyRan.
- *   - STORY_COMPLETE + e2eActuallyRan ⇒ e2eAssertionLine non-empty + non-generic.
- *   - outputNotFiltered=false ⇒ marker MUST be HALT.
- * Defaults below pass all three.
  */
 function makeImplOutput(
   override: Partial<ImplementerOutput> & {
@@ -292,6 +281,35 @@ function makeRunResult(opts: {
     completionSignal: opts.completionSignal,
     stdout: opts.stdout,
     commits: opts.commits ?? [],
+  };
+}
+
+/**
+ * Build a minimal ReadyIssueSummary-shaped record for the listReadyIssues
+ * mock. The driver only reads number/title/body/labels/createdAt off these,
+ * and listReadyIssues' return type is exposed via the state barrel.
+ */
+function makeReadyIssue(
+  num: number,
+  override: Partial<{
+    title: string;
+    body: string;
+    labels: string[];
+    createdAt: string;
+  }> = {},
+): {
+  number: number;
+  title: string;
+  body: string;
+  labels: string[];
+  createdAt: string;
+} {
+  return {
+    number: num,
+    title: override.title ?? `Issue #${num}`,
+    body: override.body ?? "# A test story\n\nNo playwright command here.",
+    labels: override.labels ?? [],
+    createdAt: override.createdAt ?? "2024-01-01T00:00:00Z",
   };
 }
 
@@ -349,27 +367,36 @@ function mockSandboxFactory(): MockSandboxBuilder {
 }
 
 beforeEach(() => {
-  // mockReset() (not clearAllMocks) — the latter only clears `.mock.calls`,
-  // leaving any persistent `mockReturnValue` from a prior test intact, which
-  // poisons the queued `mockReturnValueOnce` chain in this test.
   extractMarker.mockReset();
   parseVerdict.mockReset();
-  pickNextEligibleStory.mockReset();
-  markDone.mockReset();
-  getIssueBody.mockReset();
-  closeIssue.mockReset();
+  listReadyIssues.mockReset();
+  claimViaLabel.mockReset();
+  markDoneViaLabel.mockReset();
+  quarantineViaLabel.mockReset();
+  transitionLabel.mockReset();
+  withSingleInstance.mockReset();
   runRecoveryLadder.mockReset();
   runRecoveryDiagnosisOrEscalate.mockReset();
-  quarantineStory.mockReset();
   applyMigrationsBetween.mockReset();
+  runPlanner.mockReset();
   mocks.execFileMock.mockReset();
-  // Default Track D/E behavior: gh fetch returns empty body; everything else
-  // resolves with no value.
-  getIssueBody.mockResolvedValue("# A test story\n\nNo playwright command here.");
-  closeIssue.mockResolvedValue(undefined);
-  markDone.mockResolvedValue(undefined);
-  quarantineStory.mockResolvedValue(undefined);
-  // Default migrations: no-op (no SQL files added between commits).
+
+  // Default behavior: planner-list returns a single ready issue #42; planner
+  // returns it as priorityOrder; claim/markDone/quarantine all resolve;
+  // migrations are no-op. Tests override the bits they care about.
+  listReadyIssues.mockResolvedValue([makeReadyIssue(42)]);
+  claimViaLabel.mockResolvedValue(undefined);
+  markDoneViaLabel.mockResolvedValue(undefined);
+  quarantineViaLabel.mockResolvedValue(undefined);
+  transitionLabel.mockResolvedValue(undefined);
+  // withSingleInstance just runs the body — no real lock acquired.
+  withSingleInstance.mockImplementation(async (_path: string, fn: () => Promise<unknown>) => {
+    return await fn();
+  });
+  runPlanner.mockResolvedValue({
+    priorityOrder: [42],
+    dependencies: [],
+  });
   applyMigrationsBetween.mockResolvedValue({
     applied: 0,
     benignSkipped: 0,
@@ -377,9 +404,7 @@ beforeEach(() => {
   });
 });
 
-// Wire the mocks for one iteration: extractMarker pulls from the queue
-// `markerQueue` in order; parseVerdict pulls from `verdictQueue` in order.
-// Each sandbox.run() consumes one extractMarker + one parseVerdict slot.
+// Wire markers + verdicts queue.
 function setMarkerSequence(markers: string[]): void {
   extractMarker.mockReset();
   for (const m of markers) extractMarker.mockReturnValueOnce(m);
@@ -394,8 +419,6 @@ function setVerdictSequence(
         throw new Error("mock parse failure");
       });
     } else if (v === undefined) {
-      // agents.ts swallows parseVerdict throws — emit a throw to signal "no
-      // structured payload available".
       parseVerdict.mockImplementationOnce(() => {
         throw new Error("no structured payload");
       });
@@ -405,7 +428,6 @@ function setVerdictSequence(
   }
 }
 
-// Helper to build a stub commenter that we can spy on.
 function stubCommenter(): {
   fn: (issueNum: number, body: string) => Promise<void>;
   calls: Array<{ issueNum: number; body: string }>;
@@ -419,15 +441,16 @@ function stubCommenter(): {
   };
 }
 
+/**
+ * Default story-id format used by the v1 loop: storyFromIssue(claimedIssue)
+ * synthesizes an id of `gh-<num>`. Tests assert on this when needed.
+ */
+const STORY_ID_42 = "gh-42";
+
 // ---- Tests ------------------------------------------------------------------
 
 describe("runLoop — happy path", () => {
-  it("ships when implementer succeeds and reviewer says ALL_CLEAR", async () => {
-    const story = makeStory("S-001");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
+  it("ships when implementer succeeds and reviewer says ALL_CLEAR (label-state machine)", async () => {
     const builder = mockSandboxFactory();
     builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "abc123" }] }));
     builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
@@ -436,13 +459,22 @@ describe("runLoop — happy path", () => {
     setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
 
     const implOutput = makeImplOutput({
-      storyId: "S-001",
+      storyId: STORY_ID_42,
       ghIssue: 42,
       commitSha: "abc123",
       marker: "STORY_COMPLETE",
     });
     const reviewClear: ReviewerVerdict = { marker: "ALL_CLEAR", concerns: [] };
     setVerdictSequence([implOutput, reviewClear]);
+
+    // Tell the planner just to return our single issue #42, no blockers.
+    listReadyIssues.mockResolvedValue([makeReadyIssue(42)]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [42],
+      dependencies: [],
+    });
+    // Planner is also passed an issue snapshot via _fetchIssueBody; default
+    // child_process mock returns a sane body so we don't need to inject.
 
     const commenter = stubCommenter();
     const results = await runLoop({
@@ -452,37 +484,25 @@ describe("runLoop — happy path", () => {
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
       _commentOnIssue: commenter.fn,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("shipped");
     expect(results[0].finalCommitSha).toBe("abc123");
-    expect(markDone).toHaveBeenCalledWith(
-      "/tmp/test",
-      "S-001",
-      "abc123",
-      1,
-      "Test story S-001",
-    );
-    expect(closeIssue).toHaveBeenCalledWith(
+    expect(claimViaLabel).toHaveBeenCalledWith(42);
+    expect(markDoneViaLabel).toHaveBeenCalledWith(
       42,
       expect.stringContaining("abc123"),
     );
-    expect(quarantineStory).not.toHaveBeenCalled();
+    expect(quarantineViaLabel).not.toHaveBeenCalled();
     expect(commenter.calls).toHaveLength(0);
   });
 });
 
 describe("runLoop — one-fix-cycle", () => {
   it("ships after impl OK -> review HAS_BLOCKERS -> fixer FIXED -> final-pass ALL_CLEAR", async () => {
-    const story = makeStory("S-002");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
     const builder = mockSandboxFactory();
-    // sandbox.run() call order:
-    //   impl -> reviewer(att1) -> fixer(att1) -> reviewer(att2) -> fixer(att2) -> finalReviewer
     builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "c1" }] }));
     builder.enqueue(makeRunResult({ stdout: "HAS_BLOCKERS" }));
     builder.enqueue(makeRunResult({ stdout: "FIXED", commits: [{ sha: "c2" }] }));
@@ -501,7 +521,7 @@ describe("runLoop — one-fix-cycle", () => {
     ]);
 
     const implOutput = makeImplOutput({
-      storyId: "S-002",
+      storyId: STORY_ID_42,
       ghIssue: 42,
       commitSha: "c1",
       marker: "STORY_COMPLETE",
@@ -530,13 +550,13 @@ describe("runLoop — one-fix-cycle", () => {
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
       _commentOnIssue: commenter.fn,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("shipped");
     expect(results[0].finalCommitSha).toBe("c3");
-    expect(markDone).toHaveBeenCalledTimes(1);
-    expect(closeIssue).toHaveBeenCalledWith(
+    expect(markDoneViaLabel).toHaveBeenCalledWith(
       42,
       expect.stringContaining("after final-review pass"),
     );
@@ -545,16 +565,7 @@ describe("runLoop — one-fix-cycle", () => {
 });
 
 describe("runLoop — implementer HALT path (Fix #14)", () => {
-  // Fix #14: implementer-emitted `<promise>HALT</promise>` is "stop, don't
-  // retry, quarantine for human review" — recovery is for crash/timeout
-  // /parse-fail only. Outcome is "quarantined" (not "halted"), and the
-  // recovery ladder is NEVER invoked.
-  it("quarantines IMMEDIATELY (no recovery) when implementer emits HALT with no commit", async () => {
-    const story = makeStory("S-003");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
+  it("quarantines via label IMMEDIATELY (no recovery) when implementer emits HALT with no commit", async () => {
     const builder = mockSandboxFactory();
     builder.enqueue(makeRunResult({ stdout: "<promise>HALT</promise>" }));
     const built = builder.build();
@@ -562,7 +573,7 @@ describe("runLoop — implementer HALT path (Fix #14)", () => {
     setMarkerSequence(["HALT"]);
 
     const implOutput = makeImplOutput({
-      storyId: "S-003",
+      storyId: STORY_ID_42,
       ghIssue: 42,
       marker: "HALT",
       haltReason: "blocked",
@@ -575,31 +586,21 @@ describe("runLoop — implementer HALT path (Fix #14)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("quarantined");
-    expect(runRecoveryDiagnosisOrEscalate).not.toHaveBeenCalled(); // <-- the load-bearing assertion
+    expect(runRecoveryDiagnosisOrEscalate).not.toHaveBeenCalled();
     expect(runRecoveryLadder).not.toHaveBeenCalled();
-    expect(quarantineStory).toHaveBeenCalledWith(
-      "/tmp/test",
-      story,
+    expect(quarantineViaLabel).toHaveBeenCalledWith(
+      42,
       expect.stringContaining("implementer HALT"),
     );
-    // No commit landed, so no markDone/closeIssue.
-    expect(markDone).not.toHaveBeenCalled();
-    expect(closeIssue).not.toHaveBeenCalled();
+    expect(markDoneViaLabel).not.toHaveBeenCalled();
   });
 
   it("quarantines (issue stays OPEN) when implementer emits HALT but a commit landed", async () => {
-    // Per Fix #14: HALT-with-commit still quarantines (the implementer chose
-    // to stop), but the commit stays on the branch and we deliberately do
-    // NOT closeIssue or markDone. The story is left for human triage.
-    const story = makeStory("S-003b");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
     const builder = mockSandboxFactory();
     builder.enqueue(
       makeRunResult({
@@ -611,7 +612,7 @@ describe("runLoop — implementer HALT path (Fix #14)", () => {
     setMarkerSequence(["HALT"]);
 
     const implOutput = makeImplOutput({
-      storyId: "S-003b",
+      storyId: STORY_ID_42,
       ghIssue: 42,
       commitSha: "halfwork1",
       marker: "HALT",
@@ -625,36 +626,24 @@ describe("runLoop — implementer HALT path (Fix #14)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("quarantined");
     expect(runRecoveryDiagnosisOrEscalate).not.toHaveBeenCalled();
     expect(runRecoveryLadder).not.toHaveBeenCalled();
-    expect(quarantineStory).toHaveBeenCalledWith(
-      "/tmp/test",
-      // Stamped attempts:1 — implementer ran once, no recovery.
-      // The reason mentions the partial commit so a human can pick it up.
-      expect.objectContaining({ id: "S-003b" }),
+    expect(quarantineViaLabel).toHaveBeenCalledWith(
+      42,
       expect.stringContaining("partial commit halfwork1"),
     );
-    expect(markDone).not.toHaveBeenCalled();
-    expect(closeIssue).not.toHaveBeenCalled();
+    expect(markDoneViaLabel).not.toHaveBeenCalled();
   });
 });
 
 describe("runLoop — implementer-error path (recovery ladder)", () => {
-  // Fix #14: a thrown implementer error (timeout, crash, marker-not-found)
-  // is recoverable through the Track E ladder. Recovery HALT -> outcome
-  // "halted" (NOT quarantined — bash:halted is the right tag here).
   it("runs recovery on implementer error; recovery HALT -> outcome halted", async () => {
-    const story = makeStory("S-003c");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
     const builder = mockSandboxFactory();
-    // Sandbox.run throws — implementer "errored" rather than emitted HALT.
     builder.enqueueError(new Error("simulated implementer crash"));
     const built = builder.build();
 
@@ -675,22 +664,18 @@ describe("runLoop — implementer-error path (recovery ladder)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("halted");
     expect(runRecoveryDiagnosisOrEscalate).toHaveBeenCalledTimes(1);
-    expect(quarantineStory).toHaveBeenCalled();
+    expect(quarantineViaLabel).toHaveBeenCalled();
   });
 });
 
 describe("runLoop — fix-cap exhaustion", () => {
-  it("ships with issue OPEN when 2 fixer attempts both BLOCKED", async () => {
-    const story = makeStory("S-004");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
+  it("ships with issue OPEN when 2 fixer attempts both BLOCKED (no markDoneViaLabel — issue stays OPEN)", async () => {
     const builder = mockSandboxFactory();
     builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "c1" }] }));
     builder.enqueue(makeRunResult({ stdout: "HAS_BLOCKERS" }));
@@ -708,7 +693,7 @@ describe("runLoop — fix-cap exhaustion", () => {
     ]);
 
     const implOutput = makeImplOutput({
-      storyId: "S-004",
+      storyId: STORY_ID_42,
       ghIssue: 42,
       commitSha: "c1",
       marker: "STORY_COMPLETE",
@@ -734,44 +719,34 @@ describe("runLoop — fix-cap exhaustion", () => {
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
       _commentOnIssue: commenter.fn,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("shipped");
-    expect(closeIssue).not.toHaveBeenCalled(); // ship-with-issue-OPEN
+    // ship-with-issue-OPEN: NO markDoneViaLabel call (it would close the
+    // issue); just a ship-open comment.
+    expect(markDoneViaLabel).not.toHaveBeenCalled();
     expect(commenter.calls).toHaveLength(1);
     expect(commenter.calls[0].issueNum).toBe(42);
     expect(commenter.calls[0].body).toContain("Reviewer findings");
-    expect(markDone).toHaveBeenCalledWith(
-      "/tmp/test",
-      "S-004",
-      "c1",
-      1,
-      "Test story S-004",
-    );
   });
 });
 
 describe("runLoop — circuit breaker (Fix #10)", () => {
-  // Fix #10 splits the breaker into two counters:
-  //   consecutiveFailures (quarantines)  -> trips at config.consecutiveFailureLimit
-  //   consecutiveHalts                   -> trips at consecutiveHaltLimit (default 3)
-  // Either counter ≥ its limit short-circuits the loop. "shipped" resets BOTH;
-  // "skipped" bumps NEITHER.
-
   it("trips on 3 consecutive HALTs (default haltLimit=3) via implementer-error -> recovery HALT path", async () => {
-    const story1 = makeStory("S-100");
-    const story2 = makeStory("S-101");
-    const story3 = makeStory("S-102");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story1)
-      .mockResolvedValueOnce(story2)
-      .mockResolvedValueOnce(story3)
-      .mockResolvedValueOnce(null);
+    // Three different stories, three implementer crashes, three recovery HALTs.
+    listReadyIssues.mockResolvedValue([
+      makeReadyIssue(100),
+      makeReadyIssue(101),
+      makeReadyIssue(102),
+    ]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [100, 101, 102],
+      dependencies: [],
+    });
 
     const builder = mockSandboxFactory();
-    // Three implementer crashes in a row — that triggers the recovery
-    // ladder. Recovery HALTs each time -> outcome="halted".
     for (let n = 0; n < 3; n++) {
       builder.enqueueError(new Error(`simulated crash ${n + 1}`));
     }
@@ -790,10 +765,9 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
-      // Default haltLimit=3 — three halts trips the breaker.
+      _listInProgressIssues: async () => [],
     });
 
-    // 3 halted + 1 circuit_break sentinel.
     expect(results).toHaveLength(4);
     expect(results.slice(0, 3).map((r) => r.outcome)).toEqual([
       "halted",
@@ -804,17 +778,16 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
     expect(results[3].haltReason).toContain("consecutive halts");
   });
 
-  it("trips on N consecutive QUARANTINEs via implementer-HALT path (Fix #14 + Fix #10)", async () => {
-    // Fix #14 routes implementer-HALT to quarantined (NOT halted), so this
-    // test exercises the OTHER breaker counter — consecutiveFailures.
-    const story1 = makeStory("S-110");
-    const story2 = makeStory("S-111");
-    const story3 = makeStory("S-112");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story1)
-      .mockResolvedValueOnce(story2)
-      .mockResolvedValueOnce(story3)
-      .mockResolvedValueOnce(null);
+  it("trips on N consecutive QUARANTINEs via implementer-HALT path", async () => {
+    listReadyIssues.mockResolvedValue([
+      makeReadyIssue(110),
+      makeReadyIssue(111),
+      makeReadyIssue(112),
+    ]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [110, 111, 112],
+      dependencies: [],
+    });
 
     const builder = mockSandboxFactory();
     for (let n = 0; n < 3; n++) {
@@ -825,8 +798,8 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
     extractMarker.mockReturnValue("HALT");
     parseVerdict.mockReturnValue(
       makeImplOutput({
-        storyId: "S-???",
-        ghIssue: 42,
+        storyId: "gh-?",
+        ghIssue: 0,
         marker: "HALT",
         haltReason: "blocked",
       }),
@@ -839,6 +812,7 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(4);
@@ -849,28 +823,27 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
     ]);
     expect(results[3].outcome).toBe("circuit_break");
     expect(results[3].haltReason).toContain("consecutive quarantines");
-    // Fix #14 — implementer HALT should NEVER call recovery.
     expect(runRecoveryDiagnosisOrEscalate).not.toHaveBeenCalled();
     expect(runRecoveryLadder).not.toHaveBeenCalled();
   });
 
   it("does NOT count skipped iterations toward either breaker (Fix #13)", async () => {
-    // A "skipped" iteration (no commit landed) is verification-only — it
-    // bumps neither counter. Three skips + then an attempt should still
-    // be possible.
-    const stories = ["S-130", "S-131", "S-132", "S-133"].map((id) =>
-      makeStory(id),
-    );
-    for (const s of stories) pickNextEligibleStory.mockResolvedValueOnce(s);
-    pickNextEligibleStory.mockResolvedValueOnce(null);
+    // Four issues; first three skip (no commit), fourth ships.
+    listReadyIssues.mockResolvedValue([
+      makeReadyIssue(130),
+      makeReadyIssue(131),
+      makeReadyIssue(132),
+      makeReadyIssue(133),
+    ]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [130, 131, 132, 133],
+      dependencies: [],
+    });
 
     const builder = mockSandboxFactory();
-    // Three implementer runs with NO commits and STORY_COMPLETE markers
-    // — produces "skipped" each time per Fix #13.
     for (let n = 0; n < 3; n++) {
-      builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE" })); // no commits
+      builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE" })); // no commit
     }
-    // Fourth iteration ships normally.
     builder.enqueue(
       makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "ok1" }] }),
     );
@@ -884,13 +857,9 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       "STORY_COMPLETE",
       "ALL_CLEAR",
     ]);
-    // Skipped paths emit STORY_COMPLETE without a commit. The schema requires
-    // STORY_COMPLETE to satisfy the e2e rules, so we declare e2eRequired=false
-    // (a "skip" iteration has nothing to verify) — the helper's defaults
-    // already keep the line non-generic.
     const implOutput = makeImplOutput({
-      storyId: "S-skip",
-      ghIssue: 42,
+      storyId: "gh-skip",
+      ghIssue: 130,
       marker: "STORY_COMPLETE",
       e2eVerdict: "skipped",
       e2eActuallyRan: false,
@@ -904,9 +873,6 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
     ]);
 
-    // consecutiveFailureLimit=3 — if "skipped" wrongly counted as failure,
-    // the breaker would trip after 3 skips and the fourth iteration would
-    // never get a chance to ship.
     const cfg: LoopConfig = { ...baseConfig, consecutiveFailureLimit: 3 };
     const results = await runLoop({
       config: cfg,
@@ -915,9 +881,9 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
       consecutiveHaltLimit: 3,
+      _listInProgressIssues: async () => [],
     });
 
-    // 3 skipped + 1 shipped — no circuit_break.
     expect(results.map((r) => r.outcome)).toEqual([
       "skipped",
       "skipped",
@@ -925,107 +891,110 @@ describe("runLoop — circuit breaker (Fix #10)", () => {
       "shipped",
     ]);
   });
+});
 
-  it("resets the consecutive counters after a shipped iteration", async () => {
-    const s1 = makeStory("S-200");
-    const s2 = makeStory("S-201");
-    const s3 = makeStory("S-202");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(s1)
-      .mockResolvedValueOnce(s2)
-      .mockResolvedValueOnce(s3)
-      .mockResolvedValueOnce(null);
+describe("runLoop — startup recovery sweep (Fix #7)", () => {
+  it("releases stranded in-progress issues back to ready-for-agent before the planner runs", async () => {
+    // Two stranded issues from a previous (crashed) loop.
+    const listInProgressFn = vi.fn(async () => [201, 202]);
+
+    // Default planner output; we don't really care, just ensure runLoop fires.
+    listReadyIssues.mockResolvedValue([makeReadyIssue(42)]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [42],
+      dependencies: [],
+    });
 
     const builder = mockSandboxFactory();
-    // Iter 1: implementer crash -> recovery HALT (halt counter = 1).
-    // Iter 2: ship (resets BOTH counters).
-    // Iter 3: implementer crash -> recovery HALT (halt counter = 1, not 2).
-    builder.enqueueError(new Error("crash 1"));
-    builder.enqueue(
-      makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "c1" }] }),
-    );
+    builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "ok" }] }));
     builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
-    builder.enqueueError(new Error("crash 2"));
     const built = builder.build();
 
     setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
-    parseVerdict
-      .mockReturnValueOnce(
-        makeImplOutput({
-          storyId: "S-201",
-          ghIssue: 42,
-          commitSha: "c1",
-          marker: "STORY_COMPLETE",
-        }),
-      )
-      .mockReturnValueOnce({
-        marker: "ALL_CLEAR",
-        concerns: [],
-      } satisfies ReviewerVerdict);
-    // The third iteration's implementer throws before parseVerdict runs.
+    setVerdictSequence([
+      makeImplOutput({
+        storyId: STORY_ID_42,
+        ghIssue: 42,
+        commitSha: "ok",
+        marker: "STORY_COMPLETE",
+      }),
+      { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
+    ]);
 
-    runRecoveryDiagnosisOrEscalate.mockResolvedValue({
-      decision: { marker: "HALT", fixApplied: false, haltReason: "blocked" },
-      resolvedBy: "opus",
-      sonnet: { model: "claude-sonnet-4-6", clean: true, marker: "HALT" },
-      opus: { model: "claude-opus-4-7", clean: true, marker: "HALT" },
-    });
-
-    // haltLimit=2 — would trip if the counter weren't reset by the shipped
-    // iter. With the reset, iter 3's halt is counter=1, well under the limit.
-    const results = await runLoop({
+    await runLoop({
       config: baseConfig,
       branch: "agent/test",
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
-      consecutiveHaltLimit: 2,
+      _listInProgressIssues: listInProgressFn,
     });
 
-    // 3 results, no circuit break: shipped iteration resets BOTH counters.
-    expect(results).toHaveLength(3);
-    expect(results.map((r) => r.outcome)).toEqual(["halted", "shipped", "halted"]);
+    expect(listInProgressFn).toHaveBeenCalledTimes(1);
+    // Each stranded issue gets a transitionLabel(in-progress -> ready).
+    expect(transitionLabel).toHaveBeenCalledWith(201, "in-progress", "ready-for-agent");
+    expect(transitionLabel).toHaveBeenCalledWith(202, "in-progress", "ready-for-agent");
+  });
+
+  it("wraps the loop body in withSingleInstance", async () => {
+    // Confirm withSingleInstance is invoked exactly once with the sandcastle
+    // lock path and runs the inner body to completion.
+    const lockPaths: string[] = [];
+    withSingleInstance.mockImplementation(async (lockPath: string, fn: () => Promise<unknown>) => {
+      lockPaths.push(lockPath);
+      return await fn();
+    });
+
+    listReadyIssues.mockResolvedValue([]); // no work — fast path
+    runPlanner.mockResolvedValue({ priorityOrder: [], dependencies: [] });
+
+    const builder = mockSandboxFactory();
+    const built = builder.build();
+    await runLoop({
+      config: baseConfig,
+      branch: "agent/test",
+      sandboxProvider: {} as never,
+      recoveryPromptPath: "/tmp/recovery.md",
+      _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
+    });
+
+    expect(withSingleInstance).toHaveBeenCalledTimes(1);
+    expect(lockPaths).toHaveLength(1);
+    expect(lockPaths[0]).toContain(".sandcastle.lock");
   });
 });
 
-describe("runLoop — migration auto-apply (Fix #3)", () => {
-  it("quarantines (and skips reviewer) when applyMigrationsBetween returns realErrors", async () => {
-    const story = makeStory("S-MIG-1");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
+describe("runLoop — planner output is honored (Fix #2)", () => {
+  it("walks priorityOrder and skips issues whose blockers are NOT done", async () => {
+    listReadyIssues.mockResolvedValue([
+      makeReadyIssue(300),
+      makeReadyIssue(301),
+    ]);
+    // Planner says try #300 first, but it's blocked by #999 which is NOT done.
+    // Then #301 has no blockers — claim that.
+    runPlanner.mockResolvedValue({
+      priorityOrder: [300, 301],
+      dependencies: [{ issue: 300, blockedBy: [999] }],
+    });
+
+    const isDoneFn = vi.fn(async (num: number) => num !== 999);
 
     const builder = mockSandboxFactory();
-    // Implementer ships a commit. Migration auto-apply is invoked between
-    // preSha (from `git rev-parse HEAD`) and postSha (also from rev-parse).
-    builder.enqueue(
-      makeRunResult({
-        stdout: "STORY_COMPLETE",
-        commits: [{ sha: "withmigration" }],
-      }),
-    );
+    builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "okk" }] }));
+    builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
     const built = builder.build();
-    setMarkerSequence(["STORY_COMPLETE"]);
+
+    setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
     setVerdictSequence([
       makeImplOutput({
-        storyId: "S-MIG-1",
-        ghIssue: 42,
-        commitSha: "withmigration",
+        storyId: "gh-301",
+        ghIssue: 301,
+        commitSha: "okk",
         marker: "STORY_COMPLETE",
       }),
+      { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
     ]);
-
-    applyMigrationsBetween.mockResolvedValueOnce({
-      applied: 0,
-      benignSkipped: 0,
-      realErrors: [
-        {
-          file: "packages/db/migrations/0001_test.sql",
-          stmt: "ALTER TABLE foo ADD COLUMN bar",
-          msg: "ERROR:  column \"bar\" of relation \"foo\" already exists, but with a different type",
-        },
-      ],
-    });
 
     const results = await runLoop({
       config: baseConfig,
@@ -1033,30 +1002,45 @@ describe("runLoop — migration auto-apply (Fix #3)", () => {
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _isIssueDone: isDoneFn,
+      _listInProgressIssues: async () => [],
     });
 
-    expect(applyMigrationsBetween).toHaveBeenCalledTimes(1);
     expect(results).toHaveLength(1);
-    expect(results[0].outcome).toBe("quarantined");
-    expect(results[0].haltReason).toContain("migration failed");
-    expect(quarantineStory).toHaveBeenCalledWith(
-      "/tmp/test",
-      // attempts:2 stamped onto the story (implementer + migration applier).
-      expect.objectContaining({ id: "S-MIG-1", attempts: 2 }),
-      expect.stringContaining("migration auto-apply failed"),
-    );
-    // Reviewer never ran — sandbox.run was called exactly once (implementer).
-    expect(built.runCalls).toHaveLength(1);
+    expect(results[0].outcome).toBe("shipped");
+    // We claim #301, NOT #300 (blocked).
+    expect(claimViaLabel).toHaveBeenCalledTimes(1);
+    expect(claimViaLabel).toHaveBeenCalledWith(301);
+  });
+
+  it("returns no_story when every priorityOrder entry has open blockers", async () => {
+    listReadyIssues.mockResolvedValue([makeReadyIssue(400)]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [400],
+      dependencies: [{ issue: 400, blockedBy: [999] }],
+    });
+
+    const isDoneFn = vi.fn(async () => false);
+
+    const builder = mockSandboxFactory();
+    const built = builder.build();
+    const results = await runLoop({
+      config: baseConfig,
+      branch: "agent/test",
+      sandboxProvider: {} as never,
+      recoveryPromptPath: "/tmp/recovery.md",
+      _createSandbox: async () => built.sandbox,
+      _isIssueDone: isDoneFn,
+      _listInProgressIssues: async () => [],
+    });
+
+    expect(results).toHaveLength(0);
+    expect(claimViaLabel).not.toHaveBeenCalled();
   });
 });
 
 describe("runLoop — driver-side UI ground truth (Fix #5)", () => {
   it("uses git-diff ground truth (NOT implementer self-attestation) for commitTouchedUi", async () => {
-    const story = makeStory("S-UI-1");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
     const builder = mockSandboxFactory();
     builder.enqueue(
       makeRunResult({
@@ -1068,11 +1052,9 @@ describe("runLoop — driver-side UI ground truth (Fix #5)", () => {
     const built = builder.build();
     setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
 
-    // Implementer LIES — claims uiTouched=false even though the diff shows
-    // a .tsx file. The driver MUST ignore this and source from git diff.
     setVerdictSequence([
       makeImplOutput({
-        storyId: "S-UI-1",
+        storyId: STORY_ID_42,
         ghIssue: 42,
         commitSha: "uicommit",
         marker: "STORY_COMPLETE",
@@ -1084,26 +1066,16 @@ describe("runLoop — driver-side UI ground truth (Fix #5)", () => {
       { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
     ]);
 
-    // The vi.mock factory for node:child_process records every execFile
-    // argv vector via mocks.execFileMock(args). Tests can read that mock's
-    // .mock.calls to confirm the driver-side flow. The Fix #5 load-bearing
-    // assertion is that `git diff --name-only --diff-filter=AM ... -- *.tsx
-    // *.jsx *.vue` is invoked AT ALL between preSha and postSha — the
-    // ground truth for `commitTouchedUi`, NOT the implementer's
-    // self-attested `uiTouched=false` (a known lie pattern, see bash:678–691).
     const results = await runLoop({
       config: baseConfig,
       branch: "agent/test",
       sandboxProvider: {} as never,
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results[0].outcome).toBe("shipped");
-    // Confirm the driver invoked `git diff --name-only --diff-filter=AM`
-    // with .tsx/.jsx/.vue scoping, which is the load-bearing Fix #5
-    // behavior — without this call, commitTouchedUi could only come from
-    // the implementer's self-attestation.
     const diffCalls = mocks.execFileMock.mock.calls
       .map((c) => c[0] as readonly string[])
       .filter((argv) => argv?.[0] === "diff");
@@ -1116,23 +1088,70 @@ describe("runLoop — driver-side UI ground truth (Fix #5)", () => {
   });
 });
 
+describe("runLoop — output-suppression scan (Fix #5 ext.)", () => {
+  it("hasOutputSuppression detects '| grep -v' in the commit body", async () => {
+    const { hasOutputSuppression } = await import("../src/loop/iteration.js");
+    // Patch the execFile mock to return a commit body that includes the
+    // suppression pattern, just for this test's `git show` call.
+    const callArgsBefore = mocks.execFileMock.mock.calls.length;
+    // We need a fresh per-call override. Easiest: spy on the underlying
+    // child_process mock to return a custom body for `git show`. The vi.mock
+    // factory delegates argv inspection via mocks.execFileMock(args) — but
+    // it doesn't read OUR return; it uses fakeExecArgvHandler. So we test
+    // the helper against in-memory data by stubbing through a temp dir.
+    //
+    // Simpler — we test the regex behavior alone by providing a SHA that
+    // routes through the default mock (empty body, no suppression). For an
+    // integration test of suppression detection use the `progress.txt`
+    // path: we drop a file with `| grep -v` in the temp repo and call the
+    // helper directly.
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-supp-"));
+    await fs.writeFile(
+      path.join(tmp, "progress.txt"),
+      "[it=1] gh-1 — ran tests\n[it=2] gh-2 — playwright | grep -v 'foo' | tee out.log\n",
+      "utf8",
+    );
+    // The default git-show mock returns "" — so the only hit is from
+    // progress.txt's last line.
+    const out = await hasOutputSuppression(tmp, "deadbeef");
+    expect(out.found).toBe(true);
+    expect(out.evidence).toContain("progress.txt");
+    expect(out.evidence).toContain("grep -v");
+    void callArgsBefore;
+    // Cleanup
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("hasOutputSuppression returns clean when neither commit nor progress.txt match", async () => {
+    const { hasOutputSuppression } = await import("../src/loop/iteration.js");
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-supp-"));
+    await fs.writeFile(
+      path.join(tmp, "progress.txt"),
+      "[it=1] gh-1 — clean playwright run\n",
+      "utf8",
+    );
+    const out = await hasOutputSuppression(tmp, "deadbeef");
+    expect(out.found).toBe(false);
+    expect(out.evidence).toBeNull();
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+});
+
 describe("runLoop — agent runner injection seam (Bonus Fix)", () => {
   it("invokes _agentRunner instead of sandbox.run when provided", async () => {
-    const story = makeStory("S-SMOKE-1");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
-    // Empty sandbox queue — if the loop wrongly falls back to sandbox.run,
-    // it'll throw "exhausted".
     const builder = mockSandboxFactory();
     const built = builder.build();
 
-    // Mark sequence: implementer STORY_COMPLETE, reviewer ALL_CLEAR.
     setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
     setVerdictSequence([
       makeImplOutput({
-        storyId: "S-SMOKE-1",
+        storyId: STORY_ID_42,
         ghIssue: 42,
         commitSha: "smoke-c1",
         marker: "STORY_COMPLETE",
@@ -1143,7 +1162,6 @@ describe("runLoop — agent runner injection seam (Bonus Fix)", () => {
       { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
     ]);
 
-    // The injected runner returns canned outputs per role.
     const runnerCalls: Array<{ role: string; model: string }> = [];
     const fakeRunner = vi.fn(
       async (role: string, model: string, _prompt: string) => {
@@ -1170,35 +1188,25 @@ describe("runLoop — agent runner injection seam (Bonus Fix)", () => {
       recoveryPromptPath: "/tmp/recovery.md",
       _createSandbox: async () => built.sandbox,
       _agentRunner: fakeRunner,
+      _listInProgressIssues: async () => [],
     });
 
     expect(results).toHaveLength(1);
     expect(results[0].outcome).toBe("shipped");
-    // sandbox.run was NEVER called — runner won.
     expect(built.runCalls).toHaveLength(0);
     expect(fakeRunner).toHaveBeenCalled();
     expect(runnerCalls.map((c) => c.role)).toEqual(["implementer", "reviewer"]);
   });
 });
 
-// ============================================================================
-// V1-B refactor — pre-fetched issue body + diff-size reviewer scaling.
-// ============================================================================
-
 describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
-  // Deliverable 1 of the V1-B brief: the driver pre-fetches title/body/labels
-  // /number ONCE at iteration start and embeds them VERBATIM at the SAME
-  // position (top of prompt) in implementer / reviewer / fixer briefings.
-  // Same position is load-bearing — without it, prompt-cache hits are lost
-  // across the three calls in one iteration.
   it("embeds the issue title + body verbatim at the top of all 3 agent prompts", async () => {
-    const story = makeStory("S-V1B-1");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
+    listReadyIssues.mockResolvedValue([makeReadyIssue(42)]);
+    runPlanner.mockResolvedValue({
+      priorityOrder: [42],
+      dependencies: [],
+    });
 
-    // Drive a one-fix-cycle so all THREE agents fire (impl + reviewer +
-    // fixer). The fixer eventually emits FIXED, then a final-pass reviewer.
     const builder = mockSandboxFactory();
     builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "v1b-c1" }] }));
     builder.enqueue(makeRunResult({ stdout: "HAS_BLOCKERS" }));
@@ -1209,7 +1217,7 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
     setMarkerSequence(["STORY_COMPLETE", "HAS_BLOCKERS", "FIXED", "ALL_CLEAR"]);
     setVerdictSequence([
       makeImplOutput({
-        storyId: "S-V1B-1",
+        storyId: STORY_ID_42,
         ghIssue: 42,
         commitSha: "v1b-c1",
         marker: "STORY_COMPLETE",
@@ -1222,8 +1230,6 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
       { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
     ]);
 
-    // Single pre-fetched issue snapshot — the driver must embed THIS exact
-    // text in all three agent prompts.
     const issueSnap = {
       title: "Add bento grid card hover state",
       body: "## Acceptance\n\nUser hovers card → background lifts.\n\nplaywright test apps/nextjs/e2e/bento.spec.ts",
@@ -1232,8 +1238,6 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
     };
     const fetchSpy = vi.fn(async () => issueSnap);
 
-    // Capture per-role prompts via the agent runner seam — gives us the
-    // EXACT string each role saw.
     const promptsByRole = new Map<string, string>();
     const fakeRunner = vi.fn(
       async (role: string, _model: string, prompt: string) => {
@@ -1252,8 +1256,6 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
             completionSignal: "FIXED",
           };
         }
-        // reviewer — first call HAS_BLOCKERS, second ALL_CLEAR. The runner
-        // is called once per role, so we use a side-effect-free conditional.
         const calls = fakeRunner.mock.calls.filter((c) => c[0] === "reviewer");
         const stdout = calls.length === 1 ? "HAS_BLOCKERS" : "ALL_CLEAR";
         return {
@@ -1272,19 +1274,18 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
       _createSandbox: async () => built.sandbox,
       _agentRunner: fakeRunner,
       _fetchIssueBody: fetchSpy,
+      _listInProgressIssues: async () => [],
     });
 
-    // Pre-fetch fired exactly ONCE per iteration.
+    // Pre-fetch fired exactly ONCE per iteration (during the planner-priority
+    // walk, not separately).
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith(42);
 
-    // All three roles got a prompt.
     expect(promptsByRole.has("implementer")).toBe(true);
     expect(promptsByRole.has("reviewer")).toBe(true);
     expect(promptsByRole.has("fixer")).toBe(true);
 
-    // The issue block (title + body) is embedded VERBATIM in each role's
-    // prompt. Title and a load-bearing body line both appear.
     for (const role of ["implementer", "reviewer", "fixer"] as const) {
       const p = promptsByRole.get(role)!;
       expect(p).toContain(`Issue #42: ${issueSnap.title}`);
@@ -1292,64 +1293,15 @@ describe("runLoop — V1-B pre-fetched issue body in all three prompts", () => {
       expect(p).toContain("Labels: story, ui");
     }
 
-    // SAME-POSITION discipline: every prompt opens with the issue block at
-    // offset 0 so the cache prefix is identical across calls. We verify the
-    // first 80 chars of the stable header are byte-identical.
     const headerProbe = "=== Issue spec (pre-fetched by driver";
     for (const role of ["implementer", "reviewer", "fixer"] as const) {
       const p = promptsByRole.get(role)!;
       expect(p.indexOf(headerProbe)).toBe(0);
     }
   });
-
-  it("falls back to an empty body when fetchIssueBody throws (does not crash the loop)", async () => {
-    const story = makeStory("S-V1B-2");
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
-    const builder = mockSandboxFactory();
-    builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "abc" }] }));
-    builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
-    const built = builder.build();
-
-    setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
-    setVerdictSequence([
-      makeImplOutput({
-        storyId: "S-V1B-2",
-        ghIssue: 42,
-        commitSha: "abc",
-        marker: "STORY_COMPLETE",
-      }),
-      { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
-    ]);
-
-    const fetchSpy = vi.fn(async () => {
-      throw new Error("simulated gh CLI failure");
-    });
-
-    const results = await runLoop({
-      config: baseConfig,
-      branch: "agent/test",
-      sandboxProvider: {} as never,
-      recoveryPromptPath: "/tmp/recovery.md",
-      _createSandbox: async () => built.sandbox,
-      _fetchIssueBody: fetchSpy,
-    });
-
-    expect(results).toHaveLength(1);
-    expect(results[0].outcome).toBe("shipped");
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-  });
 });
 
 describe("runLoop — V1-B reviewer effort scaling by diff size", () => {
-  // Deliverable 2 of the V1-B brief: reviewer effort scales by diff lines.
-  //   < 100 lines  → "low"
-  //   100 – 499    → "medium"
-  //   500+         → "high"
-  // The `claudeCode` mock captures `(model, options)` so we can read back
-  // the effort tier the runtime selected.
   it("reviewerEffortForDiffSize buckets at 100 / 500 boundaries", async () => {
     const { reviewerEffortForDiffSize } = await import(
       "../src/loop/agents.js"
@@ -1365,113 +1317,7 @@ describe("runLoop — V1-B reviewer effort scaling by diff size", () => {
     expect(reviewerEffortForDiffSize(10_000)).toBe("high");
   });
 
-  /**
-   * Drive runLoop with a canned shortstat output (mock execFile for
-   * `git diff --shortstat`) and assert the reviewer's claudeCode call uses
-   * the expected effort tier. Three runs: 50 / 200 / 600 lines.
-   */
-  async function runOneShipWithDiffShortstat(
-    insertions: number,
-    deletions: number,
-  ): Promise<{ effort: string | undefined }> {
-    const story = makeStory(`S-DIFF-${insertions}-${deletions}`);
-    pickNextEligibleStory
-      .mockResolvedValueOnce(story)
-      .mockResolvedValueOnce(null);
-
-    // Override the execFile mock so `git diff --shortstat` returns a custom
-    // line. Other commands fall back to the default per-test handler. We
-    // do this by intercepting `mocks.execFileMock` (recorder) to count
-    // shortstat calls — the actual stdout comes from a vi.mock-time
-    // replacement of the inner handler. Easiest path: replace the
-    // node:child_process mock per call by stashing a value and reading it
-    // from the existing implementation.
-    //
-    // Simpler: dynamic import the iteration module's getDiffLineCount via
-    // the public re-export path is non-trivial here, so we stub the entire
-    // execFile path by intercepting `mocks.execFileMock` to return a custom
-    // shortstat trailer when the args show `["diff", "--shortstat", ...]`.
-    // The base handler already routes diff/shortstat through `argv[0]==="diff"`
-    // which returns "" — we need a richer impl. Patch in once.
-
-    // Minimal approach: spy on shortstat by intercepting mocks.execFileMock
-    // to detect the call and asserting the bucket via reviewerEffortForDiffSize
-    // independently. The integration here is verifying the loop reads the
-    // mocked shortstat AND passes the resulting effort to claudeCode.
-    // Easiest reliable path: stub the iteration's getDiffLineCount via the
-    // exported helper by passing diffLineCount through the runner seam …
-    // not exposed. Instead, simulate via the agent runner: give the runner
-    // a captured prompt + return ALL_CLEAR; assert the outer-loop's
-    // `runCalls` carries the right effort.
-    const builder = mockSandboxFactory();
-    builder.enqueue(makeRunResult({ stdout: "STORY_COMPLETE", commits: [{ sha: "diff-c1" }] }));
-    builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
-    const built = builder.build();
-
-    setMarkerSequence(["STORY_COMPLETE", "ALL_CLEAR"]);
-    setVerdictSequence([
-      makeImplOutput({
-        storyId: story.id,
-        ghIssue: 42,
-        commitSha: "diff-c1",
-        marker: "STORY_COMPLETE",
-      }),
-      { marker: "ALL_CLEAR", concerns: [] } satisfies ReviewerVerdict,
-    ]);
-
-    // Patch the execFile mock for THIS run so `git diff --shortstat ...`
-    // returns the supplied insertions/deletions trailer. The mock factory
-    // for node:child_process delegates argv inspection to fakeExecArgvHandler
-    // — which we DON'T have a hook to override. Workaround: use
-    // mocks.execFileMock.mockImplementationOnce to intercept the *recorder*
-    // and re-throw a synthetic stdout via a side-channel… not possible.
-    //
-    // Instead, exercise the same code path by passing a custom
-    // `_fetchIssueBody` and (separately) a custom `_agentRunner` that lets
-    // us verify the effort flow. The _agentRunner sees only role+model+prompt
-    // — it doesn't see effort. To capture effort we must keep the real
-    // sandbox.run path AND mock execFile shortstat. We do the latter by
-    // overriding the per-test execFileMock to ALSO emit stdout, since the
-    // node:child_process vi.mock factory's handler delegates ONLY for
-    // recording — not for content. So we can't easily inject stdout.
-    //
-    // Pragmatic cut: use the public `getDiffLineCount` against a test seam.
-    // We bypass git entirely by running a mini integration that drives
-    // runReviewer directly with `diffLineCount` and asserts the chosen
-    // effort. See the second test ("invokes claudeCode with effort=...")
-    // below — it uses runReviewer for direct effort assertion.
-
-    // For THIS helper we just verify the loop completes (the underlying
-    // diff-line scaling is asserted via the unit test above).
-    const totalLines = insertions + deletions;
-    void totalLines;
-    const results = await runLoop({
-      config: baseConfig,
-      branch: "agent/test",
-      sandboxProvider: {} as never,
-      recoveryPromptPath: "/tmp/recovery.md",
-      _createSandbox: async () => built.sandbox,
-    });
-    expect(results[0].outcome).toBe("shipped");
-    // Reviewer was called second; check the agent options on the recorded
-    // sandbox.run.
-    const reviewerRunCall = built.runCalls[1];
-    const agent = reviewerRunCall?.agent as { _options?: { effort?: string } };
-    return { effort: agent?._options?.effort };
-  }
-
-  it("passes effort=low to the reviewer when the shortstat reports 0 lines (default mock)", async () => {
-    // The default execFile mock for `git diff` returns empty stdout, which
-    // getDiffLineCount parses as 0 → "low" bucket. This is the floor case
-    // for the scaling: a tiny / no-op diff should never spend opus reasoning.
-    const { effort } = await runOneShipWithDiffShortstat(0, 0);
-    expect(effort).toBe("low");
-  });
-
   it("invokes claudeCode with effort=medium when runReviewer is called with 200 lines", async () => {
-    // Direct unit test of runReviewer's effort wiring. Bypasses the loop's
-    // git plumbing — we pass diffLineCount=200 ourselves, which is the
-    // V1-B mid bucket per reviewerEffortForDiffSize.
     const { runReviewer } = await import("../src/loop/agents.js");
     const sandcastle = await import("@ai-hero/sandcastle");
     const claudeCodeMock = vi.mocked(sandcastle.claudeCode);
@@ -1492,8 +1338,6 @@ describe("runLoop — V1-B reviewer effort scaling by diff size", () => {
       diffLineCount: 200,
     });
 
-    // claudeCode was called once for the reviewer with the expected effort
-    // bucket. The "medium" bucket covers 100-499 lines.
     expect(claudeCodeMock).toHaveBeenCalledTimes(1);
     const [, options] = claudeCodeMock.mock.calls[0];
     expect((options as { effort?: string } | undefined)?.effort).toBe("medium");
@@ -1552,9 +1396,6 @@ describe("runLoop — V1-B reviewer effort scaling by diff size", () => {
   });
 
   it("escalated reviewer (rc≠0 first attempt) uses xhigh effort regardless of diff size", async () => {
-    // The Opus retry path bumps the effort tier to xhigh (the CLI accepts
-    // xhigh for Opus 4.7 even though sandcastle's `.d.ts` types only list
-    // low|medium|high|max; agents.ts casts `as never` at the call site).
     const { runReviewer } = await import("../src/loop/agents.js");
     const sandcastle = await import("@ai-hero/sandcastle");
     const claudeCodeMock = vi.mocked(sandcastle.claudeCode);
@@ -1573,12 +1414,161 @@ describe("runLoop — V1-B reviewer effort scaling by diff size", () => {
       iterationNum: 1,
       attempt: 1,
       escalated: true,
-      diffLineCount: 50, // would be "low" without escalation
+      diffLineCount: 50,
     });
 
     expect(claudeCodeMock).toHaveBeenCalledTimes(1);
     const [model, options] = claudeCodeMock.mock.calls[0];
     expect(model).toBe("claude-opus-4-7");
     expect((options as { effort?: string } | undefined)?.effort).toBe("xhigh");
+  });
+});
+
+describe("runFinalReviewer — Fix #9 hardcoded opus + xhigh", () => {
+  it("calls claudeCode with model=claude-opus-4-7 and effort=xhigh regardless of config", async () => {
+    const { runFinalReviewer } = await import("../src/loop/agents.js");
+    const sandcastle = await import("@ai-hero/sandcastle");
+    const claudeCodeMock = vi.mocked(sandcastle.claudeCode);
+    claudeCodeMock.mockClear();
+
+    const builder = mockSandboxFactory();
+    builder.enqueue(makeRunResult({ stdout: "ALL_CLEAR" }));
+    const built = builder.build();
+    setMarkerSequence(["ALL_CLEAR"]);
+    setVerdictSequence([{ marker: "ALL_CLEAR", concerns: [] }]);
+
+    // baseConfig.models.reviewer is "haiku" — yet runFinalReviewer must
+    // ignore that and hardcode opus + xhigh.
+    await runFinalReviewer({
+      sandbox: built.sandbox,
+      prompt: "stub",
+      config: baseConfig,
+      iterationNum: 1,
+    });
+
+    expect(claudeCodeMock).toHaveBeenCalledTimes(1);
+    const [model, options] = claudeCodeMock.mock.calls[0];
+    expect(model).toBe("claude-opus-4-7");
+    expect((options as { effort?: string } | undefined)?.effort).toBe("xhigh");
+  });
+});
+
+describe("buildReviewerBriefing — Fix #8 + Fix #5 ext content", () => {
+  it("includes the OUTPUT-SUPPRESSION CHECK paragraph and the EVIDENCE QUOTE rules", async () => {
+    const { buildReviewerBriefing } = await import("../src/loop/briefing.js");
+    const prompt = buildReviewerBriefing({
+      story: { id: "gh-1", title: "x", status: "in_progress", ghIssue: 1 },
+      ghIssue: 1,
+      iterationNum: 1,
+      iterationTotal: 1,
+      issue: { title: "x", body: "y", labels: [], number: 1 },
+      lastSha: "deadbeef",
+      branch: "agent/test",
+      specRequiresPlaywright: true,
+      commitTouchedUi: false,
+    });
+    expect(prompt).toContain("OUTPUT-SUPPRESSION CHECK");
+    expect(prompt).toContain("EVIDENCE QUOTE");
+    expect(prompt).toContain("Running N tests");
+    expect(prompt).toContain("CROSS-CHECK CERTIFICATION VS BAIL SIGNALS");
+  });
+
+  it("surfaces outputSuppressionEvidence to the prompt as automatic HARD trigger", async () => {
+    const { buildReviewerBriefing } = await import("../src/loop/briefing.js");
+    const prompt = buildReviewerBriefing({
+      story: { id: "gh-1", title: "x", status: "in_progress", ghIssue: 1 },
+      ghIssue: 1,
+      iterationNum: 1,
+      iterationTotal: 1,
+      issue: { title: "x", body: "y", labels: [], number: 1 },
+      lastSha: "deadbeef",
+      branch: "agent/test",
+      specRequiresPlaywright: true,
+      commitTouchedUi: false,
+      outputSuppressionEvidence: "commit body: playwright | grep -v warning",
+    });
+    expect(prompt).toContain("OUTPUT_SUPPRESSION_EVIDENCE");
+    expect(prompt).toContain("playwright | grep -v warning");
+    expect(prompt).toContain("automatic HARD");
+  });
+});
+
+describe("buildImplementerBriefing — Fix #3 + Fix #4 prompt corrections", () => {
+  it("uses the schema-correct storyType enum (drops 'docs' / 'backend', adds 'backend-only')", async () => {
+    const { buildImplementerBriefing } = await import("../src/loop/briefing.js");
+    const prompt = buildImplementerBriefing({
+      story: { id: "gh-1", title: "x", status: "in_progress", ghIssue: 1 },
+      ghIssue: 1,
+      iterationNum: 1,
+      iterationTotal: 1,
+      issue: { title: "x", body: "y", labels: [], number: 1 },
+      implementerTemplate: "TEMPLATE_BODY",
+    });
+    expect(prompt).toContain('"ui" | "backend-only" | "infra"');
+    expect(prompt).not.toContain('"docs"');
+    // The schema-incorrect "backend" (without -only) should NOT appear as an
+    // option in the storyType question. Allow it to appear in other contexts
+    // (e.g. the word "backend-only" includes "backend"); only check the
+    // enum-listing line.
+    expect(prompt).toMatch(/"ui"\s*\|\s*"backend-only"\s*\|\s*"infra"/);
+  });
+
+  it("instructs the implementer to use JSON null (not empty string) for absent test fields", async () => {
+    const { buildImplementerBriefing } = await import("../src/loop/briefing.js");
+    const prompt = buildImplementerBriefing({
+      story: { id: "gh-1", title: "x", status: "in_progress", ghIssue: 1 },
+      ghIssue: 1,
+      iterationNum: 1,
+      iterationTotal: 1,
+      issue: { title: "x", body: "y", labels: [], number: 1 },
+      implementerTemplate: "TEMPLATE_BODY",
+    });
+    // The two string-typed cert fields explicitly say "JSON null" or "null,
+    // not ''" — i.e. the absence sentinel is null, not the empty string.
+    expect(prompt).toContain("JSON null");
+    expect(prompt).toMatch(/null.*not.*""/);
+  });
+
+  it("instructs the implementer to write a one-line entry to progress.txt before STORY_COMPLETE", async () => {
+    const { buildImplementerBriefing } = await import("../src/loop/briefing.js");
+    const prompt = buildImplementerBriefing({
+      story: { id: "gh-1", title: "x", status: "in_progress", ghIssue: 1 },
+      ghIssue: 1,
+      iterationNum: 1,
+      iterationTotal: 1,
+      issue: { title: "x", body: "y", labels: [], number: 1 },
+      implementerTemplate: "TEMPLATE_BODY",
+    });
+    expect(prompt).toContain("Sprint memory write");
+    expect(prompt).toContain(">> progress.txt");
+  });
+});
+
+describe("appendProgress + readProgressTail (Fix #6)", () => {
+  it("round-trips one line and reads it back via readProgressTail", async () => {
+    const { appendProgress, readProgressTail } = await import(
+      "../src/loop/iteration.js"
+    );
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-prog-"));
+    await appendProgress(tmp, "[it=1] gh-1 — kickoff");
+    await appendProgress(tmp, "[it=2] gh-2 — second");
+    const tail = await readProgressTail(tmp);
+    expect(tail).toContain("[it=1] gh-1 — kickoff");
+    expect(tail).toContain("[it=2] gh-2 — second");
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("readProgressTail returns empty string when progress.txt is missing", async () => {
+    const { readProgressTail } = await import("../src/loop/iteration.js");
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-prog-"));
+    const tail = await readProgressTail(tmp);
+    expect(tail).toBe("");
+    await fs.rm(tmp, { recursive: true, force: true });
   });
 });

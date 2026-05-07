@@ -31,6 +31,8 @@
 
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { claudeCode, type Sandbox } from "@ai-hero/sandcastle";
 import {
   extractMarker,
@@ -48,6 +50,18 @@ import {
   type Diagnosis,
   type HaltCause,
 } from "./diagnose.js";
+
+/**
+ * Promisified `execFile`. Used by {@link runFixCommand} to execute the
+ * environment-fix argv DIRECTLY against the sandbox's worktree path,
+ * bypassing the agent layer entirely. The earlier Haiku-based runner
+ * depended on a Bash tool grant that the sandbox doesn't always provide;
+ * when the grant was missing the agent would happily emit FIX_DONE based
+ * on its own hallucination of having executed the command. execFile makes
+ * the contract concrete: argv[0] is the binary, argv[1..] are args, exit
+ * code is the source of truth.
+ */
+const execFileP = promisify(execFile);
 
 // NOTE: Track B is expected to ship `src/verdicts/index.ts` as a barrel that
 // re-exports `parseVerdict`, `extractMarker`, the schemas, and the marker
@@ -119,6 +133,22 @@ export interface RecoveryLadderConfig {
   readonly opusModel?: string;
   /** Override the host directory where per-attempt log files are written. */
   readonly logDir?: string;
+  /**
+   * Effort knob for the Sonnet retry attempt. Defaults to `"high"`. The
+   * retry runs after a successful environment fix and benefits from the
+   * extra reasoning headroom — the failure that triggered recovery wasn't
+   * a model failure, but the post-fix retry still has to reason about
+   * whatever-was-actually-broken.
+   */
+  readonly sonnetEffort?: "high" | "max";
+  /**
+   * Effort knob for the Opus escalation attempt. Defaults to `"xhigh"`.
+   * Sandcastle's published `ClaudeCodeOptions.effort` type still lists
+   * `"low" | "medium" | "high" | "max"` — we cast `"xhigh"` through
+   * `as never` at the call site (see {@link runOpusXhighAttempt}). Bumping
+   * sandcastle will let us drop the cast.
+   */
+  readonly opusEffort?: "xhigh" | "max";
 }
 
 /** Runs Sonnet first, escalates to Opus on failure or HALT. */
@@ -217,6 +247,12 @@ interface RunRecoveryAttemptArgs {
   readonly logFilePath: string;
   readonly idleTimeoutSeconds: number;
   readonly attemptName: string;
+  /**
+   * Optional effort knob passed through to claudeCode. When omitted the
+   * SDK's default applies (which is fine for the Sonnet-first ladder; the
+   * diagnose-or-escalate path explicitly passes "high" for Sonnet retries).
+   */
+  readonly effort?: "high" | "max";
 }
 
 /**
@@ -234,6 +270,7 @@ async function runRecoveryAttempt(
     logFilePath,
     idleTimeoutSeconds,
     attemptName,
+    effort,
   } = args;
 
   let stdout = "";
@@ -241,7 +278,10 @@ async function runRecoveryAttempt(
   let runCompleted = false;
   try {
     const result = await sandbox.run({
-      agent: claudeCode(model),
+      agent:
+        effort !== undefined
+          ? claudeCode(model, { effort })
+          : claudeCode(model),
       prompt,
       maxIterations: 1,
       idleTimeoutSeconds,
@@ -450,15 +490,41 @@ export async function runRecoveryLadder(
 // ---------------------------------------------------------------------------
 
 /**
- * Diagnose the halt cause, run a one-shot fix command in-sandbox if we
- * recognise it, retry with cheap Sonnet, and only escalate to Opus when
- * diagnosis fails or the fix didn't un-stick the run.
+ * Test-only options for {@link runRecoveryDiagnosisOrEscalate}. Production
+ * callers pass `undefined` (or just omit). The fields are explicitly
+ * underscore-prefixed so it's obvious at the call site that they exist
+ * solely to inject test seams.
+ */
+export interface RunRecoveryDiagnosisTestSeams {
+  /**
+   * Override `execFile` for the fix-command runner. When supplied, the
+   * recovery ladder will call this instead of `node:child_process.execFile`
+   * to apply the diagnosed fix. Tests inject a stub so they never spawn
+   * real binaries against the host's PATH.
+   *
+   * The contract mirrors `util.promisify(execFile)`: resolve with
+   * `{ stdout, stderr }` on exit 0; reject with an Error carrying optional
+   * `code` (numeric exit code or string spawn-error code), `signal`,
+   * `stdout`, and `stderr`.
+   */
+  readonly _execFileP?: (
+    file: string,
+    argv: string[],
+    opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
+  ) => Promise<{ stdout: string; stderr: string }>;
+}
+
+/**
+ * Diagnose the halt cause, run a one-shot fix command directly against the
+ * sandbox's worktree if we recognise it, retry with cheap Sonnet, and only
+ * escalate to Opus when diagnosis fails or the fix didn't un-stick the run.
  *
  * Why this exists: retrying with Opus on a halt that's actually
  * "unapplied migration" or "dead dev server" wastes money — the
  * environment is broken, the model isn't. The new ladder spends a few
- * tokens classifying first, then a Haiku-tier execution to apply the fix,
- * then a Sonnet retry. Opus is the LAST resort, not the first.
+ * tokens classifying first, then runs the fix command via direct
+ * `execFile` (no agent, no Bash-tool grant required), then a Sonnet retry.
+ * Opus is the LAST resort, not the first.
  *
  * Algorithm:
  *
@@ -466,29 +532,34 @@ export async function runRecoveryLadder(
  *      actual error) or `halt.reason` and run it through
  *      {@link diagnoseHaltCause}.
  *   2. If the cause is recognised AND we have an auto-fix argv:
- *      a. Execute the fix via a thin claudeCode invocation: cheap model,
- *         "run this command and emit FIX_DONE / FIX_FAILED" prompt.
- *      b. If the fix succeeds, retry the recovery agent with Sonnet +
- *         `effort: "high"`. STORY_COMPLETE or RECOVERY_COMPLETE wins;
- *         anything else falls through to step 3.
+ *      a. Execute the fix via `execFile(argv[0], argv.slice(1), { cwd:
+ *         sandbox.worktreePath })`. Exit 0 = success; non-zero / spawn
+ *         failure / timeout = failure.
+ *      b. If the fix succeeds, retry the recovery agent with Sonnet at
+ *         `effort: "high"` (configurable via `config.sonnetEffort`).
+ *         RECOVERY_COMPLETE wins; anything else falls through to step 3.
  *      c. If the fix itself fails, fall through to step 3.
- *   3. Escalate to Opus 4.7 with `effort: "xhigh"` (cast through `as never`
- *      because sandcastle's ClaudeCodeOptions type union still lists "max"
- *      instead of "xhigh"). One attempt only. RECOVERY_COMPLETE wins;
- *      otherwise return marker = HALT with both diagnosis and Opus reasons
- *      stitched into `haltReason`.
+ *   3. Escalate to Opus 4.7 with `effort: "xhigh"` by default (configurable
+ *      via `config.opusEffort`; cast through `as never` because
+ *      sandcastle's ClaudeCodeOptions type union still lists "max" instead
+ *      of "xhigh"). One attempt only. RECOVERY_COMPLETE wins; otherwise
+ *      return marker = HALT with both diagnosis and Opus reasons stitched
+ *      into `haltReason`.
  */
 export async function runRecoveryDiagnosisOrEscalate(
   sandbox: Sandbox,
   ctx: IterationContext,
   halt: HaltContext,
   config: RecoveryLadderConfig,
+  seams?: RunRecoveryDiagnosisTestSeams,
 ): Promise<RecoveryLadderResult> {
   const template = await fs.readFile(config.promptTemplatePath, "utf8");
   const prompt = buildRecoveryPrompt(template, ctx, halt, config);
   const idleTimeoutSeconds = config.idleTimeoutSeconds ?? 1800;
   const sonnetModel = config.sonnetModel ?? "claude-sonnet-4-6";
   const opusModel = config.opusModel ?? "claude-opus-4-7";
+  const sonnetEffort: "high" | "max" = config.sonnetEffort ?? "high";
+  const opusEffort: "xhigh" | "max" = config.opusEffort ?? "xhigh";
   const logDir =
     config.logDir ?? path.join(process.cwd(), ".sandcastle", "logs");
   await fs.mkdir(logDir, { recursive: true });
@@ -505,15 +576,18 @@ export async function runRecoveryDiagnosisOrEscalate(
   // diagnostic AttemptSummary so callers don't trip over `undefined`.
   let sonnetAttempt: AttemptSummary | undefined;
 
-  // --- Step 2: cheap fix + Sonnet retry ------------------------------------
+  // --- Step 2: direct fix exec + Sonnet retry ------------------------------
   let fixOutcome: FixCommandOutcome | undefined;
   if (diagnosis.cause !== "unknown" && diagnosis.fixCommand !== null) {
     fixOutcome = await runFixCommand({
       sandbox,
       argv: diagnosis.fixCommand,
       logFilePath: path.join(logDir, `recovery-fix-${stamp}.log`),
-      idleTimeoutSeconds: 600, // fix commands shouldn't need 30m
+      timeoutMs: 300_000, // 5 min cap; pnpm install on a cold cache fits easily
       diagnosis,
+      ...(seams?._execFileP !== undefined
+        ? { _execFileP: seams._execFileP }
+        : {}),
     });
 
     if (fixOutcome.success) {
@@ -524,19 +598,14 @@ export async function runRecoveryDiagnosisOrEscalate(
       sonnetAttempt = await runRecoveryAttempt({
         sandbox,
         model: sonnetModel,
-        // claudeCode accepts effort; pass it via a wrapper below since
-        // runRecoveryAttempt builds the provider with no opts. We replicate
-        // its body inline here to thread effort through cleanly.
         prompt,
         logFilePath: path.join(logDir, `recovery-sonnet-retry-${stamp}.log`),
         idleTimeoutSeconds,
         attemptName: `recovery-sonnet-retry-it${ctx.iterNum}`,
-        // We re-use runRecoveryAttempt's claudeCode call (no effort arg).
-        // The "effort: high" requirement is a Sonnet behaviour hint; the
-        // existing helper already invokes Sonnet without explicit effort,
-        // which the SDK treats as the model's default. If a future change
-        // wants explicit high-effort, plumb a `claudeOptions` arg through
-        // runRecoveryAttempt — out of scope for v1.
+        // Sonnet retry runs at high effort (configurable via
+        // RecoveryLadderConfig.sonnetEffort, default "high"). Threaded
+        // through runRecoveryAttempt's new `effort` arg.
+        effort: sonnetEffort,
       });
 
       if (
@@ -562,9 +631,9 @@ export async function runRecoveryDiagnosisOrEscalate(
 
   // --- Step 3: escalate to Opus -------------------------------------------
   // Note: ClaudeCodeOptions.effort is "low" | "medium" | "high" | "max" in
-  // the current sandcastle release; the v1 spec demands "xhigh". The cast
-  // is the only `as never` in this file by design — bumping sandcastle will
-  // remove the need for it.
+  // the current sandcastle release; we default to "xhigh". The cast inside
+  // runOpusXhighAttempt is the only `as never` in this file by design —
+  // bumping sandcastle will remove the need for it.
   const opusLog = path.join(logDir, `recovery-opus-${stamp}.log`);
   const opusAttempt = await runOpusXhighAttempt({
     sandbox,
@@ -573,6 +642,7 @@ export async function runRecoveryDiagnosisOrEscalate(
     logFilePath: opusLog,
     idleTimeoutSeconds,
     attemptName: `recovery-opus-it${ctx.iterNum}`,
+    effort: opusEffort,
   });
 
   // Synthesise a Sonnet placeholder summary if we never got to Sonnet (e.g.
@@ -641,101 +711,185 @@ interface RunFixCommandArgs {
   readonly sandbox: Sandbox;
   readonly argv: readonly string[];
   readonly logFilePath: string;
-  readonly idleTimeoutSeconds: number;
+  /**
+   * Hard wall-clock cap. Default 5 minutes. `pnpm install` on a cold cache
+   * fits comfortably; anything longer is suspicious and we'd rather
+   * escalate than hang.
+   */
+  readonly timeoutMs: number;
   readonly diagnosis: Diagnosis;
+  /**
+   * Test seam: when supplied, called instead of the real `execFileP`. The
+   * default uses `node:child_process.execFile`. Tests inject a stub so they
+   * never spawn real binaries.
+   */
+  readonly _execFileP?: (
+    file: string,
+    argv: string[],
+    opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
+  ) => Promise<{ stdout: string; stderr: string }>;
 }
 
 interface FixCommandOutcome {
   readonly success: boolean;
   readonly stdout: string;
+  readonly stderr?: string;
   /** Reason the fix did not succeed, if applicable. */
   readonly failureReason?: string;
 }
 
 /**
- * Run an environment-fix command inside the sandbox.
+ * Run an environment-fix command DIRECTLY against the sandbox's worktree
+ * via `execFile`. No agent involvement.
  *
- * The Sandbox interface only exposes `.run()` (which requires an
- * AgentProvider). There is no plain shell hook in the public API, so we
- * pick the cheapest claudeCode model and hand it a prompt whose only job is
- * to exec the command and emit FIX_DONE / FIX_FAILED on the last line. The
- * model picks up zero free tokens of reasoning — the prompt is deliberately
- * mechanical.
+ * Why no agent: the previous Haiku-based implementation depended on the
+ * sandbox auto-granting a Bash tool the agent could call. When the grant
+ * was missing, the agent emitted FIX_DONE based on its own hallucination
+ * of having executed the command — silently corrupting the recovery
+ * decision. Direct `execFile` makes the contract concrete: argv[0] is the
+ * binary, argv[1..] are args, the exit code is ground truth.
  *
- * idleTimeoutSeconds is bounded to 600s by the caller — `pnpm install` on a
- * cold cache can take several minutes, but anything over that is suspicious
- * and we'd rather escalate than hang.
+ * The output (stdout + stderr) is appended to the log file purely for
+ * forensics; it is NOT parsed by the caller — exit code 0 is the sole
+ * success signal. On non-zero exit we surface the tail of stdout/stderr
+ * in `failureReason` so the eventual quarantine message is actionable.
  */
 async function runFixCommand(
   args: RunFixCommandArgs,
 ): Promise<FixCommandOutcome> {
-  const { sandbox, argv, logFilePath, idleTimeoutSeconds, diagnosis } = args;
-  // Quote each argv element with JSON.stringify so spaces and special chars
-  // don't break the shell. We assemble a single command line because the
-  // sandboxed shell needs one string, not argv.
-  const cmdLine = argv.map((a) => JSON.stringify(a)).join(" ");
-
-  const prompt =
-    `You are an environment-fix runner. Your ENTIRE job is to execute the ` +
-    `following shell command exactly once and report whether it exited zero.\n\n` +
-    `Diagnosis: ${diagnosis.cause} (evidence: ${JSON.stringify(diagnosis.evidence)})\n\n` +
-    `Command: ${cmdLine}\n\n` +
-    `Rules:\n` +
-    `  - Execute the command. Do NOT analyse output. Do NOT make additional changes.\n` +
-    `  - On success (exit 0), emit a single line containing only: FIX_DONE\n` +
-    `  - On any failure (non-zero exit, command not found, timeout), emit a ` +
-    `single line containing only: FIX_FAILED\n` +
-    `  - The marker line MUST be the LAST non-empty line of your output.\n`;
-
-  let stdout = "";
-  try {
-    // We use the cheapest tier available via the existing claudeCode helper.
-    // The model name string is illustrative — sandcastle resolves it to the
-    // configured agent. Haiku is the deliberate choice because all the work
-    // is mechanical execution; reasoning would be wasted tokens.
-    const result = await sandbox.run({
-      agent: claudeCode("claude-haiku-4-5"),
-      prompt,
-      maxIterations: 1,
-      idleTimeoutSeconds,
-      name: `recovery-fix-${diagnosis.cause}`,
-      logging: { type: "file", path: logFilePath },
-    });
-    stdout = result.stdout;
-  } catch (err) {
+  const { sandbox, argv, logFilePath, timeoutMs, diagnosis } = args;
+  if (argv.length === 0) {
     return {
       success: false,
       stdout: "",
-      failureReason: `fix command threw before producing a marker: ${(err as Error).message}`,
+      failureReason: "fix argv is empty (planner bug — refusing to run)",
     };
   }
 
-  // Look for FIX_DONE on the last non-empty line; tolerate markdown
-  // decoration since the cheap model occasionally bolds things.
+  const exec = args._execFileP ?? execFileP;
+  const file = argv[0]!;
+  const rest = argv.slice(1);
+
+  let stdout = "";
+  let stderr = "";
   try {
-    const marker = extractMarker(stdout, ["FIX_DONE", "FIX_FAILED"] as const, {
-      mode: "tolerant",
+    const result = await exec(file, [...rest], {
+      cwd: sandbox.worktreePath,
+      env: process.env,
+      // Node's execFile timeout sends SIGTERM; we surface that as a fix
+      // failure (failureReason includes "timeout").
+      timeout: timeoutMs,
     });
-    if (marker === "FIX_DONE") return { success: true, stdout };
-    return {
-      success: false,
+    stdout = result.stdout;
+    stderr = result.stderr;
+
+    // Best-effort log file write — don't fail the fix because logging
+    // failed. The forensic log records argv + exit + stdout/stderr so a
+    // human inspecting a quarantine message later can see what happened.
+    await appendFixLog(logFilePath, {
+      argv,
+      diagnosis: diagnosis.cause,
+      cwd: sandbox.worktreePath,
+      exitCode: 0,
       stdout,
-      failureReason: "fix command emitted FIX_FAILED",
-    };
+      stderr,
+    });
+
+    return { success: true, stdout, stderr };
   } catch (err) {
-    if (err instanceof MarkerNotFoundError) {
-      return {
-        success: false,
-        stdout,
-        failureReason: `fix command produced no FIX_DONE/FIX_FAILED marker (last line: ${JSON.stringify(err.lastLine)})`,
-      };
-    }
-    return {
-      success: false,
-      stdout,
-      failureReason: `fix command marker extraction threw: ${(err as Error).message}`,
+    // execFile rejects with an error carrying `code` (numeric exit), `signal`,
+    // `stdout`, `stderr`, and (for spawn failures) `code: "ENOENT"` etc.
+    const e = err as NodeJS.ErrnoException & {
+      code?: number | string;
+      signal?: string;
+      stdout?: string;
+      stderr?: string;
     };
+    stdout = typeof e.stdout === "string" ? e.stdout : "";
+    stderr = typeof e.stderr === "string" ? e.stderr : "";
+
+    let failureReason: string;
+    if (e.signal === "SIGTERM") {
+      failureReason =
+        `fix command timed out after ${timeoutMs}ms ` +
+        `(argv=${JSON.stringify(argv)})`;
+    } else if (typeof e.code === "string") {
+      // Spawn failure — file not found, permission, etc.
+      failureReason =
+        `fix command failed to spawn (${e.code}): ${e.message}`;
+    } else if (typeof e.code === "number") {
+      failureReason =
+        `fix command exited ${e.code}; ` +
+        `stderr tail: ${tailFor(stderr, 400)}; ` +
+        `stdout tail: ${tailFor(stdout, 400)}`;
+    } else {
+      failureReason = `fix command failed: ${e.message}`;
+    }
+
+    await appendFixLog(logFilePath, {
+      argv,
+      diagnosis: diagnosis.cause,
+      cwd: sandbox.worktreePath,
+      exitCode:
+        typeof e.code === "number"
+          ? e.code
+          : typeof e.code === "string"
+            ? e.code
+            : "unknown",
+      stdout,
+      stderr,
+      failureReason,
+    });
+
+    return { success: false, stdout, stderr, failureReason };
   }
+}
+
+/**
+ * Append a forensic record of one fix-command run to its per-attempt log.
+ * Failures are swallowed — the log is a forensic nice-to-have, not a
+ * load-bearing artefact (the caller never reads it back).
+ */
+async function appendFixLog(
+  logFilePath: string,
+  entry: {
+    argv: readonly string[];
+    diagnosis: HaltCause;
+    cwd: string;
+    exitCode: number | string;
+    stdout: string;
+    stderr: string;
+    failureReason?: string;
+  },
+): Promise<void> {
+  try {
+    await fs.mkdir(path.dirname(logFilePath), { recursive: true });
+    const lines = [
+      `# recovery fix-command run`,
+      `argv: ${JSON.stringify(entry.argv)}`,
+      `cwd: ${entry.cwd}`,
+      `diagnosis: ${entry.diagnosis}`,
+      `exit: ${entry.exitCode}`,
+      ...(entry.failureReason !== undefined
+        ? [`failureReason: ${entry.failureReason}`]
+        : []),
+      `--- stdout ---`,
+      entry.stdout,
+      `--- stderr ---`,
+      entry.stderr,
+      `--- end ---`,
+      "",
+    ].join("\n");
+    await fs.appendFile(logFilePath, lines, "utf8");
+  } catch {
+    // Forensic log only — never fail the fix because logging failed.
+  }
+}
+
+/** Tail-truncate output for inclusion in a one-line failureReason. */
+function tailFor(s: string, max: number): string {
+  if (s.length <= max) return s.trim();
+  return `...${s.slice(s.length - max).trim()}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -749,15 +903,23 @@ interface RunOpusXhighArgs {
   readonly logFilePath: string;
   readonly idleTimeoutSeconds: number;
   readonly attemptName: string;
+  /**
+   * Effort knob for this Opus attempt. Defaults to "xhigh"; "max" is
+   * acceptable too (sandcastle's type allows it). When set to "xhigh" we
+   * cast through `as never` because the published ClaudeCodeOptions type
+   * still lists only "low" | "medium" | "high" | "max" — see jsdoc on the
+   * function body for the rationale.
+   */
+  readonly effort?: "xhigh" | "max";
 }
 
 /**
- * Single Opus attempt with `effort: "xhigh"`. Mirrors `runRecoveryAttempt`
- * but threads the effort option through. The cast to `never` is the only
- * type escape in this file: sandcastle's published ClaudeCodeOptions type
- * still lists `effort: "low" | "medium" | "high" | "max"` while the
- * underlying CLI already accepts `"xhigh"`. Bumping sandcastle will let us
- * delete this cast.
+ * Single Opus attempt with the configured effort (default "xhigh"). Mirrors
+ * `runRecoveryAttempt` but threads the effort option through. The cast to
+ * `never` is the only type escape in this file: sandcastle's published
+ * ClaudeCodeOptions type still lists `effort: "low" | "medium" | "high" |
+ * "max"` while the underlying CLI already accepts `"xhigh"`. Bumping
+ * sandcastle will let us delete this cast.
  */
 async function runOpusXhighAttempt(
   args: RunOpusXhighArgs,
@@ -769,15 +931,20 @@ async function runOpusXhighAttempt(
     logFilePath,
     idleTimeoutSeconds,
     attemptName,
+    effort,
   } = args;
+
+  const effortValue: "xhigh" | "max" = effort ?? "xhigh";
 
   let stdout = "";
   let lastCommit: string | undefined;
   let runCompleted = false;
   try {
     const result = await sandbox.run({
-      // "xhigh" cast through `as never` — see jsdoc above.
-      agent: claudeCode(model, { effort: "xhigh" as never }),
+      // "xhigh" cast through `as never` — see jsdoc above. "max" passes
+      // through cleanly (the published type already allows it) but we
+      // route both through the same cast for symmetry.
+      agent: claudeCode(model, { effort: effortValue as never }),
       prompt,
       maxIterations: 1,
       idleTimeoutSeconds,

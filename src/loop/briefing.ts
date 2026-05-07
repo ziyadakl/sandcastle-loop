@@ -50,6 +50,13 @@ export interface BriefingArgs {
   e2eLog?: string;
   /** Optional override for the implementer template body — for tests. */
   implementerTemplate?: string;
+  /**
+   * Fix #6: tail of progress.txt (last ~50 lines) embedded at the SAME
+   * position in implementer / reviewer / fixer prompts (between the issue
+   * block and the role-specific content). Position is load-bearing for
+   * prompt-cache locality across the iteration's three roles.
+   */
+  progressTail?: string;
 }
 
 export interface FixerBriefingArgs extends BriefingArgs {
@@ -64,6 +71,13 @@ export interface ReviewerBriefingArgs extends BriefingArgs {
   specRequiresPlaywright: boolean;
   /** Driver-side post-commit git-diff: does the commit touch UI files? */
   commitTouchedUi: boolean;
+  /**
+   * Fix #5: when the driver detects output-suppression in the commit body or
+   * progress.txt (e.g. `| grep -v`, `> /dev/null`), it passes the matched
+   * substring here. The reviewer is instructed: non-empty value ⇒ automatic
+   * HARD verdict.
+   */
+  outputSuppressionEvidence?: string | null;
 }
 
 export interface RecoveryBriefingArgs {
@@ -130,6 +144,25 @@ export function formatIssueBlock(issue: IssueRef): string {
 }
 
 /**
+ * Fix #6: shared progress.txt tail block. Emitted at the SAME position
+ * (immediately AFTER the issue block, BEFORE role-specific content) in all
+ * three agent prompts so the prompt-cache prefix stays identical across the
+ * iteration's three roles.
+ *
+ * Returns the empty string when no tail is provided so the prompts collapse
+ * gracefully on a fresh repo with no progress.txt yet.
+ */
+export function formatProgressBlock(progressTail: string | undefined): string {
+  if (!progressTail || progressTail.trim().length === 0) return "";
+  return [
+    "",
+    "=== Sprint progress (last 50 lines of progress.txt — sprint memory) ===",
+    progressTail.trimEnd(),
+    "=== End sprint progress ===",
+  ].join("\n");
+}
+
+/**
  * Build the implementer prompt — analogue of bash `run_implementer()`.
  *
  * Layout (top → bottom):
@@ -147,13 +180,28 @@ export function buildImplementerBriefing(args: BriefingArgs): string {
   });
 
   const issueBlock = formatIssueBlock(args.issue);
+  const progressBlock = formatProgressBlock(args.progressTail);
   const meta = [
     `ITERATION: ${args.iterationNum}`,
     `STORY_ID: ${args.story.id}`,
     `GH_ISSUE: ${args.ghIssue}`,
   ].join("\n");
 
-  return `${issueBlock}\n\n${meta}\n\n${body}\n\n${buildSevenQuestionBlock()}`;
+  // Fix #6: implementer is REQUIRED to append a one-line trace to
+  // progress.txt before emitting STORY_COMPLETE so the next iteration's
+  // reviewer / fixer / implementer have shared sprint memory.
+  const progressInstruction =
+    `=== Sprint memory write (REQUIRED before STORY_COMPLETE) ===\n` +
+    `Before emitting STORY_COMPLETE you MUST append your reasoning to ` +
+    `progress.txt. One line, format:\n` +
+    `  [it=${args.iterationNum}] ${args.story.id} — <one-sentence summary of what you tried and why>\n` +
+    `Use the bash command:\n` +
+    `  echo '[it=${args.iterationNum}] ${args.story.id} — <summary>' >> progress.txt\n` +
+    `(The driver also appends an authoritative line post-commit; your line ` +
+    `is the implementer's own narrative for the next iteration to read.)\n` +
+    `=== End sprint memory write ===`;
+
+  return `${issueBlock}${progressBlock}\n\n${meta}\n\n${body}\n\n${buildSevenQuestionBlock()}\n\n${progressInstruction}`;
 }
 
 /**
@@ -176,9 +224,9 @@ structured output (the JSON envelope). The driver pre-computed some of them
 from the spec; if your answer contradicts the driver's ground truth, you are
 wrong and the reviewer WILL reject the commit.
 
-1) storyType: classify as "ui" | "backend" | "infra" | "docs" — based on the
+1) storyType: classify as "ui" | "backend-only" | "infra" — based on the
    issue spec and what files your diff touched. UI stories require playwright
-   per STEP 6/9.
+   per STEP 6/9. (The schema accepts EXACTLY these three values.)
 
 2) e2eRequired: true|false — did the spec REQUIRE a playwright test? The
    driver pre-computed this by grepping the issue body for "playwright test";
@@ -188,12 +236,14 @@ wrong and the reviewer WILL reject the commit.
    in this iteration (regardless of pass/fail)? If e2eRequired is true and
    this is false, you have NOT completed the story.
 
-4) testCommandUsed: the EXACT shell command you ran for the e2e (or the empty
-   string if e2eActuallyRan=false). Verbatim — no paraphrasing.
+4) testCommandUsed: the EXACT shell command you ran for the e2e (a JSON
+   string), or JSON null if e2eActuallyRan=false. Verbatim — no paraphrasing,
+   no empty string. Use null, not "".
 
 5) e2eAssertionLine: a line from /tmp/ralph-e2e-it{N}.log that PROVES the
    test reached its assertion (must start with ✓ / ✔ / PASS, contain
-   "expect(", or be the test description text). Empty string if no e2e ran.
+   "expect(", or be the test description text). JSON null if no e2e ran. Use
+   null, not "".
 
 6) outputNotFiltered: true|false — did you run playwright | tee WITHOUT
    inserting any grep/sed/awk/--quiet/--reporter=dot/redirection that would
@@ -204,7 +254,9 @@ wrong and the reviewer WILL reject the commit.
    pre-condition setup)? "1 passed" with no specific test detail = false.
 
 These 7 fields are REQUIRED by the V1-A ImplementerOutput schema; the parser
-will reject the envelope if any are missing.
+will reject the envelope if any are missing. The string fields use JSON null
+(not the empty string "") as the absent-value sentinel — the schema's
+.min(1) constraint rejects "".
 === End structural certification check ===`;
 }
 
@@ -220,21 +272,30 @@ will reject the envelope if any are missing.
  */
 export function buildReviewerBriefing(args: ReviewerBriefingArgs): string {
   const issueBlock = formatIssueBlock(args.issue);
+  const progressBlock = formatProgressBlock(args.progressTail);
   const specReqPw = args.specRequiresPlaywright ? "yes" : "no";
   const uiTouched = args.commitTouchedUi ? "yes" : "no";
+  const suppressionEvidence =
+    typeof args.outputSuppressionEvidence === "string" &&
+    args.outputSuppressionEvidence.length > 0
+      ? args.outputSuppressionEvidence
+      : "";
   const e2eAttachment = args.e2eLog
     ? `\n=== Playwright e2e log (/tmp/ralph-e2e-it${args.iterationNum}.log) ===\n${args.e2eLog}\n=== End e2e log ===\n`
     : "";
 
-  return `${issueBlock}
+  return `${issueBlock}${progressBlock}
 ${e2eAttachment}
 Use the superpowers:requesting-code-review skill to review commit ${args.lastSha} on branch ${args.branch} (iteration ${args.iterationNum}, GitHub issue #${args.ghIssue}). The issue spec is pre-loaded above — do NOT call 'gh issue view' yourself, work from that text. Check both spec fit (does the diff implement the issue's acceptance criteria?) and code quality.
 
 DRIVER GROUND TRUTH (authoritative, can't be overridden by implementer self-attestation):
 - SPEC_REQUIRES_PLAYWRIGHT=${specReqPw} — driver pre-grepped issue spec for 'playwright test'
 - COMMIT_TOUCHED_UI=${uiTouched} — driver post-commit git-diff'd for .tsx/.jsx/.vue under apps/
+- OUTPUT_SUPPRESSION_EVIDENCE=${JSON.stringify(suppressionEvidence)} — driver scanned the commit body and progress.txt for output-suppression patterns. If non-empty, this is automatic HARD.
 
 If COMMIT_TOUCHED_UI=yes, the commit modified UI surface files — the certification's first checkbox MUST be [x] regardless of what the implementer self-attests. If COMMIT_TOUCHED_UI=no AND SPEC_REQUIRES_PLAYWRIGHT=no, the story is genuinely backend-only and N/A on e2e.
+
+OUTPUT-SUPPRESSION CHECK (Fix #5 — driver-attested ground truth): if OUTPUT_SUPPRESSION_EVIDENCE is non-empty, this is an automatic HARD finding regardless of any other evidence. Emit: 'HARD: implementer filtered the playwright output before tee, suppressing the bail signals the reviewer needs. Driver matched: <quote OUTPUT_SUPPRESSION_EVIDENCE>. Re-run the spec's command verbatim.' Search patterns the driver looks for: '| grep -v', '| sed', '| awk', '--reporter=dot' (when not in spec), '--quiet', '> /dev/null', '2>/dev/null', '| head -N', '| tail -N'.
 
 Use this 4-tier classification per concern:
   HARD — must fix, story can't ship: real bug, broken test, missing required behavior, security issue, data-loss risk.
@@ -248,6 +309,15 @@ CRITICAL — execution-evidence check (do this FIRST, before reviewing code qual
   3. Does the test name match the story's behavior?
   4. Did the test reach its assertion (no auth-redirect, no 'skipped', no bail signals)?
   5. Does the certification block in the commit body have all checkboxes [x] when SPEC_REQUIRES_PLAYWRIGHT=yes or COMMIT_TOUCHED_UI=yes?
+
+EVIDENCE QUOTE — STRICT verification of the certification's e2eAssertionLine field. The quoted line MUST satisfy ALL of:
+  - Non-empty AND not the literal placeholder '<paste line>' or '<the quoted line>'.
+  - Starts with '✓' / '✔' / 'PASS' / 'PASSED' (a passing-test marker from playwright's reporter), OR contains 'expect(' (an explicit assertion call), OR contains the test description text from the test file.
+  - Actually appears in /tmp/ralph-e2e-it${args.iterationNum}.log.
+  - Is NOT one of these forbidden generic lines: 'Running N tests', 'using N worker', 'Workers:', 'Slow test file', '[chromium]' alone (without a leading ✓), a bare URL line, 'passed' / 'failed' / 'all green' on its own.
+If ANY of the above fails, emit 'HARD: certification evidence is fabricated, generic, or doesn't prove the test reached its assertion. <paste the offending line and the rule it violated>.'
+
+CROSS-CHECK CERTIFICATION VS BAIL SIGNALS. If all checkboxes are [x] BUT the playwright log shows bail signals ('redirect to /login', 'Sign in', '401', 'Unauthorized', 'skipped', 'pending', 'auth blocked', 'auth path failed', 'pending human apply', 'migration not applied', 'pre-existing', or a bare 'N passed' summary with no '✓ TestName' line above it), that's 'HARD: certification claims feature was verified but playwright log shows the test bailed. Implementer falsified the certification.' Note: legitimate auth-flow tests (testing the /login page itself) WILL contain 'Sign in' / '401' — if SPEC_REQUIRES_PLAYWRIGHT=yes AND the story spec is explicitly about auth, treat those tokens as legitimate; otherwise treat as bail.
 
 If the certification block is missing or the first checkbox conflicts with driver ground truth, emit HAS_BLOCKERS with a HARD finding.
 
@@ -267,11 +337,12 @@ The marker MUST be on its own line at the end of your output, with no surroundin
  */
 export function buildFixerBriefing(args: FixerBriefingArgs): string {
   const issueBlock = formatIssueBlock(args.issue);
+  const progressBlock = formatProgressBlock(args.progressTail);
   const reviewerSection = args.prevReviewerText
     ? `\n=== Prior reviewer findings ===\n${args.prevReviewerText}\n=== End prior reviewer findings ===\n`
     : "";
 
-  return `${issueBlock}
+  return `${issueBlock}${progressBlock}
 ${reviewerSection}
 Use the superpowers:receiving-code-review skill to judge the most recent code review on commit ${args.lastSha} (iteration ${args.iterationNum}, fix attempt ${args.attempt}, GitHub issue #${args.ghIssue}). Fix every HARD finding (must-fix bugs / blockers) and every MEDIUM finding (real concerns that won't fail tests but matter). Skip SOFT / cosmetic findings entirely — DO NOT touch variable names, formatting, comment phrasing, or 'prefer this pattern' suggestions.
 

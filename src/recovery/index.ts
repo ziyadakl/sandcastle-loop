@@ -19,6 +19,7 @@ export type {
   HaltContext,
   RecoveryLadderConfig,
   RecoveryLadderResult,
+  RunRecoveryDiagnosisTestSeams,
 } from "./ladder.js";
 
 export { diagnoseHaltCause } from "./diagnose.js";
