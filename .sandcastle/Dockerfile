@@ -93,7 +93,27 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 # field requests; if a future target project pins a different version,
 # corepack still falls back to downloading on demand.
 RUN corepack prepare pnpm@10.19.0 --activate
+
+# ---------------------------------------------------------------------------
+# Playwright — system libraries chromium needs to start (libnss, libdrm,
+# libgbm, libfribidi, libharfbuzz, libthai, libdatrie, libgraphite2, etc).
+# Without these the agent gets shipped a chromium binary it can't actually
+# launch — repeatedly observed during the 2026-05-08 issue #83 smoke where
+# the implementer hand-extracted .deb files at runtime to satisfy ldd.
+# `playwright install-deps` knows the exact list; using it keeps the image
+# in lockstep with whatever playwright version the target project pins.
+# ---------------------------------------------------------------------------
+RUN npx -y playwright@latest install-deps chromium \
+  && rm -rf /var/lib/apt/lists/*
+
 USER agent
+
+# Pre-cache the chromium binary into /home/agent/.cache/ms-playwright so each
+# new sandbox starts ready instead of downloading ~120 MB on first
+# `playwright test`. Pinned to playwright@latest; if the target project's
+# pinned version differs, playwright re-resolves and may re-download — but
+# most projects track current playwright closely.
+RUN npx -y playwright@latest install chromium
 
 # ---------------------------------------------------------------------------
 # Sandcastle bind-mounts the worktree at /workspace and overrides cwd, so we
