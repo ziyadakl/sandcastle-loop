@@ -1,11 +1,11 @@
 {
-  "name": "ralph-ts",
+  "name": "sandcastle-loop",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "TypeScript autonomous Ralph loop on @ai-hero/sandcastle",
+  "description": "TypeScript autonomous coding loop on @ai-hero/sandcastle",
   "bin": {
-    "ralph": ".sandcastle/main.mts"
+    "sandcastle-loop": ".sandcastle/main.mts"
   },
   "scripts": {
     "build": "tsc -p .",

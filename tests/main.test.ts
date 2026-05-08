@@ -262,7 +262,7 @@ function plannerStdout(issues: { id: string; title: string; branch: string }[]):
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("ralph main.mts — happy path", () => {
+describe("sandcastle-loop main.mts — happy path", () => {
   it("ships a single issue: planner → claim → implementer → review ALL_CLEAR → markDone", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
@@ -315,7 +315,7 @@ describe("ralph main.mts — happy path", () => {
   });
 });
 
-describe("ralph main.mts — reviewer ladder", () => {
+describe("sandcastle-loop main.mts — reviewer ladder", () => {
   it("fixer-sonnet then re-review ALL_CLEAR ships the issue", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
@@ -395,7 +395,7 @@ describe("ralph main.mts — reviewer ladder", () => {
   });
 });
 
-describe("ralph main.mts — recovery ladder", () => {
+describe("sandcastle-loop main.mts — recovery ladder", () => {
   it("implementer error → recovery-sonnet RECOVERY_COMPLETE → markDone, no quarantine", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
@@ -469,7 +469,7 @@ describe("ralph main.mts — recovery ladder", () => {
   });
 });
 
-describe("ralph main.mts — circuit breaker", () => {
+describe("sandcastle-loop main.mts — circuit breaker", () => {
   it("trips after consecutive-failure-limit quarantines, posts comment on last failing issue, exits 1", async () => {
     const b = buildDeps();
     // One iteration with three concurrent issues, all of which quarantine.
@@ -507,7 +507,7 @@ describe("ralph main.mts — circuit breaker", () => {
   });
 });
 
-describe("ralph main.mts — one-shot --issue mode", () => {
+describe("sandcastle-loop main.mts — one-shot --issue mode", () => {
   it("skips the planner and uses the supplied issue number directly", async () => {
     const b = buildDeps();
     // No planner enqueued — if the orchestrator calls planner the popOutcome
@@ -534,7 +534,7 @@ describe("ralph main.mts — one-shot --issue mode", () => {
   });
 });
 
-describe("ralph main.mts — parsePlan", () => {
+describe("sandcastle-loop main.mts — parsePlan", () => {
   it("parses a well-formed plan", () => {
     const issues = parsePlan(
       `<plan>{"issues":[{"id":"42","title":"hi","branch":"agent/x"}]}</plan>`,
@@ -561,7 +561,7 @@ describe("ralph main.mts — parsePlan", () => {
   });
 });
 
-describe("ralph main.mts — parseRalphArgs", () => {
+describe("sandcastle-loop main.mts — parseRalphArgs", () => {
   it("--help sets showHelp", () => {
     const r = parseRalphArgs(["--help"]);
     expect(r.showHelp).toBe(true);

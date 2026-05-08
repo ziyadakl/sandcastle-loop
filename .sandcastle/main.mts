@@ -158,10 +158,10 @@ export interface RunMainResult {
 // ---------------------------------------------------------------------------
 
 const HELP_TEXT = `\
-ralph — autonomous parallel-planner orchestrator
+sandcastle-loop — autonomous parallel-planner orchestrator
 
 Usage:
-  ralph --iterations N [options]
+  sandcastle-loop --iterations N [options]
   npx tsx .sandcastle/main.mts --iterations N [options]
 
 Required:
@@ -866,7 +866,7 @@ async function runIssuePipeline(
     const ladder = await runReviewerLadder(sandbox, ctx, postSha);
 
     if (ladder.marker === "ALL_CLEAR") {
-      const summary = `[issue=${ctx.issueNumber}] shipped via ralph (commit ${ladder.finalCommitSha}, branch ${ctx.issue.branch})`;
+      const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${ladder.finalCommitSha}, branch ${ctx.issue.branch})`;
       await ctx.deps.markDone(ctx.issueNumber, summary);
       return {
         status: "ok",
@@ -904,7 +904,7 @@ async function runIssuePipeline(
     if (recoveryMarker === "RECOVERY_COMPLETE") {
       // Recovery says it patched the issue. Treat as success — the actual
       // commit landed inside recovery's own run.
-      const summary = `[issue=${ctx.issueNumber}] recovered and shipped via ralph (branch ${ctx.issue.branch})`;
+      const summary = `[issue=${ctx.issueNumber}] recovered and shipped via sandcastle-loop (branch ${ctx.issue.branch})`;
       try {
         await ctx.deps.markDone(ctx.issueNumber, summary);
         return { status: "ok", finalMarker: "RECOVERY_COMPLETE" };
@@ -975,7 +975,7 @@ export async function runMain(
   try {
     for (let it = 1; it <= args.iterations; it++) {
       if (shuttingDown) break;
-      deps.log(`\n=== ralph iteration ${it}/${args.iterations} ===`);
+      deps.log(`\n=== sandcastle-loop iteration ${it}/${args.iterations} ===`);
       iterationsRun = it;
 
       // Phase 1: planner (or one-shot bypass)
@@ -1102,13 +1102,13 @@ export async function runMain(
       // Circuit breaker.
       if (consecutiveFailures >= args.consecutiveFailureLimit) {
         deps.logError(
-          `RALPH circuit breaker tripped: ${consecutiveFailures} consecutive failure(s) ≥ limit ${args.consecutiveFailureLimit}`,
+          `Circuit breaker tripped: ${consecutiveFailures} consecutive failure(s) ≥ limit ${args.consecutiveFailureLimit}`,
         );
         if (lastFailingIssue !== undefined) {
           try {
             await deps.comment(
               lastFailingIssue,
-              `RALPH circuit breaker tripped after ${consecutiveFailures} consecutive failures. ` +
+              `sandcastle-loop circuit breaker tripped after ${consecutiveFailures} consecutive failures. ` +
                 `Stopping the loop. Investigate before re-queuing this or other issues.`,
             );
           } catch (err) {
