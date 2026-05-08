@@ -1265,6 +1265,31 @@ export async function runMain(
           `merge phase threw: ${(err as Error).message} — continuing to next iteration`,
         );
       }
+
+      // Phase 4: post-merge review (Opus). Best-effort visibility check
+      // over the merged result on feat/agent-budgeting. Failures are
+      // logged only — they do NOT break the iteration.
+      try {
+        await deps.run({
+          name: "post-merge-reviewer",
+          maxIterations: 1,
+          model: "claude-opus-4-7",
+          promptFile: "./.sandcastle/post-merge-review-prompt.md",
+          idleTimeoutSeconds: args.reviewerTimeoutSec,
+          promptArgs: {
+            ITERATION: String(it),
+            MERGE_DEPTH: String(mergedBranches.length),
+            BRANCHES: mergedBranches.map((b) => `- ${b.branch}`).join("\n"),
+            ISSUES: mergedBranches
+              .map((i) => `- #${i.id}: ${i.title}`)
+              .join("\n"),
+          },
+        });
+      } catch (err) {
+        deps.logError(
+          `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
+        );
+      }
     }
 
     // Out of iterations.
