@@ -76,9 +76,15 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # Affinity-tracker and similar monorepos use pnpm's workspace:* protocol
 # which npm refuses to parse. Enabling corepack means our onSandboxReady
 # hook can run `pnpm install` without an extra `npm install -g pnpm` step.
+#
+# COREPACK_ENABLE_DOWNLOAD_PROMPT=0 silences the interactive "about to
+# download pnpm@X" prompt — without this, the merge phase fails non-
+# interactively when the target's `package.json` pins a packageManager
+# version corepack hasn't seen before.
 # ---------------------------------------------------------------------------
 USER root
 RUN corepack enable
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 USER agent
 
 # ---------------------------------------------------------------------------
