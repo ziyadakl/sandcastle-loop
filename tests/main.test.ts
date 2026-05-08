@@ -199,6 +199,7 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     branch: "feature/work",
     label: "ready-for-agent",
     maxConcurrent: 3,
+    imageName: "sandcastle:loop",
     implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
     fixerModel: "claude-sonnet-4-6",

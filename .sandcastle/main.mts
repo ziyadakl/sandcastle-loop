@@ -77,6 +77,14 @@ export interface RalphArgs {
   consecutiveFailureLimit: number;
   logFile?: string;
   dryRun: boolean;
+  /**
+   * Docker image to run the sandbox in. Defaults to `sandcastle:loop`.
+   * sandcastle's `docker()` factory would otherwise auto-derive the image
+   * name from the worktree directory name (e.g. `sandcastle:aft-sl-it1`),
+   * which doesn't match the image we built via
+   * `sandcastle docker build-image --image-name sandcastle:loop`.
+   */
+  imageName: string;
 }
 
 /**
@@ -186,6 +194,8 @@ Optional:
   --consecutive-failure-limit N Default: 3.
   --log-file PATH           Tee output to this file.
   --dry-run                 Skip claim/quarantine/markDone side effects.
+  --image-name NAME         Docker image to run sandboxes in.
+                            Default: sandcastle:loop.
   --help                    Show this message and exit 0.
 
 Exit codes:
@@ -228,6 +238,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "consecutive-failure-limit": { type: "string" },
       "log-file": { type: "string" },
       "dry-run": { type: "boolean" },
+      "image-name": { type: "string" },
       "help": { type: "boolean" },
     },
   });
@@ -288,6 +299,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       ) ?? 3,
     logFile: values["log-file"],
     dryRun: values["dry-run"] === true,
+    imageName: values["image-name"] ?? "sandcastle:loop",
   };
   return { args, showHelp: false };
 }
@@ -339,6 +351,7 @@ function defaultArgs(): RalphArgs {
     recoveryTimeoutSec: 1800,
     consecutiveFailureLimit: 3,
     dryRun: false,
+    imageName: "sandcastle:loop",
   };
 }
 
@@ -475,7 +488,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async run(spec) {
       const result = await sandcastle.run({
         hooks,
-        sandbox: docker(spec.mounts ? { mounts: [...spec.mounts] } : undefined),
+        sandbox: docker({ imageName: args.imageName, ...(spec.mounts ? { mounts: [...spec.mounts] } : {}) }),
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
@@ -489,7 +502,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker(spec.mounts ? { mounts: [...spec.mounts] } : undefined),
+        sandbox: docker({ imageName: args.imageName, ...(spec.mounts ? { mounts: [...spec.mounts] } : {}) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
