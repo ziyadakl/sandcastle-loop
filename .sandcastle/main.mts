@@ -25,7 +25,7 @@
 
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
@@ -419,6 +419,49 @@ export function preflight(args: RalphArgs, opts: {
 // atomic-rename writes; cause "Device or resource busy" failures).
 // ---------------------------------------------------------------------------
 
+/**
+ * Parse a target project's `.env.local` into a Record so the orchestrator
+ * can pass real Supabase / Postgres / API-key values into the sandbox via
+ * docker `-e`. Without this, target repos like affinity-tracker that ship
+ * `.env.local` as a symlink to a host-only path see broken paths inside
+ * the container, the dev-server fails to start (POSTGRES_URL undefined),
+ * and the implementer HALTs on every UI story.
+ *
+ * Format support: KEY=VALUE per line, `#` comments, blank lines skipped,
+ * single- or double-quoted values stripped. Multi-line values are not
+ * supported. Returns an empty object if the file is missing.
+ *
+ * Security note: every key in `.env.local` reaches the sandbox process
+ * environment. Don't put credentials there that you don't want the agent
+ * to see / log.
+ */
+function readEnvLocal(repoRoot: string): Record<string, string> {
+  const envPath = path.resolve(repoRoot, ".env.local");
+  let raw: string;
+  try {
+    raw = readFileSync(envPath, "utf-8");
+  } catch {
+    return {};
+  }
+  const env: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (key) env[key] = val;
+  }
+  return env;
+}
+
 function buildGitEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   const tryGet = (key: string): string | undefined => {
@@ -521,7 +564,14 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // Read git user identity from the host at CLI startup. The container's
   // safe.directory will be set up by sandcastle itself; user.name/user.email
   // come through as env vars instead of via a mount.
+  //
+  // Also read the target project's .env.local so the dev-server / playwright
+  // can find POSTGRES_URL / SUPABASE creds / etc. inside the sandbox.
+  // gitEnv keys win on collision (don't let a stray .env.local override
+  // the orchestrator's git identity).
   const gitEnv = buildGitEnv();
+  const projectEnv = readEnvLocal(args.repoRoot);
+  const containerEnv = { ...projectEnv, ...gitEnv };
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -545,7 +595,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async run(spec) {
       const result = await sandcastle.run({
         hooks,
-        sandbox: docker({ imageName: args.imageName, env: gitEnv, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: containerEnv, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
@@ -560,7 +610,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, env: gitEnv, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: containerEnv, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
