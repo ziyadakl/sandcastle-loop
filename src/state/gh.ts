@@ -101,19 +101,29 @@ async function withRetry<T>(
  * a programmer-error validation throw raised by our own argument-checking
  * code. Validation errors are deterministic — retrying just wastes time.
  *
- * We tag every internal validation throw with the function name prefix
- * (e.g. `transitionLabel:`), so a substring check is reliable.
+ * Convention: every internal validation throw in this module starts with the
+ * function name followed by either `:` (no issue number context) or `(N):`
+ * (with the issue number for diagnostic context). Examples:
+ *   - `transitionLabel: invalid issueNum '0'`
+ *   - `quarantineViaLabel: invalid issueNum '-1'`
+ *   - `fetchIssueLabels(42): unexpected gh output shape: ...`
+ *
+ * The regex below matches that shape: a leading identifier (letter, then
+ * letters/digits) followed by either `:` or `(<digits>):`. Anything that
+ * matches is treated as a deterministic validation throw (NOT retried). This
+ * is convention-based instead of prefix-listed so newly-added validation
+ * throws inherit the non-retry behavior automatically — Wave 5 / LOW-1
+ * extended this from a hand-maintained allow-list (which omitted
+ * `fetchIssueLabels(N):` and would have wasted ~6s retrying a deterministic
+ * shape-mismatch on every `transitionLabel("*", X)` failure).
  */
-function isRetryableGhError(err: unknown): boolean {
+const VALIDATION_THROW_PREFIX = /^[a-zA-Z][a-zA-Z0-9]*(:|\(\d+\):)/;
+
+export function isRetryableGhError(err: unknown): boolean {
   if (!(err instanceof Error)) return true;
-  // Validation throws from THIS module — non-retryable.
-  if (
-    err.message.startsWith("transitionLabel:") ||
-    err.message.startsWith("closeIssue:") ||
-    err.message.startsWith("getIssueBody:") ||
-    err.message.startsWith("postIssueComment:") ||
-    err.message.startsWith("listIssuesByLabel:")
-  ) {
+  // Validation throws from THIS module — non-retryable. Match against the
+  // function-name-prefix convention (see VALIDATION_THROW_PREFIX above).
+  if (VALIDATION_THROW_PREFIX.test(err.message)) {
     return false;
   }
   return true;

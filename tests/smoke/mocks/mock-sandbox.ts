@@ -298,6 +298,16 @@ export interface MockSandbox {
    * increments BEFORE the stub throws.
    */
   readonly sandboxRunCalls: number;
+  /**
+   * Wave 5 / LOW-3 — every prompt the recovery ladder fed into the stub's
+   * `sandbox.run({ prompt })`. The recovery ladder's `buildRecoveryPrompt`
+   * interpolates `halt.reason` (the implementer's error message) verbatim,
+   * so smoke variants that pin the throw path can assert this array
+   * carries the expected reason substring (e.g. `envelope failed to
+   * parse`). Pushed BEFORE the stub throws so the assertion is observable
+   * even when the run aborts immediately.
+   */
+  readonly sandboxRunPrompts: readonly string[];
   /** Wipe call history — useful when a single mock spans multiple smoke variants. */
   reset(): void;
 }
@@ -308,6 +318,7 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
   const callsMutable: MockCallRecord[] = [];
   let commitCounter = 0;
   let sandboxRunCallCount = 0;
+  const sandboxRunPromptsMutable: string[] = [];
 
   const nextCommitSha = (): string => {
     commitCounter += 1;
@@ -387,6 +398,14 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
         // through _agentRunner) can assert the ladder fired even though the
         // stub never returns a real result.
         sandboxRunCallCount += 1;
+        // Wave 5 / LOW-3 — capture the prompt verbatim. The recovery
+        // ladder's `buildRecoveryPrompt` interpolates `halt.reason` (the
+        // implementer's error message) into the prompt, so this gives
+        // smoke variants a load-bearing place to assert WHICH halt cause
+        // routed through recovery. Use a defensive `String(...)` so a
+        // future SandboxRunOptions tweak (prompt: string | something) does
+        // not silently store an object.
+        sandboxRunPromptsMutable.push(String(_o.prompt ?? ""));
         // The loop should always be using _agentRunner for per-role agent
         // calls — reaching here means EITHER someone forgot to wire the
         // seam, OR (intentionally) the recovery ladder was invoked. Either
@@ -417,10 +436,14 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
     get sandboxRunCalls(): number {
       return sandboxRunCallCount;
     },
+    get sandboxRunPrompts(): readonly string[] {
+      return sandboxRunPromptsMutable;
+    },
     reset(): void {
       callsMutable.length = 0;
       commitCounter = 0;
       sandboxRunCallCount = 0;
+      sandboxRunPromptsMutable.length = 0;
     },
   };
 }

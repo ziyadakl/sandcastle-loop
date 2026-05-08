@@ -71,6 +71,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import {
+  isRetryableGhError,
   listIssuesByLabel,
   listReadyIssues,
   transitionLabel,
@@ -278,5 +279,70 @@ describe("Wave 3 / M2 — pagination-cap WARN helper", () => {
     );
 
     stderrSpy.mockRestore();
+  });
+});
+
+describe("Wave 5 / LOW-1 — isRetryableGhError convention-based prefix check", () => {
+  // The pre-Wave-5 implementation hand-listed five function-name prefixes
+  // (`transitionLabel:`, `closeIssue:`, `getIssueBody:`, `postIssueComment:`,
+  // `listIssuesByLabel:`). `fetchIssueLabels(N):` was missing, so a
+  // deterministic shape-mismatch raised inside `transitionLabel("*", X)`'s
+  // retry body would burn ~6s of backoff before propagating. The convention-
+  // based regex (`^[a-zA-Z][a-zA-Z0-9]*(:|\(\d+\):)`) covers every existing
+  // throw shape AND any new validation throw that follows the convention.
+
+  it("returns false for fetchIssueLabels(N): ... — the LOW-1 regression", () => {
+    const err = new Error(
+      "fetchIssueLabels(42): unexpected gh output shape: invalid type at ...",
+    );
+    expect(isRetryableGhError(err)).toBe(false);
+  });
+
+  it("returns false for the historical hardcoded prefixes (transitionLabel:, closeIssue:, getIssueBody:, postIssueComment:, listIssuesByLabel:)", () => {
+    const cases = [
+      "transitionLabel: invalid issueNum '0'",
+      "closeIssue: invalid issueNum '0'",
+      "getIssueBody: invalid issueNum '0'",
+      "postIssueComment: invalid issueNum '0'",
+      "listIssuesByLabel: 'label' must be a non-empty string",
+    ];
+    for (const msg of cases) {
+      expect(isRetryableGhError(new Error(msg))).toBe(false);
+    }
+  });
+
+  it("returns false for newly-covered (N): patterns — claimViaLabel, markDoneViaLabel, quarantineViaLabel", () => {
+    const cases = [
+      "claimViaLabel: invalid issueNum '-1'",
+      "markDoneViaLabel: invalid issueNum '-1'",
+      "quarantineViaLabel: invalid issueNum '-1'",
+      // The (N): variant — what fetchIssueLabels actually emits.
+      "fetchIssueLabels(7): failed to parse gh output as JSON: unexpected token",
+      "listReadyIssues: failed to parse gh output as JSON: unexpected token",
+    ];
+    for (const msg of cases) {
+      expect(isRetryableGhError(new Error(msg))).toBe(false);
+    }
+  });
+
+  it("returns true for real runtime gh failures (transient errors) — the retry path must still fire", () => {
+    const cases = [
+      "gh issue edit 42 failed (code=503): transient API error",
+      "gh API 502 (transient)",
+      "ETIMEDOUT",
+      "connect ECONNREFUSED 127.0.0.1:443",
+      "spawn gh ENOENT",
+    ];
+    for (const msg of cases) {
+      expect(isRetryableGhError(new Error(msg))).toBe(true);
+    }
+  });
+
+  it("returns true for non-Error values (defensive — preserves prior behavior)", () => {
+    expect(isRetryableGhError("string err")).toBe(true);
+    expect(isRetryableGhError(undefined)).toBe(true);
+    expect(isRetryableGhError(null)).toBe(true);
+    expect(isRetryableGhError(42)).toBe(true);
+    expect(isRetryableGhError({ message: "foo:bar" })).toBe(true);
   });
 });

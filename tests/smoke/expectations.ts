@@ -562,6 +562,54 @@ function checkInvalidJson_claimViaLabel(
   return null;
 }
 
+/**
+ * Wave 5 / LOW-3 — pin the throw path that routed this iteration into
+ * recovery.
+ *
+ * Pre-Wave-5 the variant verified the no-ship / quarantine / no-close
+ * outcomes but never asserted the SPECIFIC reason text. If a future change
+ * makes `agents.ts:319-325` fire for a different reason (or stops firing
+ * but the iteration still halts via some other implementer-error), all 10
+ * checks would still pass — losing the load-bearing claim that the
+ * STORY_COMPLETE-with-bad-envelope path is what's exercised.
+ *
+ * `runRecoveryDiagnosisOrEscalate` builds its agent prompt by interpolating
+ * `halt.reason` (the implementer's error message) into the recovery prompt
+ * template. The mock sandbox captures every prompt it receives via
+ * `sandboxRunPrompts`. Asserting that at least one captured prompt carries
+ * the substring `envelope failed to parse` proves agents.ts:319-325 fired
+ * AND its message survived the implementer-error -> recovery wiring intact.
+ *
+ * Why prompts (not haltReason): the iteration's final `haltReason` is
+ * composed by the diagnose-first ladder as
+ *   `diagnosis: <cause>; fix tried: <cmd>; opus also halted: <inner>`
+ * where `<inner>` is the mock sandbox stub's own throw message ("MockSandbox
+ * stub.run() invoked..."), not the original implementer error. The
+ * prompts array is the closest observable carrier of the original throw
+ * reason in this stubbed environment.
+ */
+function checkInvalidJson_recoveryReasonPinned(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  const prompts = ctx.sandbox.sandboxRunPrompts;
+  if (prompts.length === 0) {
+    return `Recovery ladder fed 0 prompts to sandbox.run() — cannot verify the throw-path reason.`;
+  }
+  const NEEDLE = "envelope failed to parse";
+  const carrying = prompts.filter((p) => p.includes(NEEDLE));
+  if (carrying.length === 0) {
+    // Surface a small slice of the first prompt so a regression here is
+    // diagnosable without re-running with extra logging.
+    const head = (prompts[0] ?? "").slice(0, 240);
+    return (
+      `Expected at least one recovery-agent prompt to carry the substring ` +
+      `'${NEEDLE}' (proves agents.ts:319-325 fired with the bad-JSON envelope). ` +
+      `Got ${prompts.length} prompt(s); first prompt head: ${JSON.stringify(head)}`
+    );
+  }
+  return null;
+}
+
 export async function runInvalidJsonExpectations(
   ctx: InvalidJsonExpectationContext,
 ): Promise<ExpectationReport> {
@@ -611,6 +659,10 @@ export async function runInvalidJsonExpectations(
     {
       name: "issue NOT closed (gh issue close was never invoked)",
       fn: () => checkInvalidJson_issueNotClosed(ctx),
+    },
+    {
+      name: "recovery prompt carries 'envelope failed to parse' (Wave 5 / LOW-3 — pins agents.ts throw path)",
+      fn: () => checkInvalidJson_recoveryReasonPinned(ctx),
     },
   ];
 

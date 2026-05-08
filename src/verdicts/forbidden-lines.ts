@@ -63,15 +63,22 @@ export const GENERIC_ASSERTION_LINE_PATTERNS: readonly ForbiddenLinePattern[] = 
   (line: string): boolean =>
     /<paste[^>]*>/i.test(line) || /<the\s+quoted\s+line>/i.test(line),
 
-  // 5. `using N worker` / `using N workers` (often appears alone on a line
-  //    in playwright output banners).
-  /\busing\s+\d+\s+workers?\b/i,
+  // 5. `using N worker` / `using N workers` — playwright banner. Anchored to
+  //    start-of-line (Wave 5 / LOW-2) so it only matches banner lines, not
+  //    legitimate test descriptions like `✓ should distribute load when
+  //    using 4 workers` (which would have been false-positive rejected by
+  //    the unanchored pre-Wave-5 pattern).
+  /^\s*using\s+\d+\s+workers?\b/i,
 
   // 6. `Workers:` banner line (e.g. `Workers: 4`).
   /^\s*Workers\s*:/i,
 
-  // 7. `Slow test file` (playwright slow-test report banner).
-  /\bSlow\s+test\s+file\b/i,
+  // 7. `Slow test file` (playwright slow-test report banner). Anchored to
+  //    start-of-line (Wave 5 / LOW-2) for the same reason as pattern 5 —
+  //    a real passing assertion line whose description happens to contain
+  //    this phrase (e.g. `✓ should warn on slow test file detection`) must
+  //    NOT be classified as generic.
+  /^\s*Slow\s+test\s+file\b/i,
 
   // 8. `[chromium]` alone (no leading ✓ / ✔ / PASS / PASSED / OK marker —
   //    those would prove the test actually passed). We accept whitespace

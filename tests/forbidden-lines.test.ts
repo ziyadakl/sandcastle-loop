@@ -44,10 +44,12 @@ describe("isGenericAssertionLine — forbidden patterns (parametric)", () => {
     { line: "<the quoted line>", rule: "<the quoted line> placeholder" },
     { line: "✓ login: <paste line>", rule: "<paste …> embedded" },
 
-    // 5. `using N worker` / `using N workers` (case-insensitive)
+    // 5. `using N worker` / `using N workers` (case-insensitive). Wave 5 /
+    //    LOW-2 anchored this to start-of-line so embedded mid-line matches
+    //    no longer count as banners — see counter-cases below.
     { line: "using 1 worker", rule: "using N worker" },
     { line: "Using 4 workers", rule: "using N workers" },
-    { line: "playwright using 2 workers", rule: "using N workers embedded" },
+    { line: "  using 4 workers", rule: "using N workers (leading ws)" },
 
     // 6. `Workers:` banner
     { line: "Workers: 4", rule: "Workers banner" },
@@ -101,6 +103,12 @@ describe("isGenericAssertionLine — counter-cases (valid lines)", () => {
     // [chromium] WITH a leading checkmark — that's a real passing-test line
     "✓ [chromium] login flow completes",
     "PASS [chromium] should render",
+    // Wave 5 / LOW-2 — patterns 5 and 7 are now anchored to start-of-line
+    // (`/^\s*using\s+\d+\s+workers?\b/i` and `/^\s*Slow\s+test\s+file\b/i`)
+    // so a real passing-assertion line whose test description embeds those
+    // phrases is NO LONGER falsely classified as generic.
+    "✓ should distribute load when using 4 workers",
+    "✓ should warn on slow test file detection",
   ];
 
   for (const line of validLines) {
