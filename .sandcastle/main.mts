@@ -551,6 +551,10 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
+        // Some target repos have multi-GB node_modules (1.7 GB observed on
+        // affinity-tracker). Sandcastle's default copyToWorktree timeout is
+        // 60s — enough to silently quarantine real issues. Bump to 10 min.
+        timeouts: { copyToWorktreeMs: 600_000 },
       });
       return {
         branch: handle.branch,
