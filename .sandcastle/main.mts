@@ -529,6 +529,18 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     );
   };
 
+  // Sandcastle's default completion signal is `<promise>COMPLETE</promise>`.
+  // The implementer prompt also has `<promise>HALT</promise>` for blocked
+  // stories, but sandcastle didn't recognise HALT as terminal — so on the
+  // 2026-05-08 issue #83 smoke test, the implementer HALTed cleanly on
+  // iteration 1 and sandcastle then re-ran it 5+ more times burning Sonnet
+  // tokens. Treat HALT as a completion signal too. Other agents that don't
+  // emit HALT are unaffected.
+  const completionSignal = [
+    "<promise>COMPLETE</promise>",
+    "<promise>HALT</promise>",
+  ];
+
   return {
     async run(spec) {
       const result = await sandcastle.run({
@@ -541,6 +553,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         promptFile: spec.promptFile,
         promptArgs: spec.promptArgs,
         idleTimeoutSeconds: spec.idleTimeoutSeconds,
+        completionSignal,
       });
       return { stdout: result.stdout, commits: result.commits };
     },
@@ -567,6 +580,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
             promptFile: opts.promptFile,
             promptArgs: opts.promptArgs,
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
+            completionSignal,
           });
           return { stdout: r.stdout, commits: r.commits };
         },
