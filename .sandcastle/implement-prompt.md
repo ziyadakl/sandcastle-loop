@@ -55,12 +55,14 @@ bug-fix stories actually require.
 
 # Step markers — MANDATORY
 
-**MANDATORY FIRST ACTION:** before reading any file, before calling any
-tool, your first output must be the line: `[STEP 1/9] Pick issue
-#{{ISSUE_NUMBER}} — <one-line summary of the story>`. This is non-negotiable.
-The loop driver depends on seeing this marker to render status. If your
-first output is anything else (tool call, narration, anything), the
-iteration's status display is broken.
+**Emit `[STEP 1/9]` early in your response.** Before you call any tool —
+emit the line: `[STEP 1/9] Pick issue #{{ISSUE_NUMBER}} — <one-line
+summary of the story>`. A brief one-line acknowledgment ("Reading the
+issue spec now.") before the marker is fine; multi-paragraph narration
+before any step marker is not. The marker must appear before your first
+tool call and on its own line, exactly in the format above. The loop
+driver greps for this marker to render status, so the marker text and
+format are non-negotiable even if a sentence of prose precedes it.
 
 Before each major step, output a single line in this exact format on its
 own line:
@@ -272,7 +274,10 @@ start it; the loop never manages the dev server.
    The driver extracts the marker from the LAST line that exactly matches
    `<promise>HALT</promise>` (whitespace-only allowed before/after).
    Free-text mentions of the marker words elsewhere in your output are
-   tolerated but only the bare-line marker counts.
+   tolerated but only the bare-line marker counts. The parser only reads
+   the last non-empty line of your full response — anything you write
+   before that line, including summary paragraphs around the marker, is
+   invisible to it.
 
 Do NOT include time-in-weeks or human-team-day estimates anywhere. The loop
 runs in iterations, not human time.
@@ -285,7 +290,9 @@ some of them from the spec; if your answer contradicts the driver's ground
 truth, you are wrong and the reviewer WILL reject the commit.
 
 The envelope format is a fenced code block tagged `json` placed
-**immediately before** your final marker, like so:
+**immediately before** your final marker, like so. Brief narration before
+or after the fenced JSON block is fine — the parser locates the fenced
+block and reads its contents directly, ignoring surrounding prose.
 
 ```json
 {

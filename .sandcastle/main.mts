@@ -12,8 +12,10 @@
  *     marker MUST come with a valid ImplementerOutput JSON payload.
  *   - Migration auto-applier (src/migrations/drizzle-applier.ts) — runs
  *     between implementer and reviewer when new SQL files appear.
- *   - Fixer ladder (sonnet → re-review → opus → final review).
- *   - Recovery ladder (sonnet → opus) with quarantine fallback.
+ *   - Per-issue pipeline: implementer → migrations → reviewer → markDone, with
+ *     quarantine on any error or HAS_BLOCKERS verdict.
+ *   - Optional `--recovery on` flag: on pipeline error, retry once with the
+ *     implementer model before quarantining (off by default).
  *   - Bash-style circuit breaker (3 consecutive failures = trip).
  *
  * The driver is structured so it can be invoked as a CLI (parses argv and
@@ -67,17 +69,25 @@ export interface RalphArgs {
   maxConcurrent: number;
   implementerModel: string;
   reviewerModel: string;
+  recoveryModel: string;
   implementerTimeoutSec: number;
   reviewerTimeoutSec: number;
   consecutiveFailureLimit: number;
   logFile?: string;
   dryRun: boolean;
   /**
-   * Docker image to run the sandbox in. Defaults to `sandcastle:loop`.
+   * Opt-in single-pass recovery. When true, the orchestrator re-runs the
+   * implementer model against `./.sandcastle/recovery-prompt.md` once on a
+   * pipeline error before quarantining. Defaults to false (current behavior:
+   * any error → quarantine).
+   */
+  recoveryEnabled: boolean;
+  /**
+   * Docker image to run the sandbox in. Defaults to `sandcastle:affinity-tracker`.
    * sandcastle's `docker()` factory would otherwise auto-derive the image
    * name from the worktree directory name (e.g. `sandcastle:aft-sl-it1`),
    * which doesn't match the image we built via
-   * `sandcastle docker build-image --image-name sandcastle:loop`.
+   * `sandcastle docker build-image --image-name sandcastle:affinity-tracker`.
    */
   imageName: string;
 }
@@ -176,15 +186,19 @@ Optional:
   --branch NAME             Base branch (default: current; refuses main/master).
   --label NAME              Label to claim (default: ready-for-agent).
   --max-concurrent N        Parallel issues per cycle (default: 3).
-  --implementer-model M     Default: claude-opus-4-7.
+  --implementer-model M     Default: claude-sonnet-4-6.
   --reviewer-model M        Default: claude-haiku-4-5.
+  --recovery-model M        Default: claude-opus-4-7. Used by the recovery pass.
   --implementer-timeout-sec N   Default: 1200.
   --reviewer-timeout-sec N      Default: 600.
   --consecutive-failure-limit N Default: 3.
   --log-file PATH           Tee output to this file.
   --dry-run                 Skip claim/quarantine/markDone side effects.
+  --recovery off            Disable the single recovery pass that fires on
+                            any pipeline error. Default: on (recovery uses
+                            --recovery-model and runs once before quarantine).
   --image-name NAME         Docker image to run sandboxes in.
-                            Default: sandcastle:loop.
+                            Default: sandcastle:affinity-tracker.
   --help                    Show this message and exit 0.
 
 Exit codes:
@@ -217,11 +231,13 @@ export function parseRalphArgs(argv: readonly string[]): {
       "max-concurrent": { type: "string" },
       "implementer-model": { type: "string" },
       "reviewer-model": { type: "string" },
+      "recovery-model": { type: "string" },
       "implementer-timeout-sec": { type: "string" },
       "reviewer-timeout-sec": { type: "string" },
       "consecutive-failure-limit": { type: "string" },
       "log-file": { type: "string" },
       "dry-run": { type: "boolean" },
+      "recovery": { type: "string" },
       "image-name": { type: "string" },
       "help": { type: "boolean" },
     },
@@ -252,8 +268,9 @@ export function parseRalphArgs(argv: readonly string[]): {
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
-    implementerModel: values["implementer-model"] ?? "claude-opus-4-7",
+    implementerModel: values["implementer-model"] ?? "claude-sonnet-4-6",
     reviewerModel: values["reviewer-model"] ?? "claude-haiku-4-5",
+    recoveryModel: values["recovery-model"] ?? "claude-opus-4-7",
     implementerTimeoutSec:
       parsePositiveInt(
         values["implementer-timeout-sec"],
@@ -271,7 +288,8 @@ export function parseRalphArgs(argv: readonly string[]): {
       ) ?? 3,
     logFile: values["log-file"],
     dryRun: values["dry-run"] === true,
-    imageName: values["image-name"] ?? "sandcastle:loop",
+    recoveryEnabled: values["recovery"] !== "off",
+    imageName: values["image-name"] ?? "sandcastle:affinity-tracker",
   };
   return { args, showHelp: false };
 }
@@ -312,13 +330,15 @@ function defaultArgs(): RalphArgs {
     branch: "HEAD",
     label: LABEL_READY,
     maxConcurrent: 3,
-    implementerModel: "claude-opus-4-7",
+    implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
+    recoveryModel: "claude-opus-4-7",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
     consecutiveFailureLimit: 3,
     dryRun: false,
-    imageName: "sandcastle:loop",
+    recoveryEnabled: true,
+    imageName: "sandcastle:affinity-tracker",
   };
 }
 
@@ -724,14 +744,52 @@ async function runReviewer(
 }
 
 /**
+ * Run a single recovery pass against the existing sandbox using the
+ * recovery model and `./.sandcastle/recovery-prompt.md`. Returns the
+ * marker the agent emitted, or `"ERRORED"` if the run threw.
+ *
+ * Single pass — no Haiku→Sonnet→Opus escalation ladder. The recovery model
+ * defaults to Opus (the strongest available) so this rescue step has the
+ * best chance of finalizing the issue without escalating through cheaper
+ * tiers first. The implementer stays on a cheaper model (Sonnet by default)
+ * so the bulk of the loop's spend is bounded.
+ */
+async function runRecovery(
+  sb: SandboxHandle,
+  ctx: PipelineCtx,
+  reason: string,
+): Promise<{ marker: "RECOVERY_COMPLETE" | "HALT" | "ERRORED" }> {
+  try {
+    const r = await sb.run({
+      name: "recovery",
+      maxIterations: 1,
+      model: ctx.args.recoveryModel,
+      promptFile: "./.sandcastle/recovery-prompt.md",
+      idleTimeoutSeconds: ctx.args.implementerTimeoutSec,
+      promptArgs: {
+        ITERATION: String(ctx.iteration),
+        ISSUE_NUMBER: String(ctx.issueNumber),
+        BRANCH: ctx.issue.branch,
+        REASON: reason.slice(0, 500),
+      },
+    });
+    const marker = extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
+    return { marker };
+  } catch (err) {
+    ctx.deps.logError(
+      `[issue=${ctx.issueNumber}] recovery threw: ${(err as Error).message}`,
+    );
+    return { marker: "ERRORED" };
+  }
+}
+
+/**
  * Drive a single issue through the full implement → migrate → review →
  * markDone pipeline. Caller wraps this in `claim` and is responsible for
  * converting our return value into ship/quarantine/error counters.
  *
- * Per Matt Pocock's published guidance: no fixer/recovery escalation ladder.
- * Implementer runs once with Opus (the strongest model). If the reviewer
- * marks HAS_BLOCKERS or any step throws, the issue is quarantined for human
- * triage. The fallback in src/recovery/ is preserved as the alternative path.
+ * On error, quarantine. Set `--recovery on` to retry once with the
+ * implementer model before quarantining.
  */
 async function runIssuePipeline(
   ctx: PipelineCtx,
@@ -805,7 +863,37 @@ async function runIssuePipeline(
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
     );
-    // No recovery ladder — quarantine on any error and let a human triage.
+
+    // Opt-in single recovery pass with the implementer model. If recovery
+    // succeeds, mark done; otherwise fall through to quarantine.
+    if (ctx.args.recoveryEnabled && sandbox) {
+      ctx.deps.log(
+        `[issue=${ctx.issueNumber}] --recovery on — attempting one recovery pass`,
+      );
+      const rec = await runRecovery(sandbox, ctx, errMsg);
+      if (rec.marker === "RECOVERY_COMPLETE") {
+        const postSha = sandbox.worktreePath
+          ? await ctx.deps.captureSha(sandbox.worktreePath)
+          : "";
+        const summary =
+          `[issue=${ctx.issueNumber}] shipped via sandcastle-loop recovery ` +
+          `(commit ${postSha}, branch ${ctx.issue.branch})`;
+        try {
+          await ctx.deps.markDone(ctx.issueNumber, summary);
+          return {
+            status: "ok",
+            finalMarker: "RECOVERY_COMPLETE",
+            postSha,
+          };
+        } catch (e) {
+          ctx.deps.logError(
+            `markDone after recovery failed: ${(e as Error).message}`,
+          );
+          // Fall through to quarantine.
+        }
+      }
+    }
+
     const reason = `[issue=${ctx.issueNumber}] pipeline halted: ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
@@ -1027,7 +1115,7 @@ export async function runMain(
         await deps.run({
           name: "merger",
           maxIterations: 1,
-          model: "claude-sonnet-4-6",
+          model: "claude-opus-4-7",
           promptFile: "./.sandcastle/merge-prompt.md",
           idleTimeoutSeconds: args.implementerTimeoutSec,
           promptArgs: {

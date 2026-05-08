@@ -199,13 +199,15 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     branch: "feature/work",
     label: "ready-for-agent",
     maxConcurrent: 3,
-    imageName: "sandcastle:loop",
-    implementerModel: "claude-opus-4-7",
+    imageName: "sandcastle:affinity-tracker",
+    implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
+    recoveryModel: "claude-opus-4-7",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
     consecutiveFailureLimit: 3,
     dryRun: false,
+    recoveryEnabled: true,
     ...over,
   };
 }
@@ -348,6 +350,33 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.quarantines[0]!.issueNum).toBe(300);
     expect(b.state.marksDone).toEqual([]);
   });
+
+  it("--recovery on: implementer error → recovery RECOVERY_COMPLETE → markDone (no quarantine)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "recover", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", { stdout: "fixed it up\n\nRECOVERY_COMPLETE" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    b.enqueue("merger", { stdout: "merged" });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([71]);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(b.state.marksDone[0]!.issueNum).toBe(71);
+    expect(b.state.quarantines).toEqual([]);
+    // Confirm the recovery run happened against the sandbox.
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(1);
+  });
 });
 
 describe("sandcastle-loop main.mts — circuit breaker", () => {
@@ -461,8 +490,10 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-opus-4-7");
+    expect(r.args.implementerModel).toBe("claude-sonnet-4-6");
     expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
+    expect(r.args.recoveryModel).toBe("claude-opus-4-7");
+    expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
   });
 });
