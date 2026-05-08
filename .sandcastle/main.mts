@@ -717,9 +717,20 @@ async function runImplementer(
   if (r.commits.length === 0) {
     throw new Error("implementer made no commits");
   }
-  // Wave 1 enforcement: STORY_COMPLETE requires a valid envelope.
-  // parseVerdict throws on bad JSON, missing marker, or schema mismatch.
-  parseVerdict(r.stdout, ImplementerOutputSchema);
+  // Sandcastle's r.stdout is the parsed `result.result` from claude's final
+  // stream event — already-extracted assistant text, NOT raw stream-json
+  // envelopes. The old src/loop/agents.ts and src/planner/planner.ts both
+  // handle this with a dual-mode try (stream-json first, then fall back to
+  // `alreadyAssistantText: true`). Without the fallback every implementer
+  // run throws "no assistant text could be extracted" and triggers recovery,
+  // doubling the per-issue Opus spend. Mirror the established pattern.
+  try {
+    parseVerdict(r.stdout, ImplementerOutputSchema);
+  } catch {
+    parseVerdict(r.stdout, ImplementerOutputSchema, {
+      alreadyAssistantText: true,
+    });
+  }
   return r;
 }
 

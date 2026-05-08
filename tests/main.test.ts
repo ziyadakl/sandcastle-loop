@@ -351,6 +351,63 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.marksDone).toEqual([]);
   });
 
+  it("ships when implementer stdout is plain assistant text (no stream-json wrapper)", async () => {
+    // Regression for the 2026-05-08 smoke-test bug: sandcastle's r.stdout is
+    // the parsed `result.result` from claude's final stream event, which is
+    // already-extracted assistant text — there are no `{type:"assistant"}`
+    // envelopes to walk. Without the dual-mode try in runImplementer, every
+    // real overnight run threw "no assistant text could be extracted" and
+    // bounced through recovery, doubling Opus spend. This test enqueues that
+    // exact prod shape and asserts the issue ships normally.
+    const envelope = {
+      storyId: "gh-71",
+      ghIssue: 71,
+      e2eVerdict: "passed",
+      uiTouched: false,
+      certificationPresent: true,
+      marker: "STORY_COMPLETE",
+      storyType: "backend-only",
+      e2eRequired: false,
+      e2eActuallyRan: true,
+      testCommandUsed: "pnpm test",
+      e2eAssertionLine: "✓ does the thing",
+      outputNotFiltered: true,
+      testReachedFeature: true,
+    };
+    const plainAssistantText =
+      "Here is the verdict:\n" +
+      JSON.stringify(envelope, null, 2) +
+      "\n\nSTORY_COMPLETE";
+
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: plainAssistantText,
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    // Disable recovery so a parser failure manifests as a quarantine
+    // (clean assertion target) rather than a missing-mock error from a
+    // stray recovery call.
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([71]);
+    expect(b.state.quarantines).toEqual([]);
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toEqual([]);
+  });
+
   it("--recovery on: implementer error → recovery RECOVERY_COMPLETE → markDone (no quarantine)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
