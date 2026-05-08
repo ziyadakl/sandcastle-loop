@@ -473,10 +473,29 @@ function makeLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
  * operations so a misconfigured first run can't move labels.
  */
 export function buildDefaultDeps(args: RalphArgs): Deps {
+  // pnpm install (not npm) — affinity-tracker and similar monorepos use
+  // pnpm's workspace:* protocol which npm refuses to parse. The Dockerfile
+  // ships `corepack enable` so `pnpm` works without an extra global install.
   const hooks = {
-    sandbox: { onSandboxReady: [{ command: "npm install" }] },
+    sandbox: { onSandboxReady: [{ command: "pnpm install" }] },
   } as const;
   const copyToWorktree = ["node_modules"];
+
+  // Auth mounts — sandcastle's docker provider does NOT auto-mount these.
+  // Without them, `claude` and `gh` inside the container can't see the host's
+  // session and fail with "Not logged in" / "no auth" errors. `git config`
+  // user.name/user.email also live in ~/.gitconfig on the host; without it,
+  // the agent's `git commit` would fail with "Please tell me who you are".
+  const authMounts = [
+    { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
+    { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
+    { hostPath: "~/.gitconfig", sandboxPath: "/home/agent/.gitconfig", readonly: true },
+  ] as const;
+  const buildMounts = (extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => {
+    return extra && extra.length > 0
+      ? { mounts: [...authMounts, ...extra] }
+      : { mounts: [...authMounts] };
+  };
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -488,7 +507,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async run(spec) {
       const result = await sandcastle.run({
         hooks,
-        sandbox: docker({ imageName: args.imageName, ...(spec.mounts ? { mounts: [...spec.mounts] } : {}) }),
+        sandbox: docker({ imageName: args.imageName, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
@@ -502,7 +521,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, ...(spec.mounts ? { mounts: [...spec.mounts] } : {}) }),
+        sandbox: docker({ imageName: args.imageName, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,

@@ -72,6 +72,16 @@ ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # ---------------------------------------------------------------------------
+# Corepack — Node 16+ ships corepack which provides pnpm/yarn shims.
+# Affinity-tracker and similar monorepos use pnpm's workspace:* protocol
+# which npm refuses to parse. Enabling corepack means our onSandboxReady
+# hook can run `pnpm install` without an extra `npm install -g pnpm` step.
+# ---------------------------------------------------------------------------
+USER root
+RUN corepack enable
+USER agent
+
+# ---------------------------------------------------------------------------
 # Sandcastle bind-mounts the worktree at /workspace and overrides cwd, so we
 # set WORKDIR here for any commands that run before the bind-mount applies.
 # ENTRYPOINT keeps the container alive while the host issues `docker exec`s.
