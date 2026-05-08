@@ -641,6 +641,67 @@ describe("runLoop — implementer HALT path (Fix #14)", () => {
   });
 });
 
+describe("runLoop — Wave 2 / M4: quarantineViaLabel exhausting retries is non-fatal", () => {
+  it("returns quarantined when implementer HALT + quarantineViaLabel always throws (loop continues, WARN on stderr)", async () => {
+    // Make quarantineViaLabel reject — simulates the GH label transition
+    // failing after the retry-with-backoff inside transitionLabel exhausted
+    // its 3 attempts. The iteration should still return `quarantined` (not
+    // crash) so the global circuit breaker counts the failure and the next
+    // loop wake-up's startup-recovery sweep can reset orphaned in-progress
+    // issues back to ready-for-agent.
+    quarantineViaLabel.mockRejectedValue(
+      new Error("gh API 503 (final after retries)"),
+    );
+
+    const builder = mockSandboxFactory();
+    builder.enqueue(makeRunResult({ stdout: "<promise>HALT</promise>" }));
+    const built = builder.build();
+    setMarkerSequence(["HALT"]);
+
+    const implOutput = makeImplOutput({
+      storyId: STORY_ID_42,
+      ghIssue: 42,
+      marker: "HALT",
+      haltReason: "blocked external API",
+    });
+    setVerdictSequence([implOutput]);
+
+    // Capture stderr writes so we can assert the WARN line is emitted.
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    const results = await runLoop({
+      config: baseConfig,
+      branch: "agent/test",
+      sandboxProvider: {} as never,
+      recoveryPromptPath: "/tmp/recovery.md",
+      _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
+    });
+
+    // Outcome is still `quarantined` even though the label transition failed.
+    expect(results).toHaveLength(1);
+    expect(results[0].outcome).toBe("quarantined");
+
+    // quarantineViaLabel was attempted at least once (and threw).
+    expect(quarantineViaLabel).toHaveBeenCalled();
+
+    // stderr received the WARN line with the expected shape.
+    const stderrText = stderrSpy.mock.calls
+      .map((c) => String(c[0]))
+      .join("");
+    expect(stderrText).toMatch(
+      /WARN: quarantineViaLabel\(42\) failed after retries: gh API 503 \(final after retries\)/,
+    );
+
+    // markDoneViaLabel must not have been called — the iteration didn't ship.
+    expect(markDoneViaLabel).not.toHaveBeenCalled();
+
+    stderrSpy.mockRestore();
+  });
+});
+
 describe("runLoop — implementer-error path (recovery ladder)", () => {
   it("runs recovery on implementer error; recovery HALT -> outcome halted", async () => {
     const builder = mockSandboxFactory();

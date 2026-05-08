@@ -201,7 +201,7 @@ export function buildImplementerBriefing(args: BriefingArgs): string {
     `is the implementer's own narrative for the next iteration to read.)\n` +
     `=== End sprint memory write ===`;
 
-  return `${issueBlock}${progressBlock}\n\n${meta}\n\n${body}\n\n${buildSevenQuestionBlock()}\n\n${progressInstruction}`;
+  return `${issueBlock}${progressBlock}\n\n${meta}\n\n${body}\n\n${buildSevenQuestionBlock(args.iterationNum)}\n\n${progressInstruction}`;
 }
 
 /**
@@ -216,7 +216,7 @@ export function buildImplementerBriefing(args: BriefingArgs): string {
  * flows in via the implementer-prompt placeholder substitution; the driver
  * recomputes commitTouchedUi from `git diff` post-commit.
  */
-function buildSevenQuestionBlock(): string {
+function buildSevenQuestionBlock(iterationNum: number): string {
   return `=== STRUCTURAL CERTIFICATION CHECK — answer all 7 questions ===
 
 Before emitting STORY_COMPLETE you MUST answer these 7 questions in your final
@@ -240,7 +240,7 @@ wrong and the reviewer WILL reject the commit.
    string), or JSON null if e2eActuallyRan=false. Verbatim — no paraphrasing,
    no empty string. Use null, not "".
 
-5) e2eAssertionLine: a line from /tmp/ralph-e2e-it{N}.log that PROVES the
+5) e2eAssertionLine: a line from /tmp/ralph-e2e-it${iterationNum}.log that PROVES the
    test reached its assertion (must start with ✓ / ✔ / PASS, contain
    "expect(", or be the test description text). JSON null if no e2e ran. Use
    null, not "".

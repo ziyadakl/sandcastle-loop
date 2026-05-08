@@ -567,10 +567,17 @@ export async function runIteration(
   } catch (err) {
     // If we can't even read HEAD, the worktree is broken — quarantine the
     // story rather than entering a half-instrumented iteration.
-    await quarantineViaLabel(
-      ghIssue,
-      `pre-iteration git rev-parse HEAD failed: ${errorMessage(err)}`,
-    );
+    // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+    try {
+      await quarantineViaLabel(
+        ghIssue,
+        `pre-iteration git rev-parse HEAD failed: ${errorMessage(err)}`,
+      );
+    } catch (qErr) {
+      process.stderr.write(
+        `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+      );
+    }
     return quarantined(story, args.iterationNum);
   }
 
@@ -635,18 +642,34 @@ export async function runIteration(
       // commit stays on the branch and we deliberately do NOT close the issue
       // or mark done. The story is left in `needs-human` label state so a
       // human can decide what to do with the partial work.
-      await quarantineViaLabel(
-        ghIssue,
-        `implementer HALT (with partial commit ${lastCommitSha}): ${
-          implementerHaltReason ?? "(no reason)"
-        }`,
-      );
+      // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries — we
+      // still return `quarantined` so the circuit breaker counts the failure
+      // and the next loop wake-up's startup-recovery sweep can reset any
+      // orphaned `in-progress` label back to `ready-for-agent`.
+      try {
+        await quarantineViaLabel(
+          ghIssue,
+          `implementer HALT (with partial commit ${lastCommitSha}): ${
+            implementerHaltReason ?? "(no reason)"
+          }`,
+        );
+      } catch (qErr) {
+        process.stderr.write(
+          `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+        );
+      }
       return quarantined(story, args.iterationNum);
     }
-    await quarantineViaLabel(
-      ghIssue,
-      `implementer HALT: ${implementerHaltReason ?? "(no reason)"}`,
-    );
+    try {
+      await quarantineViaLabel(
+        ghIssue,
+        `implementer HALT: ${implementerHaltReason ?? "(no reason)"}`,
+      );
+    } catch (qErr) {
+      process.stderr.write(
+        `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+      );
+    }
     return quarantined(story, args.iterationNum);
   }
 
@@ -676,10 +699,20 @@ export async function runIteration(
 
     if (recovery.decision.marker === "HALT") {
       // Deliberate HALT from recovery — quarantine.
-      await quarantineViaLabel(
-        ghIssue,
-        recovery.decision.haltReason ?? "recovery HALT",
-      );
+      // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries; the
+      // returned `halted` outcome still feeds the global circuit breaker, and
+      // startup-recovery's `in-progress` sweep on the next loop wake-up resets
+      // the orphaned label.
+      try {
+        await quarantineViaLabel(
+          ghIssue,
+          recovery.decision.haltReason ?? "recovery HALT",
+        );
+      } catch (qErr) {
+        process.stderr.write(
+          `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+        );
+      }
       return halted(story, args.iterationNum, recovery.decision.haltReason);
     }
 
@@ -706,10 +739,17 @@ export async function runIteration(
   try {
     postSha = await gitRevParseHead(repoRoot);
   } catch (err) {
-    await quarantineViaLabel(
-      ghIssue,
-      `post-implementer git rev-parse HEAD failed: ${errorMessage(err)}`,
-    );
+    // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+    try {
+      await quarantineViaLabel(
+        ghIssue,
+        `post-implementer git rev-parse HEAD failed: ${errorMessage(err)}`,
+      );
+    } catch (qErr) {
+      process.stderr.write(
+        `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+      );
+    }
     return quarantined(story, args.iterationNum);
   }
 
@@ -819,10 +859,17 @@ export async function runIteration(
         });
       } catch (secondErr) {
         // Both reviewer attempts failed — quarantine.
-        await quarantineViaLabel(
-          ghIssue,
-          `reviewer-ladder-exhausted: ${errorMessage(secondErr)}; first error: ${errorMessage(firstErr)}`,
-        );
+        // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+        try {
+          await quarantineViaLabel(
+            ghIssue,
+            `reviewer-ladder-exhausted: ${errorMessage(secondErr)}; first error: ${errorMessage(firstErr)}`,
+          );
+        } catch (qErr) {
+          process.stderr.write(
+            `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+          );
+        }
         return quarantined(story, args.iterationNum);
       }
     }
@@ -870,10 +917,17 @@ export async function runIteration(
     } catch (err) {
       // Bash treats fixer failure as fatal (afk-ralph.sh:746 `exit 1`). We
       // soften that: quarantine the story and let the outer loop continue.
-      await quarantineViaLabel(
-        ghIssue,
-        `fixer-failed-attempt-${attempt}: ${errorMessage(err)}`,
-      );
+      // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+      try {
+        await quarantineViaLabel(
+          ghIssue,
+          `fixer-failed-attempt-${attempt}: ${errorMessage(err)}`,
+        );
+      } catch (qErr) {
+        process.stderr.write(
+          `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+        );
+      }
       return quarantined(story, args.iterationNum);
     }
 
@@ -889,10 +943,17 @@ export async function runIteration(
       try {
         postSha = await gitRevParseHead(repoRoot);
       } catch (err) {
-        await quarantineViaLabel(
-          ghIssue,
-          `post-fixer-${attempt} git rev-parse HEAD failed: ${errorMessage(err)}`,
-        );
+        // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+        try {
+          await quarantineViaLabel(
+            ghIssue,
+            `post-fixer-${attempt} git rev-parse HEAD failed: ${errorMessage(err)}`,
+          );
+        } catch (qErr) {
+          process.stderr.write(
+            `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+          );
+        }
         return quarantined(story, args.iterationNum);
       }
       try {
@@ -1088,10 +1149,17 @@ async function runMigrationsOrQuarantine(
   } catch (err) {
     // Throws are limited to misconfiguration (no DATABASE_URL) and git
     // failure. Either way the iteration can't proceed safely.
-    await quarantineViaLabel(
-      ghIssue,
-      `migration auto-apply threw: ${errorMessage(err)}`,
-    );
+    // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+    try {
+      await quarantineViaLabel(
+        ghIssue,
+        `migration auto-apply threw: ${errorMessage(err)}`,
+      );
+    } catch (qErr) {
+      process.stderr.write(
+        `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+      );
+    }
     return {
       story,
       outcome: "quarantined",
@@ -1102,10 +1170,17 @@ async function runMigrationsOrQuarantine(
 
   if (migResult.realErrors.length > 0) {
     const first = migResult.realErrors[0]!;
-    await quarantineViaLabel(
-      ghIssue,
-      `migration auto-apply failed: ${first.msg}`,
-    );
+    // Wave 2 (M4): tolerate quarantineViaLabel exhausting its retries.
+    try {
+      await quarantineViaLabel(
+        ghIssue,
+        `migration auto-apply failed: ${first.msg}`,
+      );
+    } catch (qErr) {
+      process.stderr.write(
+        `WARN: quarantineViaLabel(${ghIssue}) failed after retries: ${errorMessage(qErr)}\n`,
+      );
+    }
     return {
       story,
       outcome: "quarantined",

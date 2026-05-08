@@ -18,6 +18,89 @@ interface RunResult {
   stderr: string;
 }
 
+/**
+ * Default backoff schedule for `withRetry` (Wave 2 / N3 fix). Three attempts
+ * total: first retry after 500ms, second retry after a further 1500ms, third
+ * (final) retry after a further 4000ms — total worst-case wait ≈ 6000ms.
+ *
+ * Production code uses real `setTimeout`. Tests inject a no-op `sleep` so
+ * vitest doesn't actually wait.
+ */
+const DEFAULT_BACKOFFS_MS: readonly number[] = [500, 1500, 4000];
+
+/** Real-time sleep helper. Replaceable in tests. */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry an async operation with exponential-style backoff (delays from
+ * `opts.backoffsMs`).
+ *
+ * Semantics:
+ * - `opts.attempts` total tries (so `attempts=3` ⇒ at most 2 retries).
+ * - Wait `opts.backoffsMs[i]` BEFORE attempt `i` (i.e. the first attempt has
+ *   no preceding wait — `backoffsMs[0]` is the wait before the second attempt,
+ *   etc). Caller-supplied schedules of length 3 cover up to 3 attempts.
+ * - On success at any attempt: return immediately.
+ * - On final failure: throw the original error so callers see the underlying
+ *   gh error message verbatim.
+ * - `opts.shouldRetry` (optional) gates retries — return false to bail
+ *   immediately (used for validation errors which won't get fixed by waiting).
+ *
+ * Tests inject `opts.sleep` to skip real timers; production omits it and gets
+ * the real `setTimeout`-based sleep.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts: {
+    attempts: number;
+    backoffsMs: readonly number[];
+    shouldRetry?: (err: unknown) => boolean;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<T> {
+  const { attempts, backoffsMs } = opts;
+  const sleep = opts.sleep ?? defaultSleep;
+  const shouldRetry = opts.shouldRetry ?? (() => true);
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isLast = i === attempts - 1;
+      if (isLast || !shouldRetry(err)) break;
+      const delay = backoffsMs[i] ?? 0;
+      if (delay > 0) await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * True iff the error is a runtime gh / network failure (worth retrying), not
+ * a programmer-error validation throw raised by our own argument-checking
+ * code. Validation errors are deterministic — retrying just wastes time.
+ *
+ * We tag every internal validation throw with the function name prefix
+ * (e.g. `transitionLabel:`), so a substring check is reliable.
+ */
+function isRetryableGhError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  // Validation throws from THIS module — non-retryable.
+  if (
+    err.message.startsWith("transitionLabel:") ||
+    err.message.startsWith("closeIssue:") ||
+    err.message.startsWith("getIssueBody:") ||
+    err.message.startsWith("postIssueComment:") ||
+    err.message.startsWith("listIssuesByLabel:")
+  ) {
+    return false;
+  }
+  return true;
+}
+
 async function runGh(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<RunResult> {
   try {
     const { stdout, stderr } = await execFileP(GH_BIN, args, {
@@ -57,41 +140,64 @@ export async function transitionLabel(
   issueNum: number,
   from: string,
   to: string,
+  /**
+   * Test seam (Wave 2): inject a no-op sleep so the retry-with-backoff
+   * doesn't actually wait in unit tests. Production callers omit it and get
+   * the real `setTimeout`-based sleep from `defaultSleep`.
+   */
+  _sleep?: (ms: number) => Promise<void>,
 ): Promise<void> {
   if (!Number.isInteger(issueNum) || issueNum <= 0) {
     throw new Error(`transitionLabel: invalid issueNum '${issueNum}'`);
   }
-  if (!to) {
+  if (typeof from !== "string" || from === "") {
+    throw new Error("transitionLabel: 'fromLabel' must be a non-empty string");
+  }
+  if (typeof to !== "string" || to === "") {
     throw new Error("transitionLabel: 'to' label must be non-empty");
   }
-  if (from === "*") {
-    // Strip every known status label currently on the issue, preserving
-    // non-status labels (priority:*, kind:*, etc), then add `to`.
-    const current = await fetchIssueLabels(issueNum);
-    for (const label of current) {
-      if (isStatusLabel(label) && label !== to) {
-        await runGh([
-          "issue",
-          "edit",
-          String(issueNum),
-          "--remove-label",
-          label,
-        ]);
+  // Wrap the gh-issuing body in a retry-with-backoff so transient API hiccups
+  // (network blips, GH rate-limit jitter, intermittent auth lookups) don't
+  // propagate up the loop. Validation throws above are non-retryable by
+  // design — they fail fast, before the retry loop starts.
+  await withRetry(
+    async () => {
+      if (from === "*") {
+        // Strip every known status label currently on the issue, preserving
+        // non-status labels (priority:*, kind:*, etc), then add `to`.
+        const current = await fetchIssueLabels(issueNum);
+        for (const label of current) {
+          if (isStatusLabel(label) && label !== to) {
+            await runGh([
+              "issue",
+              "edit",
+              String(issueNum),
+              "--remove-label",
+              label,
+            ]);
+          }
+        }
+        await runGh(["issue", "edit", String(issueNum), "--add-label", to]);
+        return;
       }
-    }
-    await runGh(["issue", "edit", String(issueNum), "--add-label", to]);
-    return;
-  }
-  const args: string[] = [
-    "issue",
-    "edit",
-    String(issueNum),
-    "--add-label",
-    to,
-    "--remove-label",
-    from,
-  ];
-  await runGh(args);
+      const args: string[] = [
+        "issue",
+        "edit",
+        String(issueNum),
+        "--add-label",
+        to,
+        "--remove-label",
+        from,
+      ];
+      await runGh(args);
+    },
+    {
+      attempts: 3,
+      backoffsMs: DEFAULT_BACKOFFS_MS,
+      shouldRetry: isRetryableGhError,
+      sleep: _sleep,
+    },
+  );
 }
 
 /**
