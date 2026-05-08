@@ -638,8 +638,13 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
 
   return {
     async run(spec) {
+      // Top-level runs (planner, merger) don't need `pnpm install` — the
+      // planner just calls `gh` + reads files, the merger just runs `git
+      // merge`. Running the hook here previously failed the merger every
+      // time on a fresh sandbox because it doesn't get copyToWorktree's
+      // node_modules so the install starts from scratch on a 1.7 GB
+      // monorepo and trips workspace catalog errors.
       const result = await sandcastle.run({
-        hooks,
         sandbox: docker({ imageName: args.imageName, env: containerEnv, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         name: spec.name,
