@@ -420,26 +420,14 @@ export function preflight(args: RalphArgs, opts: {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse a target project's `.env.local` into a Record so the orchestrator
- * can pass real Supabase / Postgres / API-key values into the sandbox via
- * docker `-e`. Without this, target repos like affinity-tracker that ship
- * `.env.local` as a symlink to a host-only path see broken paths inside
- * the container, the dev-server fails to start (POSTGRES_URL undefined),
- * and the implementer HALTs on every UI story.
- *
- * Format support: KEY=VALUE per line, `#` comments, blank lines skipped,
- * single- or double-quoted values stripped. Multi-line values are not
- * supported. Returns an empty object if the file is missing.
- *
- * Security note: every key in `.env.local` reaches the sandbox process
- * environment. Don't put credentials there that you don't want the agent
- * to see / log.
+ * Parse one dotenv-style file into a Record. Returns {} on read error.
+ * Format: KEY=VALUE per line, `#` comments, blank lines skipped, single-
+ * or double-quoted values stripped. Multi-line values are not supported.
  */
-function readEnvLocal(repoRoot: string): Record<string, string> {
-  const envPath = path.resolve(repoRoot, ".env.local");
+function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
   try {
-    raw = readFileSync(envPath, "utf-8");
+    raw = readFileSync(filePath, "utf-8");
   } catch {
     return {};
   }
@@ -460,6 +448,63 @@ function readEnvLocal(repoRoot: string): Record<string, string> {
     if (key) env[key] = val;
   }
   return env;
+}
+
+/**
+ * Read the target project's dotenv files so the orchestrator can pass real
+ * Supabase / Postgres / API-key values into the sandbox via docker `-e`.
+ *
+ * Why this is needed: target repos like affinity-tracker keep their real
+ * POSTGRES_URL in `.env` at the main-repo root and only symlink `.env.local`
+ * into worktrees (and even that symlink is broken inside the bind-mounted
+ * sandbox). Without surfacing those vars as docker env, the Next.js dev-
+ * server can't initialise, playwright can't run, and every UI story HALTs.
+ *
+ * Search order (later files override earlier ones, matching Next.js's
+ * `.env*` loading order):
+ *
+ *   1. mainRepoRoot/.env
+ *   2. mainRepoRoot/.env.local
+ *   3. repoRoot/.env             (worktree overlay)
+ *   4. repoRoot/.env.local       (worktree overlay)
+ *
+ * `mainRepoRoot` is discovered via `git rev-parse --git-common-dir`, which
+ * returns the shared .git directory even when invoked from a worktree.
+ *
+ * Security note: every key in these files reaches the sandbox process
+ * environment. Don't put credentials there that you don't want the agent
+ * to see / log.
+ */
+function readProjectEnv(repoRoot: string): Record<string, string> {
+  const resolvedRepo = path.resolve(repoRoot);
+  let mainRoot = resolvedRepo;
+  try {
+    const out = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+      cwd: resolvedRepo,
+      encoding: "utf-8",
+    });
+    const commonDir = path.resolve(resolvedRepo, out.trim());
+    mainRoot = path.dirname(commonDir);
+  } catch {
+    /* not a git repo; mainRoot stays = resolvedRepo */
+  }
+
+  const candidates = [
+    path.join(mainRoot, ".env"),
+    path.join(mainRoot, ".env.local"),
+  ];
+  if (resolvedRepo !== mainRoot) {
+    candidates.push(
+      path.join(resolvedRepo, ".env"),
+      path.join(resolvedRepo, ".env.local"),
+    );
+  }
+
+  const merged: Record<string, string> = {};
+  for (const f of candidates) {
+    Object.assign(merged, parseDotenvFile(f));
+  }
+  return merged;
 }
 
 function buildGitEnv(): Record<string, string> {
@@ -570,7 +615,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // gitEnv keys win on collision (don't let a stray .env.local override
   // the orchestrator's git identity).
   const gitEnv = buildGitEnv();
-  const projectEnv = readEnvLocal(args.repoRoot);
+  const projectEnv = readProjectEnv(args.repoRoot);
   const containerEnv = { ...projectEnv, ...gitEnv };
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
