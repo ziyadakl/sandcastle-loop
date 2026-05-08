@@ -281,14 +281,55 @@ export async function runImplementer(
     mode: "strict",
   });
 
-  // Try to parse a structured payload. This is best-effort: the implementer
-  // prompt asks for one but the bash original tolerates its absence. If
-  // parsing fails (no JSON body, schema mismatch), surface marker-only.
+  // Parse the structured payload. Strictness depends on the marker:
+  //
+  //   - STORY_COMPLETE — the JSON envelope is LOAD-BEARING. The ship signal
+  //     in the loop ladder is "raw stdout marker says STORY_COMPLETE AND the
+  //     typed verdict round-trips". A schema parse failure here used to set
+  //     `output: undefined` silently, which let the loop ship on the raw
+  //     marker alone — re-introducing the very failure mode the typed-verdict
+  //     layer (V1-A) was built to prevent. Now we re-throw so the iteration
+  //     catch routes to the recovery ladder (Track E).
+  //
+  //   - HALT (and any non-STORY_COMPLETE terminal marker, e.g. a future
+  //     NEEDS_HELP) — soft. An implementer admitting failure may not have a
+  //     structured envelope, and the bash original tolerated that. We keep
+  //     `output = undefined` so iteration.ts's HALT path (Fix #14) can still
+  //     quarantine via label.
+  //
+  // Additionally: when parsing succeeds, `output.marker` MUST equal the raw
+  // stdout marker. If the JSON envelope says "HALT" but the last stdout line
+  // says "STORY_COMPLETE" (or vice versa), that's a contradiction — we
+  // trusted raw before, which let an envelope-HALT ship on stdout-COMPLETE.
+  // Throw on disagreement so the recovery ladder runs.
   let output: ImplementerOutput | undefined;
   try {
-    output = parseVerdict(result.stdout, ImplementerOutputSchema);
-  } catch {
+    // Match the planner's dual-mode pattern (planner.ts:382-400): stdout from
+    // sandbox.run can be EITHER stream-json envelopes OR plain assistant text
+    // depending on how Sandcastle was configured. Try stream-json first; on
+    // failure retry with `alreadyAssistantText: true`.
+    try {
+      output = parseVerdict(result.stdout, ImplementerOutputSchema);
+    } catch {
+      output = parseVerdict(result.stdout, ImplementerOutputSchema, {
+        alreadyAssistantText: true,
+      });
+    }
+  } catch (err) {
+    if (marker === "STORY_COMPLETE") {
+      throw new Error(
+        `implementer emitted STORY_COMPLETE but the structured JSON envelope failed to parse: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     output = undefined;
+  }
+
+  if (output && output.marker !== marker) {
+    throw new Error(
+      `implementer raw stdout marker (${marker}) disagrees with JSON envelope marker (${output.marker}); refusing to ship on raw marker alone`,
+    );
   }
 
   return { marker, output, raw: result };

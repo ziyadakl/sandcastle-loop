@@ -1572,3 +1572,244 @@ describe("appendProgress + readProgressTail (Fix #6)", () => {
     await fs.rm(tmp, { recursive: true, force: true });
   });
 });
+
+// ---- Wave 1 (N1 + N1b): typed verdicts MANDATORY for STORY_COMPLETE --------
+//
+// Background (adversarial review): the implementer's STORY_COMPLETE ship
+// signal was relying on the raw stdout marker alone — a parseVerdict() failure
+// silently set output=undefined and the loop shipped anyway. Plus the raw
+// marker and JSON envelope marker were never cross-checked, so an envelope
+// saying HALT could ship on a stdout STORY_COMPLETE. Both paths must throw
+// from runImplementer so iteration.ts's existing catch (line ~621) routes to
+// the recovery ladder.
+//
+// These tests exercise runImplementer directly (cheaper, more targeted than
+// the full runLoop integration) and one runLoop test that confirms the throw
+// flows into the implementer-error → recovery-ladder branch.
+
+describe("runImplementer — Wave 1 (N1): STORY_COMPLETE requires structured envelope", () => {
+  it("throws when STORY_COMPLETE marker + parseVerdict fails (invalid JSON body)", async () => {
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout: "{ this is not valid json }\nSTORY_COMPLETE",
+        commits: [{ sha: "shipme" }],
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["STORY_COMPLETE"]);
+    // runImplementer parses in dual mode (stream-json then plain text). Both
+    // attempts hit the same broken JSON, so enqueue a throw for each leg.
+    setVerdictSequence(["throw", "throw"]);
+
+    await expect(
+      runImplementer({
+        sandbox: built.sandbox,
+        prompt: "stub",
+        config: baseConfig,
+        iterationNum: 1,
+        story: { id: STORY_ID_42, ghIssue: 42 },
+      }),
+    ).rejects.toThrow(/STORY_COMPLETE.*envelope failed to parse/);
+  });
+
+  it("throws when STORY_COMPLETE marker but no JSON envelope at all", async () => {
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout: "all done.\nSTORY_COMPLETE",
+        commits: [{ sha: "shipme" }],
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["STORY_COMPLETE"]);
+    // `undefined` in setVerdictSequence makes parseVerdict throw "no
+    // structured payload" — same as the no-JSON-body production case. Two
+    // throws cover the dual-mode (stream-json + plain text) retry pattern.
+    setVerdictSequence([undefined, undefined]);
+
+    await expect(
+      runImplementer({
+        sandbox: built.sandbox,
+        prompt: "stub",
+        config: baseConfig,
+        iterationNum: 1,
+        story: { id: STORY_ID_42, ghIssue: 42 },
+      }),
+    ).rejects.toThrow(/STORY_COMPLETE.*envelope failed to parse/);
+  });
+
+  it("throws when raw stdout marker is STORY_COMPLETE but JSON envelope's marker is HALT (markers disagree)", async () => {
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout:
+          'BEGIN_VERDICT\n{"marker":"HALT", ...}\nEND_VERDICT\nSTORY_COMPLETE',
+        commits: [{ sha: "shipme" }],
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["STORY_COMPLETE"]);
+    // Parser succeeds but returns marker:HALT — disagreement with raw.
+    setVerdictSequence([
+      makeImplOutput({
+        storyId: STORY_ID_42,
+        ghIssue: 42,
+        marker: "HALT",
+        haltReason: "secretly halted",
+      }),
+    ]);
+
+    await expect(
+      runImplementer({
+        sandbox: built.sandbox,
+        prompt: "stub",
+        config: baseConfig,
+        iterationNum: 1,
+        story: { id: STORY_ID_42, ghIssue: 42 },
+      }),
+    ).rejects.toThrow(/raw stdout marker.*disagrees with JSON envelope marker/);
+  });
+
+  it("regression — STORY_COMPLETE + valid matching JSON envelope still ships (returns marker + output)", async () => {
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout: "valid envelope\nSTORY_COMPLETE",
+        commits: [{ sha: "shipok" }],
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["STORY_COMPLETE"]);
+    const happyOutput = makeImplOutput({
+      storyId: STORY_ID_42,
+      ghIssue: 42,
+      commitSha: "shipok",
+      marker: "STORY_COMPLETE",
+    });
+    setVerdictSequence([happyOutput]);
+
+    const r = await runImplementer({
+      sandbox: built.sandbox,
+      prompt: "stub",
+      config: baseConfig,
+      iterationNum: 1,
+      story: { id: STORY_ID_42, ghIssue: 42 },
+    });
+    expect(r.marker).toBe("STORY_COMPLETE");
+    expect(r.output).toEqual(happyOutput);
+  });
+
+  it("regression — HALT marker with no JSON envelope keeps soft fallback (output=undefined)", async () => {
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout: "couldn't proceed\n<promise>HALT</promise>",
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["HALT"]);
+    // Dual-mode parser: two throws (stream-json + plain text) so both legs
+    // miss, leaving output=undefined per the HALT soft-fallback contract.
+    setVerdictSequence([undefined, undefined]);
+
+    const r = await runImplementer({
+      sandbox: built.sandbox,
+      prompt: "stub",
+      config: baseConfig,
+      iterationNum: 1,
+      story: { id: STORY_ID_42, ghIssue: 42 },
+    });
+    expect(r.marker).toBe("HALT");
+    expect(r.output).toBeUndefined();
+  });
+
+  it("regression — non-STORY_COMPLETE marker + parse failure stays soft (RECOVERY_COMPLETE / future NEEDS_HELP path)", async () => {
+    // The current IMPLEMENTER_MARKERS set is {STORY_COMPLETE, HALT,
+    // RECOVERY_COMPLETE}. RECOVERY_COMPLETE represents the "implementer
+    // recovered after a prior crash" case the spec calls out as a soft
+    // path — parse failure must not throw here. (If a future NEEDS_HELP
+    // marker is added it inherits the same soft-fallback contract.)
+    const { runImplementer } = await import("../src/loop/agents.js");
+    const builder = mockSandboxFactory();
+    builder.enqueue(
+      makeRunResult({
+        stdout: "no envelope here\nRECOVERY_COMPLETE",
+      }),
+    );
+    const built = builder.build();
+    setMarkerSequence(["RECOVERY_COMPLETE"]);
+    // Dual-mode parser: two throws (stream-json + plain text).
+    setVerdictSequence([undefined, undefined]);
+
+    const r = await runImplementer({
+      sandbox: built.sandbox,
+      prompt: "stub",
+      config: baseConfig,
+      iterationNum: 1,
+      story: { id: STORY_ID_42, ghIssue: 42 },
+    });
+    expect(r.marker).toBe("RECOVERY_COMPLETE");
+    expect(r.output).toBeUndefined();
+  });
+});
+
+describe("runLoop — Wave 1 (N1): runImplementer throw routes into recovery ladder", () => {
+  it("STORY_COMPLETE + invalid JSON envelope throws inside runImplementer → caught at iteration.ts → recovery dispatched", async () => {
+    const builder = mockSandboxFactory();
+    // The implementer's sandbox.run produces a STORY_COMPLETE marker but
+    // the parseVerdict mock will throw — so runImplementer rejects, the
+    // catch in iteration.ts at L621 sets implementerError, and we expect
+    // runRecoveryDiagnosisOrEscalate to fire. We make recovery HALT so
+    // the iteration outcome is `halted` (matches the existing
+    // implementer-error path test on L645).
+    builder.enqueue(
+      makeRunResult({
+        stdout: "{ broken json }\nSTORY_COMPLETE",
+        commits: [{ sha: "ghost" }],
+      }),
+    );
+    const built = builder.build();
+
+    setMarkerSequence(["STORY_COMPLETE"]);
+    // Dual-mode parser: both legs throw, so STORY_COMPLETE branch raises.
+    setVerdictSequence(["throw", "throw"]);
+
+    runRecoveryDiagnosisOrEscalate.mockResolvedValueOnce({
+      decision: {
+        marker: "HALT",
+        fixApplied: false,
+        haltReason: "recovery decided to halt after parse-fail",
+      },
+      resolvedBy: "opus",
+      sonnet: { model: "claude-sonnet-4-6", clean: true, marker: "HALT" },
+      opus: { model: "claude-opus-4-7", clean: true, marker: "HALT" },
+    });
+
+    const results = await runLoop({
+      config: baseConfig,
+      branch: "agent/test",
+      sandboxProvider: {} as never,
+      recoveryPromptPath: "/tmp/recovery.md",
+      _createSandbox: async () => built.sandbox,
+      _listInProgressIssues: async () => [],
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0].outcome).toBe("halted");
+    expect(runRecoveryDiagnosisOrEscalate).toHaveBeenCalledTimes(1);
+    // Confirm the recovery reason carries the parse-fail message — proves
+    // the throw payload survived the catch.
+    const recoveryArgs = runRecoveryDiagnosisOrEscalate.mock.calls[0];
+    expect(recoveryArgs[2].reason).toMatch(/envelope failed to parse/);
+    expect(recoveryArgs[2].priorWho).toBe("implementer");
+    // Critically: markDoneViaLabel must NOT have been called — the loop
+    // did not silently ship on the raw marker.
+    expect(markDoneViaLabel).not.toHaveBeenCalled();
+  });
+});
