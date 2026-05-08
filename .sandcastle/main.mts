@@ -429,6 +429,39 @@ export function preflight(args: RalphArgs, opts: {
 }
 
 // ---------------------------------------------------------------------------
+// Git identity helper — read user.name + user.email from host so the agent's
+// `git commit` calls inside the container have a committer identity. We
+// bypass mounting ~/.gitconfig (single-file Docker mounts are flaky on
+// atomic-rename writes; cause "Device or resource busy" failures).
+// ---------------------------------------------------------------------------
+
+function buildGitEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  const tryGet = (key: string): string | undefined => {
+    try {
+      const out = execFileSync("git", ["config", "--get", key], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      return out.length > 0 ? out : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const name = tryGet("user.name");
+  const email = tryGet("user.email");
+  if (name !== undefined) {
+    env.GIT_AUTHOR_NAME = name;
+    env.GIT_COMMITTER_NAME = name;
+  }
+  if (email !== undefined) {
+    env.GIT_AUTHOR_EMAIL = email;
+    env.GIT_COMMITTER_EMAIL = email;
+  }
+  return env;
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency limiter (small inline semaphore — no extra dep)
 // ---------------------------------------------------------------------------
 
@@ -483,24 +516,28 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
 
   // Auth mounts — sandcastle's docker provider does NOT auto-mount these.
   // Without them, `claude` and `gh` inside the container can't see the host's
-  // session and fail with "Not logged in" / "no auth" errors. `git config`
-  // user.name/user.email also live in ~/.gitconfig on the host; without it,
-  // the agent's `git commit` would fail with "Please tell me who you are".
+  // session and fail with "Not logged in" / "no auth" errors.
+  //
+  // Note: we deliberately do NOT mount ~/.gitconfig. Single-file bind mounts
+  // in Docker fail with "Device or resource busy" when anyone (sandcastle's
+  // own setup, or the agent) tries to update the file via the standard
+  // write-temp-then-rename pattern that git config uses. Instead we read
+  // user.name / user.email from the host's gitconfig at CLI startup and
+  // pass them as GIT_* env vars (see buildGitEnv below).
   const authMounts = [
     { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
     { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
-    // Read-write — sandcastle runs `git config --global --add safe.directory`
-    // early in container boot, which fails if the mount is readonly. The
-    // agent's writes to ~/.gitconfig do reach the host, but in practice the
-    // only writes are sandcastle's own safe.directory entries which are
-    // harmless to accumulate on the host.
-    { hostPath: "~/.gitconfig", sandboxPath: "/home/agent/.gitconfig" },
   ] as const;
   const buildMounts = (extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => {
     return extra && extra.length > 0
       ? { mounts: [...authMounts, ...extra] }
       : { mounts: [...authMounts] };
   };
+
+  // Read git user identity from the host at CLI startup. The container's
+  // safe.directory will be set up by sandcastle itself; user.name/user.email
+  // come through as env vars instead of via a mount.
+  const gitEnv = buildGitEnv();
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -512,7 +549,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async run(spec) {
       const result = await sandcastle.run({
         hooks,
-        sandbox: docker({ imageName: args.imageName, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: gitEnv, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
@@ -526,7 +563,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: gitEnv, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
