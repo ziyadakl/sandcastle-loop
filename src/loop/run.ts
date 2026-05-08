@@ -43,8 +43,10 @@ import type { AgentRunner } from "./iteration.js";
 import type { IssueRef } from "./briefing.js";
 import {
   listReadyIssues,
+  postIssueComment,
   transitionLabel,
   withSingleInstance,
+  warnIfHitLimit,
   LABEL_IN_PROGRESS,
   LABEL_READY,
 } from "../state/index.js";
@@ -158,6 +160,13 @@ export interface RunLoopOptions {
     lockPath: string,
     fn: () => Promise<T>,
   ) => Promise<T>;
+  /**
+   * Test-only: override `postIssueComment` used by the M1 circuit-breaker
+   * best-effort comment poster. When omitted, the live `postIssueComment` is
+   * used (same gh shell-out path as the rest of state/gh.ts).
+   * @internal
+   */
+  _postIssueComment?: typeof postIssueComment;
 }
 
 /**
@@ -198,6 +207,10 @@ async function defaultListInProgressIssues(): Promise<number[]> {
         out.push(row.number);
       }
     }
+    // Wave 3 / M2 — same pagination-cap WARN as listReadyIssues /
+    // listIssuesByLabel. Counted on the parsed integer list, not the raw
+    // gh array, because we only count well-formed entries.
+    warnIfHitLimit(out.length, "defaultListInProgressIssues");
     return out;
   } catch (err) {
     process.stderr.write(
@@ -219,6 +232,7 @@ export async function runLoop(
     opts._listInProgressIssues ?? defaultListInProgressIssues;
   const transition = opts._transitionLabel ?? transitionLabel;
   const wrapInSingleInstance = opts._withSingleInstance ?? withSingleInstance;
+  const commentPoster = opts._postIssueComment ?? postIssueComment;
 
   const lockPath = path.join(config.repoRoot, ".sandcastle.lock");
 
@@ -369,6 +383,30 @@ export async function runLoop(
           consecutiveFailures >= config.consecutiveFailureLimit
             ? `${consecutiveFailures} consecutive quarantines`
             : `${consecutiveHalts} consecutive halts`;
+        // Wave 3 / M1 — pre-Wave-3 the loop just exited silently when the
+        // global breaker tripped (no log, no notification). Now we WARN
+        // loudly to stderr and best-effort comment on the LAST FAILING
+        // ISSUE so the operator hears about the halt.
+        process.stderr.write(
+          `WARN: circuit breaker tripped (${trippedBy}). Loop exiting.\n`,
+        );
+        const lastFailingIssue = iterResult.story.ghIssue;
+        if (
+          typeof lastFailingIssue === "number" &&
+          Number.isInteger(lastFailingIssue) &&
+          lastFailingIssue > 0
+        ) {
+          try {
+            await commentPoster(
+              lastFailingIssue,
+              `RALPH circuit breaker tripped (${trippedBy}). Loop exited after this iteration. Issue left in its current label state for human triage.`,
+            );
+          } catch (err) {
+            process.stderr.write(
+              `WARN: circuit-breaker comment on #${lastFailingIssue} failed: ${(err as Error).message}\n`,
+            );
+          }
+        }
         results.push({
           story: iterResult.story,
           outcome: "circuit_break",

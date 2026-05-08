@@ -15,6 +15,7 @@ import type {
   FixerVerdict,
   RecoveryDecision,
 } from "../types.js";
+import { isGenericAssertionLine } from "./forbidden-lines.js";
 
 /** Severity ladder for reviewer concerns. */
 export const ConcernSeveritySchema = z.enum([
@@ -38,29 +39,15 @@ export const ConcernSchema = z.object({
  */
 export const StoryTypeSchema = z.enum(["ui", "backend-only", "infra"]);
 
-/**
- * Patterns for the e2e assertion-line check (question 5). The implementer
- * MUST quote a line that proves the test reached its assertion. These are
- * the known rubber-stamp evasions:
- *   - `Running 3 tests` / `Running 1 test using 1 worker` — playwright's
- *     preamble line, present in every run regardless of outcome.
- *   - bare URL — `http://localhost:3000/foo` on its own, no assertion proof.
- *
- * The reference fork's reviewer rejects these explicitly
- * (`refs/afk-ralph.sh.local-fork` line ~143). We encode the same rule here
- * so a rubber-stamp attempt fails at parse time, before it can reach
- * the reviewer.
- */
-const RUNNING_PREAMBLE_RE = /^\s*Running\s+\d+\s+tests?\b/i;
-const BARE_URL_RE = /^\s*https?:\/\/\S+\s*$/i;
-
-/** Rejected assertion-line predicate: returns true when the quote is generic. */
-function isGenericAssertionLine(line: string): boolean {
-  if (line.trim().length === 0) return true;
-  if (RUNNING_PREAMBLE_RE.test(line)) return true;
-  if (BARE_URL_RE.test(line)) return true;
-  return false;
-}
+// Wave 3 / M7 — the schema's assertion-line vacuousness check now imports
+// from `./forbidden-lines.js`, which is the single source of truth shared with
+// the reviewer prompt. The 9 forbidden patterns (empty, `Running N tests`,
+// bare URL, `<paste line>`, `using N worker`, `Workers:`, `Slow test file`,
+// `[chromium]` alone, bare words `passed`/`failed`/`all green`) live there.
+//
+// Pre-Wave-3 the schema covered 3 patterns and the reviewer prompt covered 9
+// — vacuous lines passed the schema and were rubber-stamped. With this import
+// the two stay in lockstep.
 
 /**
  * Base shape of the implementer verdict before cross-field refinement. Kept

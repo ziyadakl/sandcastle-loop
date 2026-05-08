@@ -17,6 +17,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Story } from "../types.js";
+import { FORBIDDEN_LINES_PROMPT_TEXT } from "../verdicts/forbidden-lines.js";
 
 /**
  * Driver-fetched GitHub issue snapshot. The driver pre-fetches this once at
@@ -314,7 +315,8 @@ EVIDENCE QUOTE — STRICT verification of the certification's e2eAssertionLine f
   - Non-empty AND not the literal placeholder '<paste line>' or '<the quoted line>'.
   - Starts with '✓' / '✔' / 'PASS' / 'PASSED' (a passing-test marker from playwright's reporter), OR contains 'expect(' (an explicit assertion call), OR contains the test description text from the test file.
   - Actually appears in /tmp/ralph-e2e-it${args.iterationNum}.log.
-  - Is NOT one of these forbidden generic lines: 'Running N tests', 'using N worker', 'Workers:', 'Slow test file', '[chromium]' alone (without a leading ✓), a bare URL line, 'passed' / 'failed' / 'all green' on its own.
+  - Is NOT any of these forbidden generic lines (single source of truth — same list the implementer-output schema rejects):
+${FORBIDDEN_LINES_PROMPT_TEXT}
 If ANY of the above fails, emit 'HARD: certification evidence is fabricated, generic, or doesn't prove the test reached its assertion. <paste the offending line and the rule it violated>.'
 
 CROSS-CHECK CERTIFICATION VS BAIL SIGNALS. If all checkboxes are [x] BUT the playwright log shows bail signals ('redirect to /login', 'Sign in', '401', 'Unauthorized', 'skipped', 'pending', 'auth blocked', 'auth path failed', 'pending human apply', 'migration not applied', 'pre-existing', or a bare 'N passed' summary with no '✓ TestName' line above it), that's 'HARD: certification claims feature was verified but playwright log shows the test bailed. Implementer falsified the certification.' Note: legitimate auth-flow tests (testing the /login page itself) WILL contain 'Sign in' / '401' — if SPEC_REQUIRES_PLAYWRIGHT=yes AND the story spec is explicitly about auth, treat those tokens as legitimate; otherwise treat as bail.

@@ -70,7 +70,12 @@ vi.mock("node:child_process", async () => {
   };
 });
 
-import { transitionLabel } from "../src/state/gh.js";
+import {
+  listIssuesByLabel,
+  listReadyIssues,
+  transitionLabel,
+  warnIfHitLimit,
+} from "../src/state/gh.js";
 
 beforeEach(() => {
   ghCalls.length = 0;
@@ -157,5 +162,121 @@ describe("transitionLabel — Wave 2 / N3 retry-with-backoff", () => {
     await transitionLabel(42, "in-progress", "needs-human", fatalSleep);
 
     expect(ghCalls).toHaveLength(1);
+  });
+});
+
+describe("Wave 3 / M2 — pagination-cap WARN helper", () => {
+  it("warnIfHitLimit writes a WARN to stderr when count===100", () => {
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    warnIfHitLimit(100, "myFn");
+
+    const stderrText = stderrSpy.mock.calls
+      .map((c) => String(c[0]))
+      .join("");
+    expect(stderrText).toMatch(
+      /WARN: myFn returned exactly 100 results — may have hit the limit\. Backlog could be larger\./,
+    );
+
+    stderrSpy.mockRestore();
+  });
+
+  it("warnIfHitLimit does NOT write anything when count<100 or count>100", () => {
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    warnIfHitLimit(0, "myFn");
+    warnIfHitLimit(99, "myFn");
+    warnIfHitLimit(101, "myFn");
+
+    expect(stderrSpy).not.toHaveBeenCalled();
+
+    stderrSpy.mockRestore();
+  });
+
+  it("listReadyIssues emits the WARN when gh returns exactly 100 issues", async () => {
+    // Build a fake gh JSON output with 100 ready issues.
+    const rows: Array<Record<string, unknown>> = [];
+    for (let n = 1; n <= 100; n++) {
+      rows.push({
+        number: n,
+        title: `Issue ${n}`,
+        body: "",
+        labels: [{ name: "ready-for-agent" }],
+        createdAt: `2024-01-01T00:00:${String(n % 60).padStart(2, "0")}Z`,
+      });
+    }
+    mockState.sequence = [{ kind: "ok", stdout: JSON.stringify(rows) }];
+
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    const result = await listReadyIssues();
+    expect(result).toHaveLength(100);
+
+    const stderrText = stderrSpy.mock.calls
+      .map((c) => String(c[0]))
+      .join("");
+    expect(stderrText).toMatch(
+      /WARN: listReadyIssues returned exactly 100 results/,
+    );
+
+    stderrSpy.mockRestore();
+  });
+
+  it("listReadyIssues does NOT emit the WARN when gh returns 99 issues", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    for (let n = 1; n <= 99; n++) {
+      rows.push({
+        number: n,
+        title: `Issue ${n}`,
+        body: "",
+        labels: [],
+        createdAt: `2024-01-01T00:00:${String(n % 60).padStart(2, "0")}Z`,
+      });
+    }
+    mockState.sequence = [{ kind: "ok", stdout: JSON.stringify(rows) }];
+
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    const result = await listReadyIssues();
+    expect(result).toHaveLength(99);
+    expect(stderrSpy).not.toHaveBeenCalled();
+
+    stderrSpy.mockRestore();
+  });
+
+  it("listIssuesByLabel emits the WARN when gh returns exactly 100 issues", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    for (let n = 1; n <= 100; n++) {
+      rows.push({
+        number: n,
+        title: `Issue ${n}`,
+        labels: [{ name: "in-progress" }],
+      });
+    }
+    mockState.sequence = [{ kind: "ok", stdout: JSON.stringify(rows) }];
+
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((..._a: unknown[]) => true) as never);
+
+    const result = await listIssuesByLabel("in-progress");
+    expect(result).toHaveLength(100);
+
+    const stderrText = stderrSpy.mock.calls
+      .map((c) => String(c[0]))
+      .join("");
+    expect(stderrText).toMatch(
+      /WARN: listIssuesByLabel returned exactly 100 results/,
+    );
+
+    stderrSpy.mockRestore();
   });
 });

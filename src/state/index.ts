@@ -26,6 +26,9 @@ export {
   getPriorityFromLabels,
   isStatusLabel,
   isQuarantineLabel,
+  // Wave 3 / M2 — pagination-limit WARN helper, shared across the gh
+  // wrappers and the loop driver's in-progress sweep.
+  warnIfHitLimit,
   LABEL_READY,
   LABEL_IN_PROGRESS,
   LABEL_DONE,

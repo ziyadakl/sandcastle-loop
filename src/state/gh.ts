@@ -28,6 +28,24 @@ interface RunResult {
  */
 const DEFAULT_BACKOFFS_MS: readonly number[] = [500, 1500, 4000];
 
+/**
+ * Wave 3 / M2 — the gh wrappers cap `gh issue list` calls at `--limit 100`.
+ * If the backlog actually exceeds 100, items 101+ silently fall off. Per the
+ * Wave 3 brief we don't paginate yet (would change semantics elsewhere); we
+ * just emit a loud stderr WARN whenever a list call returns exactly 100
+ * results so the silent loss becomes loud and operators can manually requeue.
+ *
+ * Exported so `src/loop/run.ts:defaultListInProgressIssues` can use the same
+ * helper rather than duplicating the message string.
+ */
+export function warnIfHitLimit(count: number, fn: string): void {
+  if (count === 100) {
+    process.stderr.write(
+      `WARN: ${fn} returned exactly 100 results — may have hit the limit. Backlog could be larger.\n`,
+    );
+  }
+}
+
 /** Real-time sleep helper. Replaceable in tests. */
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -427,6 +445,11 @@ export async function listReadyIssues(): Promise<ReadyIssueSummary[]> {
     return 0;
   });
 
+  // Wave 3 / M2 — loud WARN when the result count exactly equals the gh
+  // `--limit` cap. We almost certainly hit the limit; items 101+ are silently
+  // dropped until pagination lands.
+  warnIfHitLimit(summaries.length, "listReadyIssues");
+
   return summaries;
 }
 
@@ -607,5 +630,9 @@ export async function listIssuesByLabel(
     labels: row.labels.map((l) => l.name),
   }));
   summaries.sort((a, b) => a.number - b.number);
+
+  // Wave 3 / M2 — same pagination-cap WARN as listReadyIssues.
+  warnIfHitLimit(summaries.length, "listIssuesByLabel");
+
   return summaries;
 }

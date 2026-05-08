@@ -170,6 +170,61 @@ function specRequiresPlaywright(issueBody: string): boolean {
 }
 
 /**
+ * Wave 3 / M6 — fallback playwright command for the recovery agent's verify
+ * loop when the spec doesn't pin a more specific invocation. The recovery
+ * prompt template substitutes `__VERIFY_COMMANDS__` with whatever this loop
+ * provides; pre-Wave-3 the field was never set, so the recovery agent always
+ * ran with the default `pnpm typecheck` even on stories that the spec
+ * explicitly required playwright for.
+ *
+ * If the spec contains a more specific command (e.g. `pnpm --filter
+ * @acme/nextjs exec playwright test path/to/spec`), `extractPlaywrightCommand`
+ * (below) tries to lift it out of the issue body. Failing that, this default
+ * is the safe baseline.
+ */
+const DEFAULT_PLAYWRIGHT_CMD = "pnpm playwright test";
+
+/**
+ * Wave 3 / M6 — best-effort lift of the spec's exact playwright command.
+ *
+ * The Acceptance / Verify section of an issue body conventionally pins a
+ * concrete invocation, e.g.:
+ *   ```
+ *   pnpm --filter @acme/nextjs exec playwright test apps/web/e2e/login.spec.ts
+ *   ```
+ *
+ * We scan the body for the FIRST line containing the substring `playwright
+ * test` and return it verbatim (trimmed, with leading shell prompts /
+ * markdown bullets / fenced-code markers stripped). When nothing scrapes
+ * cleanly, fall back to {@link DEFAULT_PLAYWRIGHT_CMD}.
+ *
+ * The result is the playwright HALF of `verifyCommands`; the loop joins it
+ * with `pnpm typecheck` on a single ` && ` separator.
+ */
+function extractPlaywrightCommand(issueBody: string): string {
+  const lines = issueBody.split(/\r?\n/);
+  for (const raw of lines) {
+    if (!/playwright test/.test(raw)) continue;
+    let line = raw.trim();
+    // Strip a leading bullet, code-fence marker, blockquote, or dollar-prompt.
+    line = line.replace(/^[-*>]\s+/, "");
+    line = line.replace(/^```\w*\s*/, "");
+    line = line.replace(/\s*```\s*$/, "");
+    line = line.replace(/^\$\s+/, "");
+    line = line.trim();
+    if (line.length === 0) continue;
+    // Reject lines that are clearly prose ("Run the playwright tests with…")
+    // — we want command lines, not narrative. Heuristic: the trimmed line
+    // either starts with a known runner (`pnpm`, `npx`, `yarn`, `bun`) or
+    // contains one of those tokens before `playwright test`.
+    if (/^(pnpm|npx|yarn|bun|playwright)\b/.test(line)) {
+      return line;
+    }
+  }
+  return DEFAULT_PLAYWRIGHT_CMD;
+}
+
+/**
  * V1-B refactor — pre-fetch the GH issue title + body + labels + number in
  * ONE call at iteration start. The result is embedded VERBATIM at the same
  * position in all three agent prompts (implementer, reviewer, fixer) for
@@ -554,6 +609,16 @@ export async function runIteration(
   const issue: IssueRef = claimedIssue;
   const specReqPw = specRequiresPlaywright(issue.body);
 
+  // Wave 3 / M6 — compute the recovery agent's verify-command string ONCE per
+  // iteration. Pre-Wave-3 this was never set, so the recovery prompt's
+  // `__VERIFY_COMMANDS__` placeholder always rendered as the default `pnpm
+  // typecheck` even on stories whose spec explicitly required playwright. The
+  // result is threaded into `RecoveryLadderConfig.verifyCommands` at the
+  // implementer-error recovery call site below.
+  const verifyCommands = specReqPw
+    ? `pnpm typecheck && ${extractPlaywrightCommand(issue.body)}`
+    : "pnpm typecheck";
+
   // Fix #6 — read progress.txt tail ONCE per iteration. Embedded at the SAME
   // position (after the issue block) in all three agent prompts so the cache
   // prefix is shared.
@@ -690,6 +755,11 @@ export async function runIteration(
       {
         promptTemplatePath: args.recoveryPromptPath,
         idleTimeoutSeconds: msToSec(args.config.agentTimeouts.recovery),
+        // Wave 3 / M6 — populate verifyCommands so the recovery prompt's
+        // `__VERIFY_COMMANDS__` substitution renders the spec-specific
+        // playwright command on stories that need one. Pre-Wave-3 this was
+        // never set, so the recovery agent always ran `pnpm typecheck` only.
+        verifyCommands,
         // Intent (Fix #10): Sonnet recovery retry at effort high. Field is
         // not yet on RecoveryLadderConfig; documented here as cross-track
         // contract until FIX-3 accepts it.
