@@ -34,10 +34,10 @@ import {
   markDoneViaLabel,
   postIssueComment,
   LABEL_READY,
-} from "../src/state/index.js";
-import { parseVerdict, extractMarker } from "../src/verdicts/index.js";
-import { ImplementerOutputSchema } from "../src/verdicts/index.js";
-import { applyMigrationsBetween } from "../src/migrations/index.js";
+} from "./lib/state/index.js";
+import { parseVerdict, extractMarker } from "./lib/verdicts/index.js";
+import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
+import { applyMigrationsBetween } from "./lib/migrations/index.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,13 +67,8 @@ export interface RalphArgs {
   maxConcurrent: number;
   implementerModel: string;
   reviewerModel: string;
-  fixerModel: string;
-  recoveryModel: string;
-  recoveryEscalatedModel: string;
   implementerTimeoutSec: number;
   reviewerTimeoutSec: number;
-  fixerTimeoutSec: number;
-  recoveryTimeoutSec: number;
   consecutiveFailureLimit: number;
   logFile?: string;
   dryRun: boolean;
@@ -181,16 +176,10 @@ Optional:
   --branch NAME             Base branch (default: current; refuses main/master).
   --label NAME              Label to claim (default: ready-for-agent).
   --max-concurrent N        Parallel issues per cycle (default: 3).
-  --implementer-model M     Default: claude-sonnet-4-6.
+  --implementer-model M     Default: claude-opus-4-7.
   --reviewer-model M        Default: claude-haiku-4-5.
-  --fixer-model M           Default: claude-sonnet-4-6.
-  --recovery-model M        Default: claude-sonnet-4-6.
-  --recovery-escalated-model M
-                            Default: claude-opus-4-7.
   --implementer-timeout-sec N   Default: 1200.
   --reviewer-timeout-sec N      Default: 600.
-  --fixer-timeout-sec N         Default: 900.
-  --recovery-timeout-sec N      Default: 1800.
   --consecutive-failure-limit N Default: 3.
   --log-file PATH           Tee output to this file.
   --dry-run                 Skip claim/quarantine/markDone side effects.
@@ -228,13 +217,8 @@ export function parseRalphArgs(argv: readonly string[]): {
       "max-concurrent": { type: "string" },
       "implementer-model": { type: "string" },
       "reviewer-model": { type: "string" },
-      "fixer-model": { type: "string" },
-      "recovery-model": { type: "string" },
-      "recovery-escalated-model": { type: "string" },
       "implementer-timeout-sec": { type: "string" },
       "reviewer-timeout-sec": { type: "string" },
-      "fixer-timeout-sec": { type: "string" },
-      "recovery-timeout-sec": { type: "string" },
       "consecutive-failure-limit": { type: "string" },
       "log-file": { type: "string" },
       "dry-run": { type: "boolean" },
@@ -268,12 +252,8 @@ export function parseRalphArgs(argv: readonly string[]): {
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
-    implementerModel: values["implementer-model"] ?? "claude-sonnet-4-6",
+    implementerModel: values["implementer-model"] ?? "claude-opus-4-7",
     reviewerModel: values["reviewer-model"] ?? "claude-haiku-4-5",
-    fixerModel: values["fixer-model"] ?? "claude-sonnet-4-6",
-    recoveryModel: values["recovery-model"] ?? "claude-sonnet-4-6",
-    recoveryEscalatedModel:
-      values["recovery-escalated-model"] ?? "claude-opus-4-7",
     implementerTimeoutSec:
       parsePositiveInt(
         values["implementer-timeout-sec"],
@@ -284,14 +264,6 @@ export function parseRalphArgs(argv: readonly string[]): {
         values["reviewer-timeout-sec"],
         "--reviewer-timeout-sec",
       ) ?? 600,
-    fixerTimeoutSec:
-      parsePositiveInt(values["fixer-timeout-sec"], "--fixer-timeout-sec") ??
-      900,
-    recoveryTimeoutSec:
-      parsePositiveInt(
-        values["recovery-timeout-sec"],
-        "--recovery-timeout-sec",
-      ) ?? 1800,
     consecutiveFailureLimit:
       parsePositiveInt(
         values["consecutive-failure-limit"],
@@ -340,15 +312,10 @@ function defaultArgs(): RalphArgs {
     branch: "HEAD",
     label: LABEL_READY,
     maxConcurrent: 3,
-    implementerModel: "claude-sonnet-4-6",
+    implementerModel: "claude-opus-4-7",
     reviewerModel: "claude-haiku-4-5",
-    fixerModel: "claude-sonnet-4-6",
-    recoveryModel: "claude-sonnet-4-6",
-    recoveryEscalatedModel: "claude-opus-4-7",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
-    fixerTimeoutSec: 900,
-    recoveryTimeoutSec: 1800,
     consecutiveFailureLimit: 3,
     dryRun: false,
     imageName: "sandcastle:loop",
@@ -363,9 +330,6 @@ const REQUIRED_PROMPT_FILES = [
   "plan-prompt.md",
   "implement-prompt.md",
   "review-prompt.md",
-  "fix-prompt.md",
-  "final-review-prompt.md",
-  "recovery-prompt.md",
   "merge-prompt.md",
 ] as const;
 
@@ -759,138 +723,15 @@ async function runReviewer(
   return { marker, stdout: r.stdout };
 }
 
-async function runFixer(
-  sb: SandboxHandle,
-  ctx: PipelineCtx,
-  model: string,
-): Promise<{ stdout: string; commits: readonly { sha: string }[] }> {
-  const r = await sb.run({
-    name: "fixer",
-    maxIterations: 50,
-    model,
-    promptFile: "./.sandcastle/fix-prompt.md",
-    idleTimeoutSeconds: ctx.args.fixerTimeoutSec,
-    promptArgs: {
-      ITERATION: String(ctx.iteration),
-      ISSUE_NUMBER: String(ctx.issueNumber),
-      BRANCH: ctx.issue.branch,
-    },
-  });
-  return r;
-}
-
-/**
- * Run the reviewer/fixer loop after a successful implementer run.
- *
- * Ladder (matches bash parity):
- *   review (haiku) → ALL_CLEAR ⇒ done
- *                  → HAS_BLOCKERS ⇒ fixer (sonnet) → re-review (haiku)
- *                                  → ALL_CLEAR ⇒ done
- *                                  → HAS_BLOCKERS ⇒ fixer (opus, via fix-prompt)
- *                                                  → final-review (haiku)
- *                                                    → ALL_CLEAR ⇒ done
- *                                                    → HAS_BLOCKERS ⇒ final-review (opus) → final
- */
-async function runReviewerLadder(
-  sb: SandboxHandle,
-  ctx: PipelineCtx,
-  initialCommitSha: string,
-): Promise<{ marker: string; finalCommitSha: string }> {
-  // Pass 1: review
-  let commitSha = initialCommitSha;
-  let r1 = await runReviewer(sb, ctx, commitSha);
-  if (r1.marker === "ALL_CLEAR") return { marker: "ALL_CLEAR", finalCommitSha: commitSha };
-
-  // Pass 2: fixer (sonnet) → re-review (haiku)
-  ctx.deps.log(
-    `[issue=${ctx.issueNumber}] reviewer HAS_BLOCKERS — invoking fixer (sonnet)`,
-  );
-  const f1 = await runFixer(sb, ctx, ctx.args.fixerModel);
-  if (f1.commits.length > 0) commitSha = f1.commits[f1.commits.length - 1]!.sha;
-  let r2 = await runReviewer(sb, ctx, commitSha);
-  if (r2.marker === "ALL_CLEAR") return { marker: "ALL_CLEAR", finalCommitSha: commitSha };
-
-  // Pass 3: fixer (opus) → final-review (haiku)
-  ctx.deps.log(
-    `[issue=${ctx.issueNumber}] reviewer still HAS_BLOCKERS — escalating to fixer (opus)`,
-  );
-  const f2 = await runFixer(sb, ctx, ctx.args.recoveryEscalatedModel);
-  if (f2.commits.length > 0) commitSha = f2.commits[f2.commits.length - 1]!.sha;
-  let r3 = await runReviewer(
-    sb,
-    ctx,
-    commitSha,
-    "./.sandcastle/final-review-prompt.md",
-  );
-  if (r3.marker === "ALL_CLEAR") return { marker: "ALL_CLEAR", finalCommitSha: commitSha };
-
-  // Pass 4: final-review (opus)
-  ctx.deps.log(
-    `[issue=${ctx.issueNumber}] final-review still HAS_BLOCKERS — escalating final review to opus`,
-  );
-  const r4 = await runReviewer(
-    sb,
-    ctx,
-    commitSha,
-    "./.sandcastle/final-review-prompt.md",
-    ctx.args.recoveryEscalatedModel,
-  );
-  return { marker: r4.marker, finalCommitSha: commitSha };
-}
-
-/**
- * Recovery ladder: invoked from the catch-block when any sandbox.run() in the
- * pipeline throws. Tries sonnet first; if that emits HALT (or throws), tries
- * opus. Returns whichever marker the ladder ends on, or "HALT" if both fail.
- *
- * Recovery uses top-level `sandcastle.run` (NOT the issue's sandbox) because
- * the sandbox may already be torn down or mid-failure when we get here.
- */
-async function runRecovery(
-  ctx: PipelineCtx,
-  reason: string,
-): Promise<{ marker: string }> {
-  const tryModel = async (model: string): Promise<string | null> => {
-    try {
-      const r = await ctx.deps.run({
-        name: "recovery",
-        maxIterations: 1,
-        model,
-        promptFile: "./.sandcastle/recovery-prompt.md",
-        idleTimeoutSeconds: ctx.args.recoveryTimeoutSec,
-        promptArgs: {
-          REASON: reason,
-          ITERATION: String(ctx.iteration),
-          ISSUE_NUMBER: String(ctx.issueNumber),
-          BRANCH: ctx.issue.branch,
-        },
-      });
-      return extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
-    } catch (err) {
-      ctx.deps.logError(
-        `recovery (${model}) threw: ${(err as Error).message}`,
-      );
-      return null;
-    }
-  };
-
-  const m1 = await tryModel(ctx.args.recoveryModel);
-  if (m1 === "RECOVERY_COMPLETE") return { marker: "RECOVERY_COMPLETE" };
-
-  ctx.deps.log(
-    `[issue=${ctx.issueNumber}] recovery (sonnet) ${m1 ?? "threw"} — escalating to opus`,
-  );
-  const m2 = await tryModel(ctx.args.recoveryEscalatedModel);
-  if (m2 === "RECOVERY_COMPLETE") return { marker: "RECOVERY_COMPLETE" };
-
-  return { marker: "HALT" };
-}
-
 /**
  * Drive a single issue through the full implement → migrate → review →
- * fix-as-needed → markDone pipeline. Caller wraps this in `claim` and is
- * responsible for converting our return value into ship/quarantine/error
- * counters.
+ * markDone pipeline. Caller wraps this in `claim` and is responsible for
+ * converting our return value into ship/quarantine/error counters.
+ *
+ * Per Matt Pocock's published guidance: no fixer/recovery escalation ladder.
+ * Implementer runs once with Opus (the strongest model). If the reviewer
+ * marks HAS_BLOCKERS or any step throws, the issue is quarantined for human
+ * triage. The fallback in src/recovery/ is preserved as the alternative path.
  */
 async function runIssuePipeline(
   ctx: PipelineCtx,
@@ -936,67 +777,42 @@ async function runIssuePipeline(
       }
     }
 
-    // Phase 2c: reviewer ladder
-    const ladder = await runReviewerLadder(sandbox, ctx, postSha);
+    // Phase 2c: reviewer (single pass, no ladder)
+    const review = await runReviewer(sandbox, ctx, postSha);
 
-    if (ladder.marker === "ALL_CLEAR") {
-      const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${ladder.finalCommitSha}, branch ${ctx.issue.branch})`;
+    if (review.marker === "ALL_CLEAR") {
+      const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${postSha}, branch ${ctx.issue.branch})`;
       await ctx.deps.markDone(ctx.issueNumber, summary);
       return {
         status: "ok",
         finalMarker: "ALL_CLEAR",
-        postSha: ladder.finalCommitSha,
+        postSha,
       };
     }
 
-    // Reviewer ladder ended on HAS_BLOCKERS even after final opus pass —
-    // quarantine.
+    // Reviewer marked HAS_BLOCKERS — quarantine for human triage.
     const reason =
-      `[issue=${ctx.issueNumber}] reviewer ladder ended on ${ladder.marker} ` +
-      `after the final opus pass — quarantining for human triage.`;
+      `[issue=${ctx.issueNumber}] reviewer marked ${review.marker} — ` +
+      `quarantining for human triage.`;
     await ctx.deps.quarantine(ctx.issueNumber, reason);
     return {
       status: "quarantined",
-      finalMarker: ladder.marker,
-      postSha: ladder.finalCommitSha,
+      finalMarker: review.marker,
+      postSha,
     };
   } catch (err) {
     const errMsg = (err as Error).message;
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
     );
-    // Recovery ladder.
-    let recoveryMarker = "HALT";
-    try {
-      const rec = await runRecovery(ctx, errMsg);
-      recoveryMarker = rec.marker;
-    } catch (innerErr) {
-      ctx.deps.logError(
-        `[issue=${ctx.issueNumber}] recovery ladder itself threw: ${(innerErr as Error).message}`,
-      );
-    }
-    if (recoveryMarker === "RECOVERY_COMPLETE") {
-      // Recovery says it patched the issue. Treat as success — the actual
-      // commit landed inside recovery's own run.
-      const summary = `[issue=${ctx.issueNumber}] recovered and shipped via sandcastle-loop (branch ${ctx.issue.branch})`;
-      try {
-        await ctx.deps.markDone(ctx.issueNumber, summary);
-        return { status: "ok", finalMarker: "RECOVERY_COMPLETE" };
-      } catch (e) {
-        ctx.deps.logError(
-          `markDone after recovery failed: ${(e as Error).message}`,
-        );
-        return { status: "error", finalMarker: "RECOVERY_COMPLETE" };
-      }
-    }
-    // HALT or unhandled — quarantine.
+    // No recovery ladder — quarantine on any error and let a human triage.
     const reason = `[issue=${ctx.issueNumber}] pipeline halted: ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
-      return { status: "quarantined", finalMarker: recoveryMarker };
+      return { status: "quarantined", finalMarker: "HALT" };
     } catch (e) {
       ctx.deps.logError(`quarantine failed: ${(e as Error).message}`);
-      return { status: "error", finalMarker: recoveryMarker };
+      return { status: "error", finalMarker: "HALT" };
     }
   } finally {
     if (sandbox) {

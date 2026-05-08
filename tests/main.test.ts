@@ -200,15 +200,10 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     label: "ready-for-agent",
     maxConcurrent: 3,
     imageName: "sandcastle:loop",
-    implementerModel: "claude-sonnet-4-6",
+    implementerModel: "claude-opus-4-7",
     reviewerModel: "claude-haiku-4-5",
-    fixerModel: "claude-sonnet-4-6",
-    recoveryModel: "claude-sonnet-4-6",
-    recoveryEscalatedModel: "claude-opus-4-7",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
-    fixerTimeoutSec: 900,
-    recoveryTimeoutSec: 1800,
     consecutiveFailureLimit: 3,
     dryRun: false,
     ...over,
@@ -316,8 +311,8 @@ describe("sandcastle-loop main.mts — happy path", () => {
   });
 });
 
-describe("sandcastle-loop main.mts — reviewer ladder", () => {
-  it("fixer-sonnet then re-review ALL_CLEAR ships the issue", async () => {
+describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () => {
+  it("reviewer HAS_BLOCKERS quarantines the issue, no markDone", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([{ id: "100", title: "x", branch: "agent/issue-100" }]),
@@ -327,146 +322,31 @@ describe("sandcastle-loop main.mts — reviewer ladder", () => {
       commits: [{ sha: "c1" }],
     });
     b.enqueue("reviewer", { stdout: "Found a bug.\nHAS_BLOCKERS" });
-    b.enqueue("fixer", {
-      stdout: "fixed",
-      commits: [{ sha: "c2" }],
-    });
-    b.enqueue("reviewer", { stdout: "Looks good now.\nALL_CLEAR" });
-    b.enqueue("merger", { stdout: "merged" });
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
     const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
 
     expect(result.exitCode).toBe(0);
-    expect(result.shippedIssues).toEqual([100]);
-    expect(b.state.marksDone).toHaveLength(1);
-    // Run order includes the fixer + second reviewer.
-    const names = b.state.runCalls.map((c) => c.spec.name);
-    expect(names).toEqual([
-      "planner",
-      "implementer",
-      "reviewer",
-      "fixer",
-      "reviewer",
-      "merger",
-      "planner",
-    ]);
+    expect(result.shippedIssues).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(100);
+    expect(b.state.marksDone).toEqual([]);
   });
 
-  it("escalates to fixer-opus + final-review when sonnet fix doesn't clear", async () => {
-    const b = buildDeps();
-    b.enqueue("planner", {
-      stdout: plannerStdout([{ id: "200", title: "y", branch: "agent/issue-200" }]),
-    });
-    b.enqueue("implementer", {
-      stdout: implementerStdout({ ghIssue: 200 }),
-      commits: [{ sha: "c1" }],
-    });
-    b.enqueue("reviewer", { stdout: "Bug.\nHAS_BLOCKERS" });
-    b.enqueue("fixer", { stdout: "first try\nFIXED", commits: [{ sha: "c2" }] });
-    b.enqueue("reviewer", { stdout: "still bad\nHAS_BLOCKERS" });
-    b.enqueue("fixer", {
-      stdout: "second try\nFIXED",
-      commits: [{ sha: "c3" }],
-    });
-    b.enqueue("reviewer", { stdout: "now good\nALL_CLEAR" });
-    b.enqueue("merger", { stdout: "merged" });
-    b.enqueue("planner", { stdout: plannerStdout([]) });
-
-    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
-
-    expect(result.exitCode).toBe(0);
-    expect(result.shippedIssues).toEqual([200]);
-    // The escalated fixer+reviewer use opus; check the second fixer's model.
-    const fixerCalls = b.state.runCalls.filter(
-      (c) => c.spec.name === "fixer",
-    );
-    expect(fixerCalls).toHaveLength(2);
-    expect(fixerCalls[0]!.spec.model).toBe("claude-sonnet-4-6");
-    expect(fixerCalls[1]!.spec.model).toBe("claude-opus-4-7");
-    // Final-review prompt must be referenced for at least one of the
-    // post-opus reviewer passes.
-    const reviewerCalls = b.state.runCalls.filter(
-      (c) => c.spec.name === "reviewer",
-    );
-    expect(reviewerCalls.length).toBe(3);
-    expect(reviewerCalls[2]!.spec.promptFile).toBe(
-      "./.sandcastle/final-review-prompt.md",
-    );
-  });
-});
-
-describe("sandcastle-loop main.mts — recovery ladder", () => {
-  it("implementer error → recovery-sonnet RECOVERY_COMPLETE → markDone, no quarantine", async () => {
+  it("implementer error quarantines the issue (no recovery ladder)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([{ id: "300", title: "z", branch: "agent/issue-300" }]),
     });
-    // Implementer crashes — a sandbox.run() that throws.
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    b.enqueue("recovery", { stdout: "fixed by recovery\nRECOVERY_COMPLETE" });
-    b.enqueue("merger", { stdout: "merged" });
-    b.enqueue("planner", { stdout: plannerStdout([]) });
-
-    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
-
-    expect(result.exitCode).toBe(0);
-    expect(result.shippedIssues).toEqual([300]);
-    expect(b.state.quarantines).toEqual([]);
-    expect(b.state.marksDone).toHaveLength(1);
-    // Recovery is a TOP-LEVEL run (not sandbox) per the orchestrator's design.
-    const recoveryCalls = b.state.runCalls.filter(
-      (c) => c.spec.name === "recovery",
-    );
-    expect(recoveryCalls).toHaveLength(1);
-    expect(recoveryCalls[0]!.kind).toBe("top-level");
-  });
-
-  it("implementer error → recovery-sonnet HALT → recovery-opus RECOVERY_COMPLETE → markDone", async () => {
-    const b = buildDeps();
-    b.enqueue("planner", {
-      stdout: plannerStdout([{ id: "400", title: "w", branch: "agent/issue-400" }]),
-    });
-    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    b.enqueue("recovery", { stdout: "give up\nHALT" });
-    b.enqueue("recovery", {
-      stdout: "rescued by opus\nRECOVERY_COMPLETE",
-    });
-    b.enqueue("merger", { stdout: "merged" });
-    b.enqueue("planner", { stdout: plannerStdout([]) });
-
-    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
-
-    expect(result.exitCode).toBe(0);
-    expect(result.shippedIssues).toEqual([400]);
-    expect(b.state.quarantines).toEqual([]);
-    const recoveryCalls = b.state.runCalls.filter(
-      (c) => c.spec.name === "recovery",
-    );
-    expect(recoveryCalls).toHaveLength(2);
-    expect(recoveryCalls[0]!.spec.model).toBe("claude-sonnet-4-6");
-    expect(recoveryCalls[1]!.spec.model).toBe("claude-opus-4-7");
-  });
-
-  it("implementer error + both recovery passes HALT → quarantine fires, no markDone", async () => {
-    const b = buildDeps();
-    b.enqueue("planner", {
-      stdout: plannerStdout([{ id: "500", title: "v", branch: "agent/issue-500" }]),
-    });
-    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    b.enqueue("recovery", { stdout: "give up\nHALT" });
-    b.enqueue("recovery", { stdout: "give up too\nHALT" });
-    // No second planner — quarantine bumps consecutiveFailures, but with
-    // limit 3 (default) and 1 fail, the loop continues to iteration 2.
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
     const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
 
     expect(result.exitCode).toBe(0);
     expect(b.state.quarantines).toHaveLength(1);
-    expect(b.state.quarantines[0]!.issueNum).toBe(500);
+    expect(b.state.quarantines[0]!.issueNum).toBe(300);
     expect(b.state.marksDone).toEqual([]);
-    expect(result.shippedIssues).toEqual([]);
   });
 });
 
@@ -581,9 +461,8 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-sonnet-4-6");
+    expect(r.args.implementerModel).toBe("claude-opus-4-7");
     expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
-    expect(r.args.recoveryEscalatedModel).toBe("claude-opus-4-7");
     expect(r.args.consecutiveFailureLimit).toBe(3);
   });
 });
