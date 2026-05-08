@@ -56,13 +56,18 @@ export const StoryTypeSchema = z.enum(["ui", "backend-only", "infra"]);
  * assertion at the bottom of this file enforces the match).
  */
 const ImplementerOutputBaseSchema = z.object({
-  // ---- existing fields (preserved) ----
-  storyId: z.string().min(1),
-  ghIssue: z.number().int().nonnegative(),
+  // ---- legacy carry-over fields (now OPTIONAL) ----
+  // implement-prompt.md only teaches the implementer to emit "the 7 fields"
+  // of the structural certification + marker. These five carryover fields
+  // were required by older tracks but no new-path code reads them, so they
+  // were dead weight that just made parses fail. Validation still applies
+  // (.min, .nonnegative, .enum) when they ARE present.
+  storyId: z.string().min(1).optional(),
+  ghIssue: z.number().int().nonnegative().optional(),
   commitSha: z.string().min(1).optional(),
-  e2eVerdict: z.enum(["passed", "failed", "skipped", "halted"]),
-  uiTouched: z.boolean(),
-  certificationPresent: z.boolean(),
+  e2eVerdict: z.enum(["passed", "failed", "skipped", "halted"]).optional(),
+  uiTouched: z.boolean().optional(),
+  certificationPresent: z.boolean().optional(),
   marker: z.enum(["STORY_COMPLETE", "HALT", "RECOVERY_COMPLETE"]),
   haltReason: z.string().optional(),
 

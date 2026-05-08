@@ -100,13 +100,15 @@ export type StoryType = "ui" | "backend-only" | "infra";
  *     read `e2eRan` should migrate.
  */
 export interface ImplementerOutput {
-  // ---- existing fields (preserved) ----
-  storyId: string;
-  ghIssue: number;
+  // ---- legacy carry-over fields (now OPTIONAL) ----
+  // See .sandcastle/lib/types.ts for the rationale (2026-05-08 smoke-test
+  // prompt/schema mismatch). Mirrored here so src/ stays in sync.
+  storyId?: string;
+  ghIssue?: number;
   commitSha?: string;
-  e2eVerdict: "passed" | "failed" | "skipped" | "halted";
-  uiTouched: boolean;
-  certificationPresent: boolean;
+  e2eVerdict?: "passed" | "failed" | "skipped" | "halted";
+  uiTouched?: boolean;
+  certificationPresent?: boolean;
   marker: "STORY_COMPLETE" | "HALT" | "RECOVERY_COMPLETE";
   haltReason?: string;
 

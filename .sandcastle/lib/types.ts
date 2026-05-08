@@ -100,13 +100,20 @@ export type StoryType = "ui" | "backend-only" | "infra";
  *     read `e2eRan` should migrate.
  */
 export interface ImplementerOutput {
-  // ---- existing fields (preserved) ----
-  storyId: string;
-  ghIssue: number;
+  // ---- legacy carry-over fields (now OPTIONAL) ----
+  // The 2026-05-08 smoke test on issue #84 surfaced a prompt/schema mismatch:
+  // implement-prompt.md teaches the implementer to emit "the 7 fields" of the
+  // structural certification + marker, but the schema also required these
+  // five from earlier tracks. No new-path code reads them (and the old path
+  // explicitly does NOT trust impl.output.uiTouched per iteration.ts:826),
+  // so they're dead weight. Marking optional matches what the prompt asks
+  // for; validation still applies when they're present.
+  storyId?: string;
+  ghIssue?: number;
   commitSha?: string;
-  e2eVerdict: "passed" | "failed" | "skipped" | "halted";
-  uiTouched: boolean;
-  certificationPresent: boolean;
+  e2eVerdict?: "passed" | "failed" | "skipped" | "halted";
+  uiTouched?: boolean;
+  certificationPresent?: boolean;
   marker: "STORY_COMPLETE" | "HALT" | "RECOVERY_COMPLETE";
   haltReason?: string;
 

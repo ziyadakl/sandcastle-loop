@@ -85,6 +85,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 USER root
 RUN corepack enable
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+# Pre-fetch pnpm so the merger's `pnpm install` hook never needs to download
+# at runtime. The 2026-05-08 smoke test showed that even with the prompt
+# silenced, the runtime download step itself was failing inside the merger's
+# fresh sandbox. Baking the version in eliminates that whole code path.
+# Pinned to the version affinity-tracker's `package.json` packageManager
+# field requests; if a future target project pins a different version,
+# corepack still falls back to downloading on demand.
+RUN corepack prepare pnpm@10.19.0 --activate
 USER agent
 
 # ---------------------------------------------------------------------------
