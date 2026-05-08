@@ -72,6 +72,7 @@ export interface MockCallRecord {
 export type FailureMode =
   | "none"
   | "implementer-halts"
+  | "implementer-invalid-json"
   | "reviewer-blocks-then-fixer-fixes";
 
 export interface MockSandboxOptions {
@@ -101,6 +102,36 @@ interface CannedOutput {
 function canned(role: AgentRole, mode: FailureMode): CannedOutput {
   switch (role) {
     case "implementer": {
+      if (mode === "implementer-invalid-json") {
+        // Wave-1 N1 smoke variant — STORY_COMPLETE marker on the last line
+        // (strict marker extraction MUST succeed) but the JSON envelope is
+        // deliberately broken so `parseVerdict(... ImplementerOutputSchema)`
+        // throws. runImplementer's STORY_COMPLETE branch re-throws as
+        // `"implementer emitted STORY_COMPLETE but the structured JSON
+        // envelope failed to parse: ..."` — caught by iteration.ts and routed
+        // to the recovery ladder. With recovery sandbox.run() throwing too
+        // (the stub below), the ladder synthesises HALT and the iteration
+        // ends with outcome="halted" + a quarantineViaLabel call.
+        //
+        // The broken payload below has unquoted JSON-ish text that NEITHER a
+        // streaming-stdout pass NOR the `alreadyAssistantText` fallback can
+        // parse. Both attempts inside runImplementer (lines agents.ts:312-317)
+        // will throw, and the marker === "STORY_COMPLETE" branch will rethrow.
+        const brokenPayload =
+          `{"storyId":"${STORY_ID}","ghIssue":${GH_ISSUE},"badJSON"truncated`;
+        return {
+          stdout: [
+            "[STEP 1/9] Read spec",
+            "[STEP 9/9] Commit",
+            "Implementer claims it shipped, but its envelope is corrupt.",
+            brokenPayload,
+            "",
+            "STORY_COMPLETE",
+          ].join("\n"),
+          marker: "STORY_COMPLETE",
+          producesCommit: true,
+        };
+      }
       if (mode === "implementer-halts") {
         const payload = JSON.stringify({
           storyId: STORY_ID,
@@ -259,6 +290,14 @@ export interface MockSandbox {
   runAgent(opts: MockRunOptions): Promise<MockRunResult>;
   /** Ordered log of every runAgent invocation. */
   readonly calls: readonly MockCallRecord[];
+  /**
+   * Count of `sandbox.run()` invocations against the stub. The recovery
+   * ladder (recovery/ladder.ts) calls `sandbox.run()` directly rather than
+   * routing through `_agentRunner` — so smoke variants that exercise the
+   * recovery path use this counter to assert the ladder fired. Each call
+   * increments BEFORE the stub throws.
+   */
+  readonly sandboxRunCalls: number;
   /** Wipe call history — useful when a single mock spans multiple smoke variants. */
   reset(): void;
 }
@@ -268,6 +307,7 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
   const branch = options.branch ?? "agent/smoke.1";
   const callsMutable: MockCallRecord[] = [];
   let commitCounter = 0;
+  let sandboxRunCallCount = 0;
 
   const nextCommitSha = (): string => {
     commitCounter += 1;
@@ -342,8 +382,16 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
       branch: stubBranch,
       worktreePath: stubWorktreePath,
       run: async (_o: SandboxRunOptions): Promise<SandboxRunResult> => {
-        // The loop should always be using _agentRunner — reaching here means
-        // someone forgot to wire the seam. Fail loudly so the smoke surfaces it.
+        // Count the invocation BEFORE throwing so smoke variants exercising
+        // the recovery ladder (which calls sandbox.run() directly, not
+        // through _agentRunner) can assert the ladder fired even though the
+        // stub never returns a real result.
+        sandboxRunCallCount += 1;
+        // The loop should always be using _agentRunner for per-role agent
+        // calls — reaching here means EITHER someone forgot to wire the
+        // seam, OR (intentionally) the recovery ladder was invoked. Either
+        // way, fail loudly: the recovery ladder catches this throw and
+        // routes it to a HALT decision, so the smoke flow is preserved.
         throw new Error(
           "MockSandbox stub.run() invoked: _agentRunner test seam missing or not threaded.",
         );
@@ -366,9 +414,13 @@ export function createMockSandbox(options: MockSandboxOptions = {}): MockSandbox
     get calls(): readonly MockCallRecord[] {
       return callsMutable;
     },
+    get sandboxRunCalls(): number {
+      return sandboxRunCallCount;
+    },
     reset(): void {
       callsMutable.length = 0;
       commitCounter = 0;
+      sandboxRunCallCount = 0;
     },
   };
 }

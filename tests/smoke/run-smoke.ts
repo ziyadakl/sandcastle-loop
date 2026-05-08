@@ -51,14 +51,56 @@ import type { IterationResult, LoopConfig } from "../../src/types.js";
 import {
   createMockSandbox,
   type AgentRole as MockAgentRole,
+  type FailureMode as MockFailureMode,
   type MockSandbox,
   type MockCallRecord,
 } from "./mocks/mock-sandbox.js";
 import {
   runAllExpectations,
+  runInvalidJsonExpectations,
   type ExpectationContext,
   type RunLoopArtifacts,
 } from "./expectations.js";
+
+/**
+ * Smoke variant selector.
+ *
+ *   - "green" (default) — Wave 1 baseline. Implementer ships clean, reviewer
+ *     ALL_CLEARs, loop calls markDoneViaLabel + closeIssue. 13 assertions in
+ *     `runAllExpectations`.
+ *
+ *   - "invalid-json" — Wave 1 N1 regression smoke. Implementer emits a valid
+ *     STORY_COMPLETE marker on the last line BUT a broken JSON envelope.
+ *     `runImplementer` throws; iteration.ts catches and routes to the
+ *     recovery ladder; recovery's `sandbox.run()` calls hit the stub's
+ *     throw → ladder synthesises HALT → iteration quarantines via label and
+ *     returns outcome="halted". Assertions in `runInvalidJsonExpectations`
+ *     (~10 checks) prove the issue is NOT shipped, NOT closed, and the
+ *     `in-progress` -> `needs-human` label transition fired.
+ *
+ * Selected via the `SMOKE_MODE` env var; CLI argv `--mode=<x>` is also
+ * accepted as a convenience wrapper.
+ */
+type SmokeMode = "green" | "invalid-json";
+
+function resolveSmokeMode(): SmokeMode {
+  const argv = process.argv.slice(2);
+  for (const a of argv) {
+    if (a.startsWith("--mode=")) {
+      const v = a.slice("--mode=".length).trim();
+      if (v === "green" || v === "invalid-json") return v;
+      throw new Error(
+        `Unknown --mode=${JSON.stringify(v)}. Expected 'green' or 'invalid-json'.`,
+      );
+    }
+  }
+  const env = (process.env.SMOKE_MODE ?? "").trim();
+  if (env === "" || env === "green") return "green";
+  if (env === "invalid-json") return "invalid-json";
+  throw new Error(
+    `Unknown SMOKE_MODE=${JSON.stringify(env)}. Expected 'green' or 'invalid-json'.`,
+  );
+}
 
 const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 10);
 
@@ -240,6 +282,7 @@ interface CapturedAgentCall {
 
 interface SmokeOutcome {
   readonly mode: "runLoop";
+  readonly variant: SmokeMode;
   readonly repoRoot: string;
   readonly failures: readonly string[];
   readonly checks: readonly string[];
@@ -248,7 +291,8 @@ interface SmokeOutcome {
   readonly artifacts: RunLoopArtifacts;
 }
 
-async function main(): Promise<SmokeOutcome> {
+async function main(variant: SmokeMode): Promise<SmokeOutcome> {
+  console.log(`[smoke] variant=${variant}`);
   console.log("[smoke] copying fixture to temp dir");
   const repoRoot = await copyFixtureToTempDir();
   console.log(`[smoke] fixture at ${repoRoot}`);
@@ -259,7 +303,14 @@ async function main(): Promise<SmokeOutcome> {
   console.log("[smoke] installing gh stub");
   const gh = await installGhStub();
 
-  const sandbox = createMockSandbox({ branch: SMOKE_BRANCH });
+  // Wave 1 N1 variant — feed the mock sandbox a failure mode whose canned
+  // implementer stdout has STORY_COMPLETE on the last line BUT a broken JSON
+  // envelope. runImplementer must throw; iteration.ts must route to the
+  // recovery ladder; the ladder must end in HALT (the stub's sandbox.run()
+  // throws on every call); the iteration must quarantine.
+  const failureMode: MockFailureMode =
+    variant === "invalid-json" ? "implementer-invalid-json" : "none";
+  const sandbox = createMockSandbox({ branch: SMOKE_BRANCH, failureMode });
   const config = defaultLoopConfig(repoRoot);
 
   // Per-role prompt capture — used by the "issue body verbatim at same offset"
@@ -420,12 +471,16 @@ async function main(): Promise<SmokeOutcome> {
     ghCalls,
     artifacts,
   };
-  const report = await runAllExpectations(ctx);
+  const report =
+    variant === "invalid-json"
+      ? await runInvalidJsonExpectations(ctx)
+      : await runAllExpectations(ctx);
 
   const warnings = await cleanup(repoRoot, gh);
 
   return {
     mode: "runLoop",
+    variant,
     repoRoot,
     failures: report.failures,
     checks: report.checks,
@@ -463,9 +518,10 @@ async function cleanup(repoRoot: string, gh: GhStub): Promise<string[]> {
 
 void (async (): Promise<void> => {
   try {
-    const outcome = await main();
+    const variant = resolveSmokeMode();
+    const outcome = await main(variant);
     console.log("");
-    console.log(`[smoke] mode=${outcome.mode}`);
+    console.log(`[smoke] mode=${outcome.mode} variant=${outcome.variant}`);
     console.log(`[smoke] iteration results:`);
     for (const r of outcome.artifacts.iterationResults) {
       console.log(

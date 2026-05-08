@@ -75,6 +75,15 @@ export interface ExpectationContext {
 }
 
 /**
+ * Wave-1 N1 smoke variant context. Same shape as ExpectationContext for the
+ * green-path smoke; the variant assertions (runInvalidJsonExpectations)
+ * inspect the same `ghCalls` + `sandbox.sandboxRunCalls` + `artifacts` to
+ * prove the loop quarantined instead of shipping when the implementer's
+ * STORY_COMPLETE envelope was unparseable.
+ */
+export type InvalidJsonExpectationContext = ExpectationContext;
+
+/**
  * Result of a full assertion pass — every failure message in order. Empty
  * `failures` means PASS; any entry means FAIL.
  */
@@ -384,6 +393,225 @@ export async function runAllExpectations(
     { name: "at least one commit on branch", fn: () => checkAtLeastOneCommit(ctx) },
     { name: "agent call order: implementer -> reviewer", fn: () => checkCallOrder(ctx) },
     { name: "no ship-with-issue-OPEN comments on green path", fn: () => checkNoCommentOnIssue(ctx) },
+  ];
+
+  for (const c of cases) {
+    checks.push(c.name);
+    const result = await c.fn();
+    if (result !== null) {
+      failures.push(`${c.name}: ${result}`);
+    }
+  }
+
+  return { checks, failures };
+}
+
+// ---------------------------------------------------------------------------
+// Wave-1 N1 smoke variant: implementer emits STORY_COMPLETE with an
+// unparseable JSON envelope. The loop MUST NOT ship; it MUST route to
+// recovery, recovery (with the stub sandbox.run() throwing) MUST end in HALT,
+// and the iteration MUST quarantine via label `in-progress` -> `needs-human`.
+//
+// These assertions are the inverse of the green-path: shipped is now FAIL,
+// markDoneViaLabel firing is FAIL, the issue being closed is FAIL, and the
+// presence of a `needs-human` label transition is REQUIRED.
+// ---------------------------------------------------------------------------
+
+function checkInvalidJson_outcomeHalted(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  const results = ctx.artifacts.iterationResults;
+  if (results.length !== 1) {
+    return `Expected runLoop to return exactly 1 IterationResult, got ${results.length}.`;
+  }
+  const only = results[0]!;
+  // iteration.ts:786 returns `halted(...)` when recovery decides HALT after
+  // an implementer error path. (Compare: implementer-HALT marker without
+  // recovery returns `quarantined`; the bad-JSON path takes the
+  // implementerError branch first, so the outcome is `halted`.)
+  if (only.outcome !== "halted") {
+    return `Expected outcome="halted" (recovery HALT after implementer JSON parse fail), got "${only.outcome}".`;
+  }
+  return null;
+}
+
+function checkInvalidJson_notShipped(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  const shipped = ctx.artifacts.iterationResults.filter(
+    (r) => r.outcome === "shipped",
+  );
+  if (shipped.length > 0) {
+    return `Expected NO shipped IterationResults; got ${shipped.length}. The bad-JSON envelope must NOT ship the story.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_markDoneNeverCalled(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // markDoneViaLabel emits `gh issue edit <num> --add-label done --remove-label in-progress`.
+  const flips = ctx.ghCalls.filter((c) =>
+    isLabelEdit(c, ctx.ghIssue, "done", "in-progress"),
+  );
+  if (flips.length > 0) {
+    return `markDoneViaLabel(${ctx.ghIssue}) was invoked ${flips.length} time(s); expected 0 — the bad-JSON path must NOT mark done.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_quarantineCalled(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // quarantineViaLabel emits `gh issue edit <num> --add-label needs-human --remove-label in-progress`
+  // followed by `gh issue comment <num> --body <reason>`. Assert the label
+  // transition fired at least once.
+  const flips = ctx.ghCalls.filter((c) =>
+    isLabelEdit(c, ctx.ghIssue, "needs-human", "in-progress"),
+  );
+  if (flips.length === 0) {
+    return `quarantineViaLabel(${ctx.ghIssue}) was never invoked. Expected at least one ` +
+      `gh issue edit ${ctx.ghIssue} --add-label needs-human --remove-label in-progress.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_labelTransitionInProgressToNeedsHuman(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // Strict re-check of the state-machine edge: there must exist a gh argv
+  // that adds `needs-human` AND removes `in-progress` (in either order) for
+  // the smoke issue. This is the load-bearing routing claim.
+  const transitions = ctx.ghCalls.filter((c) =>
+    isLabelEdit(c, ctx.ghIssue, "needs-human", "in-progress"),
+  );
+  if (transitions.length < 1) {
+    return `Label state-machine transition 'in-progress' -> 'needs-human' did NOT happen for issue ${ctx.ghIssue}.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_issueNotClosed(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // quarantineViaLabel deliberately does NOT close the issue (gh.ts:505 NB
+  // comment). Assert no `gh issue close <num>` was emitted.
+  const closes = ctx.ghCalls.filter((c) => isIssueClose(c, ctx.ghIssue));
+  if (closes.length > 0) {
+    return `Expected 0 'gh issue close ${ctx.ghIssue}' calls; got ${closes.length}. Quarantine must leave the issue OPEN for human triage.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_recoveryAgentInvoked(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // The recovery ladder calls `sandbox.run()` directly (not through
+  // _agentRunner — see recovery/ladder.ts:280, :943). On the bad-JSON path,
+  // both the Sonnet and the Opus xhigh attempt should be invoked; each one
+  // increments the stub's run-call counter before throwing. Assert >= 1.
+  const runCount = ctx.sandbox.sandboxRunCalls;
+  if (runCount < 1) {
+    return `Recovery agent was NOT invoked: sandbox.run() was called 0 times. Expected at least 1 (Sonnet attempt) — the recovery ladder didn't fire.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_implementerCalledOnce(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // The implementer mock should have been called exactly once (the bad
+  // envelope makes runImplementer throw, so iteration.ts skips the reviewer
+  // entirely and goes straight to the recovery ladder).
+  const implCalls = ctx.sandbox.calls.filter((c) => c.role === "implementer");
+  if (implCalls.length !== 1) {
+    return `Expected exactly 1 implementer call; got ${implCalls.length}.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_reviewerNeverCalled(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // The bad-JSON path throws inside runImplementer BEFORE the reviewer ladder
+  // is reached — so the reviewer mock must NEVER be invoked. If the reviewer
+  // fires, that means the loop accepted the bad envelope and proceeded to
+  // ship review (the very regression Wave 1 N1 prevents).
+  const revCalls = ctx.sandbox.calls.filter(
+    (c) => c.role === "reviewer" || c.role === "final-reviewer",
+  );
+  if (revCalls.length > 0) {
+    return `Reviewer was invoked ${revCalls.length} time(s). The bad-JSON envelope must abort BEFORE the reviewer ladder runs.`;
+  }
+  return null;
+}
+
+function checkInvalidJson_claimViaLabel(
+  ctx: InvalidJsonExpectationContext,
+): string | null {
+  // The loop still claims the issue (`ready-for-agent` -> `in-progress`)
+  // before the implementer runs — so this transition MUST appear once in the
+  // gh-stub log. Without it, the subsequent quarantine flip would have
+  // nothing to remove.
+  const matches = ctx.ghCalls.filter((c) =>
+    isLabelEdit(c, ctx.ghIssue, "in-progress", "ready-for-agent"),
+  );
+  if (matches.length !== 1) {
+    return `claimViaLabel(${ctx.ghIssue}) expected exactly 1 invocation, got ${matches.length}.`;
+  }
+  return null;
+}
+
+export async function runInvalidJsonExpectations(
+  ctx: InvalidJsonExpectationContext,
+): Promise<ExpectationReport> {
+  const checks: string[] = [];
+  const failures: string[] = [];
+
+  const cases: Array<{
+    name: string;
+    fn: () => Promise<string | null> | string | null;
+  }> = [
+    {
+      name: "iteration outcome is 'halted' (recovery HALT after implementer JSON parse fail)",
+      fn: () => checkInvalidJson_outcomeHalted(ctx),
+    },
+    {
+      name: "no IterationResult with outcome='shipped'",
+      fn: () => checkInvalidJson_notShipped(ctx),
+    },
+    {
+      name: "claimViaLabel(999) called exactly once (issue was claimed before failure)",
+      fn: () => checkInvalidJson_claimViaLabel(ctx),
+    },
+    {
+      name: "implementer called exactly once",
+      fn: () => checkInvalidJson_implementerCalledOnce(ctx),
+    },
+    {
+      name: "reviewer NEVER called (bad envelope aborts before review ladder)",
+      fn: () => checkInvalidJson_reviewerNeverCalled(ctx),
+    },
+    {
+      name: "recovery agent invoked (sandbox.run() called at least once)",
+      fn: () => checkInvalidJson_recoveryAgentInvoked(ctx),
+    },
+    {
+      name: "markDoneViaLabel NEVER called (bad-JSON must not mark done)",
+      fn: () => checkInvalidJson_markDoneNeverCalled(ctx),
+    },
+    {
+      name: "quarantineViaLabel called (label flipped to needs-human)",
+      fn: () => checkInvalidJson_quarantineCalled(ctx),
+    },
+    {
+      name: "label state machine: in-progress -> needs-human transition fired",
+      fn: () => checkInvalidJson_labelTransitionInProgressToNeedsHuman(ctx),
+    },
+    {
+      name: "issue NOT closed (gh issue close was never invoked)",
+      fn: () => checkInvalidJson_issueNotClosed(ctx),
+    },
   ];
 
   for (const c of cases) {
