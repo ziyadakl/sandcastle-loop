@@ -581,8 +581,13 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // pnpm install (not npm) — affinity-tracker and similar monorepos use
   // pnpm's workspace:* protocol which npm refuses to parse. The Dockerfile
   // ships `corepack enable` so `pnpm` works without an extra global install.
+  // CI=true is required: without it, pnpm refuses to repair the modules
+  // dir on a fresh sandbox (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)
+  // because there's no TTY to confirm. The hook runs non-interactively
+  // by definition, so the install hangs/exits without restoring the
+  // per-package workspace symlinks (apps/nextjs/node_modules etc.).
   const hooks = {
-    sandbox: { onSandboxReady: [{ command: "pnpm install" }] },
+    sandbox: { onSandboxReady: [{ command: "CI=true pnpm install" }] },
   } as const;
   const copyToWorktree = ["node_modules"];
 
