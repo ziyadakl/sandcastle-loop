@@ -489,7 +489,12 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   const authMounts = [
     { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
     { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
-    { hostPath: "~/.gitconfig", sandboxPath: "/home/agent/.gitconfig", readonly: true },
+    // Read-write — sandcastle runs `git config --global --add safe.directory`
+    // early in container boot, which fails if the mount is readonly. The
+    // agent's writes to ~/.gitconfig do reach the host, but in practice the
+    // only writes are sandcastle's own safe.directory entries which are
+    // harmless to accumulate on the host.
+    { hostPath: "~/.gitconfig", sandboxPath: "/home/agent/.gitconfig" },
   ] as const;
   const buildMounts = (extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => {
     return extra && extra.length > 0
