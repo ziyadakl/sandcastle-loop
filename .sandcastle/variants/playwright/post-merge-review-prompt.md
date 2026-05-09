@@ -60,13 +60,18 @@ deliverables.
 
 # OUTPUT — markers
 
-Immediately above your completion signal, emit EXACTLY ONE of:
+End your response with EXACTLY ONE of these two markers, on its own line,
+as the **LAST non-empty line** of your output (no surrounding text, no
+trailing completion signal — sandcastle injects the completion signal
+itself):
 
 - `POST_MERGE_ALL_CLEAR` — combined state is healthy, no concerns.
-- `POST_MERGE_ISSUES_FOUND` — preceded by a numbered list of concerns. Be
-  specific: file:line, which issue/branch caused it, what's wrong, and
-  whether it's severe enough to require human action before the next
-  iteration. Findings are LOGGED only — the orchestrator will continue
-  the loop regardless. Your job is visibility, not gating.
+- `POST_MERGE_ISSUES_FOUND` — preceded earlier in the response by a
+  numbered list of concerns. Be specific: file:line, which issue/branch
+  caused it, what's wrong, and whether it's severe enough to require
+  human action before the next iteration. Findings are LOGGED only —
+  the orchestrator will continue the loop regardless. Your job is
+  visibility, not gating.
 
-End with `<promise>COMPLETE</promise>` on its own line as the LAST line.
+The marker MUST be a bare word on a line by itself, as the LAST non-empty
+line of your response.
