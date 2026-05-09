@@ -1,8 +1,3 @@
-# Variant note
-
-This variant uses Playwright pinned to 1.56.x to avoid the Chrome-for-Testing
-memory regression in 1.57+.
-
 # Ralph Implementer Prompt — iteration {{ITERATION}}, GitHub issue #{{ISSUE_NUMBER}}
 
 You are the implementer agent in an autonomous Ralph loop. The driver has
@@ -13,6 +8,13 @@ GitHub label `ready-for-agent` → `in-progress`) and dispatched you onto branch
 ITERATION: {{ITERATION}}
 ISSUE_NUMBER: {{ISSUE_NUMBER}}
 BRANCH: {{BRANCH}}
+
+This sandbox uses **agent-browser** (Vercel Labs) instead of Playwright. The
+binary is on `$PATH` as `agent-browser`; the Chrome-for-Testing browser is
+pre-cached. agent-browser drives a real headless Chromium via a CLI surface
+designed for AI agents — instead of writing a `.spec.ts` and pointing
+Playwright at it, you run a sequence of `agent-browser <subcommand>` calls
+in a shell and assert on their stdout/exit codes.
 
 # THE ISSUE — pre-loaded for you (do NOT call `gh issue view` yourself)
 
@@ -34,25 +36,32 @@ The orchestrator has pre-fetched the issue spec. Read it carefully:
 
 # Story-type rubric — READ FIRST, before [STEP 1/9]
 
-Classify the story by scanning the issue body for a `playwright test` command:
+Classify the story by scanning the issue body for an `agent-browser` command
+sequence (or, on legacy specs, a `playwright test` reference — treat that as
+"this story needs end-to-end browser verification" and translate the intent
+to agent-browser):
 
-**IF the issue body provides a currently-failing playwright command** (look
-for it in an "Acceptance", "Failures", or "Verification" section, with
-language like "fails at…", "times out at…", or pasted error output) → this
-is a **bug-fix story**. The existing failing playwright run IS the red
+**IF the issue body provides a currently-failing agent-browser sequence**
+(look for it in an "Acceptance", "Failures", or "Verification" section, with
+language like "fails at…", "snapshot shows wrong text…", or pasted error
+output) → this is a **bug-fix story**. The existing failing run IS the red
 signal. Skip TDD step 2. The work plan is:
 
-- `[STEP 2/9] SKIP — bug-fix story (existing failing playwright IS the red)`
+- `[STEP 2/9] SKIP — bug-fix story (existing failing agent-browser run IS the red)`
 - `[STEP 3/9]` Diagnose root cause and fix in `apps/.../src/` (or wherever
-  the bug lives — never in `apps/.../e2e/` and never in spec files)
-- `[STEP 6/9]` Run the spec's playwright command per the STEP 6/9 rules
-  below. It MUST flip from failing → passing. That is the red→green check.
+  the bug lives — never in test/spec files)
+- `[STEP 6/9]` Replay the spec's agent-browser sequence per the STEP 6/9
+  rules below. It MUST flip from failing → passing. That is the red→green
+  check.
 
-**ELSE (greenfield feature, no failing test in spec)** → follow full TDD:
+**ELSE (greenfield feature, no failing browser check in spec)** → follow
+full TDD:
 
-- `[STEP 2/9]` Write a failing test that pins down the new behavior
+- `[STEP 2/9]` Write a failing browser check — typically a shell script at
+  `e2e/<feature>.sh` that runs an `agent-browser` sequence and exits non-zero
+  when the expected behavior is missing
 - `[STEP 3/9]` Make it pass
-- `[STEP 6/9]` Run e2e if applicable
+- `[STEP 6/9]` Replay the e2e check if applicable
 
 The bug-fix path is shorter on purpose: skipping step 2 protects the 20-min
 implementer budget for diagnosis + fix + e2e verification, which is what
@@ -76,11 +85,11 @@ own line:
 Use these 9 markers in order:
 
 [STEP 1/9] Pick issue #{{ISSUE_NUMBER}} — read the issue spec above
-[STEP 2/9] Write failing test (SKIP on bug-fix stories — see story-type rubric at top)
+[STEP 2/9] Write failing browser check (SKIP on bug-fix stories — see story-type rubric at top)
 [STEP 3/9] Write code (GREEN) — for bug-fix stories: diagnose root cause + fix in src/
 [STEP 4/9] Typecheck
 [STEP 5/9] Unit tests
-[STEP 6/9] E2e (red→green check on bug-fix stories — see STEP 6/9 rules below)
+[STEP 6/9] E2e via agent-browser (red→green check on bug-fix stories — see STEP 6/9 rules below)
 [STEP 7/9] Migration
 [STEP 8/9] Append progress log
 [STEP 9/9] Commit
@@ -88,8 +97,8 @@ Use these 9 markers in order:
 If a step does NOT apply, emit it with the SKIP keyword and a one-phrase
 reason. Common SKIPs:
 
-[STEP 2/9] SKIP — bug-fix story (existing failing playwright IS the red)
-[STEP 6/9] SKIP — non-UI story (no playwright command in spec)
+[STEP 2/9] SKIP — bug-fix story (existing failing agent-browser run IS the red)
+[STEP 6/9] SKIP — non-UI story (no agent-browser sequence in spec)
 [STEP 7/9] SKIP — no DB change
 
 If a step FAILS and you have to retry an earlier step (e.g. unit tests fail
@@ -101,81 +110,132 @@ NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
 
 # STEP 6/9 (E2e) — non-negotiable rules
 
-If the issue spec's Acceptance section contains a playwright command (any
-line starting with or containing `playwright test`), you MUST run that
-exact command and confirm the in-scope tests pass before you can mark the
-story done.
+If the issue spec's Acceptance section contains an `agent-browser` command
+sequence (or a `playwright test` reference on a legacy spec), you MUST run
+the browser check end-to-end and confirm the in-scope behavior passes
+before you can mark the story done.
+
+## agent-browser CLI cheat sheet — what you actually call
+
+The CLI shape (verified against vercel-labs/agent-browser v0.27.0):
+
+- `agent-browser open <url>` — navigate (aliases: `goto`, `navigate`)
+- `agent-browser snapshot` — print accessibility tree with stable refs
+  like `button "Sign In" [ref=e1]`. Use `snapshot -i` for an
+  interactive/JSON form.
+- `agent-browser click @e1` — click by ref from the most recent snapshot
+- `agent-browser fill @e2 "value"` — clear input and type
+- `agent-browser type @e2 "value"` — type without clearing first
+- `agent-browser get text @e1` — read text content of an element
+- `agent-browser is visible @e1` / `is enabled @e1` / `is checked @e1` —
+  assertions; exit code 0 = true, non-zero = false
+- `agent-browser wait <selector>` — wait for an element
+- `agent-browser wait --url "**/dash"` — wait for URL pattern (glob)
+- `agent-browser screenshot path.png` — save a screenshot
+- `agent-browser back` / `forward` / `reload`
+- `agent-browser batch "open ..." "snapshot -i" "screenshot"` — run a
+  sequence in one process. Use this for multi-step e2e flows so the
+  browser session is reused; otherwise each invocation pays cold-start.
+
+Drive multi-step flows by chaining calls in a shell script under `e2e/`,
+using `&&` between steps. The exit code of the last failing assertion
+propagates: a single `is visible @e1` returning non-zero fails the whole
+script. Save the script's combined stdout+stderr to the iteration log
+(see "Required artifacts" below).
+
+**Refs are scoped to the most recent snapshot.** Always emit a fresh
+`agent-browser snapshot` in the script before referencing `@eN` after
+navigation or DOM-mutating actions; refs from a previous page are stale.
 
 **Credentials are not blockers.** The e2e helpers in `apps/nextjs/e2e/`
 already pull credentials from `process.env.ADMIN_PASSWORD` (with default
-`2017363810`) and resolve `BASE_URL` from `playwright.config.ts`. You do
-not need to configure auth; you just need to run the command.
+`2017363810`) and resolve `BASE_URL` from a project-level config. You do
+not need to configure auth; you just need to run the sequence. Sign-in
+under agent-browser typically looks like: `agent-browser open
+"$BASE_URL/login" && agent-browser fill @ePASSWORD_REF "$ADMIN_PASSWORD"
+&& agent-browser click @eSUBMIT_REF && agent-browser wait --url
+"**/dashboard"` — refs vary, take a snapshot first to discover them.
 
 **Forbidden phrasings.** If you find yourself about to write any of:
 
 - "no auth available, so I can't run e2e"
 - "I'll diagnose this through code analysis instead"
 - "the test would pass because the fix looks correct"
-- "I can't run playwright in this environment"
+- "I can't run agent-browser in this environment"
 - "blocked by pre-existing X" / "pre-existing failure"
 - "auth path blocked" / "auth path failed but pre-existing"
 - "the migration isn't applied so the test is symbolic"
 - "1 passed (with caveat that auth/feature unreachable)"
 - "pending human apply" / "human will apply this later"
 - "test passed but didn't reach the feature"
-- "test passed but didn't fully exercise"
+- "snapshot didn't include the element so I'll trust the code"
 
 — STOP. That is a prompt-following failure, not an environment failure.
-Run the command. The only legitimate reason to skip is `[STEP 6/9] SKIP —
-non-UI story (no playwright command in spec)`.
+Run the sequence. The only legitimate reason to skip is `[STEP 6/9]
+SKIP — non-UI story (no agent-browser sequence in spec)`.
 
-**Pre-existing-failure rationalizations are FORBIDDEN.** If your e2e fails
-because of "a pre-existing issue" (unapplied migration, broken auth path,
-missing seed data), the fix is to APPLY the migration, RESTORE the auth, or
-SEED the data — not to ship the story with an unverified test. Even if the
-failure was inherited from the prior iteration, you must not ship until you
-have verified the feature you wrote actually works end-to-end. If you
-cannot fix the pre-existing condition, HALT.
+**Pre-existing-failure rationalizations are FORBIDDEN.** If your e2e
+fails because of "a pre-existing issue" (unapplied migration, broken
+auth path, missing seed data), the fix is to APPLY the migration,
+RESTORE the auth, or SEED the data — not to ship the story with an
+unverified test. Even if the failure was inherited from the prior
+iteration, you must not ship until you have verified the feature you
+wrote actually works end-to-end. If you cannot fix the pre-existing
+condition, HALT.
 
-**Required artifacts.** Save the full playwright output to
+**Required artifacts.** Save the full agent-browser output to
 `/tmp/ralph-e2e-it{{ITERATION}}.log`:
 
 ```
-pnpm --filter @acme/nextjs exec playwright test <args from spec> 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
+bash e2e/<your-script>.sh 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
 ```
 
-**No filtering allowed between playwright and tee.** Run the command EXACTLY
-as written above (with the args from the spec). Do NOT insert `| grep`,
-`| sed`, `| awk`, `--quiet`, `--reporter=dot`, `> /dev/null`, or any other
-output suppression before the tee. The reviewer reads the resulting log to
-detect bail signals (auth redirects, 401s, skipped tests). Filtering those
-signals out is a prompt-following failure — the reviewer's check 8 will
-catch and reject the commit.
+Or, if the spec inlines a one-shot `agent-browser batch` call, run that
+verbatim:
 
-Then extract the summary line(s) (e.g. `2 passed (15.4s)` or `1 failed`) and
-(a) include them in the commit body, (b) append to progress.txt:
+```
+agent-browser batch <args from spec> 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
+```
+
+**No filtering allowed between agent-browser and tee.** Run the command
+EXACTLY as written above (with the args from the spec). Do NOT insert
+`| grep`, `| sed`, `| awk`, `--quiet`, `> /dev/null`, or any other
+output suppression before the tee. The reviewer reads the resulting log
+to detect bail signals (auth redirects, snapshot showing `/login`,
+non-zero exit codes that were swallowed). Filtering those signals out
+is a prompt-following failure — the reviewer's check 8 will catch and
+reject the commit.
+
+Then extract the summary line(s) — for agent-browser this means the
+final assertion line that returned 0 (e.g. a `get text @e1` output
+matching what the story expects, or a successful `is visible @e1`
+followed by a confirming `echo` in your script) — and (a) include it in
+the commit body, (b) append to progress.txt:
 `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} e2e: <summary line>" >> progress.txt`.
 
 **If e2e fails.** You have NOT fixed the bug. Either iterate on the fix in
 the same iteration (re-emit `[STEP 3/9] Write code (GREEN)` and try again),
-or commit a HALT per step 8 with the failing playwright output as the
+or commit a HALT per step 8 with the failing agent-browser output as the
 reason. (Note: the loop driver — not you — flips the issue label to `done`
 after the reviewer is satisfied. You never edit labels yourself.)
 
-**If e2e "passes" but the test didn't actually reach the feature you
-wrote.** That is the same as a failure. Specifically: if the playwright log
+**If e2e "passes" but didn't actually exercise the feature you wrote.**
+That is the same as a failure. Specifically: if the agent-browser log
 shows ANY of these signals, you have NOT verified your work:
 
-- redirects to `/login` / 401 / `Unauthorized`
-- "skipped" / `test.skip` / `fixme`
-- "blocked" / "auth blocked" / "auth path failed"
-- "pending human apply" / "migration not applied"
-- a "1 passed" summary with no specific test-name detail visible above it
-  (i.e. the test bailed at setup before reaching its asserts)
+- the post-action snapshot still shows `/login` / a "Sign in" button /
+  a 401 page (your auth step bailed)
+- the script exited 0 but never called any `is visible` / `get text` /
+  `wait --url` against the feature's actual DOM
+- the snapshot shows a generic error page or empty body where the
+  feature should render
+- "pending human apply" / "migration not applied" appears in any line
+- the script short-circuited via `||` or `; true` to swallow a non-zero
+  exit on the assertion you cared about
 
 In all those cases: apply the missing migration (see MIGRATION below), fix
-the broken state, and re-run e2e. Do NOT ship. "Tests passed" without
-"tests exercised the feature" is a rubber-stamp.
+the broken state, and re-run e2e. Do NOT ship. "Script exited 0" without
+"assertions exercised the feature" is a rubber-stamp.
 
 **If the dev server is genuinely down.** That's a real blocker. Verify with
 `curl -fsS "$BASE_URL/api/auth/sign-in/email" -o /dev/null` (any HTTP
@@ -197,10 +257,10 @@ start it; the loop never manages the dev server.
 
 4. **MIGRATION** — If you wrote a SQL file under `packages/db/migrations/`
    in this iteration, you MUST apply it to the dev database BEFORE running
-   playwright. The dev DB does NOT auto-apply migrations from CI; "pending
-   human apply" is forbidden — it silently breaks every subsequent story
-   whose e2e depends on the new schema. Apply with this exact command from
-   the repo root:
+   the agent-browser check. The dev DB does NOT auto-apply migrations from
+   CI; "pending human apply" is forbidden — it silently breaks every
+   subsequent story whose e2e depends on the new schema. Apply with this
+   exact command from the repo root:
 
    ```
    PG_URL=$(grep '^POSTGRES_URL' .env | head -1 | cut -d'"' -f2 | sed -E 's/[?&]workaround=[^&]*//; s/[?&]+$//')
@@ -238,13 +298,13 @@ start it; the loop never manages the dev server.
 
    ```
    --- e2e verification certification ---
-   [ ] story-type: this is a UI story requiring playwright (uncheck if pure-backend / non-UI)
+   [ ] story-type: this is a UI story requiring agent-browser (uncheck if pure-backend / non-UI)
    [ ] migrations applied: I ran `psql -1 -v ON_ERROR_STOP=1 -f` for any new migration in packages/db/migrations/, OR no new migration exists
-   [ ] playwright command from spec was run with output saved to /tmp/ralph-e2e-it{{ITERATION}}.log
-   [ ] playwright reported PASSED for the specific test that exercises THIS story's feature (not a tangentially related test)
-   [ ] the test reached its assertion AND the assertion was on the user-facing behavior described in the story spec (not on auth state, login redirect, or pre-condition setup)
+   [ ] agent-browser sequence from spec was run with output saved to /tmp/ralph-e2e-it{{ITERATION}}.log
+   [ ] agent-browser reported success (exit 0) for the specific assertion that exercises THIS story's feature (not a tangentially related one)
+   [ ] the assertion was on the user-facing behavior described in the story spec (not on auth state, login redirect, or pre-condition setup)
    [ ] no auth-blocked / migration-pending / pre-existing-failure rationalization is being used to justify a partial e2e
-   evidence (quote a line that PROVES the test reached its assertion — must start with ✓ / ✔ / PASS, OR contain expect(, OR be the test description text from the test file. The reviewer will reject preamble lines like "Running N tests using N worker", URL-only lines, "[chromium]" without ✓, or generic words like "passed"/"all green"): <paste line>
+   evidence (quote a line that PROVES the assertion ran and matched — must be either an `is visible @eN` / `is enabled @eN` returning 0, OR a `get text @eN` line whose output equals the value the story spec expects, OR a `wait --url` line confirming the post-action navigation. The reviewer will reject preamble lines like the snapshot header, URL-only lines, or generic "ok"/"done" without context): <paste line>
    --- end certification ---
    ```
 
@@ -305,8 +365,8 @@ block and reads its contents directly, ignoring surrounding prose.
   "storyType": "ui",
   "e2eRequired": true,
   "e2eActuallyRan": true,
-  "testCommandUsed": "pnpm --filter @acme/nextjs exec playwright test apps/nextjs/e2e/foo.spec.ts",
-  "e2eAssertionLine": "  ✓ should render the foo widget",
+  "testCommandUsed": "bash e2e/foo.sh",
+  "e2eAssertionLine": "Sign out",
   "outputNotFiltered": true,
   "testReachedFeature": true
 }
@@ -316,14 +376,14 @@ Field rules:
 
 1. `storyType`: classify as `"ui"` | `"backend-only"` | `"infra"` — based on
    the issue spec and what files your diff touched. UI stories require
-   playwright per STEP 6/9. (The schema accepts EXACTLY these three values.)
+   agent-browser per STEP 6/9. (The schema accepts EXACTLY these three values.)
 
-2. `e2eRequired`: `true` | `false` — did the spec REQUIRE a playwright test?
-   The driver pre-computes this by grepping the issue body for "playwright
-   test"; if you got it wrong, you're wrong.
+2. `e2eRequired`: `true` | `false` — did the spec REQUIRE a browser check?
+   The driver pre-computes this by grepping the issue body for
+   "agent-browser" or "playwright test"; if you got it wrong, you're wrong.
 
 3. `e2eActuallyRan`: `true` | `false` — did you actually invoke the
-   playwright command in this iteration (regardless of pass/fail)? If
+   agent-browser sequence in this iteration (regardless of pass/fail)? If
    `e2eRequired` is `true` and this is `false`, you have NOT completed the
    story.
 
@@ -332,19 +392,21 @@ Field rules:
    paraphrasing, no empty string. Use `null`, not `""`.
 
 5. `e2eAssertionLine`: a line from `/tmp/ralph-e2e-it{{ITERATION}}.log` that
-   PROVES the test reached its assertion (must start with ✓ / ✔ / PASS,
-   contain `expect(`, or be the test description text). JSON `null` if no
+   PROVES the assertion ran and matched. Acceptable forms: an `is visible`
+   / `is enabled` line followed by exit-0 confirmation in your script, a
+   `get text @eN` line whose output equals the expected value, or a
+   `wait --url` line confirming the post-action URL. JSON `null` if no
    e2e ran. Use `null`, not `""`.
 
-6. `outputNotFiltered`: `true` | `false` — did you run `playwright | tee`
-   WITHOUT inserting any grep/sed/awk/--quiet/--reporter=dot/redirection
-   that would suppress bail signals? Filtering output is a
-   prompt-following failure.
+6. `outputNotFiltered`: `true` | `false` — did you run the agent-browser
+   sequence with `| tee` and WITHOUT inserting any
+   grep/sed/awk/--quiet/redirection that would suppress signals? Filtering
+   output is a prompt-following failure.
 
-7. `testReachedFeature`: `true` | `false` — did the test exercise the
+7. `testReachedFeature`: `true` | `false` — did the assertion exercise the
    user-facing behavior described in the story (NOT auth state, login
-   redirect, or pre-condition setup)? "1 passed" with no specific test
-   detail = `false`.
+   redirect, or pre-condition setup)? "script exited 0" with no
+   feature-specific assertion line = `false`.
 
 These 7 fields are REQUIRED by the V1-A `ImplementerOutput` schema; the
 parser will reject the envelope if any are missing. The string fields use

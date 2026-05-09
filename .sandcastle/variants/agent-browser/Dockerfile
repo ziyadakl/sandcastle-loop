@@ -1,11 +1,13 @@
-# Sandcastle ralph-loop sandbox image — playwright variant.
+# Sandcastle ralph-loop sandbox image — agent-browser variant.
 #
-# This variant pins Playwright to 1.56.x to avoid the Chrome-for-Testing
-# memory regression introduced in Playwright 1.57+. From 1.57 onwards
-# Playwright switched its bundled browser to Chrome-for-Testing, which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs
-# inside the sandbox. We also cap PLAYWRIGHT_WORKERS and Node old-space
-# to keep total memory bounded.
+# This variant replaces Playwright with Vercel Labs' agent-browser
+# (https://github.com/vercel-labs/agent-browser): a native Rust CLI
+# designed for AI agents to drive a browser from the shell. We use it
+# because it's lighter than Playwright (single Rust binary, no Node
+# wrapper layer), exposes pages via an accessibility-tree snapshot with
+# stable element refs (e1, e2, ...) that the agent can target without
+# guessing CSS selectors, and ships ARM64-native binaries for Apple
+# Silicon hosts.
 #
 # This is the per-issue execution container that the orchestrator
 # (`.sandcastle/main.mts`) spins up via the `docker()` factory call.
@@ -83,55 +85,45 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # Affinity-tracker and similar monorepos use pnpm's workspace:* protocol
 # which npm refuses to parse. Enabling corepack means our onSandboxReady
 # hook can run `pnpm install` without an extra `npm install -g pnpm` step.
-#
-# COREPACK_ENABLE_DOWNLOAD_PROMPT=0 silences the interactive "about to
-# download pnpm@X" prompt — without this, the merge phase fails non-
-# interactively when the target's `package.json` pins a packageManager
-# version corepack hasn't seen before.
 # ---------------------------------------------------------------------------
 USER root
 RUN corepack enable
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-# Pre-fetch pnpm so the merger's `pnpm install` hook never needs to download
-# at runtime. The 2026-05-08 smoke test showed that even with the prompt
-# silenced, the runtime download step itself was failing inside the merger's
-# fresh sandbox. Baking the version in eliminates that whole code path.
-# Pinned to the version affinity-tracker's `package.json` packageManager
-# field requests; if a future target project pins a different version,
-# corepack still falls back to downloading on demand.
 RUN corepack prepare pnpm@10.19.0 --activate
 
 # ---------------------------------------------------------------------------
-# Playwright — system libraries chromium needs to start (libnss, libdrm,
-# libgbm, libfribidi, libharfbuzz, libthai, libdatrie, libgraphite2, etc).
-# Without these the agent gets shipped a chromium binary it can't actually
-# launch — repeatedly observed during the 2026-05-08 issue #83 smoke where
-# the implementer hand-extracted .deb files at runtime to satisfy ldd.
-# `playwright install-deps` knows the exact list; using it keeps the image
-# in lockstep with whatever playwright version the target project pins.
+# agent-browser — Vercel Labs CLI for AI-driven browser automation.
+#
+# Lighter than Playwright (single Rust binary, no Node wrapper) and
+# designed for AI agents: snapshot returns an accessibility tree with
+# stable refs (e1, e2, ...) that the agent targets directly, instead of
+# inventing CSS selectors. Pinned to a specific version because v0.x is
+# pre-1.0 and the snapshot/ref format has changed between minors.
 # ---------------------------------------------------------------------------
-# Pinned to ~1.56.0: Playwright 1.57+ switched to Chrome-for-Testing which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs.
-RUN npx -y playwright@~1.56.0 install-deps chromium \
+ARG AGENT_BROWSER_VERSION=0.27.0
+RUN npm install -g agent-browser@${AGENT_BROWSER_VERSION}
+
+# `agent-browser install --with-deps` downloads Chrome-for-Testing AND
+# pulls the Linux system libs Chrome needs (libnss, libgbm, libdrm,
+# libxkbcommon, etc). Doing this at image build time means the per-issue
+# sandbox starts with the browser already cached — no first-run delay.
+# Run as root so --with-deps can apt-install; switch back afterward.
+RUN agent-browser install --with-deps \
   && rm -rf /var/lib/apt/lists/*
 
 USER agent
 
-# Pre-cache the chromium binary into /home/agent/.cache/ms-playwright so each
-# new sandbox starts ready instead of downloading ~120 MB on first
-# `playwright test`.
-# Pinned to ~1.56.0: Playwright 1.57+ switched to Chrome-for-Testing which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs.
-RUN npx -y playwright@~1.56.0 install chromium
+# Pre-cache the agent-browser Chrome download into the agent user's home
+# so each new sandbox starts without a 120 MB download on first invoke.
+# (The root install above lands in /root; redo as agent so the cache is
+# in /home/agent/.cache/agent-browser where the runtime user finds it.)
+RUN agent-browser install
 
 # ---------------------------------------------------------------------------
-# Memory caps for Playwright runs.
-# PLAYWRIGHT_WORKERS=2 bounds parallelism so even if a target project
-# accidentally bumps to 1.57+ at the package.json level, we don't fan out
-# enough Chrome-for-Testing instances to OOM the host.
-# NODE_OPTIONS old-space=4096 caps the test-runner process itself.
+# Memory caps. agent-browser is single-threaded by default but we still
+# bound the Node test-runner process so a stray test harness can't OOM
+# the host. NODE_OPTIONS old-space=4096 mirrors the playwright variant.
 # ---------------------------------------------------------------------------
-ENV PLAYWRIGHT_WORKERS=2
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 # ---------------------------------------------------------------------------

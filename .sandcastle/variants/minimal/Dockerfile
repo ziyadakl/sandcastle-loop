@@ -1,11 +1,4 @@
-# Sandcastle ralph-loop sandbox image — playwright variant.
-#
-# This variant pins Playwright to 1.56.x to avoid the Chrome-for-Testing
-# memory regression introduced in Playwright 1.57+. From 1.57 onwards
-# Playwright switched its bundled browser to Chrome-for-Testing, which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs
-# inside the sandbox. We also cap PLAYWRIGHT_WORKERS and Node old-space
-# to keep total memory bounded.
+# Sandcastle ralph-loop sandbox image — MINIMAL variant.
 #
 # This is the per-issue execution container that the orchestrator
 # (`.sandcastle/main.mts`) spins up via the `docker()` factory call.
@@ -14,6 +7,15 @@
 #
 # Base: bookworm-slim per the Wave 6.1 spec. We pre-install only the
 # CLIs that the agent prompts shell out to (gh, claude, psql, jq, git).
+#
+# This minimal variant skips Playwright + Chromium (and the system
+# libraries chromium needs to launch). Use it for projects that don't
+# need browser automation — Python scrapers, CLI tools, data pipelines,
+# pure backend services. Verification happens via the project's own
+# test runner (pytest, npm test, cargo test, go test, etc.) instead of
+# playwright. Resulting image is significantly smaller because the
+# ~120 MB chromium binary and its libnss/libdrm/libgbm/etc transitive
+# system deps are all absent.
 
 FROM node:22-bookworm-slim
 
@@ -101,38 +103,7 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 # corepack still falls back to downloading on demand.
 RUN corepack prepare pnpm@10.19.0 --activate
 
-# ---------------------------------------------------------------------------
-# Playwright — system libraries chromium needs to start (libnss, libdrm,
-# libgbm, libfribidi, libharfbuzz, libthai, libdatrie, libgraphite2, etc).
-# Without these the agent gets shipped a chromium binary it can't actually
-# launch — repeatedly observed during the 2026-05-08 issue #83 smoke where
-# the implementer hand-extracted .deb files at runtime to satisfy ldd.
-# `playwright install-deps` knows the exact list; using it keeps the image
-# in lockstep with whatever playwright version the target project pins.
-# ---------------------------------------------------------------------------
-# Pinned to ~1.56.0: Playwright 1.57+ switched to Chrome-for-Testing which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs.
-RUN npx -y playwright@~1.56.0 install-deps chromium \
-  && rm -rf /var/lib/apt/lists/*
-
 USER agent
-
-# Pre-cache the chromium binary into /home/agent/.cache/ms-playwright so each
-# new sandbox starts ready instead of downloading ~120 MB on first
-# `playwright test`.
-# Pinned to ~1.56.0: Playwright 1.57+ switched to Chrome-for-Testing which
-# spikes to ~20 GB RAM per browser instance and crashes parallel runs.
-RUN npx -y playwright@~1.56.0 install chromium
-
-# ---------------------------------------------------------------------------
-# Memory caps for Playwright runs.
-# PLAYWRIGHT_WORKERS=2 bounds parallelism so even if a target project
-# accidentally bumps to 1.57+ at the package.json level, we don't fan out
-# enough Chrome-for-Testing instances to OOM the host.
-# NODE_OPTIONS old-space=4096 caps the test-runner process itself.
-# ---------------------------------------------------------------------------
-ENV PLAYWRIGHT_WORKERS=2
-ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 # ---------------------------------------------------------------------------
 # Sandcastle bind-mounts the worktree at /workspace and overrides cwd, so we
