@@ -78,6 +78,13 @@ function injectIntoProjectPackageJson() {
     }
   }
 
+  // Sort alphabetically — many project linters (sherif, etc.) require it.
+  projPkg.devDependencies = Object.fromEntries(
+    Object.entries(projPkg.devDependencies).sort(([a], [b]) =>
+      a.localeCompare(b),
+    ),
+  );
+
   writeFileSync(projPkgPath, JSON.stringify(projPkg, null, 2) + "\n");
   return added;
 }
