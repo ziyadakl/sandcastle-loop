@@ -655,7 +655,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       // node_modules so the install starts from scratch on a 1.7 GB
       // monorepo and trips workspace catalog errors.
       const result = await sandcastle.run({
-        sandbox: docker({ imageName: args.imageName, env: containerEnv, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
@@ -670,7 +670,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, env: containerEnv, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
