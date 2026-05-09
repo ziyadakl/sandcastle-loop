@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TypeScript autonomous coding loop on @ai-hero/sandcastle",
   "bin": {
-    "sandcastle-loop": ".sandcastle/main.mts"
+    "sandcastle-loop": "bin/init.mjs"
   },
   "scripts": {
     "build": "tsc -p .",
