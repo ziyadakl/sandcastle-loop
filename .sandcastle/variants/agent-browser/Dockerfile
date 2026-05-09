@@ -108,7 +108,12 @@ RUN npm install -g agent-browser@${AGENT_BROWSER_VERSION}
 # libxkbcommon, etc). Doing this at image build time means the per-issue
 # sandbox starts with the browser already cached — no first-run delay.
 # Run as root so --with-deps can apt-install; switch back afterward.
-RUN agent-browser install --with-deps \
+#
+# `apt-get update` is required here because the previous RUN blocks wiped
+# /var/lib/apt/lists/*; without a fresh refresh, the apt-install step
+# inside `--with-deps` fails with "package not found".
+RUN apt-get update \
+  && agent-browser install --with-deps \
   && rm -rf /var/lib/apt/lists/*
 
 USER agent

@@ -106,10 +106,13 @@ line starting with or containing `playwright test`), you MUST run that
 exact command and confirm the in-scope tests pass before you can mark the
 story done.
 
-**Credentials are not blockers.** The e2e helpers in `apps/nextjs/e2e/`
-already pull credentials from `process.env.ADMIN_PASSWORD` (with default
-`2017363810`) and resolve `BASE_URL` from `playwright.config.ts`. You do
-not need to configure auth; you just need to run the command.
+**Credentials are not blockers.** Use whatever credentials the project's
+`.env` exposes for tests (look for variables named like `ADMIN_PASSWORD`,
+`TEST_USER_PASSWORD`, `E2E_PASSWORD`, etc., or check the project's
+`playwright.config.ts` / fixture files for how it resolves credentials).
+The project's own e2e helpers should already handle auth setup — you just
+need to run the command. `BASE_URL` is resolved by the project's
+`playwright.config.ts`.
 
 **Forbidden phrasings.** If you find yourself about to write any of:
 
@@ -138,10 +141,16 @@ have verified the feature you wrote actually works end-to-end. If you
 cannot fix the pre-existing condition, HALT.
 
 **Required artifacts.** Save the full playwright output to
-`/tmp/ralph-e2e-it{{ITERATION}}.log`:
+`/tmp/ralph-e2e-it{{ITERATION}}.log`. Detect the project's playwright
+config location (search for `playwright.config.{ts,js,mjs}` from repo
+root) and run the project-native invocation — `pnpm exec playwright test`
+in a single-package repo, `pnpm --filter <package-name> exec playwright
+test` in a workspace where the playwright config lives in a sub-package,
+or `npx playwright test` if pnpm isn't used. Use whatever the project's
+own `package.json` scripts or CI config invoke:
 
 ```
-pnpm --filter @acme/nextjs exec playwright test <args from spec> 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
+<project's-playwright-invocation> <args from spec> 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
 ```
 
 **No filtering allowed between playwright and tee.** Run the command EXACTLY
@@ -305,7 +314,7 @@ block and reads its contents directly, ignoring surrounding prose.
   "storyType": "ui",
   "e2eRequired": true,
   "e2eActuallyRan": true,
-  "testCommandUsed": "pnpm --filter @acme/nextjs exec playwright test apps/nextjs/e2e/foo.spec.ts",
+  "testCommandUsed": "pnpm exec playwright test e2e/foo.spec.ts",
   "e2eAssertionLine": "  ✓ should render the foo widget",
   "outputNotFiltered": true,
   "testReachedFeature": true

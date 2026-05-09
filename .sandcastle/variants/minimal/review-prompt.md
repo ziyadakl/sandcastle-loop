@@ -108,7 +108,7 @@ Verify:
 5. Does the certification block in the commit body have all checkboxes
    `[x]` when SPEC_REQUIRES_TESTS=yes or COMMIT_TOUCHED_BEHAVIOR=yes?
 
-# EVIDENCE QUOTE — STRICT verification of the certification's `testAssertionLine` field
+# EVIDENCE QUOTE — STRICT verification of the certification's `e2eAssertionLine` field
 
 The quoted line MUST satisfy ALL of:
 

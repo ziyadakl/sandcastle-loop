@@ -147,14 +147,15 @@ script. Save the script's combined stdout+stderr to the iteration log
 `agent-browser snapshot` in the script before referencing `@eN` after
 navigation or DOM-mutating actions; refs from a previous page are stale.
 
-**Credentials are not blockers.** The e2e helpers in `apps/nextjs/e2e/`
-already pull credentials from `process.env.ADMIN_PASSWORD` (with default
-`2017363810`) and resolve `BASE_URL` from a project-level config. You do
-not need to configure auth; you just need to run the sequence. Sign-in
-under agent-browser typically looks like: `agent-browser open
-"$BASE_URL/login" && agent-browser fill @ePASSWORD_REF "$ADMIN_PASSWORD"
-&& agent-browser click @eSUBMIT_REF && agent-browser wait --url
-"**/dashboard"` — refs vary, take a snapshot first to discover them.
+**Credentials are not blockers.** Use whatever credentials the project's
+`.env` exposes for tests (look for variables named like `ADMIN_PASSWORD`,
+`TEST_USER_PASSWORD`, `E2E_PASSWORD`, etc.) and resolve `BASE_URL` from
+the project's own config. You do not need to configure auth; you just
+need to run the sequence. Sign-in under agent-browser typically looks
+like: `agent-browser open "$BASE_URL/login" && agent-browser snapshot &&
+agent-browser fill @ePASSWORD_REF "$TEST_PASSWORD" && agent-browser
+click @eSUBMIT_REF && agent-browser wait --url "**/dashboard"` — refs
+vary, take a `snapshot` first to discover them.
 
 **Forbidden phrasings.** If you find yourself about to write any of:
 

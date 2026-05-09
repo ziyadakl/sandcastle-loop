@@ -338,36 +338,49 @@ block and reads its contents directly, ignoring surrounding prose.
 {
   "marker": "STORY_COMPLETE",
   "storyType": "backend-only",
-  "testsRequired": true,
-  "testsActuallyRan": true,
+  "e2eRequired": true,
+  "e2eActuallyRan": true,
   "testCommandUsed": "pytest tests/test_foo.py::test_bar",
-  "testAssertionLine": "PASSED tests/test_foo.py::test_bar",
+  "e2eAssertionLine": "PASSED tests/test_foo.py::test_bar",
   "outputNotFiltered": true,
   "testReachedFeature": true
 }
 ```
 
+(Note on field names: the JSON keys `e2eRequired` / `e2eActuallyRan` /
+`e2eAssertionLine` are required by the shared `ImplementerOutput` Zod
+schema even in the minimal variant — the schema's field names date back
+to when only the Playwright variant existed. In this variant they mean
+"tests required / tests ran / passing-test line from the runner",
+not browser e2e specifically. Use them with that minimal-variant
+interpretation; the field NAMES are non-negotiable, but the SEMANTICS
+in this variant are the project's own test runner.)
+
 Field rules:
 
-1. `storyType`: classify as `"backend-only"` | `"infra"` | `"docs"` — based
-   on the issue spec and what files your diff touched. (The minimal variant
-   has no `"ui"` story type because there's no browser stack to verify it
-   with — UI work belongs in the default Playwright variant, not here. The
-   schema accepts EXACTLY these three values.)
+1. `storyType`: classify as `"ui"` | `"backend-only"` | `"infra"` — based
+   on the issue spec and what files your diff touched. The minimal variant
+   has no browser stack, so `"ui"` is rare here (it would mean a UI story
+   verified through a project-native test runner like RTL/Vue Test Utils
+   without browser e2e); most stories are `"backend-only"` or `"infra"`.
+   **Map docs-only stories to `"backend-only"`** — the schema does not
+   accept a `"docs"` value; the schema accepts EXACTLY these three.
 
-2. `testsRequired`: `true` | `false` — does this story require a passing
+2. `e2eRequired`: `true` | `false` — does this story require a passing
    test run? `false` only for pure docs / config-only stories with no
-   behavior change. Default `true`.
+   behavior change. Default `true`. (Field name is `e2eRequired` for
+   schema compatibility; in this variant it means "tests required",
+   not Playwright specifically.)
 
-3. `testsActuallyRan`: `true` | `false` — did you actually invoke the test
-   command in this iteration (regardless of pass/fail)? If `testsRequired`
+3. `e2eActuallyRan`: `true` | `false` — did you actually invoke the test
+   command in this iteration (regardless of pass/fail)? If `e2eRequired`
    is `true` and this is `false`, you have NOT completed the story.
 
 4. `testCommandUsed`: the EXACT shell command you ran (a JSON string), or
-   JSON `null` if `testsActuallyRan=false`. Verbatim — no paraphrasing, no
+   JSON `null` if `e2eActuallyRan=false`. Verbatim — no paraphrasing, no
    empty string. Use `null`, not `""`.
 
-5. `testAssertionLine`: a line from `/tmp/ralph-test-it{{ITERATION}}.log`
+5. `e2eAssertionLine`: a line from `/tmp/ralph-test-it{{ITERATION}}.log`
    that PROVES the test reached its assertion (a passing-test line from
    the runner — `PASSED test_foo`, `✓ should do X`, `test result: ok`,
    `test test_foo ... ok` — or a line containing `assert`/`expect(`, or
