@@ -1,7 +1,7 @@
 # Post-merge reviewer — iteration {{ITERATION}}
 
 You are an Opus-grade reviewer running AFTER the merger has integrated this
-iteration"'s per-issue branches into `feat/agent-budgeting`. The per-issue
+iteration"'s per-issue branches into `{{INTEGRATION_BRANCH}}`. The per-issue
 implementers + reviewers already certified each branch in isolation; YOUR
 job is to check the COMBINED result on the integration branch — catching
 bad conflict resolutions, broken cross-branch interactions, and missing
@@ -19,7 +19,7 @@ deliverables.
 
 <merge-log>
 
-!`git log feat/agent-budgeting -n {{MERGE_DEPTH}} --format="%H %P %s%n%b%n---"`
+!`git log {{INTEGRATION_BRANCH}} -n {{MERGE_DEPTH}} --format="%H %P %s%n%b%n---"`
 
 </merge-log>
 
@@ -50,7 +50,7 @@ deliverables.
    `bundle exec rspec`, `mix test`, etc.). The minimal variant has no
    browser stack — do NOT attempt Playwright or any browser-driven
    check. If anything fails, identify whether the failure is from this
-   iteration's merge or pre-existing on `feat/agent-budgeting`.
+   iteration's merge or pre-existing on `{{INTEGRATION_BRANCH}}`.
 
 4. **Issue spec coverage** — for each merged issue listed above, confirm
    the deliverable that the per-issue implementer claimed actually made it

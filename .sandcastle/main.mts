@@ -1272,7 +1272,7 @@ export async function runMain(
       }
 
       // Phase 4: post-merge review (Opus). Best-effort visibility check
-      // over the merged result on feat/agent-budgeting. Failures are
+      // over the merged result on the integration branch. Failures are
       // logged only — they do NOT break the iteration.
       let postMergeMarker = "";
       try {
@@ -1285,6 +1285,7 @@ export async function runMain(
           promptArgs: {
             ITERATION: String(it),
             MERGE_DEPTH: String(mergedBranches.length),
+            INTEGRATION_BRANCH: args.branch,
             BRANCHES: mergedBranches.map((b) => `- ${b.branch}`).join("\n"),
             ISSUES: mergedBranches
               .map((i) => `- #${i.id}: ${i.title}`)
