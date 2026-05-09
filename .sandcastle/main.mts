@@ -1269,8 +1269,9 @@ export async function runMain(
       // Phase 4: post-merge review (Opus). Best-effort visibility check
       // over the merged result on feat/agent-budgeting. Failures are
       // logged only — they do NOT break the iteration.
+      let postMergeMarker = "";
       try {
-        await deps.run({
+        const r = await deps.run({
           name: "post-merge-reviewer",
           maxIterations: 1,
           model: "claude-opus-4-7",
@@ -1285,10 +1286,40 @@ export async function runMain(
               .join("\n"),
           },
         });
+        postMergeMarker = extractMarker(r.stdout, [
+          "POST_MERGE_ALL_CLEAR",
+          "POST_MERGE_ISSUES_FOUND",
+        ] as const);
+        deps.log(
+          `post-merge review: ${postMergeMarker || "(no marker emitted)"}`,
+        );
       } catch (err) {
         deps.logError(
           `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
         );
+      }
+
+      // Phase 5: cleanup stale per-issue sub-worktrees, gated on the
+      // post-merge reviewer's verdict. ALL_CLEAR means the merge is
+      // certified — the per-issue scaffolding has done its job and can be
+      // safely garbage-collected. ISSUES_FOUND, no marker, or any error
+      // above → leave the worktrees in place for human inspection.
+      if (postMergeMarker === "POST_MERGE_ALL_CLEAR") {
+        for (const issue of mergedBranches) {
+          const wtName = issue.branch.replace(/\//g, "-");
+          const wtPath = `.sandcastle/worktrees/${wtName}`;
+          try {
+            execFileSync("git", ["worktree", "remove", "--force", wtPath], {
+              cwd: args.repoRoot,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            deps.log(`cleaned up worktree ${wtPath}`);
+          } catch (err) {
+            deps.logError(
+              `worktree cleanup failed for ${wtPath}: ${(err as Error).message}`,
+            );
+          }
+        }
       }
     }
 
