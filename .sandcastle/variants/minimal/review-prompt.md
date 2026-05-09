@@ -139,7 +139,19 @@ The quoted line MUST satisfy ALL of:
   - the bare words 'passed', 'failed', 'all green', or 'OK' on a line by
     themselves
 
-If ANY of the above fails, emit:
+If ANY of the above fails, FIRST cross-check against the actual test log:
+
+- If the log clearly shows tests passed (a summary line like `N passed in
+  X.YZs` AND a non-empty per-file dot/check line like `tests/test_foo.py
+  ......`) AND no bail signals (see next section) are present, treat the
+  format mismatch as SOFT — DO NOT flag, skip silently. Pytest in default
+  (non-verbose) mode does not emit `PASSED test_name` lines, so the
+  implementer cannot quote one literally; the dot-summary IS valid evidence
+  that tests ran and passed. Same for jest/cargo/go-test summary modes.
+- ONLY emit HARD if the log shows zero passing dots/checks, OR if bail
+  signals are present (covered in the next section), OR if the
+  implementer's quoted line is the literal placeholder `<paste line>` /
+  `<the quoted line>` / empty / whitespace-only:
 
 > HARD: certification evidence is fabricated, generic, or doesn't prove
 > the test reached its assertion. `<paste the offending line and the rule
