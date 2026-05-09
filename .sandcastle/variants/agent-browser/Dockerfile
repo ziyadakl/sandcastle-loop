@@ -132,6 +132,25 @@ RUN agent-browser install
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 # ---------------------------------------------------------------------------
+# Make /home/agent writable by ANY UID. Sandcastle's docker provider
+# unconditionally launches the container with `--user $hostUid:$hostGid`
+# (see node_modules/@ai-hero/sandcastle/dist/sandboxes/docker.js around
+# line 42 — `process.getuid()` overrides whatever USER directive this
+# Dockerfile sets). On macOS the host UID is typically 501; the agent
+# user we created is 1001. Without the chmod below, the container starts
+# but can't write `.gitconfig`, `.gitconfig.lock`, npm cache files, etc.
+# `a+rwX` gives owner+group+other read/write/conditional-execute so files
+# written by the host UID land happily in dirs created by UID 1001.
+# /workspace gets the same treatment so bind-mounted worktrees aren't
+# blocked by permission errors on host-UID-owned files.
+# Run as root and switch back so the chmod can touch every file regardless
+# of which earlier RUN created it.
+# ---------------------------------------------------------------------------
+USER root
+RUN chmod -R a+rwX /home/agent /workspace
+USER agent
+
+# ---------------------------------------------------------------------------
 # Sandcastle bind-mounts the worktree at /workspace and overrides cwd, so we
 # set WORKDIR here for any commands that run before the bind-mount applies.
 # ENTRYPOINT keeps the container alive while the host issues `docker exec`s.

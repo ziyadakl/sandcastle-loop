@@ -103,6 +103,21 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 # corepack still falls back to downloading on demand.
 RUN corepack prepare pnpm@10.19.0 --activate
 
+# ---------------------------------------------------------------------------
+# Make /home/agent writable by ANY UID. Sandcastle's docker provider
+# unconditionally launches the container with `--user $hostUid:$hostGid`
+# (see node_modules/@ai-hero/sandcastle/dist/sandboxes/docker.js around
+# line 42 — `process.getuid()` overrides whatever USER directive this
+# Dockerfile sets). On macOS the host UID is typically 501; the agent
+# user we created is 1001. Without the chmod below, the container starts
+# but can't write `.gitconfig`, `.gitconfig.lock`, npm cache files, etc.
+# `a+rwX` gives owner+group+other read/write/conditional-execute so files
+# written by the host UID land happily in dirs created by UID 1001.
+# /workspace gets the same treatment so bind-mounted worktrees aren't
+# blocked by permission errors on host-UID-owned files.
+# ---------------------------------------------------------------------------
+RUN chmod -R a+rwX /home/agent /workspace
+
 USER agent
 
 # ---------------------------------------------------------------------------

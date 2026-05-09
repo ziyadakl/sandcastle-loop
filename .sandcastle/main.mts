@@ -28,7 +28,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
   claimViaLabel,
@@ -83,11 +83,12 @@ export interface RalphArgs {
    */
   recoveryEnabled: boolean;
   /**
-   * Docker image to run the sandbox in. Defaults to `sandcastle:affinity-tracker`.
-   * sandcastle's `docker()` factory would otherwise auto-derive the image
-   * name from the worktree directory name (e.g. `sandcastle:aft-sl-it1`),
-   * which doesn't match the image we built via
-   * `sandcastle docker build-image --image-name sandcastle:affinity-tracker`.
+   * Docker image to run the sandbox in. Defaults to the same name
+   * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
+   * `--repo-root` (e.g. `~/Dev/myproj` → `sandcastle:myproj`). That match
+   * is critical: sandcastle's own `docker()` would otherwise derive the
+   * name from the per-issue WORKTREE dir (`sandcastle:agent-issue-83`)
+   * which is never the image we just built. Override with `--image-name`.
    */
   imageName: string;
 }
@@ -198,7 +199,9 @@ Optional:
                             any pipeline error. Default: on (recovery uses
                             --recovery-model and runs once before quarantine).
   --image-name NAME         Docker image to run sandboxes in.
-                            Default: sandcastle:affinity-tracker.
+                            Default: derived from --repo-root basename
+                            (e.g. /Dev/myproj → sandcastle:myproj),
+                            matching 'sandcastle docker build-image'.
   --help                    Show this message and exit 0.
 
 Exit codes:
@@ -289,7 +292,9 @@ export function parseRalphArgs(argv: readonly string[]): {
     logFile: values["log-file"],
     dryRun: values["dry-run"] === true,
     recoveryEnabled: values["recovery"] !== "off",
-    imageName: values["image-name"] ?? "sandcastle:affinity-tracker",
+    imageName:
+      values["image-name"] ??
+      defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
   };
   return { args, showHelp: false };
 }
@@ -338,7 +343,7 @@ function defaultArgs(): RalphArgs {
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,
-    imageName: "sandcastle:affinity-tracker",
+    imageName: defaultImageName(process.cwd()),
   };
 }
 
