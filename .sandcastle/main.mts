@@ -43,6 +43,12 @@ import { parseVerdict, extractMarker } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { applyMigrationsBetween } from "./lib/migrations/index.js";
 import { models } from "./models.js";
+import {
+  envForModel,
+  defaultCodingModelFor,
+  isProviderName,
+  type ProviderName,
+} from "./providers.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -109,6 +115,18 @@ export interface RalphArgs {
    * straight `in-progress` → `done` on a successful merger pass.
    */
   stagingEnabled: boolean;
+  /**
+   * Implementer-side provider override. When set (via `--provider kimi|glm`),
+   * the implementer model is replaced with that provider's default coding
+   * model (`kimi-for-coding` for kimi, `glm-4.6` for glm) for both the
+   * initial pass and the escalation slot. All other roles (planner, reviewer,
+   * merger, post-merge-reviewer, post-merge-fixer, recovery) stay on whatever
+   * `.sandcastle/models.ts` defines — typically Anthropic on subscription.
+   *
+   * Undefined means "no override — use models.ts as-is" (Anthropic everywhere
+   * by default).
+   */
+  provider?: ProviderName;
   /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
@@ -252,6 +270,14 @@ Optional:
                             writes directly to --branch and the post-merge
                             reviewer is advisory-only (no fixer pass, no
                             fast-forward gating). Default: staging ON.
+  --provider NAME           Override the implementer provider for this run.
+                            One of: kimi | glm | anthropic. Maps to that
+                            provider's default coding model (kimi-for-coding,
+                            glm-4.6, claude-sonnet-4-6). Reads keys from .env
+                            at the repo root (KIMI_API_KEY, GLM_API_KEY).
+                            Anthropic uses the local Claude subscription.
+                            Default: no override — implementer uses
+                            models.implementer.default from models.ts.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -300,6 +326,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "recovery": { type: "string" },
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
+      "provider": { type: "string" },
       "image-name": { type: "string" },
       "help": { type: "boolean" },
     },
@@ -322,6 +349,24 @@ export function parseRalphArgs(argv: readonly string[]): {
       ? parsePositiveInt(values.issue, "--issue") ?? undefined
       : undefined;
 
+  // --provider overrides the implementer model with that provider's default
+  // coding model. --implementer-model still wins if both are passed (more
+  // specific flag).
+  let provider: ProviderName | undefined;
+  if (values.provider !== undefined) {
+    if (!isProviderName(values.provider)) {
+      throw new Error(
+        `--provider: expected one of kimi|glm|anthropic, got ${JSON.stringify(values.provider)}`,
+      );
+    }
+    provider = values.provider;
+  }
+  const implementerModel =
+    values["implementer-model"] ??
+    (provider !== undefined
+      ? defaultCodingModelFor(provider)
+      : models.implementer.default);
+
   const args: RalphArgs = {
     iterations,
     issue,
@@ -331,7 +376,7 @@ export function parseRalphArgs(argv: readonly string[]): {
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
     plannerModel: values["planner-model"] ?? models.planner.default,
-    implementerModel: values["implementer-model"] ?? models.implementer.default,
+    implementerModel,
     reviewerModel: values["reviewer-model"] ?? models.reviewer.default,
     mergerModel: values["merger-model"] ?? models.merger.default,
     postMergeReviewerModel:
@@ -357,6 +402,7 @@ export function parseRalphArgs(argv: readonly string[]): {
     recoveryEnabled: values["recovery"] !== "off",
     retryEnabled: values["no-retry"] !== true,
     stagingEnabled: values["no-staging"] !== true,
+    provider,
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
@@ -415,6 +461,44 @@ function defaultArgs(): RalphArgs {
     stagingEnabled: true,
     imageName: defaultImageName(process.cwd()),
   };
+}
+
+// ---------------------------------------------------------------------------
+// .env loader (minimal — no new deps)
+// ---------------------------------------------------------------------------
+
+/**
+ * Best-effort load of `.env` at the given root into `process.env`. Existing
+ * env vars win (real shell exports take precedence over the file). Lines:
+ *   KEY=value          → process.env.KEY = "value"
+ *   KEY="val ue"       → strips matching surrounding quotes
+ *   # comment / blank  → skipped
+ *
+ * Silently no-ops if the file doesn't exist. Throws only on read errors.
+ * Parser is intentionally tiny — for full dotenv semantics (multiline,
+ * variable expansion, etc.) install the `dotenv` package and replace this.
+ */
+export function loadDotenv(repoRoot: string): void {
+  const dotenvPath = path.join(repoRoot, ".env");
+  if (!existsSync(dotenvPath)) return;
+  const raw = readFileSync(dotenvPath, "utf8");
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +955,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         cwd: args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
-        agent: sandcastle.claudeCode(spec.model),
+        agent: sandcastle.claudeCode(spec.model, { env: envForModel(spec.model) }),
         promptFile: spec.promptFile,
         promptArgs: spec.promptArgs,
         idleTimeoutSeconds: spec.idleTimeoutSeconds,
@@ -898,7 +982,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
           const r = await handle.run({
             name: opts.name,
             maxIterations: opts.maxIterations ?? 1,
-            agent: sandcastle.claudeCode(opts.model),
+            agent: sandcastle.claudeCode(opts.model, { env: envForModel(opts.model) }),
             promptFile: opts.promptFile,
             promptArgs: opts.promptArgs,
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
@@ -1902,6 +1986,10 @@ if (isMain()) {
       process.exit(0);
     }
     const { args } = parsed;
+
+    // Load .env BEFORE preflight so provider keys are visible to envForModel.
+    // Real shell exports still win — loadDotenv only fills in missing keys.
+    loadDotenv(args.repoRoot);
 
     const pre = preflight(args);
     if (!pre.ok) {
