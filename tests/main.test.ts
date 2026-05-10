@@ -289,11 +289,15 @@ describe("sandcastle-loop main.mts — happy path", () => {
     });
     b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
     b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
     // After the first successful cycle the orchestrator loops; we want it
     // to exit 0 ("no claimable") on iteration 2 — enqueue an empty plan.
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
-    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
 
     expect(result.exitCode).toBe(0);
     expect(result.shippedIssues).toEqual([71]);
@@ -311,6 +315,7 @@ describe("sandcastle-loop main.mts — happy path", () => {
       "implementer",
       "reviewer",
       "merger",
+      "post-merge-reviewer",
       "planner",
     ]);
   });
@@ -487,9 +492,10 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     b.enqueue("recovery", { stdout: "fixed it up\n\nRECOVERY_COMPLETE" });
     b.enqueue("planner", { stdout: plannerStdout([]) });
     b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
 
     const result = await runMain(
-      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      baseArgs({ iterations: 2, recoveryEnabled: true, stagingEnabled: false }),
       b.deps,
     );
 
@@ -617,8 +623,8 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-sonnet-4-6");
-    expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
+    expect(r.args.implementerModel).toBe("kimi-for-coding");
+    expect(r.args.reviewerModel).toBe("kimi-for-coding");
     expect(r.args.recoveryModel).toBe("claude-opus-4-7");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
