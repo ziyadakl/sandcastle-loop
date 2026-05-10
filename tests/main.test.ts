@@ -24,10 +24,14 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import {
   runMain,
   parsePlan,
   parseRalphArgs,
+  loadDotenv,
   type Deps,
   type RalphArgs,
   type SandboxRunSpec,
@@ -628,5 +632,119 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
     expect(r.args.recoveryModel).toBe("claude-opus-4-7");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
+  });
+});
+
+describe("sandcastle-loop main.mts — loadDotenv chain", () => {
+  // The chain (first hit per-key wins, lower fills gaps):
+  //   1. process.env  2. $SANDCASTLE_ENV_FILE  3. <repoRoot>/.env
+  //   4. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
+
+  function withTempDirs(fn: (dirs: {
+    repoRoot: string;
+    xdg: string;
+    explicit: string;
+  }) => void): void {
+    const tmp = mkdtempSync(path.join(tmpdir(), "sc-env-"));
+    const repoRoot = path.join(tmp, "repo");
+    const xdg = path.join(tmp, "xdg");
+    const explicitDir = path.join(tmp, "explicit");
+    mkdirSync(repoRoot, { recursive: true });
+    mkdirSync(path.join(xdg, "sandcastle"), { recursive: true });
+    mkdirSync(explicitDir, { recursive: true });
+    const explicit = path.join(explicitDir, "explicit.env");
+
+    const savedKeys = [
+      "KIMI_API_KEY",
+      "GLM_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "GH_TOKEN",
+      "XDG_CONFIG_HOME",
+      "SANDCASTLE_ENV_FILE",
+    ] as const;
+    const saved: Record<string, string | undefined> = {};
+    for (const k of savedKeys) saved[k] = process.env[k];
+
+    try {
+      for (const k of savedKeys) delete process.env[k];
+      process.env.XDG_CONFIG_HOME = xdg;
+      fn({ repoRoot, xdg, explicit });
+    } finally {
+      for (const k of savedKeys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  it("loads from host-level file when no project .env", () => {
+    withTempDirs(({ repoRoot, xdg }) => {
+      writeFileSync(
+        path.join(xdg, "sandcastle", ".env"),
+        "KIMI_API_KEY=from-host\n",
+      );
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-host");
+    });
+  });
+
+  it("project .env overrides host-level for same key", () => {
+    withTempDirs(({ repoRoot, xdg }) => {
+      writeFileSync(
+        path.join(xdg, "sandcastle", ".env"),
+        "KIMI_API_KEY=from-host\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "KIMI_API_KEY=from-project\n");
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-project");
+    });
+  });
+
+  it("merges keys across sources when they don't conflict", () => {
+    withTempDirs(({ repoRoot, xdg }) => {
+      writeFileSync(
+        path.join(xdg, "sandcastle", ".env"),
+        "KIMI_API_KEY=from-host\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "GH_TOKEN=from-project\n");
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-host");
+      expect(process.env.GH_TOKEN).toBe("from-project");
+    });
+  });
+
+  it("pre-set process.env wins over every file", () => {
+    withTempDirs(({ repoRoot, xdg }) => {
+      process.env.KIMI_API_KEY = "from-shell";
+      writeFileSync(
+        path.join(xdg, "sandcastle", ".env"),
+        "KIMI_API_KEY=from-host\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "KIMI_API_KEY=from-project\n");
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-shell");
+    });
+  });
+
+  it("$SANDCASTLE_ENV_FILE wins over both project and host files", () => {
+    withTempDirs(({ repoRoot, xdg, explicit }) => {
+      writeFileSync(
+        path.join(xdg, "sandcastle", ".env"),
+        "KIMI_API_KEY=from-host\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "KIMI_API_KEY=from-project\n");
+      writeFileSync(explicit, "KIMI_API_KEY=from-explicit\n");
+      process.env.SANDCASTLE_ENV_FILE = explicit;
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-explicit");
+    });
+  });
+
+  it("silently no-ops when no files exist and no env vars set", () => {
+    withTempDirs(({ repoRoot }) => {
+      expect(() => loadDotenv(repoRoot)).not.toThrow();
+      expect(process.env.KIMI_API_KEY).toBeUndefined();
+    });
   });
 });

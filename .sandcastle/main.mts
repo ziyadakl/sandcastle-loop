@@ -27,6 +27,7 @@ import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
@@ -474,20 +475,25 @@ function defaultArgs(): RalphArgs {
 // ---------------------------------------------------------------------------
 
 /**
- * Best-effort load of `.env` at the given root into `process.env`. Existing
- * env vars win (real shell exports take precedence over the file). Lines:
- *   KEY=value          → process.env.KEY = "value"
- *   KEY="val ue"       → strips matching surrounding quotes
- *   # comment / blank  → skipped
- *
- * Silently no-ops if the file doesn't exist. Throws only on read errors.
- * Parser is intentionally tiny — for full dotenv semantics (multiline,
- * variable expansion, etc.) install the `dotenv` package and replace this.
+ * Keys we surface in the startup-log so the user can see which source each
+ * one resolved from. PATH and friends would spam the log.
  */
-export function loadDotenv(repoRoot: string): void {
-  const dotenvPath = path.join(repoRoot, ".env");
-  if (!existsSync(dotenvPath)) return;
-  const raw = readFileSync(dotenvPath, "utf8");
+const LOGGED_ENV_KEYS = new Set([
+  "KIMI_API_KEY",
+  "GLM_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GH_TOKEN",
+]);
+
+/** Parse a single .env file into process.env. Earlier writers win — we never
+ * overwrite an existing value. Silently no-ops if the file doesn't exist.
+ * Returns the map of keys this file contributed (only counts the keys it
+ * actually set, not ones that were already populated by an earlier source).
+ */
+function parseEnvFileInto(filePath: string): Record<string, true> {
+  const contributed: Record<string, true> = {};
+  if (!existsSync(filePath)) return contributed;
+  const raw = readFileSync(filePath, "utf8");
   for (const rawLine of raw.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === "" || line.startsWith("#")) continue;
@@ -503,6 +509,59 @@ export function loadDotenv(repoRoot: string): void {
     }
     if (!(key in process.env)) {
       process.env[key] = value;
+      contributed[key] = true;
+    }
+  }
+  return contributed;
+}
+
+/**
+ * Resolve sandcastle's env vars from a lookup chain into `process.env`.
+ * Earlier sources win per-key; later sources only fill keys still missing.
+ *
+ * Order:
+ *   1. process.env (shell exports — implicit; we never overwrite)
+ *   2. $SANDCASTLE_ENV_FILE if set (escape hatch for secret-manager piping)
+ *   3. <repoRoot>/.env (project-local override)
+ *   4. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
+ *      (host-level default — write once per machine)
+ *
+ * The host-level path means a user can put `KIMI_API_KEY` once in
+ * `~/.config/sandcastle/.env` and have every project + every worktree
+ * inherit it. Per-project `.env` still wins for overrides.
+ *
+ * Logs which source each known key came from. Unknown keys load silently.
+ * Parser is intentionally tiny — install `dotenv` and replace `parseEnvFileInto`
+ * if you need multiline / variable expansion.
+ */
+export function loadDotenv(repoRoot: string): void {
+  const sources: { label: string; path: string }[] = [];
+  const explicit = process.env.SANDCASTLE_ENV_FILE;
+  if (explicit && explicit.trim() !== "") {
+    sources.push({ label: "$SANDCASTLE_ENV_FILE", path: explicit });
+  }
+  sources.push({ label: "<repoRoot>/.env", path: path.join(repoRoot, ".env") });
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const hostDir =
+    xdg && xdg.trim() !== ""
+      ? path.join(xdg, "sandcastle")
+      : path.join(os.homedir(), ".config", "sandcastle");
+  sources.push({
+    label: "~/.config/sandcastle/.env",
+    path: path.join(hostDir, ".env"),
+  });
+
+  const resolvedFrom = new Map<string, string>();
+  for (const src of sources) {
+    const got = parseEnvFileInto(src.path);
+    for (const key of Object.keys(got)) {
+      if (!resolvedFrom.has(key)) resolvedFrom.set(key, src.label);
+    }
+  }
+  for (const key of LOGGED_ENV_KEYS) {
+    if (process.env[key] && process.env[key]!.trim() !== "") {
+      const from = resolvedFrom.get(key) ?? "process.env (shell)";
+      console.log(`[env] ${key} ← ${from}`);
     }
   }
 }
