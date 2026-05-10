@@ -40,6 +40,7 @@ import {
 import { parseVerdict, extractMarker } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { applyMigrationsBetween } from "./lib/migrations/index.js";
+import { models } from "./models.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,8 +68,11 @@ export interface RalphArgs {
   branch: string;
   label: string;
   maxConcurrent: number;
+  plannerModel: string;
   implementerModel: string;
   reviewerModel: string;
+  mergerModel: string;
+  postMergeReviewerModel: string;
   recoveryModel: string;
   implementerTimeoutSec: number;
   reviewerTimeoutSec: number;
@@ -187,9 +191,12 @@ Optional:
   --branch NAME             Base branch (default: current; refuses main/master).
   --label NAME              Label to claim (default: ready-for-agent).
   --max-concurrent N        Parallel issues per cycle (default: 3).
-  --implementer-model M     Default: claude-sonnet-4-6.
-  --reviewer-model M        Default: claude-haiku-4-5.
-  --recovery-model M        Default: claude-opus-4-7. Used by the recovery pass.
+  --planner-model M             Default: from .sandcastle/models.ts (planner.default).
+  --implementer-model M         Default: from .sandcastle/models.ts (implementer.default).
+  --reviewer-model M            Default: from .sandcastle/models.ts (reviewer.default).
+  --merger-model M              Default: from .sandcastle/models.ts (merger.default).
+  --post-merge-reviewer-model M Default: from .sandcastle/models.ts (postMergeReviewer.default).
+  --recovery-model M            Default: from .sandcastle/models.ts (recovery.default). Used by the recovery pass.
   --implementer-timeout-sec N   Default: 1200.
   --reviewer-timeout-sec N      Default: 600.
   --consecutive-failure-limit N Default: 3.
@@ -232,8 +239,11 @@ export function parseRalphArgs(argv: readonly string[]): {
       "branch": { type: "string" },
       "label": { type: "string" },
       "max-concurrent": { type: "string" },
+      "planner-model": { type: "string" },
       "implementer-model": { type: "string" },
       "reviewer-model": { type: "string" },
+      "merger-model": { type: "string" },
+      "post-merge-reviewer-model": { type: "string" },
       "recovery-model": { type: "string" },
       "implementer-timeout-sec": { type: "string" },
       "reviewer-timeout-sec": { type: "string" },
@@ -271,9 +281,13 @@ export function parseRalphArgs(argv: readonly string[]): {
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
-    implementerModel: values["implementer-model"] ?? "claude-sonnet-4-6",
-    reviewerModel: values["reviewer-model"] ?? "claude-haiku-4-5",
-    recoveryModel: values["recovery-model"] ?? "claude-opus-4-7",
+    plannerModel: values["planner-model"] ?? models.planner.default,
+    implementerModel: values["implementer-model"] ?? models.implementer.default,
+    reviewerModel: values["reviewer-model"] ?? models.reviewer.default,
+    mergerModel: values["merger-model"] ?? models.merger.default,
+    postMergeReviewerModel:
+      values["post-merge-reviewer-model"] ?? models.postMergeReviewer.default,
+    recoveryModel: values["recovery-model"] ?? models.recovery.default,
     implementerTimeoutSec:
       parsePositiveInt(
         values["implementer-timeout-sec"],
@@ -335,9 +349,12 @@ function defaultArgs(): RalphArgs {
     branch: "HEAD",
     label: LABEL_READY,
     maxConcurrent: 3,
-    implementerModel: "claude-sonnet-4-6",
-    reviewerModel: "claude-haiku-4-5",
-    recoveryModel: "claude-opus-4-7",
+    plannerModel: models.planner.default,
+    implementerModel: models.implementer.default,
+    reviewerModel: models.reviewer.default,
+    mergerModel: models.merger.default,
+    postMergeReviewerModel: models.postMergeReviewer.default,
+    recoveryModel: models.recovery.default,
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
     consecutiveFailureLimit: 3,
@@ -1111,7 +1128,7 @@ export async function runMain(
           const planResult = await deps.run({
             name: "planner",
             maxIterations: 1,
-            model: "claude-opus-4-7",
+            model: args.plannerModel,
             promptFile: "./.sandcastle/plan-prompt.md",
             idleTimeoutSeconds: args.implementerTimeoutSec,
             promptArgs: {
@@ -1254,7 +1271,7 @@ export async function runMain(
         await deps.run({
           name: "merger",
           maxIterations: 1,
-          model: "claude-opus-4-7",
+          model: args.mergerModel,
           promptFile: "./.sandcastle/merge-prompt.md",
           idleTimeoutSeconds: args.implementerTimeoutSec,
           promptArgs: {
@@ -1279,7 +1296,7 @@ export async function runMain(
         const r = await deps.run({
           name: "post-merge-reviewer",
           maxIterations: 1,
-          model: "claude-opus-4-7",
+          model: args.postMergeReviewerModel,
           promptFile: "./.sandcastle/post-merge-review-prompt.md",
           idleTimeoutSeconds: args.reviewerTimeoutSec,
           promptArgs: {
