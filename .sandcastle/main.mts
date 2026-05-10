@@ -34,6 +34,8 @@ import {
   claimViaLabel,
   quarantineViaLabel,
   markDoneViaLabel,
+  markMergedToStagingViaLabel,
+  promoteAllStagingToDone,
   postIssueComment,
   LABEL_READY,
 } from "./lib/state/index.js";
@@ -97,6 +99,17 @@ export interface RalphArgs {
    */
   retryEnabled: boolean;
   /**
+   * Route every merge through a persistent `integration-candidate` staging
+   * branch and gate the fast-forward of `--branch` on a post-merge reviewer
+   * pass (with a fixer escalation in between). Default: true.
+   *
+   * When false (`--no-staging`), the loop falls back to today's behavior:
+   * the merger merges directly into `--branch`, the post-merge reviewer
+   * runs but only logs warnings, no fix-loop runs, and per-issue labels go
+   * straight `in-progress` → `done` on a successful merger pass.
+   */
+  stagingEnabled: boolean;
+  /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
    * `--repo-root` (e.g. `~/Dev/myproj` → `sandcastle:myproj`). That match
@@ -155,6 +168,21 @@ export interface Deps {
   /** Label state machine. */
   claim(issueNum: number): Promise<void>;
   markDone(issueNum: number, summary: string): Promise<void>;
+  /**
+   * Flip an issue's label to `merged-to-staging` after its branch lands on
+   * `integration-candidate`. The issue stays open until staging certifies
+   * and `promoteStagingToDone` fast-forwards integration.
+   */
+  markMergedToStaging(issueNum: number): Promise<void>;
+  /**
+   * Promote every still-`merged-to-staging` issue in `issueNums` to `done`
+   * with the shared `summary` comment, after staging fast-forwards into the
+   * integration branch.
+   */
+  promoteStagingToDone(
+    issueNums: readonly number[],
+    summary: string,
+  ): Promise<{ failed: readonly number[] }>;
   quarantine(issueNum: number, reason: string): Promise<void>;
   comment(issueNum: number, body: string): Promise<void>;
   /** Migrations between two SHAs in `repoRoot`. Returns # applied + errors. */
@@ -219,6 +247,11 @@ Optional:
                             (a HAS_BLOCKERS verdict triggers one escalated
                             implementer + reviewer attempt before quarantine,
                             using the role's escalations[0] model).
+  --no-staging              Disable the integration-candidate staging branch
+                            and post-merge fix-loop. With this flag the merger
+                            writes directly to --branch and the post-merge
+                            reviewer is advisory-only (no fixer pass, no
+                            fast-forward gating). Default: staging ON.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -266,6 +299,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "dry-run": { type: "boolean" },
       "recovery": { type: "string" },
       "no-retry": { type: "boolean" },
+      "no-staging": { type: "boolean" },
       "image-name": { type: "string" },
       "help": { type: "boolean" },
     },
@@ -322,6 +356,7 @@ export function parseRalphArgs(argv: readonly string[]): {
     dryRun: values["dry-run"] === true,
     recoveryEnabled: values["recovery"] !== "off",
     retryEnabled: values["no-retry"] !== true,
+    stagingEnabled: values["no-staging"] !== true,
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
@@ -377,6 +412,7 @@ function defaultArgs(): RalphArgs {
     dryRun: false,
     recoveryEnabled: true,
     retryEnabled: true,
+    stagingEnabled: true,
     imageName: defaultImageName(process.cwd()),
   };
 }
@@ -390,6 +426,8 @@ const REQUIRED_PROMPT_FILES = [
   "implement-prompt.md",
   "review-prompt.md",
   "merge-prompt.md",
+  "post-merge-review-prompt.md",
+  "post-merge-fix-prompt.md",
 ] as const;
 
 export interface PreflightResult {
@@ -573,6 +611,146 @@ function buildGitEnv(): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
+// Staging branch — git helpers
+// ---------------------------------------------------------------------------
+
+/** Persistent staging branch name. Reused across iterations. */
+const STAGING_BRANCH = "integration-candidate";
+
+interface GitRunResult {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+function runGit(repoRoot: string, ...gitArgs: string[]): GitRunResult {
+  try {
+    const stdout = execFileSync("git", gitArgs, {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true, stdout: stdout.trim(), stderr: "" };
+  } catch (err) {
+    const e = err as Error & { stderr?: Buffer | string; stdout?: Buffer | string };
+    const stderr = typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? "");
+    const stdout = typeof e.stdout === "string" ? e.stdout : (e.stdout?.toString() ?? "");
+    return { ok: false, stdout: stdout.trim(), stderr: stderr.trim() || e.message };
+  }
+}
+
+/**
+ * Resolve a ref to its commit SHA. Returns "" if the ref does not exist
+ * (caller decides whether that's an error or just first-iteration setup).
+ */
+function resolveRefSha(repoRoot: string, ref: string): string {
+  const r = runGit(repoRoot, "rev-parse", "--verify", "--quiet", ref);
+  return r.ok ? r.stdout : "";
+}
+
+/**
+ * Reset the staging branch to the integration tip and check it out.
+ *
+ * - If staging exists and its current tip was left by a failed iteration
+ *   (caller passes `failureTagIteration > 0`), tag the tip first as
+ *   `bad-merge-iter-<N>` so evidence is preserved without leaking branches.
+ * - Force-update staging to point at the current integration tip (this is
+ *   how we avoid the stale-local-ref problem if integration moved).
+ * - Check out staging so subsequent merge ops land there.
+ *
+ * Returns the integration tip SHA on success, "" on any failure (caller
+ * logs and decides whether to fall back).
+ */
+function resetStagingToIntegrationTip(
+  repoRoot: string,
+  integrationBranch: string,
+  failureTagIteration: number | null,
+  log: (s: string) => void,
+  logError: (s: string) => void,
+): string {
+  const integrationTip = resolveRefSha(repoRoot, integrationBranch);
+  if (integrationTip === "") {
+    logError(
+      `staging-reset: cannot resolve integration branch '${integrationBranch}' — staging not reset`,
+    );
+    return "";
+  }
+  const stagingTip = resolveRefSha(repoRoot, STAGING_BRANCH);
+  if (stagingTip !== "" && failureTagIteration !== null && failureTagIteration > 0) {
+    const tagName = `bad-merge-iter-${failureTagIteration}`;
+    const tag = runGit(repoRoot, "tag", "-f", tagName, stagingTip);
+    if (tag.ok) {
+      log(`staging-reset: tagged failed staging tip ${stagingTip.slice(0, 8)} as ${tagName}`);
+    } else {
+      logError(`staging-reset: failed to tag bad-merge: ${tag.stderr}`);
+      // Non-fatal — proceed with reset.
+    }
+  }
+  // Force-update staging to integration tip. `git branch -f` works whether
+  // staging exists or not (creates if absent).
+  const reset = runGit(repoRoot, "branch", "-f", STAGING_BRANCH, integrationTip);
+  if (!reset.ok) {
+    logError(`staging-reset: 'git branch -f ${STAGING_BRANCH} ${integrationTip}' failed: ${reset.stderr}`);
+    return "";
+  }
+  const checkout = runGit(repoRoot, "checkout", STAGING_BRANCH);
+  if (!checkout.ok) {
+    logError(`staging-reset: 'git checkout ${STAGING_BRANCH}' failed: ${checkout.stderr}`);
+    return "";
+  }
+  log(`staging-reset: ${STAGING_BRANCH} → ${integrationTip.slice(0, 8)} (from ${integrationBranch})`);
+  return integrationTip;
+}
+
+/**
+ * Fast-forward `integrationBranch` to the staging tip. Uses
+ * `git update-ref` so we don't have to switch branches first.
+ * Returns true on success.
+ */
+function fastForwardIntegration(
+  repoRoot: string,
+  integrationBranch: string,
+  log: (s: string) => void,
+  logError: (s: string) => void,
+): boolean {
+  const stagingTip = resolveRefSha(repoRoot, STAGING_BRANCH);
+  if (stagingTip === "") {
+    logError(`fast-forward: cannot resolve ${STAGING_BRANCH}`);
+    return false;
+  }
+  const integrationTip = resolveRefSha(repoRoot, integrationBranch);
+  if (integrationTip === "") {
+    logError(`fast-forward: cannot resolve integration branch '${integrationBranch}'`);
+    return false;
+  }
+  // Verify it's actually a fast-forward — refuse to clobber unrelated history.
+  const merge = runGit(repoRoot, "merge-base", "--is-ancestor", integrationTip, stagingTip);
+  if (!merge.ok) {
+    logError(
+      `fast-forward refused: ${integrationBranch} (${integrationTip.slice(0, 8)}) ` +
+        `is not an ancestor of ${STAGING_BRANCH} (${stagingTip.slice(0, 8)}); ` +
+        `human triage required`,
+    );
+    return false;
+  }
+  const update = runGit(
+    repoRoot,
+    "update-ref",
+    `refs/heads/${integrationBranch}`,
+    stagingTip,
+    integrationTip,
+  );
+  if (!update.ok) {
+    logError(`fast-forward: update-ref failed: ${update.stderr}`);
+    return false;
+  }
+  log(
+    `fast-forward: ${integrationBranch} ${integrationTip.slice(0, 8)} → ${stagingTip.slice(0, 8)}`,
+  );
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency limiter (small inline semaphore — no extra dep)
 // ---------------------------------------------------------------------------
 
@@ -738,6 +916,17 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     async markDone(n, summary) {
       if (args.dryRun) return dryLog("markDone", n, summary);
       await markDoneViaLabel(n, summary);
+    },
+    async markMergedToStaging(n) {
+      if (args.dryRun) return dryLog("markMergedToStaging", n);
+      await markMergedToStagingViaLabel(n);
+    },
+    async promoteStagingToDone(nums, summary) {
+      if (args.dryRun) {
+        dryLog("promoteStagingToDone", nums, summary);
+        return { failed: [] };
+      }
+      return promoteAllStagingToDone(nums, summary);
     },
     async quarantine(n, reason) {
       if (args.dryRun) return dryLog("quarantine", n, reason);
@@ -1023,7 +1212,13 @@ async function shipAfterMigrations(
   }
   void sandbox; // sandbox lifecycle handled by the caller's finally block
   const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${postSha}, branch ${ctx.issue.branch})`;
-  await ctx.deps.markDone(ctx.issueNumber, summary);
+  // Under --no-staging (legacy), flip label → done immediately. Under staging
+  // (default), keep the issue in `in-progress` until the merger lands it on
+  // `integration-candidate`; the outer loop flips it to `merged-to-staging`
+  // there, then to `done` after the post-merge fast-forward.
+  if (!ctx.args.stagingEnabled) {
+    await ctx.deps.markDone(ctx.issueNumber, summary);
+  }
   return { status: "ok", finalMarker, postSha };
 }
 
@@ -1146,7 +1341,11 @@ async function runIssuePipeline(
           `[issue=${ctx.issueNumber}] shipped via sandcastle-loop recovery ` +
           `(commit ${postSha}, branch ${ctx.issue.branch})`;
         try {
-          await ctx.deps.markDone(ctx.issueNumber, summary);
+          // Under staging, keep `in-progress` until the merger / staging
+          // flow takes over. Under --no-staging, flip immediately.
+          if (!ctx.args.stagingEnabled) {
+            await ctx.deps.markDone(ctx.issueNumber, summary);
+          }
           return {
             status: "ok",
             finalMarker: "RECOVERY_COMPLETE",
@@ -1201,6 +1400,10 @@ export async function runMain(
   const shippedIssues: number[] = [];
   const quarantinedIssues: number[] = [];
   let iterationsRun = 0;
+  // Cross-iteration staging state — the iteration number that left staging
+  // in a known-bad state, or null if last iteration finished clean. Used to
+  // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
+  let lastFailedStagingIteration: number | null = null;
 
   // Graceful shutdown: register once. We don't abort in-flight gh calls;
   // we set a flag the outer loop checks at iteration boundaries.
@@ -1378,6 +1581,41 @@ export async function runMain(
         deps.log("no shipped branches this cycle — skipping merge phase");
         continue;
       }
+      const mergedIssueNums = mergedBranches
+        .map((b) => Number(b.id))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      const branchesArg = mergedBranches.map((b) => `- ${b.branch}`).join("\n");
+      const issuesArg = mergedBranches
+        .map((i) => `- #${i.id}: ${i.title}`)
+        .join("\n");
+
+      // Staging prelude (default). Tag the previous iteration's bad staging
+      // tip if the last iteration left one, then force-update staging to
+      // the current integration tip and check it out so the merger lands
+      // its work on `integration-candidate` rather than directly on the
+      // integration branch.
+      let stagingActive = false;
+      if (args.stagingEnabled) {
+        const tip = resetStagingToIntegrationTip(
+          args.repoRoot,
+          args.branch,
+          lastFailedStagingIteration,
+          (s) => deps.log(s),
+          (s) => deps.logError(s),
+        );
+        if (tip === "") {
+          deps.logError(
+            `staging reset failed — falling back to direct merge into ${args.branch} for iteration ${it}`,
+          );
+        } else {
+          stagingActive = true;
+          // Reset succeeded, so any prior failure is now preserved as a tag;
+          // clear the cross-iteration marker.
+          lastFailedStagingIteration = null;
+        }
+      }
+
+      let mergerOk = true;
       try {
         await deps.run({
           name: "merger",
@@ -1387,22 +1625,78 @@ export async function runMain(
           idleTimeoutSeconds: args.implementerTimeoutSec,
           promptArgs: {
             ITERATION: String(it),
-            BRANCHES: mergedBranches.map((b) => `- ${b.branch}`).join("\n"),
-            ISSUES: mergedBranches
-              .map((i) => `- #${i.id}: ${i.title}`)
-              .join("\n"),
+            BRANCHES: branchesArg,
+            ISSUES: issuesArg,
           },
         });
       } catch (err) {
+        mergerOk = false;
         deps.logError(
           `merge phase threw: ${(err as Error).message} — continuing to next iteration`,
         );
       }
 
-      // Phase 4: post-merge review (Opus). Best-effort visibility check
-      // over the merged result on the integration branch. Failures are
-      // logged only — they do NOT break the iteration.
+      // After a successful merger, flip every shipped issue's label from
+      // `in-progress` → `merged-to-staging`. Skip when staging is off
+      // (legacy flow already flipped them straight to `done` inside
+      // runIssuePipeline).
+      if (stagingActive && mergerOk) {
+        for (const n of mergedIssueNums) {
+          try {
+            await deps.markMergedToStaging(n);
+          } catch (err) {
+            deps.logError(
+              `[issue=${n}] markMergedToStaging failed: ${(err as Error).message}`,
+            );
+          }
+        }
+      }
+
+      // Phase 4: post-merge review. Under staging, the verdict GATES the
+      // fast-forward of the integration branch and triggers the fixer
+      // ladder. Under --no-staging, it stays advisory (today's behavior).
+      const runPostMergeReviewer = async (
+        model: string,
+      ): Promise<string> => {
+        try {
+          const r = await deps.run({
+            name: "post-merge-reviewer",
+            maxIterations: 1,
+            model,
+            promptFile: "./.sandcastle/post-merge-review-prompt.md",
+            idleTimeoutSeconds: args.reviewerTimeoutSec,
+            promptArgs: {
+              ITERATION: String(it),
+              MERGE_DEPTH: String(mergedBranches.length),
+              INTEGRATION_BRANCH: args.branch,
+              BRANCHES: branchesArg,
+              ISSUES: issuesArg,
+            },
+          });
+          const marker = extractMarker(r.stdout, [
+            "POST_MERGE_ALL_CLEAR",
+            "POST_MERGE_ISSUES_FOUND",
+          ] as const);
+          deps.log(
+            `post-merge review: ${marker || "(no marker emitted)"}`,
+          );
+          // Capture the reviewer's stdout so the fixer can read its
+          // concerns verbatim — the marker is just the verdict, the BODY
+          // is what the fixer needs.
+          return marker;
+        } catch (err) {
+          deps.logError(
+            `post-merge review threw: ${(err as Error).message}`,
+          );
+          return "";
+        }
+      };
+
+      // First pass uses the default model. We need access to stdout for the
+      // fixer pass below, so re-implement the call inline rather than using
+      // the helper above.
       let postMergeMarker = "";
+      let postMergeFeedback = "";
       try {
         const r = await deps.run({
           name: "post-merge-reviewer",
@@ -1414,16 +1708,15 @@ export async function runMain(
             ITERATION: String(it),
             MERGE_DEPTH: String(mergedBranches.length),
             INTEGRATION_BRANCH: args.branch,
-            BRANCHES: mergedBranches.map((b) => `- ${b.branch}`).join("\n"),
-            ISSUES: mergedBranches
-              .map((i) => `- #${i.id}: ${i.title}`)
-              .join("\n"),
+            BRANCHES: branchesArg,
+            ISSUES: issuesArg,
           },
         });
         postMergeMarker = extractMarker(r.stdout, [
           "POST_MERGE_ALL_CLEAR",
           "POST_MERGE_ISSUES_FOUND",
         ] as const);
+        postMergeFeedback = r.stdout;
         deps.log(
           `post-merge review: ${postMergeMarker || "(no marker emitted)"}`,
         );
@@ -1431,6 +1724,111 @@ export async function runMain(
         deps.logError(
           `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
         );
+      }
+
+      // Fix-ladder. Only runs under staging AND only when the first pass
+      // flagged ISSUES_FOUND. Single fix attempt with the escalated fixer
+      // model, then re-run the reviewer on the escalated model.
+      if (
+        stagingActive &&
+        postMergeMarker === "POST_MERGE_ISSUES_FOUND"
+      ) {
+        const fixerModel =
+          models.postMergeFixer.escalations[0] ?? models.postMergeFixer.default;
+        deps.log(
+          `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
+        );
+        let fixerOk = true;
+        try {
+          await deps.run({
+            name: "post-merge-fixer",
+            maxIterations: 1,
+            model: fixerModel,
+            promptFile: "./.sandcastle/post-merge-fix-prompt.md",
+            idleTimeoutSeconds: args.implementerTimeoutSec,
+            promptArgs: {
+              ITERATION: String(it),
+              INTEGRATION_BRANCH: args.branch,
+              BRANCHES: branchesArg,
+              ISSUES: issuesArg,
+              POST_MERGE_FEEDBACK: postMergeFeedback.slice(0, 8000),
+            },
+          });
+        } catch (err) {
+          fixerOk = false;
+          deps.logError(
+            `post-merge fixer threw: ${(err as Error).message} — falling through to quarantine`,
+          );
+        }
+        if (fixerOk) {
+          const reviewerEscModel =
+            models.postMergeReviewer.escalations[0] ??
+            args.postMergeReviewerModel;
+          deps.log(
+            `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,
+          );
+          postMergeMarker = await runPostMergeReviewer(reviewerEscModel);
+        }
+      }
+
+      // Promotion / quarantine decision.
+      if (stagingActive) {
+        if (postMergeMarker === "POST_MERGE_ALL_CLEAR" && mergerOk) {
+          // Fast-forward integration, then promote all merged-to-staging
+          // issues to done.
+          const ff = fastForwardIntegration(
+            args.repoRoot,
+            args.branch,
+            (s) => deps.log(s),
+            (s) => deps.logError(s),
+          );
+          if (ff) {
+            const summary =
+              `[ralph it=${it}] integration ${args.branch} fast-forwarded; ` +
+              `staging certified by post-merge reviewer`;
+            try {
+              const promoteRes = await deps.promoteStagingToDone(
+                mergedIssueNums,
+                summary,
+              );
+              if (promoteRes.failed.length > 0) {
+                deps.logError(
+                  `promoteStagingToDone failed for issues: ${promoteRes.failed.join(", ")}`,
+                );
+              }
+            } catch (err) {
+              deps.logError(
+                `promoteStagingToDone threw: ${(err as Error).message}`,
+              );
+            }
+            lastFailedStagingIteration = null;
+          } else {
+            // Fast-forward refused — treat as a staging failure.
+            lastFailedStagingIteration = it;
+          }
+        } else {
+          // Staging failed certification (post-fixer too) OR merger failed
+          // OR no marker — quarantine every merged-to-staging issue, leave
+          // staging at its current tip (next iteration's reset will tag
+          // it as `bad-merge-iter-<N>`).
+          const reason =
+            `[ralph it=${it}] staging post-merge reviewer marked ` +
+            `${postMergeMarker || "(no marker)"} after fixer pass — ` +
+            `quarantining all issues that landed on ${STAGING_BRANCH} ` +
+            `this iteration. Integration ${args.branch} NOT advanced.`;
+          deps.logError(reason);
+          for (const n of mergedIssueNums) {
+            try {
+              await deps.quarantine(n, reason);
+              quarantinedIssues.push(n);
+            } catch (err) {
+              deps.logError(
+                `[issue=${n}] staging-failure quarantine threw: ${(err as Error).message}`,
+              );
+            }
+          }
+          lastFailedStagingIteration = it;
+        }
       }
 
       // Phase 5: cleanup stale per-issue sub-worktrees, gated on the
