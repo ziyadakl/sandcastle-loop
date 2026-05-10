@@ -211,6 +211,7 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,
+    retryEnabled: true,
     ...over,
   };
 }

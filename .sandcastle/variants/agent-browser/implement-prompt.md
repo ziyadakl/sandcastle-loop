@@ -8,6 +8,51 @@ GitHub label `ready-for-agent` → `in-progress`) and dispatched you onto branch
 ITERATION: {{ITERATION}}
 ISSUE_NUMBER: {{ISSUE_NUMBER}}
 BRANCH: {{BRANCH}}
+ATTEMPT_NUMBER: {{ATTEMPT_NUMBER}}
+
+# RETRY PASS — only relevant when ATTEMPT_NUMBER > 1
+
+If `ATTEMPT_NUMBER` above is `1` (or empty), ignore this section entirely
+and proceed with the standard flow below.
+
+If `ATTEMPT_NUMBER` is `2`, this is a retry. Your previous commits ARE
+still on the branch — the worktree was NOT reset between attempts. The
+reviewer rejected the previous attempt; the verbatim reviewer output is in
+the `<reviewer-feedback>` block below. Read it carefully.
+
+You have two choices on a retry:
+
+1. **Fix the feedback.** Append a new commit on top of the existing branch
+   that addresses every HARD/MEDIUM finding the reviewer raised. Use the
+   same commit-prefix and certification rules as a normal pass. End with
+   the same JSON envelope and `STORY_COMPLETE` marker. This is the default
+   path — pick it unless you have a strong, evidence-based reason the
+   reviewer is wrong.
+
+2. **Disagree (rebuttal).** If you genuinely believe the reviewer is wrong
+   about a specific finding, you may emit a `<rebuttal>...</rebuttal>`
+   block instead of writing more code. The next reviewer pass (run on a
+   stronger model) will see your rebuttal and weigh it before deciding
+   ALL_CLEAR or HAS_BLOCKERS. The reviewer always has the final word — a
+   rebuttal is a request for reconsideration, not a veto. Format:
+
+   ```
+   <rebuttal>
+   The reviewer flagged X as a HARD finding, but: <evidence + reasoning>.
+   Cite specific lines from the diff or test output that support your case.
+   Keep it under ~200 words.
+   </rebuttal>
+   ```
+
+   When you emit a rebuttal, you MAY skip the JSON envelope and the
+   `STORY_COMPLETE` marker — the host treats the rebuttal block as the
+   terminal output for this pass. Still finish with `<promise>COMPLETE</promise>`
+   so the sandbox exits cleanly. Do NOT emit both code commits AND a
+   rebuttal in the same pass; pick one.
+
+<reviewer-feedback>
+{{REVIEWER_FEEDBACK}}
+</reviewer-feedback>
 
 This sandbox uses **agent-browser** (Vercel Labs) instead of Playwright. The
 binary is on `$PATH` as `agent-browser`; the Chrome-for-Testing browser is

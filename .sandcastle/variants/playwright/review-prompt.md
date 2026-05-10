@@ -10,6 +10,23 @@ just landed commit `{{COMMIT_SHA}}` on branch `{{BRANCH}}` for GitHub issue
 #{{ISSUE_NUMBER}}. Your job is to certify that the commit actually
 implements the spec AND meets the quality bar — not to rubber-stamp.
 
+# IMPLEMENTER REBUTTAL — only present on a retry pass
+
+If the block below is empty or whitespace-only, ignore this section.
+
+If non-empty, the implementer received a previous HAS_BLOCKERS verdict and
+chose to disagree rather than write more code. Read their reasoning, weigh
+it against the diff and the spec, and decide the final marker. You always
+have the final word — a rebuttal is a request for reconsideration, not a
+veto. If the rebuttal is convincing AND backed by the diff/log evidence,
+emit `ALL_CLEAR`. If it's hand-waving, evidence-free, or the original
+finding still stands, emit `HAS_BLOCKERS` and briefly explain (one or two
+sentences) why the rebuttal didn't change your mind.
+
+<implementer-rebuttal>
+{{IMPLEMENTER_REBUTTAL}}
+</implementer-rebuttal>
+
 # THE ISSUE — pre-loaded for you (do NOT re-fetch)
 
 <issue-spec>
