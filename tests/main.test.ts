@@ -155,6 +155,13 @@ function buildDeps(opts: {
     async markDone(n, summary) {
       state.marksDone.push({ issueNum: n, summary });
     },
+    async markMergedToStaging(_n) {
+      // no-op for legacy tests; staging-aware tests can override.
+    },
+    async promoteStagingToDone(_ns, _summary) {
+      // no-op for legacy tests; staging-aware tests can override.
+      return { failed: [] };
+    },
     async quarantine(n, reason) {
       state.quarantines.push({ issueNum: n, reason });
     },
@@ -211,6 +218,7 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,
+    stagingEnabled: true,
     ...over,
   };
 }
