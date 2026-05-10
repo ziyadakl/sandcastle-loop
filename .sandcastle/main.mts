@@ -87,6 +87,16 @@ export interface RalphArgs {
    */
   recoveryEnabled: boolean;
   /**
+   * Bounded retry ladder for the per-issue pipeline. When true (default), a
+   * HAS_BLOCKERS verdict on the first reviewer pass triggers a second
+   * implementer pass on `models.implementer.escalations[0]` (with the
+   * reviewer's feedback in-prompt) followed by a second reviewer pass on
+   * `models.reviewer.escalations[0]`. ALL_CLEAR at any point ships
+   * immediately. Set to false (via `--no-retry`) to fall back to the legacy
+   * one-shot behavior (HAS_BLOCKERS → quarantine immediately).
+   */
+  retryEnabled: boolean;
+  /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
    * `--repo-root` (e.g. `~/Dev/myproj` → `sandcastle:myproj`). That match
@@ -205,6 +215,10 @@ Optional:
   --recovery off            Disable the single recovery pass that fires on
                             any pipeline error. Default: on (recovery uses
                             --recovery-model and runs once before quarantine).
+  --no-retry                Disable the per-issue retry ladder. Default: on
+                            (a HAS_BLOCKERS verdict triggers one escalated
+                            implementer + reviewer attempt before quarantine,
+                            using the role's escalations[0] model).
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -251,6 +265,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "log-file": { type: "string" },
       "dry-run": { type: "boolean" },
       "recovery": { type: "string" },
+      "no-retry": { type: "boolean" },
       "image-name": { type: "string" },
       "help": { type: "boolean" },
     },
@@ -306,6 +321,7 @@ export function parseRalphArgs(argv: readonly string[]): {
     logFile: values["log-file"],
     dryRun: values["dry-run"] === true,
     recoveryEnabled: values["recovery"] !== "off",
+    retryEnabled: values["no-retry"] !== true,
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
@@ -360,6 +376,7 @@ function defaultArgs(): RalphArgs {
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,
+    retryEnabled: true,
     imageName: defaultImageName(process.cwd()),
   };
 }
@@ -841,11 +858,20 @@ interface PipelineCtx {
 async function runImplementer(
   sb: SandboxHandle,
   ctx: PipelineCtx,
+  opts: {
+    attemptNumber?: 1 | 2;
+    model?: string;
+    reviewerFeedback?: string;
+  } = {},
 ): Promise<{ commits: readonly { sha: string }[]; stdout: string }> {
+  const attemptNumber = opts.attemptNumber ?? 1;
+  // Attempt 2 may legitimately produce zero new commits if the implementer
+  // emits a <rebuttal> block instead of writing code. Attempt 1 must commit.
+  const requireCommits = attemptNumber === 1;
   const r = await sb.run({
-    name: "implementer",
+    name: attemptNumber === 1 ? "implementer" : "implementer-retry",
     maxIterations: 100,
-    model: ctx.args.implementerModel,
+    model: opts.model ?? ctx.args.implementerModel,
     promptFile: "./.sandcastle/implement-prompt.md",
     idleTimeoutSeconds: ctx.args.implementerTimeoutSec,
     promptArgs: {
@@ -853,9 +879,11 @@ async function runImplementer(
       ISSUE_NUMBER: String(ctx.issueNumber),
       STORY_TITLE: ctx.issue.title,
       BRANCH: ctx.issue.branch,
+      ATTEMPT_NUMBER: String(attemptNumber),
+      REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
     },
   });
-  if (r.commits.length === 0) {
+  if (requireCommits && r.commits.length === 0) {
     throw new Error("implementer made no commits");
   }
   // Sandcastle's r.stdout is the parsed `result.result` from claude's final
@@ -865,14 +893,33 @@ async function runImplementer(
   // `alreadyAssistantText: true`). Without the fallback every implementer
   // run throws "no assistant text could be extracted" and triggers recovery,
   // doubling the per-issue Opus spend. Mirror the established pattern.
-  try {
-    parseVerdict(r.stdout, ImplementerOutputSchema);
-  } catch {
-    parseVerdict(r.stdout, ImplementerOutputSchema, {
-      alreadyAssistantText: true,
-    });
+  //
+  // Attempt 2 may emit a <rebuttal>...</rebuttal> block instead of a
+  // STORY_COMPLETE envelope (the implementer disagrees with the reviewer).
+  // In that case skip the envelope parse — the caller handles the rebuttal
+  // path by extracting the rebuttal block from stdout.
+  if (!(attemptNumber === 2 && extractRebuttal(r.stdout) !== "")) {
+    try {
+      parseVerdict(r.stdout, ImplementerOutputSchema);
+    } catch {
+      parseVerdict(r.stdout, ImplementerOutputSchema, {
+        alreadyAssistantText: true,
+      });
+    }
   }
   return r;
+}
+
+/**
+ * Extract a `<rebuttal>...</rebuttal>` block from implementer stdout.
+ * Returns the inner text (trimmed) or "" if no rebuttal was emitted.
+ * Used on attempt 2 — the implementer may disagree with the reviewer
+ * instead of writing code; main.mts forwards the rebuttal text into the
+ * next reviewer pass as IMPLEMENTER_REBUTTAL.
+ */
+function extractRebuttal(stdout: string): string {
+  const m = stdout.match(/<rebuttal>([\s\S]*?)<\/rebuttal>/);
+  return m ? (m[1] ?? "").trim() : "";
 }
 
 async function runReviewer(
@@ -881,9 +928,10 @@ async function runReviewer(
   commitSha: string,
   promptFile = "./.sandcastle/review-prompt.md",
   model?: string,
+  opts: { implementerRebuttal?: string; name?: string } = {},
 ): Promise<{ marker: string; stdout: string }> {
   const r = await sb.run({
-    name: "reviewer",
+    name: opts.name ?? "reviewer",
     maxIterations: 1,
     model: model ?? ctx.args.reviewerModel,
     promptFile,
@@ -893,6 +941,7 @@ async function runReviewer(
       ISSUE_NUMBER: String(ctx.issueNumber),
       COMMIT_SHA: commitSha,
       BRANCH: ctx.issue.branch,
+      IMPLEMENTER_REBUTTAL: opts.implementerRebuttal ?? "",
     },
   });
   const marker = extractMarker(r.stdout, ["ALL_CLEAR", "HAS_BLOCKERS"] as const);
@@ -940,12 +989,58 @@ async function runRecovery(
 }
 
 /**
- * Drive a single issue through the full implement → migrate → review →
- * markDone pipeline. Caller wraps this in `claim` and is responsible for
- * converting our return value into ship/quarantine/error counters.
+ * Apply migrations from the final accepted state and mark the issue done.
+ * Migrations are deferred until after the final ALL_CLEAR so that only the
+ * accepted SQL hits the dev DB — intermediate state from a failed first
+ * attempt never leaks. Returns the IssueOutcome the caller should bubble up.
+ */
+async function shipAfterMigrations(
+  ctx: PipelineCtx,
+  sandbox: SandboxHandle,
+  preSha: string,
+  postSha: string,
+  finalMarker: string,
+): Promise<IssueOutcome> {
+  if (preSha !== "" && postSha !== "" && preSha !== postSha) {
+    const mres = await ctx.deps.applyMigrations(
+      ctx.args.repoRoot,
+      preSha,
+      postSha,
+    );
+    if (mres.realErrors.length > 0) {
+      throw new Error(
+        `migrations failed: ${mres.realErrors
+          .map((e) => e.msg)
+          .join("; ")
+          .slice(0, 500)}`,
+      );
+    }
+    if (mres.applied > 0) {
+      ctx.deps.log(
+        `[issue=${ctx.issueNumber}] applied ${mres.applied} migration statement(s)`,
+      );
+    }
+  }
+  void sandbox; // sandbox lifecycle handled by the caller's finally block
+  const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${postSha}, branch ${ctx.issue.branch})`;
+  await ctx.deps.markDone(ctx.issueNumber, summary);
+  return { status: "ok", finalMarker, postSha };
+}
+
+/**
+ * Drive a single issue through the full implement → review → (retry?) →
+ * migrate → markDone pipeline. Caller wraps this in `claim` and is
+ * responsible for converting our return value into ship/quarantine/error
+ * counters.
  *
- * On error, quarantine. Set `--recovery on` to retry once with the
- * implementer model before quarantining.
+ * Retry ladder (when retryEnabled and escalations are configured):
+ *   implementer (default) → reviewer (default) → fail → implementer
+ *   (escalated, sees reviewer feedback, may rebut) → reviewer (escalated,
+ *   sees rebuttal if any) → fail → quarantine.
+ *
+ * Migrations only apply on the ALL_CLEAR ship path. On any pipeline error,
+ * quarantine. Set `--recovery on` to retry once with the implementer model
+ * before quarantining.
  */
 async function runIssuePipeline(
   ctx: PipelineCtx,
@@ -958,62 +1053,78 @@ async function runIssuePipeline(
       ? await ctx.deps.captureSha(sandbox.worktreePath)
       : "";
 
-    // Phase 2a: implementer
-    const impl = await runImplementer(sandbox, ctx);
-    const postSha = sandbox.worktreePath
+    // Phase 2a: implementer attempt 1 (default model, no feedback)
+    const impl1 = await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+    let postSha = sandbox.worktreePath
       ? await ctx.deps.captureSha(sandbox.worktreePath)
-      : impl.commits[impl.commits.length - 1]?.sha ?? "";
+      : impl1.commits[impl1.commits.length - 1]?.sha ?? "";
 
-    // Phase 2b: migrations between preSha & postSha (no-op if no SQL files)
-    if (preSha !== "" && postSha !== "" && preSha !== postSha) {
-      try {
-        const mres = await ctx.deps.applyMigrations(
-          ctx.args.repoRoot,
-          preSha,
-          postSha,
-        );
-        if (mres.realErrors.length > 0) {
-          throw new Error(
-            `migrations failed: ${mres.realErrors
-              .map((e) => e.msg)
-              .join("; ")
-              .slice(0, 500)}`,
-          );
-        }
-        if (mres.applied > 0) {
-          ctx.deps.log(
-            `[issue=${ctx.issueNumber}] applied ${mres.applied} migration statement(s)`,
-          );
-        }
-      } catch (err) {
-        // Re-throw — recovery ladder + quarantine will handle.
-        throw err;
-      }
+    // Phase 2b: reviewer attempt 1 (default model). Note: migrations are
+    // deferred until AFTER ALL_CLEAR — only the final accepted SQL hits the
+    // dev DB, never the intermediate state of a failed first attempt.
+    const review1 = await runReviewer(sandbox, ctx, postSha);
+
+    if (review1.marker === "ALL_CLEAR") {
+      return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
     }
 
-    // Phase 2c: reviewer (single pass, no ladder)
-    const review = await runReviewer(sandbox, ctx, postSha);
+    // Reviewer attempt 1 marked HAS_BLOCKERS. Decide retry vs quarantine.
+    const implEscalations = models.implementer.escalations;
+    const revEscalations = models.reviewer.escalations;
+    const canRetry =
+      ctx.args.retryEnabled &&
+      implEscalations.length > 0 &&
+      revEscalations.length > 0;
 
-    if (review.marker === "ALL_CLEAR") {
-      const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${postSha}, branch ${ctx.issue.branch})`;
-      await ctx.deps.markDone(ctx.issueNumber, summary);
-      return {
-        status: "ok",
-        finalMarker: "ALL_CLEAR",
-        postSha,
-      };
+    if (!canRetry) {
+      const why = !ctx.args.retryEnabled
+        ? "retry disabled (--no-retry)"
+        : "no escalation model available for implementer or reviewer";
+      const reason =
+        `[issue=${ctx.issueNumber}] reviewer marked ${review1.marker} — ` +
+        `quarantining (${why}).`;
+      await ctx.deps.quarantine(ctx.issueNumber, reason);
+      return { status: "quarantined", finalMarker: review1.marker, postSha };
     }
 
-    // Reviewer marked HAS_BLOCKERS — quarantine for human triage.
+    // Phase 2c: implementer attempt 2 (escalated, with reviewer feedback).
+    // Worktree is NOT reset — the implementer sees its own commits and
+    // either appends a fix on top OR emits a <rebuttal> instead of code.
+    ctx.deps.log(
+      `[issue=${ctx.issueNumber}] reviewer attempt 1 HAS_BLOCKERS — ` +
+        `escalating implementer to ${implEscalations[0]}`,
+    );
+    const impl2 = await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      model: implEscalations[0],
+      reviewerFeedback: review1.stdout,
+    });
+    const rebuttal = extractRebuttal(impl2.stdout);
+    const postSha2 = sandbox.worktreePath
+      ? await ctx.deps.captureSha(sandbox.worktreePath)
+      : impl2.commits[impl2.commits.length - 1]?.sha ?? postSha;
+    postSha = postSha2;
+
+    // Phase 2d: reviewer attempt 2 (escalated). If implementer disagreed,
+    // pass the rebuttal in. Reviewer always has the final word.
+    ctx.deps.log(
+      `[issue=${ctx.issueNumber}] running reviewer attempt 2 on ` +
+        `${revEscalations[0]}${rebuttal ? " (with implementer rebuttal)" : ""}`,
+    );
+    const review2 = await runReviewer(sandbox, ctx, postSha, undefined, revEscalations[0], {
+      implementerRebuttal: rebuttal,
+      name: "reviewer-retry",
+    });
+
+    if (review2.marker === "ALL_CLEAR") {
+      return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
+    }
+
     const reason =
-      `[issue=${ctx.issueNumber}] reviewer marked ${review.marker} — ` +
-      `quarantining for human triage.`;
+      `[issue=${ctx.issueNumber}] reviewer marked ${review2.marker} after ` +
+      `escalated retry — quarantining for human triage.`;
     await ctx.deps.quarantine(ctx.issueNumber, reason);
-    return {
-      status: "quarantined",
-      finalMarker: review.marker,
-      postSha,
-    };
+    return { status: "quarantined", finalMarker: review2.marker, postSha };
   } catch (err) {
     const errMsg = (err as Error).message;
     ctx.deps.logError(
