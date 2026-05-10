@@ -316,6 +316,7 @@ describe("Wave 5 / LOW-1 — isRetryableGhError convention-based prefix check", 
       "claimViaLabel: invalid issueNum '-1'",
       "markDoneViaLabel: invalid issueNum '-1'",
       "quarantineViaLabel: invalid issueNum '-1'",
+      "releaseViaLabel: invalid issueNum '-1'",
       // The (N): variant — what fetchIssueLabels actually emits.
       "fetchIssueLabels(7): failed to parse gh output as JSON: unexpected token",
       "listReadyIssues: failed to parse gh output as JSON: unexpected token",

@@ -516,6 +516,23 @@ export async function quarantineViaLabel(
 }
 
 /**
+ * Release an in-progress issue back to ready-for-agent. Used when the loop
+ * defers an issue due to a transient rate-limit — the next iteration will
+ * re-claim and retry. Posts a comment so there's an audit trail of why the
+ * issue bounced back.
+ */
+export async function releaseViaLabel(
+  issueNum: number,
+  reason: string,
+): Promise<void> {
+  if (!Number.isInteger(issueNum) || issueNum <= 0) {
+    throw new Error(`releaseViaLabel: invalid issueNum '${issueNum}'`);
+  }
+  await transitionLabel(issueNum, LABEL_IN_PROGRESS, LABEL_READY);
+  await postIssueComment(issueNum, reason);
+}
+
+/**
  * Post a comment on an issue via `gh issue comment <num> --body <body>`.
  * Exported for the v1 loop's progress-reporting paths; `markDoneViaLabel`
  * uses `closeIssue`'s --comment passthrough instead, and `quarantineViaLabel`

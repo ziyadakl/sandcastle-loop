@@ -24,6 +24,7 @@ export {
   markMergedToStagingViaLabel,
   promoteAllStagingToDone,
   quarantineViaLabel,
+  releaseViaLabel,
   postIssueComment,
   getPriorityFromLabels,
   isStatusLabel,

@@ -33,6 +33,7 @@ import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 import {
   claimViaLabel,
   quarantineViaLabel,
+  releaseViaLabel,
   markDoneViaLabel,
   markMergedToStagingViaLabel,
   promoteAllStagingToDone,
@@ -202,6 +203,11 @@ export interface Deps {
     summary: string,
   ): Promise<{ failed: readonly number[] }>;
   quarantine(issueNum: number, reason: string): Promise<void>;
+  /**
+   * Release an in-progress issue back to `ready-for-agent` so the next loop
+   * iteration re-claims it. Used for transient rate-limit deferrals.
+   */
+  release(issueNum: number, reason: string): Promise<void>;
   comment(issueNum: number, body: string): Promise<void>;
   /** Migrations between two SHAs in `repoRoot`. Returns # applied + errors. */
   applyMigrations(
@@ -1016,6 +1022,10 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       if (args.dryRun) return dryLog("quarantine", n, reason);
       await quarantineViaLabel(n, reason);
     },
+    async release(n, reason) {
+      if (args.dryRun) return dryLog("release", n, reason);
+      await releaseViaLabel(n, reason);
+    },
     async comment(n, body) {
       if (args.dryRun) return dryLog("comment", n, body);
       await postIssueComment(n, body);
@@ -1112,8 +1122,10 @@ export function parsePlan(stdout: string): PlanIssue[] {
 
 interface IssueOutcome {
   /** "ok" => marked done; "quarantined" => label flipped to needs-human;
-   *  "error" => unhandled and not yet quarantined (caller decides). */
-  status: "ok" | "quarantined" | "error";
+   *  "error" => unhandled and not yet quarantined (caller decides);
+   *  "deferred" => transient rate-limit, label flipped back to ready-for-agent
+   *  for retry next iteration. */
+  status: "ok" | "quarantined" | "error" | "deferred";
   /** Marker that ended the pipeline ("ALL_CLEAR" / "HALT" / etc), if any. */
   finalMarker?: string;
   /** Most recent commit SHA on the branch, if any. */
@@ -1141,21 +1153,35 @@ async function runImplementer(
   // Attempt 2 may legitimately produce zero new commits if the implementer
   // emits a <rebuttal> block instead of writing code. Attempt 1 must commit.
   const requireCommits = attemptNumber === 1;
-  const r = await sb.run({
-    name: attemptNumber === 1 ? "implementer" : "implementer-retry",
-    maxIterations: 100,
-    model: opts.model ?? ctx.args.implementerModel,
-    promptFile: "./.sandcastle/implement-prompt.md",
-    idleTimeoutSeconds: ctx.args.implementerTimeoutSec,
-    promptArgs: {
-      ITERATION: String(ctx.iteration),
-      ISSUE_NUMBER: String(ctx.issueNumber),
-      STORY_TITLE: ctx.issue.title,
-      BRANCH: ctx.issue.branch,
-      ATTEMPT_NUMBER: String(attemptNumber),
-      REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
-    },
-  });
+  const primaryModel = opts.model ?? ctx.args.implementerModel;
+  // On attempt 1, allow a one-hop fallback to escalations[0] when the primary
+  // throws a rate-limit error. Attempt 2 is already on the escalation, so no
+  // further fallback — it just throws and the pipeline catch handles it.
+  const fallbackModel =
+    attemptNumber === 1 ? models.implementer.escalations[0] : undefined;
+  const r = await runWithRateLimitFallback(
+    (model) =>
+      sb.run({
+        name: attemptNumber === 1 ? "implementer" : "implementer-retry",
+        maxIterations: 100,
+        model,
+        promptFile: "./.sandcastle/implement-prompt.md",
+        idleTimeoutSeconds: ctx.args.implementerTimeoutSec,
+        promptArgs: {
+          ITERATION: String(ctx.iteration),
+          ISSUE_NUMBER: String(ctx.issueNumber),
+          STORY_TITLE: ctx.issue.title,
+          BRANCH: ctx.issue.branch,
+          ATTEMPT_NUMBER: String(attemptNumber),
+          REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
+        },
+      }),
+    primaryModel,
+    fallbackModel,
+    ctx.deps.log,
+    `implementer (issue=${ctx.issueNumber})`,
+    "implementer",
+  );
   if (requireCommits && r.commits.length === 0) {
     throw new Error("implementer made no commits");
   }
@@ -1195,6 +1221,77 @@ function extractRebuttal(stdout: string): string {
   return m ? (m[1] ?? "").trim() : "";
 }
 
+/** Match common shapes of rate-limit / quota errors across providers. */
+function isRateLimitError(msg: string): boolean {
+  // Negative guard: permanent errors that won't recover via fallback. All
+  // alternatives are either snake_case Anthropic SDK error type slugs (with
+  // word boundaries — won't match prose) or JSON-shaped GLM/Kimi numeric
+  // codes. Avoids matching prose like "authentication middleware" or the
+  // word "monthly limit" that may appear inside a real rate-limit message.
+  if (/\b(invalid_api_key|invalid_request_error|authentication_error|permission_error|not_found_error|model_not_found|insufficient_quota|account_deactivated)\b|"code"\s*:\s*1113\b|"code"\s*:\s*1110\b/i.test(msg)) {
+    return false;
+  }
+  return /rate[- ]?limit|\b429\b|rate_limit_error|\bquota\b|usage limit/i.test(msg);
+}
+
+// Circuit breaker: if a (role, primary) pair fallbacks BREAKER_THRESHOLD times
+// within BREAKER_WINDOW_MS, skip the primary entirely for subsequent calls
+// until the rolling window empties. Protects against a known-broken primary
+// (e.g. Kimi UA-bug phantom 429s) burning the fallback budget on every call.
+const BREAKER_THRESHOLD = 3;
+const BREAKER_WINDOW_MS = 60_000;
+const fallbackHistory = new Map<string, number[]>();
+// Per-issue deferral counter for transient rate-limit storms. Reset on success
+// and on process restart (acceptable — a fresh process means the storm is over
+// or the operator intervened).
+const deferralCounts = new Map<number, number>();
+const MAX_DEFERRALS = 3;
+function recentFallbacks(key: string): number[] {
+  const now = Date.now();
+  const fresh = (fallbackHistory.get(key) ?? []).filter((t) => now - t < BREAKER_WINDOW_MS);
+  fallbackHistory.set(key, fresh);
+  return fresh;
+}
+
+/**
+ * Run a model-parameterized call with one rate-limit fallback. If the primary
+ * call throws a rate-limit-shaped error AND a fallback model is provided, retry
+ * once on the fallback. Any other error (or rate-limit on the fallback itself)
+ * propagates to the caller.
+ */
+async function runWithRateLimitFallback<T>(
+  doRun: (model: string) => Promise<T>,
+  primary: string,
+  fallback: string | undefined,
+  log: (m: string) => void,
+  roleLabel: string,
+  roleKey: string,
+): Promise<T> {
+  const breakerKey = `${roleKey}::${primary}`;
+  if (fallback !== undefined && recentFallbacks(breakerKey).length >= BREAKER_THRESHOLD) {
+    // Refresh timestamp so the breaker stays open while primary remains broken.
+    // Without this, timestamps age out after 60s and the breaker closes even if
+    // every call has been hitting the fallback.
+    recentFallbacks(breakerKey).push(Date.now());
+    log(`${roleLabel}: circuit breaker open for ${primary} — using ${fallback} directly`);
+    return await doRun(fallback);
+  }
+  try {
+    return await doRun(primary);
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    log(`${roleLabel}: [isRateLimitError-audit] verdict=${isRateLimitError(msg)} primary=${primary} msg=${JSON.stringify(msg)}`);
+    if (!isRateLimitError(msg) || fallback === undefined) throw err;
+    recentFallbacks(breakerKey).push(Date.now());
+    // Jitter prevents concurrent workers (--max-concurrent N) from bursting
+    // onto the fallback model at the same instant after a shared rate-limit.
+    const jitterMs = 100 + Math.floor(Math.random() * 400);
+    await new Promise((r) => setTimeout(r, jitterMs));
+    log(`${roleLabel}: rate-limit on ${primary}; falling back to ${fallback} (jitter=${jitterMs}ms)`);
+    return await doRun(fallback);
+  }
+}
+
 async function runReviewer(
   sb: SandboxHandle,
   ctx: PipelineCtx,
@@ -1203,20 +1300,35 @@ async function runReviewer(
   model?: string,
   opts: { implementerRebuttal?: string; name?: string } = {},
 ): Promise<{ marker: string; stdout: string }> {
-  const r = await sb.run({
-    name: opts.name ?? "reviewer",
-    maxIterations: 1,
-    model: model ?? ctx.args.reviewerModel,
-    promptFile,
-    idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
-    promptArgs: {
-      ITERATION: String(ctx.iteration),
-      ISSUE_NUMBER: String(ctx.issueNumber),
-      COMMIT_SHA: commitSha,
-      BRANCH: ctx.issue.branch,
-      IMPLEMENTER_REBUTTAL: opts.implementerRebuttal ?? "",
-    },
-  });
+  const primaryModel = model ?? ctx.args.reviewerModel;
+  // Only the default reviewer pass gets a rate-limit fallback. The escalated
+  // reviewer-retry pass (already on escalations[0]) has no further fallback.
+  const fallbackModel =
+    primaryModel === ctx.args.reviewerModel
+      ? models.reviewer.escalations[0]
+      : undefined;
+  const r = await runWithRateLimitFallback(
+    (m) =>
+      sb.run({
+        name: opts.name ?? "reviewer",
+        maxIterations: 1,
+        model: m,
+        promptFile,
+        idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
+        promptArgs: {
+          ITERATION: String(ctx.iteration),
+          ISSUE_NUMBER: String(ctx.issueNumber),
+          COMMIT_SHA: commitSha,
+          BRANCH: ctx.issue.branch,
+          IMPLEMENTER_REBUTTAL: opts.implementerRebuttal ?? "",
+        },
+      }),
+    primaryModel,
+    fallbackModel,
+    ctx.deps.log,
+    `reviewer (issue=${ctx.issueNumber})`,
+    "reviewer",
+  );
   const marker = extractMarker(r.stdout, ["ALL_CLEAR", "HAS_BLOCKERS"] as const);
   return { marker, stdout: r.stdout };
 }
@@ -1303,6 +1415,7 @@ async function shipAfterMigrations(
   if (!ctx.args.stagingEnabled) {
     await ctx.deps.markDone(ctx.issueNumber, summary);
   }
+  deferralCounts.delete(ctx.issueNumber);
   return { status: "ok", finalMarker, postSha };
 }
 
@@ -1406,13 +1519,55 @@ async function runIssuePipeline(
     return { status: "quarantined", finalMarker: review2.marker, postSha };
   } catch (err) {
     const errMsg = (err as Error).message;
+    const rateLimitVerdict = isRateLimitError(errMsg);
+    ctx.deps.log(
+      `[isRateLimitError-audit] issue=${ctx.issueNumber} verdict=${rateLimitVerdict} msg=${JSON.stringify(errMsg)}`,
+    );
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
     );
 
+    // Defer transient rate-limit failures back to ready-for-agent so the next
+    // loop iteration retries them. Without this, a brief Anthropic outage
+    // could quarantine many issues that would have succeeded on retry.
+    // Bounded by MAX_DEFERRALS — after that the issue legitimately quarantines.
+    if (rateLimitVerdict) {
+      const c = (deferralCounts.get(ctx.issueNumber) ?? 0) + 1;
+      if (c <= MAX_DEFERRALS) {
+        deferralCounts.set(ctx.issueNumber, c);
+        const deferReason =
+          `[sandcastle-defer] [issue=${ctx.issueNumber}] rate-limited ` +
+          `(attempt ${c}/${MAX_DEFERRALS}) — released for retry next iteration: ` +
+          `${errMsg.slice(0, 400)}`;
+        ctx.deps.log(deferReason);
+        try {
+          await ctx.deps.release(ctx.issueNumber, deferReason);
+          return { status: "deferred", finalMarker: "RATE_LIMITED" };
+        } catch (releaseErr) {
+          ctx.deps.logError(
+            `[issue=${ctx.issueNumber}] release failed: ${(releaseErr as Error).message} — falling through to quarantine`,
+          );
+          // fall through to quarantine on release failure
+        }
+      } else {
+        ctx.deps.logError(
+          `[issue=${ctx.issueNumber}] exceeded MAX_DEFERRALS (${MAX_DEFERRALS}) — escalating to quarantine`,
+        );
+        deferralCounts.delete(ctx.issueNumber);
+        // fall through to quarantine
+      }
+    }
+
     // Opt-in single recovery pass with the implementer model. If recovery
-    // succeeds, mark done; otherwise fall through to quarantine.
-    if (ctx.args.recoveryEnabled && sandbox) {
+    // succeeds, mark done; otherwise fall through to quarantine. Skip recovery
+    // entirely on rate-limit errors — recovery uses the recoveryModel
+    // (Anthropic Opus by default), which would just burn subscription quota
+    // on a problem the model can't fix anyway.
+    if (
+      ctx.args.recoveryEnabled &&
+      sandbox &&
+      !rateLimitVerdict
+    ) {
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] --recovery on — attempting one recovery pass`,
       );
@@ -1430,6 +1585,7 @@ async function runIssuePipeline(
           if (!ctx.args.stagingEnabled) {
             await ctx.deps.markDone(ctx.issueNumber, summary);
           }
+          deferralCounts.delete(ctx.issueNumber);
           return {
             status: "ok",
             finalMarker: "RECOVERY_COMPLETE",
@@ -1444,7 +1600,7 @@ async function runIssuePipeline(
       }
     }
 
-    const reason = `[issue=${ctx.issueNumber}] pipeline halted: ${errMsg.slice(0, 400)}`;
+    const reason = `[issue=${ctx.issueNumber}] pipeline halted (rateLimitVerdict=${rateLimitVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: "HALT" };
@@ -1483,6 +1639,7 @@ export async function runMain(
   let lastFailingIssue: number | undefined;
   const shippedIssues: number[] = [];
   const quarantinedIssues: number[] = [];
+  const deferredIssues: number[] = [];
   let iterationsRun = 0;
   // Cross-iteration staging state — the iteration number that left staging
   // in a known-bad state, or null if last iteration finished clean. Used to
@@ -1613,6 +1770,12 @@ export async function runMain(
             quarantinedIssues.push(s.value.issueNumber);
             consecutiveFailures += 1;
             lastFailingIssue = s.value.issueNumber;
+          } else if (s.value.outcome.status === "deferred") {
+            deferredIssues.push(s.value.issueNumber);
+            // Intentionally do NOT touch consecutiveFailures — a transient
+            // rate-limit storm must not trip the loop's overall circuit
+            // breaker. The issue is already released back to ready-for-agent
+            // and will be re-claimed on the next iteration.
           } else {
             // "error" — couldn't even quarantine.
             consecutiveFailures += 1;

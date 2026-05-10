@@ -22,6 +22,7 @@ export {
   claimViaLabel,
   markDoneViaLabel,
   quarantineViaLabel,
+  releaseViaLabel,
   postIssueComment,
   getPriorityFromLabels,
   isStatusLabel,

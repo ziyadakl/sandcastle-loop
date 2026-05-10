@@ -59,6 +59,7 @@ interface MockState {
   claims: number[];
   marksDone: { issueNum: number; summary: string }[];
   quarantines: { issueNum: number; reason: string }[];
+  releases: { issueNum: number; reason: string }[];
   comments: { issueNum: number; body: string }[];
   migrationsCalls: { repoRoot: string; preSha: string; postSha: string }[];
   logs: string[];
@@ -73,6 +74,7 @@ function newState(): MockState {
     claims: [],
     marksDone: [],
     quarantines: [],
+    releases: [],
     comments: [],
     migrationsCalls: [],
     logs: [],
@@ -164,6 +166,9 @@ function buildDeps(opts: {
     },
     async quarantine(n, reason) {
       state.quarantines.push({ issueNum: n, reason });
+    },
+    async release(n, reason) {
+      state.releases.push({ issueNum: n, reason });
     },
     async comment(n, body) {
       state.comments.push({ issueNum: n, body });
@@ -361,6 +366,59 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(300);
     expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("rate-limit error defers the issue (release, no quarantine)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "400", title: "rl", branch: "agent/issue-400" }]),
+    });
+    const rl = () =>
+      new Error('API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Slow down"}}');
+    // First implementer attempt rate-limits; runWithRateLimitFallback retries
+    // on the escalation model — that also rate-limits and the pipeline catch
+    // deferral fires.
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.releases).toHaveLength(1);
+    expect(b.state.releases[0]!.issueNum).toBe(400);
+    expect(b.state.releases[0]!.reason).toMatch(/sandcastle-defer/);
+    expect(b.state.releases[0]!.reason).toMatch(/attempt 1\/3/);
+  });
+
+  it("rate-limit deferrals are bounded by MAX_DEFERRALS — 4th hit quarantines", async () => {
+    const b = buildDeps();
+    const rlError = () => new Error('API Error: 429 rate_limit_error');
+    // 4 iterations, each plans the same issue, each rate-limits.
+    // 4 iterations × 2 implementer calls each (primary + fallback both 429).
+    for (let i = 0; i < 4; i++) {
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "401", title: "rl-bounded", branch: "agent/issue-401" }]),
+      });
+      b.enqueue("implementer", { stdout: "", throw: rlError() });
+      b.enqueue("implementer", { stdout: "", throw: rlError() });
+    }
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 5, recoveryEnabled: false, consecutiveFailureLimit: 99 }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toHaveLength(3);
+    expect(b.state.releases.every((r) => r.issueNum === 401)).toBe(true);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(401);
   });
 
   it("ships when implementer stdout is plain assistant text (no stream-json wrapper)", async () => {
