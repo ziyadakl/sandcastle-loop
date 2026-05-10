@@ -286,6 +286,17 @@ export const LABEL_IN_PROGRESS = "in-progress";
 export const LABEL_DONE = "done";
 export const LABEL_NEEDS_HUMAN = "needs-human";
 /**
+ * Intermediate label for the staging fix-loop. An issue's branch flips from
+ * `in-progress` → `merged-to-staging` once it lands in `integration-candidate`,
+ * and only flips to `done` after the post-merge reviewer certifies staging
+ * (POST_MERGE_ALL_CLEAR) and the orchestrator fast-forwards integration.
+ *
+ * If staging fails certification (POST_MERGE_ISSUES_FOUND, even after the
+ * fixer pass), every issue still in `merged-to-staging` for that iteration is
+ * quarantined via `LABEL_NEEDS_HUMAN`.
+ */
+export const LABEL_MERGED_TO_STAGING = "merged-to-staging";
+/**
  * Legacy synonym for `needs-human` — older bash drivers and a not-yet-
  * fixed call site (`quarantineStoryInPrd` in src/state/prd.ts) still write
  * this spelling. Readers MUST accept both `"needs-human"` and `"quarantine"`
@@ -311,6 +322,7 @@ export const LABEL_QUARANTINE_ALIAS = LABEL_QUARANTINE_LEGACY;
 export const STATUS_LABELS = [
   "ready-for-agent",
   "in-progress",
+  "merged-to-staging",
   "done",
   "needs-human",
   "quarantine",
@@ -491,6 +503,51 @@ export async function markDoneViaLabel(
   await transitionLabel(issueNum, LABEL_IN_PROGRESS, LABEL_DONE);
   // closeIssue posts the comment + closes in a single gh invocation.
   await closeIssue(issueNum, summary);
+}
+
+/**
+ * Flip `in-progress` → `merged-to-staging` once an issue's branch lands on
+ * the `integration-candidate` staging branch. The issue stays OPEN — only
+ * `promoteAllStagingToDone` (after POST_MERGE_ALL_CLEAR) closes it.
+ *
+ * Uses the wildcard transition (`*` → target) so it tolerates issues that
+ * already lost the `in-progress` label for any reason; the wildcard strips
+ * every status label and re-adds the target.
+ */
+export async function markMergedToStagingViaLabel(
+  issueNum: number,
+): Promise<void> {
+  if (!Number.isInteger(issueNum) || issueNum <= 0) {
+    throw new Error(`markMergedToStagingViaLabel: invalid issueNum '${issueNum}'`);
+  }
+  await transitionLabel(issueNum, "*", LABEL_MERGED_TO_STAGING);
+}
+
+/**
+ * Promote every `merged-to-staging` issue to `done` after staging fast-
+ * forwards into the integration branch. Posts a single shared `summary`
+ * comment on each issue and closes it. Per-issue failures are isolated —
+ * one bad gh call doesn't block the rest. Returns the list of issues that
+ * could not be promoted (caller logs / decides quarantine).
+ */
+export async function promoteAllStagingToDone(
+  issueNums: readonly number[],
+  summary: string,
+): Promise<{ failed: readonly number[] }> {
+  const failed: number[] = [];
+  for (const n of issueNums) {
+    if (!Number.isInteger(n) || n <= 0) {
+      failed.push(n);
+      continue;
+    }
+    try {
+      await transitionLabel(n, LABEL_MERGED_TO_STAGING, LABEL_DONE);
+      await closeIssue(n, summary);
+    } catch {
+      failed.push(n);
+    }
+  }
+  return { failed };
 }
 
 /**
