@@ -178,6 +178,23 @@ export interface TopLevelRunSpec extends SandboxRunSpec {
 export interface CreateSandboxSpec {
   readonly branch: string;
   readonly mounts?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[];
+  /**
+   * Implementer model that will run inside this sandbox. Used to compute the
+   * provider env (kimi/glm/anthropic) and bake it into the container at
+   * startup via sandcastle's `sandbox.env`. Required because the SDK
+   * (@ai-hero/sandcastle) drops per-call agent env on persistent sandboxes
+   * — `createSandbox.js` hardcodes `agentProviderEnv: {}`, so the env we
+   * pass through `claudeCode(model, { env })` never reaches the container
+   * for `handle.run`. Only `sandbox.env` survives, and that's set at
+   * sandbox-creation time. Implication: every call inside this sandbox
+   * routes to the implementer's provider — if a reviewer escalation flips
+   * to a different provider, that call mis-routes. With current model
+   * defaults (implementer + reviewer both kimi-for-coding, escalations
+   * both Anthropic), the bounded impact is: failed-Kimi pipelines escalate
+   * inside the same sandbox and re-fail. Acceptable for now; revisit when
+   * the SDK is patched upstream.
+   */
+  readonly implementerModel: string;
 }
 
 export interface Deps {
@@ -1029,9 +1046,17 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
+      // Work around the SDK bug where createSandbox hardcodes
+      // agentProviderEnv: {}, dropping per-call env injection. We bake the
+      // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
+      // into sandbox.env so it actually reaches the container. Anthropic
+      // models return {} from envForModel (subscription path), so this is
+      // a no-op for the default Anthropic case.
+      const implEnv = envForModel(spec.implementerModel);
+      const sandboxEnv = { ...containerEnv, ...implEnv };
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
+        sandbox: docker({ imageName: args.imageName, env: sandboxEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
@@ -1499,7 +1524,10 @@ async function runIssuePipeline(
   let sandbox: SandboxHandle | undefined;
   let preSha = "";
   try {
-    sandbox = await ctx.deps.createSandbox({ branch: ctx.issue.branch });
+    sandbox = await ctx.deps.createSandbox({
+      branch: ctx.issue.branch,
+      implementerModel: ctx.args.implementerModel,
+    });
     preSha = sandbox.worktreePath
       ? await ctx.deps.captureSha(sandbox.worktreePath)
       : "";

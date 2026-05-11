@@ -40,6 +40,7 @@ import {
   type RunHandle,
   type SandboxHandle,
 } from "../.sandcastle/main.mjs";
+import { envForModel } from "../.sandcastle/providers.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -746,5 +747,73 @@ describe("sandcastle-loop main.mts — loadDotenv chain", () => {
       expect(() => loadDotenv(repoRoot)).not.toThrow();
       expect(process.env.KIMI_API_KEY).toBeUndefined();
     });
+  });
+});
+
+describe("sandcastle-loop — provider env injection (SDK workaround)", () => {
+  // Verifies the fix for the SDK bug where createSandbox hardcodes
+  // agentProviderEnv: {}, dropping per-call env. We bake the implementer's
+  // provider env into sandbox.env at sandbox-creation time instead.
+
+  it("envForModel returns ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY for kimi", () => {
+    const saved = process.env.KIMI_API_KEY;
+    process.env.KIMI_API_KEY = "test-kimi-key";
+    try {
+      const env = envForModel("kimi-for-coding");
+      expect(env.ANTHROPIC_BASE_URL).toBe("https://api.kimi.com/coding/");
+      expect(env.ANTHROPIC_API_KEY).toBe("test-kimi-key");
+    } finally {
+      if (saved === undefined) delete process.env.KIMI_API_KEY;
+      else process.env.KIMI_API_KEY = saved;
+    }
+  });
+
+  it("envForModel returns empty bag for anthropic models (subscription path)", () => {
+    const env = envForModel("claude-sonnet-4-6");
+    expect(env).toEqual({});
+  });
+
+  it("envForModel throws when kimi key missing — fails loudly at startup", () => {
+    const saved = process.env.KIMI_API_KEY;
+    delete process.env.KIMI_API_KEY;
+    try {
+      expect(() => envForModel("kimi-for-coding")).toThrow(/KIMI_API_KEY/);
+    } finally {
+      if (saved !== undefined) process.env.KIMI_API_KEY = saved;
+    }
+  });
+
+  it("runIssuePipeline forwards implementerModel into the sandbox spec", async () => {
+    // The bug fix's effect: createSandbox now needs the implementer model
+    // so it can compute the right provider env. This test asserts the
+    // caller (runIssuePipeline) actually threads it through.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: `<plan>${JSON.stringify({
+        issues: [{ id: "71", title: "smoke", branch: "agent/issue-71" }],
+      })}</plan>`,
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "ALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: `<plan>${JSON.stringify({ issues: [] })}</plan>` });
+
+    await runMain(
+      baseArgs({
+        iterations: 2,
+        stagingEnabled: false,
+        implementerModel: "kimi-for-coding",
+      }),
+      b.deps,
+    );
+
+    expect(b.state.sandboxesCreated).toHaveLength(1);
+    expect(b.state.sandboxesCreated[0]!.implementerModel).toBe(
+      "kimi-for-coding",
+    );
   });
 });
