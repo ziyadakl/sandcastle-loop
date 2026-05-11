@@ -1354,6 +1354,14 @@ const fallbackHistory = new Map<string, number[]>();
 // or the operator intervened).
 const deferralCounts = new Map<number, number>();
 const MAX_DEFERRALS = 3;
+
+/** Test-only: clear module-level transient-state maps. Production never calls
+ * this; tests use it in `beforeEach` so prior tests' fallback-breaker or
+ * defer-counter state can't bleed into ordering-sensitive cases. */
+export function __resetTransientStateForTests(): void {
+  fallbackHistory.clear();
+  deferralCounts.clear();
+}
 function recentFallbacks(key: string): number[] {
   const now = Date.now();
   const fresh = (fallbackHistory.get(key) ?? []).filter((t) => now - t < BREAKER_WINDOW_MS);
@@ -1590,6 +1598,7 @@ async function runIssuePipeline(
       const reason =
         `[issue=${ctx.issueNumber}] reviewer marked ${review1.marker} — ` +
         `quarantining (${why}).`;
+      deferralCounts.delete(ctx.issueNumber);
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: review1.marker, postSha };
     }
@@ -1630,6 +1639,7 @@ async function runIssuePipeline(
     const reason =
       `[issue=${ctx.issueNumber}] reviewer marked ${review2.marker} after ` +
       `escalated retry — quarantining for human triage.`;
+    deferralCounts.delete(ctx.issueNumber);
     await ctx.deps.quarantine(ctx.issueNumber, reason);
     return { status: "quarantined", finalMarker: review2.marker, postSha };
   } catch (err) {
@@ -1747,6 +1757,10 @@ async function runIssuePipeline(
       }
     }
 
+    // Issue is heading to quarantine — clear any stale defer counter so a
+    // future un-quarantine + re-claim starts fresh at attempt 1/MAX_DEFERRALS,
+    // not partway through the budget.
+    deferralCounts.delete(ctx.issueNumber);
     const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);

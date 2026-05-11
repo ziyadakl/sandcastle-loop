@@ -23,7 +23,7 @@
  *  10. parsePlan: malformed input throws.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -33,6 +33,7 @@ import {
   parseRalphArgs,
   loadDotenv,
   isTransientServerError,
+  __resetTransientStateForTests,
   type Deps,
   type RalphArgs,
   type SandboxRunSpec,
@@ -288,6 +289,13 @@ function plannerStdout(issues: { id: string; title: string; branch: string }[]):
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// Reset module-level transient state (fallback breaker + defer counter)
+// before every test so prior-test state can't bleed into ordering-sensitive
+// cases. Cheap; safe.
+beforeEach(() => {
+  __resetTransientStateForTests();
+});
 
 describe("sandcastle-loop main.mts — happy path", () => {
   it("ships a single issue: planner → claim → implementer → review ALL_CLEAR → markDone", async () => {
@@ -1013,11 +1021,6 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     // share one budget per issue (a flaky issue can't slip past the
     // MAX_DEFERRALS=3 ceiling by bouncing between the two paths).
     //
-    // NOTE: uses claude-haiku-4-5 as the implementer model so the
-    // fallback-breaker key (`implementer::claude-haiku-4-5`) starts fresh —
-    // prior tests in this file already pushed the `implementer::claude-sonnet-4-6`
-    // breaker past threshold, which would skip the primary call and consume
-    // only one mock implementer outcome instead of two.
     const b = buildDeps();
     // Iteration 1 — pipeline-catch defer (rate-limit).
     b.enqueue("planner", {
@@ -1043,7 +1046,6 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
         iterations: 3,
         recoveryEnabled: true,
         consecutiveFailureLimit: 99,
-        implementerModel: "claude-haiku-4-5",
       }),
       b.deps,
     );
@@ -1084,5 +1086,58 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toHaveLength(1);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(506);
+  });
+
+  it("quarantine path clears deferralCounts (un-quarantine starts fresh at 1/3)", async () => {
+    // Scenario: an issue defers a couple of times for transient errors,
+    // then a non-transient failure quarantines it. The counter must be
+    // cleared on quarantine so that if an operator un-quarantines the
+    // issue and the loop picks it up again, the next transient gets a
+    // fresh `attempt 1/3` budget — not whatever stale count was left.
+    const b = buildDeps();
+    const rl = () =>
+      new Error('API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}');
+    // Iteration 1: rate-limit → defer #507 (counter goes 0→1)
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "507", title: "leak", branch: "agent/issue-507" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    // Iteration 2: non-transient implementer crash + non-transient
+    // recovery error → quarantines (no defer). MUST clear counter.
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "507", title: "leak", branch: "agent/issue-507" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key"),
+    });
+    // Iteration 3: simulate operator un-quarantine — fresh transient error
+    // should land as `attempt 1/3`, not `attempt 2/3`.
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "507", title: "leak", branch: "agent/issue-507" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    await runMain(
+      baseArgs({
+        iterations: 4,
+        recoveryEnabled: true,
+        consecutiveFailureLimit: 99,
+      }),
+      b.deps,
+    );
+
+    // First defer (iter 1) → 1/3, then quarantine (iter 2) clears the
+    // counter, then re-defer (iter 3) → 1/3 again. If the counter leaked,
+    // iter 3 would say 2/3.
+    expect(b.state.releases).toHaveLength(2);
+    expect(b.state.releases[0]!.reason).toMatch(/attempt 1\/3/);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(507);
+    expect(b.state.releases[1]!.reason).toMatch(/attempt 1\/3/);
   });
 });
