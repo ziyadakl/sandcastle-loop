@@ -846,6 +846,17 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       "not_found_error",
       "agent crashed",
       "implementer made no commits",
+      // Adversarial-review false-positive cases: bare 3-digit numbers must
+      // NOT classify as transient (would burn 3 retries on real bugs like a
+      // dead Postgres / Vite dev server / unreachable port).
+      "connect ECONNREFUSED 127.0.0.1:5432",
+      "vite dev server on 5173 unreachable",
+      "couchdb on 5984 timed out",
+      "node v20.5.0 crashed",
+      "playwright timeout after 500ms exceeded",
+      "file not found: api_error.log",
+      "the server is overloaded with traffic",
+      "permission denied accessing internal server error.log",
     ];
     for (const msg of negative) {
       expect(isTransientServerError(msg)).toBe(false);
@@ -901,5 +912,64 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(501);
+  });
+
+  it("recovery-throw deferrals are bounded by MAX_DEFERRALS — 4th hit quarantines", async () => {
+    const b = buildDeps();
+    const transientThrow = () =>
+      new Error("API Error: The server had an error while processing your request");
+    // 4 iterations, each plans the same issue, each errors via recovery throw.
+    for (let i = 0; i < 4; i++) {
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "502", title: "rec-bounded", branch: "agent/issue-502" }]),
+      });
+      b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+      b.enqueue("recovery", { stdout: "", throw: transientThrow() });
+    }
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({
+        iterations: 5,
+        recoveryEnabled: true,
+        consecutiveFailureLimit: 99,
+      }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toHaveLength(3);
+    expect(b.state.releases.every((r) => r.issueNum === 502)).toBe(true);
+    // The 4th attempt exceeds MAX_DEFERRALS and quarantines.
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(502);
+  });
+
+  it("recovery-throw release-comment cites the recovery error, not the original", async () => {
+    // Regression for the misleading-log issue surfaced in adversarial review:
+    // the release comment must point at the actual cause (recovery's throw),
+    // not the original pipeline error.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "503", title: "log-cause", branch: "agent/issue-503" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: "",
+      throw: new Error("DISTINCTIVE_PIPELINE_ERROR_TOKEN"),
+    });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("DISTINCTIVE_RECOVERY_TOKEN: the server had an error"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(b.state.releases).toHaveLength(1);
+    expect(b.state.releases[0]!.reason).toMatch(/DISTINCTIVE_RECOVERY_TOKEN/);
+    expect(b.state.releases[0]!.reason).not.toMatch(/DISTINCTIVE_PIPELINE_ERROR_TOKEN/);
   });
 });

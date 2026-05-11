@@ -1322,10 +1322,18 @@ function isRateLimitError(msg: string): boolean {
  * rate-limit because these shouldn't trigger a model fallback — they're not
  * a problem with the chosen model, just bad luck on the provider's
  * infrastructure. Used at the pipeline catch level to defer instead of
- * quarantine. */
+ * quarantine.
+ *
+ * Patterns are intentionally context-anchored. A bare `\b5\d{2}\b` would
+ * mis-classify "Postgres on port 5432" or "vite on 5173" as transient.
+ * Each alternative requires HTTP-error context: Anthropic prose, JSON SDK
+ * slugs in `"type":...` shape, the 529 numeric (Anthropic-specific, rare
+ * elsewhere), or the full "500 Internal Server Error" / "503 Service
+ * Unavailable" / "502 Bad Gateway" / "504 Gateway Timeout" phrases.
+ */
 export function isTransientServerError(msg: string): boolean {
   if (isPermanentError(msg)) return false;
-  return /\b(5\d{2}|529)\b|overloaded(_error)?|service unavailable|bad gateway|gateway timeout|internal server error|\bapi_error\b|the server had an error/i.test(msg);
+  return /the server had an error|"type"\s*:\s*"(?:api_error|overloaded_error)"|\boverloaded_error\b|\b529\b|\bservice unavailable\b|\bbad gateway\b|\bgateway timeout\b|\b500 internal server error\b/i.test(msg);
 }
 
 /** Combined predicate for the pipeline-catch defer decision. Either kind of
@@ -1635,10 +1643,18 @@ async function runIssuePipeline(
     );
 
     // Shared helper: try to defer the issue (release label, return "deferred"
-    // status). Returns true if the defer landed, false if we exhausted the
-    // budget or the release call failed (caller should fall through to
-    // quarantine). Bounded by MAX_DEFERRALS — after that, real quarantine.
-    const tryDefer = async (kind: string): Promise<IssueOutcome | null> => {
+    // status). Returns the outcome on success, null on budget exhaustion or
+    // release failure (caller should fall through to quarantine). Bounded by
+    // MAX_DEFERRALS — after that, real quarantine.
+    //
+    // `causeMsg` is the error that actually motivated the defer — pass it
+    // explicitly so the release comment points the operator at the right
+    // failure (the pipeline-level path passes errMsg; the recovery-throw path
+    // passes the recovery's own thrown message).
+    const tryDefer = async (
+      kind: string,
+      causeMsg: string,
+    ): Promise<IssueOutcome | null> => {
       const c = (deferralCounts.get(ctx.issueNumber) ?? 0) + 1;
       if (c > MAX_DEFERRALS) {
         ctx.deps.logError(
@@ -1651,7 +1667,7 @@ async function runIssuePipeline(
       const deferReason =
         `[sandcastle-defer] [issue=${ctx.issueNumber}] ${kind} ` +
         `(attempt ${c}/${MAX_DEFERRALS}) — released for retry next iteration: ` +
-        `${errMsg.slice(0, 400)}`;
+        `${causeMsg.slice(0, 400)}`;
       ctx.deps.log(deferReason);
       try {
         await ctx.deps.release(ctx.issueNumber, deferReason);
@@ -1669,7 +1685,7 @@ async function runIssuePipeline(
     // Anthropic outage could quarantine many issues that would succeed on
     // retry.
     if (transientVerdict) {
-      const deferred = await tryDefer("transient error");
+      const deferred = await tryDefer("transient error", errMsg);
       if (deferred) return deferred;
       // fall through to quarantine on budget exhaustion or release failure
     }
@@ -1722,7 +1738,10 @@ async function runIssuePipeline(
         ctx.deps.log(
           `[issue=${ctx.issueNumber}] recovery threw transient (${JSON.stringify(rec.errorMsg)}) — deferring instead of quarantining`,
         );
-        const deferred = await tryDefer("recovery threw transient");
+        const deferred = await tryDefer(
+          "recovery threw transient",
+          rec.errorMsg ?? "",
+        );
         if (deferred) return deferred;
         // fall through to quarantine on budget exhaustion or release failure
       }
