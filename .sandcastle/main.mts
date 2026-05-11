@@ -518,11 +518,21 @@ function parseEnvFileInto(filePath: string): Record<string, true> {
     if (eq <= 0) continue;
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
+    const isDoubleQuoted = value.startsWith('"') && value.endsWith('"');
+    const isSingleQuoted = value.startsWith("'") && value.endsWith("'");
+    if (isDoubleQuoted || isSingleQuoted) {
       value = value.slice(1, -1);
+    }
+    // Double-quoted values get standard dotenv escape semantics: \n → newline,
+    // \r → CR, \t → tab, \\ → literal backslash. Single-quoted stays literal.
+    // Single-pass regex w/ callback so `\\n` resolves to `\n` literal, not LF.
+    if (isDoubleQuoted) {
+      value = value.replace(/\\([\\nrt])/g, (_match, ch: string) => {
+        if (ch === "n") return "\n";
+        if (ch === "r") return "\r";
+        if (ch === "t") return "\t";
+        return "\\";
+      });
     }
     if (!(key in process.env)) {
       process.env[key] = value;

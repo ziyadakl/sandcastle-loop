@@ -763,6 +763,23 @@ describe("sandcastle-loop main.mts — loadDotenv chain", () => {
       expect(process.env.KIMI_API_KEY).toBeUndefined();
     });
   });
+
+  it("unescapes \\n \\r \\t \\\\ inside double-quoted values only", () => {
+    withTempDirs(({ repoRoot }) => {
+      writeFileSync(
+        path.join(repoRoot, ".env"),
+        [
+          'KIMI_API_KEY="line1\\nline2"',
+          "GLM_API_KEY='line1\\nline2'",
+          'ANTHROPIC_API_KEY="back\\\\slash"',
+        ].join("\n") + "\n",
+      );
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("line1\nline2");
+      expect(process.env.GLM_API_KEY).toBe("line1\\nline2");
+      expect(process.env.ANTHROPIC_API_KEY).toBe("back\\slash");
+    });
+  });
 });
 
 describe("sandcastle-loop — provider env injection (SDK workaround)", () => {
