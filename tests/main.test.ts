@@ -112,6 +112,9 @@ function buildDeps(opts: {
   shas?: readonly string[];
   /** If true, applyMigrations always reports realErrors[0]. */
   migrationsFail?: boolean;
+  /** If true, release() throws — exercises the release-failure fallthrough
+   *  to quarantine. */
+  releaseThrows?: boolean;
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -175,6 +178,9 @@ function buildDeps(opts: {
     },
     async release(n, reason) {
       state.releases.push({ issueNum: n, reason });
+      if (opts.releaseThrows) {
+        throw new Error("simulated release failure");
+      }
     },
     async comment(n, body) {
       state.comments.push({ issueNum: n, body });
@@ -971,5 +977,112 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toHaveLength(1);
     expect(b.state.releases[0]!.reason).toMatch(/DISTINCTIVE_RECOVERY_TOKEN/);
     expect(b.state.releases[0]!.reason).not.toMatch(/DISTINCTIVE_PIPELINE_ERROR_TOKEN/);
+  });
+
+  it("recovery returns HALT marker → quarantines (no defer, no release)", async () => {
+    // Recovery RAN and judged the work unrecoverable. That's a legit
+    // verdict, not a transient error — should quarantine, not defer.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "504", title: "rec-halt", branch: "agent/issue-504" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", {
+      stdout: "Tried but couldn't fix it.\n\nHALT",
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(504);
+  });
+
+  it("two-tier deferral across iterations shares one MAX_DEFERRALS counter", async () => {
+    // Iteration 1: implementer throws transient (rate-limit) → defers at
+    //   pipeline-catch level. Counter = 1.
+    // Iteration 2: implementer throws non-transient → recovery runs →
+    //   recovery throws transient → defers at recovery-throw level.
+    //   Counter = 2.
+    // The same counter is incremented both times, proving the two paths
+    // share one budget per issue (a flaky issue can't slip past the
+    // MAX_DEFERRALS=3 ceiling by bouncing between the two paths).
+    //
+    // NOTE: uses claude-haiku-4-5 as the implementer model so the
+    // fallback-breaker key (`implementer::claude-haiku-4-5`) starts fresh —
+    // prior tests in this file already pushed the `implementer::claude-sonnet-4-6`
+    // breaker past threshold, which would skip the primary call and consume
+    // only one mock implementer outcome instead of two.
+    const b = buildDeps();
+    // Iteration 1 — pipeline-catch defer (rate-limit).
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "505", title: "two-tier", branch: "agent/issue-505" }]),
+    });
+    const rl = () =>
+      new Error('API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}');
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    // Iteration 2 — recovery-throw defer (5xx).
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "505", title: "two-tier", branch: "agent/issue-505" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("API Error: The server had an error while processing your request"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({
+        iterations: 3,
+        recoveryEnabled: true,
+        consecutiveFailureLimit: 99,
+        implementerModel: "claude-haiku-4-5",
+      }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.releases).toHaveLength(2);
+    expect(b.state.releases[0]!.reason).toMatch(/attempt 1\/3/);
+    expect(b.state.releases[0]!.reason).toMatch(/transient error/);
+    expect(b.state.releases[1]!.reason).toMatch(/attempt 2\/3/);
+    expect(b.state.releases[1]!.reason).toMatch(/recovery threw transient/);
+  });
+
+  it("release-failure on recovery-throw branch falls through to quarantine", async () => {
+    // If the release() call itself throws (GitHub flake, etc.), the
+    // pipeline can't actually defer the issue. Falls through to
+    // quarantine rather than leaving the issue in a stuck in-progress
+    // state forever.
+    const b = buildDeps({ releaseThrows: true });
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "506", title: "rel-fail", branch: "agent/issue-506" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("API Error: The server had an error while processing your request"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // Release was attempted but threw — so it's in releases (mock pushes
+    // before throwing) but quarantine also fires.
+    expect(b.state.releases).toHaveLength(1);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(506);
   });
 });
