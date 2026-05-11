@@ -95,9 +95,13 @@ const ImplementerOutputBaseSchema = z.object({
  *   2. STORY_COMPLETE + `e2eActuallyRan === true` ⇒ `e2eAssertionLine` MUST
  *      be non-empty AND MUST NOT match the generic preamble (`Running N
  *      tests`) or a bare URL pattern.
- *   3. `outputNotFiltered === false` ⇒ marker MUST be HALT. Filtered output
- *      is auto-HALT — the reviewer cannot trust filtered evidence so the
- *      implementer is required to admit defeat.
+ *   3. `e2eActuallyRan === true` AND `outputNotFiltered === false` ⇒ marker
+ *      MUST be HALT. Filtered output is auto-HALT — the reviewer cannot
+ *      trust filtered evidence so the implementer is required to admit
+ *      defeat. The rule is gated on a test having actually run, because the
+ *      "did you filter the output" question is vacuous when no test ran
+ *      (backend-only stories, HITL holds, etc.) — in that case the
+ *      implementer should emit `outputNotFiltered: true` (vacuously true).
  *   4. HALT marker is the escape hatch: the soft fields (`testCommandUsed`,
  *      `e2eAssertionLine`) may be null even when `e2eRequired === true`,
  *      because the implementer is admitting they couldn't run / verify.
@@ -107,10 +111,17 @@ export const ImplementerOutputSchema = ImplementerOutputBaseSchema.superRefine(
   (val, ctx) => {
     const isHalt = val.marker === "HALT";
 
-    // Rule 3: filtered output ⇒ auto-HALT.
-    // Even if every other field looks good, an admission that the output was
-    // filtered means the verdict is untrustworthy and MUST be HALT.
-    if (val.outputNotFiltered === false && !isHalt) {
+    // Rule 3: filtered output ⇒ auto-HALT, but ONLY when a test actually ran.
+    // If e2eActuallyRan=false (backend-only story, no spec, HITL hold) the
+    // "did you filter the output" question is vacuous — there is no output to
+    // filter — so we don't punish the implementer for emitting `false` there.
+    // The implementer prompt instructs them to emit `true` (vacuously) when
+    // no test ran; this gate is defensive in case they emit `false` instead.
+    if (
+      val.e2eActuallyRan === true &&
+      val.outputNotFiltered === false &&
+      !isHalt
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["marker"],

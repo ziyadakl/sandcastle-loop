@@ -435,6 +435,9 @@ Field rules:
 6. `outputNotFiltered`: `true` | `false` — did you run `<runner> | tee`
    WITHOUT inserting any grep/sed/awk/--quiet/-q/redirection that would
    suppress bail signals? Filtering output is a prompt-following failure.
+   If `e2eActuallyRan=false` (no test runner ran at all — backend-only
+   story, HITL hold, etc.), set this to `true` (vacuously true: nothing
+   to filter).
 
 7. `testReachedFeature`: `true` | `false` — did the test exercise the
    behavior described in the story (NOT just import success, fixture

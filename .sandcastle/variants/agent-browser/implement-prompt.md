@@ -447,7 +447,9 @@ Field rules:
 6. `outputNotFiltered`: `true` | `false` — did you run the agent-browser
    sequence with `| tee` and WITHOUT inserting any
    grep/sed/awk/--quiet/redirection that would suppress signals? Filtering
-   output is a prompt-following failure.
+   output is a prompt-following failure. If `e2eActuallyRan=false` (no
+   browser sequence ran at all — backend-only story, HITL hold, etc.), set
+   this to `true` (vacuously true: nothing to filter).
 
 7. `testReachedFeature`: `true` | `false` — did the assertion exercise the
    user-facing behavior described in the story (NOT auth state, login

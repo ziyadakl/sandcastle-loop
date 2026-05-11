@@ -498,6 +498,25 @@ describe("ImplementerOutputSchema", () => {
     expect(parsed.marker).toBe("HALT");
     expect(parsed.outputNotFiltered).toBe(false);
   });
+
+  it("ACCEPTS STORY_COMPLETE with outputNotFiltered=false when e2eActuallyRan=false (vacuous — no output to filter)", () => {
+    // Backend-only stories don't run e2e, so the filtering question is
+    // meaningless. Earlier the schema rejected this combo and forced
+    // implementers to HALT correct work; now Rule 3 is gated on
+    // e2eActuallyRan=true.
+    const parsed = ImplementerOutputSchema.parse({
+      ...validUiStoryComplete(),
+      storyType: "backend-only" as const,
+      e2eRequired: false,
+      e2eActuallyRan: false,
+      testCommandUsed: null,
+      e2eAssertionLine: null,
+      outputNotFiltered: false,
+      testReachedFeature: false,
+    });
+    expect(parsed.marker).toBe("STORY_COMPLETE");
+    expect(parsed.outputNotFiltered).toBe(false);
+  });
 });
 
 describe("ReviewerVerdictSchema", () => {
