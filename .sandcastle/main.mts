@@ -1305,17 +1305,33 @@ function extractRebuttal(stdout: string): string {
   return m ? (m[1] ?? "").trim() : "";
 }
 
+/** Negative guard shared by both transient-error predicates: permanent errors
+ * that won't recover via retry. Matched as snake_case SDK slugs (won't hit
+ * prose) or JSON-shaped numeric codes. */
+function isPermanentError(msg: string): boolean {
+  return /\b(invalid_api_key|invalid_request_error|authentication_error|permission_error|not_found_error|model_not_found|insufficient_quota|account_deactivated)\b|"code"\s*:\s*1113\b|"code"\s*:\s*1110\b/i.test(msg);
+}
+
 /** Match common shapes of rate-limit / quota errors across providers. */
 function isRateLimitError(msg: string): boolean {
-  // Negative guard: permanent errors that won't recover via fallback. All
-  // alternatives are either snake_case Anthropic SDK error type slugs (with
-  // word boundaries — won't match prose) or JSON-shaped GLM/Kimi numeric
-  // codes. Avoids matching prose like "authentication middleware" or the
-  // word "monthly limit" that may appear inside a real rate-limit message.
-  if (/\b(invalid_api_key|invalid_request_error|authentication_error|permission_error|not_found_error|model_not_found|insufficient_quota|account_deactivated)\b|"code"\s*:\s*1113\b|"code"\s*:\s*1110\b/i.test(msg)) {
-    return false;
-  }
+  if (isPermanentError(msg)) return false;
   return /rate[- ]?limit|\b429\b|rate_limit_error|\bquota\b|usage limit/i.test(msg);
+}
+
+/** Match transient HTTP 5xx / upstream-infra-unhealthy errors. Distinct from
+ * rate-limit because these shouldn't trigger a model fallback — they're not
+ * a problem with the chosen model, just bad luck on the provider's
+ * infrastructure. Used at the pipeline catch level to defer instead of
+ * quarantine. */
+export function isTransientServerError(msg: string): boolean {
+  if (isPermanentError(msg)) return false;
+  return /\b(5\d{2}|529)\b|overloaded(_error)?|service unavailable|bad gateway|gateway timeout|internal server error|\bapi_error\b|the server had an error/i.test(msg);
+}
+
+/** Combined predicate for the pipeline-catch defer decision. Either kind of
+ * transient error (rate-limit OR 5xx) → defer rather than quarantine. */
+function isTransientError(msg: string): boolean {
+  return isRateLimitError(msg) || isTransientServerError(msg);
 }
 
 // Circuit breaker: if a (role, primary) pair fallbacks BREAKER_THRESHOLD times
@@ -1432,7 +1448,10 @@ async function runRecovery(
   sb: SandboxHandle,
   ctx: PipelineCtx,
   reason: string,
-): Promise<{ marker: "RECOVERY_COMPLETE" | "HALT" | "ERRORED" }> {
+): Promise<{
+  marker: "RECOVERY_COMPLETE" | "HALT" | "ERRORED";
+  errorMsg?: string;
+}> {
   try {
     const r = await sb.run({
       name: "recovery",
@@ -1450,10 +1469,11 @@ async function runRecovery(
     const marker = extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
     return { marker };
   } catch (err) {
+    const errorMsg = (err as Error).message;
     ctx.deps.logError(
-      `[issue=${ctx.issueNumber}] recovery threw: ${(err as Error).message}`,
+      `[issue=${ctx.issueNumber}] recovery threw: ${errorMsg}`,
     );
-    return { marker: "ERRORED" };
+    return { marker: "ERRORED", errorMsg };
   }
 }
 
@@ -1606,54 +1626,62 @@ async function runIssuePipeline(
     return { status: "quarantined", finalMarker: review2.marker, postSha };
   } catch (err) {
     const errMsg = (err as Error).message;
-    const rateLimitVerdict = isRateLimitError(errMsg);
+    const transientVerdict = isTransientError(errMsg);
     ctx.deps.log(
-      `[isRateLimitError-audit] issue=${ctx.issueNumber} verdict=${rateLimitVerdict} msg=${JSON.stringify(errMsg)}`,
+      `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} msg=${JSON.stringify(errMsg)}`,
     );
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
     );
 
-    // Defer transient rate-limit failures back to ready-for-agent so the next
-    // loop iteration retries them. Without this, a brief Anthropic outage
-    // could quarantine many issues that would have succeeded on retry.
-    // Bounded by MAX_DEFERRALS — after that the issue legitimately quarantines.
-    if (rateLimitVerdict) {
+    // Shared helper: try to defer the issue (release label, return "deferred"
+    // status). Returns true if the defer landed, false if we exhausted the
+    // budget or the release call failed (caller should fall through to
+    // quarantine). Bounded by MAX_DEFERRALS — after that, real quarantine.
+    const tryDefer = async (kind: string): Promise<IssueOutcome | null> => {
       const c = (deferralCounts.get(ctx.issueNumber) ?? 0) + 1;
-      if (c <= MAX_DEFERRALS) {
-        deferralCounts.set(ctx.issueNumber, c);
-        const deferReason =
-          `[sandcastle-defer] [issue=${ctx.issueNumber}] rate-limited ` +
-          `(attempt ${c}/${MAX_DEFERRALS}) — released for retry next iteration: ` +
-          `${errMsg.slice(0, 400)}`;
-        ctx.deps.log(deferReason);
-        try {
-          await ctx.deps.release(ctx.issueNumber, deferReason);
-          return { status: "deferred", finalMarker: "RATE_LIMITED" };
-        } catch (releaseErr) {
-          ctx.deps.logError(
-            `[issue=${ctx.issueNumber}] release failed: ${(releaseErr as Error).message} — falling through to quarantine`,
-          );
-          // fall through to quarantine on release failure
-        }
-      } else {
+      if (c > MAX_DEFERRALS) {
         ctx.deps.logError(
           `[issue=${ctx.issueNumber}] exceeded MAX_DEFERRALS (${MAX_DEFERRALS}) — escalating to quarantine`,
         );
         deferralCounts.delete(ctx.issueNumber);
-        // fall through to quarantine
+        return null;
       }
+      deferralCounts.set(ctx.issueNumber, c);
+      const deferReason =
+        `[sandcastle-defer] [issue=${ctx.issueNumber}] ${kind} ` +
+        `(attempt ${c}/${MAX_DEFERRALS}) — released for retry next iteration: ` +
+        `${errMsg.slice(0, 400)}`;
+      ctx.deps.log(deferReason);
+      try {
+        await ctx.deps.release(ctx.issueNumber, deferReason);
+        return { status: "deferred", finalMarker: "TRANSIENT_ERROR" };
+      } catch (releaseErr) {
+        ctx.deps.logError(
+          `[issue=${ctx.issueNumber}] release failed: ${(releaseErr as Error).message} — falling through to quarantine`,
+        );
+        return null;
+      }
+    };
+
+    // Defer transient failures (rate-limit OR upstream 5xx) back to
+    // ready-for-agent so the next iteration retries. Without this, a brief
+    // Anthropic outage could quarantine many issues that would succeed on
+    // retry.
+    if (transientVerdict) {
+      const deferred = await tryDefer("transient error");
+      if (deferred) return deferred;
+      // fall through to quarantine on budget exhaustion or release failure
     }
 
     // Opt-in single recovery pass with the implementer model. If recovery
     // succeeds, mark done; otherwise fall through to quarantine. Skip recovery
-    // entirely on rate-limit errors — recovery uses the recoveryModel
-    // (Anthropic Opus by default), which would just burn subscription quota
-    // on a problem the model can't fix anyway.
+    // entirely on transient errors — they already deferred above (and recovery
+    // uses Opus which would just burn quota on a problem the model can't fix).
     if (
       ctx.args.recoveryEnabled &&
       sandbox &&
-      !rateLimitVerdict
+      !transientVerdict
     ) {
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] --recovery on — attempting one recovery pass`,
@@ -1684,10 +1712,23 @@ async function runIssuePipeline(
           );
           // Fall through to quarantine.
         }
+      } else if (
+        rec.marker === "ERRORED" &&
+        isTransientError(rec.errorMsg ?? "")
+      ) {
+        // Recovery never produced a verdict — it threw an upstream transient
+        // error (e.g. Anthropic 5xx). Don't quarantine a perfectly recoverable
+        // issue over Anthropic's bad luck; defer to the next iteration.
+        ctx.deps.log(
+          `[issue=${ctx.issueNumber}] recovery threw transient (${JSON.stringify(rec.errorMsg)}) — deferring instead of quarantining`,
+        );
+        const deferred = await tryDefer("recovery threw transient");
+        if (deferred) return deferred;
+        // fall through to quarantine on budget exhaustion or release failure
       }
     }
 
-    const reason = `[issue=${ctx.issueNumber}] pipeline halted (rateLimitVerdict=${rateLimitVerdict}): ${errMsg.slice(0, 400)}`;
+    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: "HALT" };

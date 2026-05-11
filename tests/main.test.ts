@@ -32,6 +32,7 @@ import {
   parsePlan,
   parseRalphArgs,
   loadDotenv,
+  isTransientServerError,
   type Deps,
   type RalphArgs,
   type SandboxRunSpec,
@@ -815,5 +816,90 @@ describe("sandcastle-loop — provider env injection (SDK workaround)", () => {
     expect(b.state.sandboxesCreated[0]!.implementerModel).toBe(
       "kimi-for-coding",
     );
+  });
+});
+
+describe("sandcastle-loop — transient-error defer on recovery throw", () => {
+  // The bug: when the recovery agent throws a transient upstream 5xx
+  // (Anthropic "The server had an error"), the orchestrator used to
+  // quarantine. Now it defers, bounded by MAX_DEFERRALS=3.
+
+  it("isTransientServerError matches common 5xx shapes", () => {
+    const positive = [
+      "API Error: The server had an error while processing your request",
+      "529 overloaded",
+      "503 Service Unavailable",
+      "Bad Gateway 502",
+      "Gateway Timeout 504",
+      "500 Internal Server Error",
+      '{"type":"error","error":{"type":"overloaded_error"}}',
+      '{"type":"error","error":{"type":"api_error","message":"oops"}}',
+    ];
+    for (const msg of positive) {
+      expect(isTransientServerError(msg)).toBe(true);
+    }
+    const negative = [
+      "invalid_api_key",
+      "model_not_found",
+      "authentication_error",
+      "permission_error",
+      "not_found_error",
+      "agent crashed",
+      "implementer made no commits",
+    ];
+    for (const msg of negative) {
+      expect(isTransientServerError(msg)).toBe(false);
+    }
+  });
+
+  it("recovery throws transient 5xx → defers (release, no quarantine)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "500", title: "rec-5xx", branch: "agent/issue-500" }]),
+    });
+    // Implementer throws a non-transient error so the pipeline runs recovery.
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Recovery itself throws an Anthropic 5xx. Pipeline should defer.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("API Error: The server had an error while processing your request"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.releases).toHaveLength(1);
+    expect(b.state.releases[0]!.issueNum).toBe(500);
+    expect(b.state.releases[0]!.reason).toMatch(/recovery threw transient/);
+    expect(b.state.releases[0]!.reason).toMatch(/attempt 1\/3/);
+  });
+
+  it("recovery throws non-transient → still quarantines (existing behavior preserved)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "501", title: "rec-perm", branch: "agent/issue-501" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Recovery throws a permanent error (auth) — should not defer.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("authentication_error: bad key"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(501);
   });
 });
