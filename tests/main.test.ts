@@ -643,8 +643,8 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("kimi-for-coding");
-    expect(r.args.reviewerModel).toBe("kimi-for-coding");
+    expect(r.args.implementerModel).toBe("claude-sonnet-4-6");
+    expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
     expect(r.args.recoveryModel).toBe("claude-opus-4-7");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
