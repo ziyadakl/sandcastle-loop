@@ -11,8 +11,6 @@
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit -p .",
     "test": "vitest run",
-    "smoke": "tsx tests/smoke/run-smoke.ts",
-    "smoke:invalid-json": "SMOKE_MODE=invalid-json tsx tests/smoke/run-smoke.ts",
     "start": "tsx .sandcastle/main.mts"
   },
   "engines": {
