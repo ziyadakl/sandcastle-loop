@@ -329,10 +329,36 @@ export function isDrizzleMigrationPath(p: string): boolean {
  * it's safe to call at loop startup before any commits exist.
  *
  * Synchronous so it can run inside `preflight()` alongside the other sync
- * checks (`existsSync`, `execFileSync`). The walk skips `node_modules`,
- * `.git`, dot-directories, and `.sandcastle/worktrees` to keep it cheap on
- * repos with many vendored files.
+ * checks (`existsSync`, `execFileSync`).
+ *
+ * Defensive bits worth knowing about:
+ *   - Symlinks are skipped entirely (Dirent.isSymbolicLink). Otherwise a
+ *     cycle (e.g. a vendored repo with `node_modules/foo -> ../..`) would
+ *     blow the stack at boot.
+ *   - Returned relative paths are normalized to forward slashes before being
+ *     passed to `isDrizzleMigrationPath`, which hardcodes `/migrations/` /
+ *     `/meta/` substrings. Otherwise Windows hosts would always return [].
+ *   - Skip list is an explicit denylist of known-large dirs, not a blanket
+ *     `startsWith(".")`, so a project that puts migrations under e.g.
+ *     `.db/migrations/0001_init.sql` is still detected.
  */
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  ".sandcastle",
+  ".next",
+  ".turbo",
+  ".vercel",
+  ".cache",
+  ".svelte-kit",
+  ".nuxt",
+  ".output",
+  ".expo",
+  ".parcel-cache",
+  ".yarn",
+  ".pnpm-store",
+]);
+
 export function listMigrationsOnDisk(repoRoot: string): string[] {
   const out: string[] = [];
   function walk(dir: string): void {
@@ -343,21 +369,13 @@ export function listMigrationsOnDisk(repoRoot: string): string[] {
       return;
     }
     for (const ent of entries) {
+      if (ent.isSymbolicLink()) continue;
       const full = path.join(dir, ent.name);
       if (ent.isDirectory()) {
-        if (
-          ent.name === "node_modules" ||
-          ent.name === ".git" ||
-          ent.name.startsWith(".")
-        ) {
-          continue;
-        }
-        if (full.includes(`${path.sep}.sandcastle${path.sep}worktrees`)) {
-          continue;
-        }
+        if (SKIP_DIRS.has(ent.name)) continue;
         walk(full);
       } else if (ent.isFile()) {
-        const rel = path.relative(repoRoot, full);
+        const rel = path.relative(repoRoot, full).split(path.sep).join("/");
         if (isDrizzleMigrationPath(rel)) out.push(rel);
       }
     }

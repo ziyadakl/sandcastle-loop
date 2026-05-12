@@ -1778,8 +1778,26 @@ async function runIssuePipeline(
               );
             }
           } catch (e) {
+            const reviewErrMsg = (e as Error).message;
+            // Mirror the implementer/normal-reviewer transient policy: a
+            // brief Anthropic 5xx during the recovery-reviewer pass defers
+            // the issue for next-iteration retry instead of burning a
+            // quarantine slot. Without this guard, a vendor blip during a
+            // recovery review reintroduces exactly the regression
+            // commit 87c2c6f closed for the rest of the pipeline.
+            if (isTransientError(reviewErrMsg)) {
+              ctx.deps.log(
+                `[issue=${ctx.issueNumber}] recovery-reviewer threw transient (${JSON.stringify(reviewErrMsg)}) — deferring instead of quarantining`,
+              );
+              const deferred = await tryDefer(
+                "recovery-reviewer threw transient",
+                reviewErrMsg,
+              );
+              if (deferred) return deferred;
+              // fall through to quarantine on budget exhaustion
+            }
             ctx.deps.logError(
-              `[issue=${ctx.issueNumber}] recovery-reviewer threw: ${(e as Error).message} — quarantining`,
+              `[issue=${ctx.issueNumber}] recovery-reviewer threw: ${reviewErrMsg} — quarantining`,
             );
           }
         }

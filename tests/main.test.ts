@@ -1259,4 +1259,35 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
     expect(res.ok).toBe(true);
     expect(res.errors).toEqual([]);
   });
+
+  // Integration test: exercise the REAL listMigrationsOnDisk walk against a
+  // real temp dir. The four stubbed tests above only cover the preflight
+  // gate logic; this one catches regressions in the actual fs scan
+  // (symlink handling, path-separator normalization, skip-dir denylist).
+  it("real walk detects a drizzle migration file written to disk", () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), "sc-preflight-"));
+    try {
+      mkdirSync(path.join(tmp, "db", "migrations"), { recursive: true });
+      writeFileSync(
+        path.join(tmp, "db", "migrations", "0001_init.sql"),
+        "CREATE TABLE foo (id int);\n",
+      );
+      const args = baseArgs({ repoRoot: tmp });
+      const prev = process.env.DATABASE_URL;
+      delete process.env.DATABASE_URL;
+      try {
+        const res = preflight(args, {
+          exec: () => ({ ok: true }),
+          fileExists: () => true,
+        });
+        expect(res.ok).toBe(false);
+        expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+        expect(res.errors.join("\n")).toMatch(/0001_init\.sql/);
+      } finally {
+        if (prev !== undefined) process.env.DATABASE_URL = prev;
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
