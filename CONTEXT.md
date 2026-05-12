@@ -38,8 +38,8 @@ The typed JSON envelope an agent emits at the end of a run. Parsed by `src/verdi
 **Issue / story**:
 A unit of backlog work in GitHub Issues. Carries one of these status labels at a time: `ready-for-agent`, `in-progress`, `done`, `needs-human`.
 
-**Old path / fallback loop**:
-The earlier orchestrator design that lives in `src/loop/`, `src/planner/`, `src/recovery/`. Kept as a switchable alternative. New default is `.sandcastle/main.mts`.
+**Archived v1 orchestrator**:
+The earlier orchestrator design now frozen under `archive/loop/`, `archive/planner/`, `archive/recovery/` (moved by commit `76de6fa`). Not switchable; not type-checked by the root tsconfig; not run by vitest. Kept for pattern reference — particularly `archive/recovery/diagnose.ts`, whose three actionable halt-cause patterns have been ported into `.sandcastle/lib/diagnose.ts` (hint-only, since the live sandbox surface is LLM-only). Live orchestrator: `.sandcastle/main.mts`.
 
 **Matt's pattern**:
 The setup convention this repo follows: one self-contained `.sandcastle/` folder per project, run via `npm run sandcastle` from the project root, no external orchestrator package. Named after Matt Pocock's stock templates [per published video content — see footnote].
@@ -55,7 +55,7 @@ The predecessor at `/home/deploy/dev/affinity-tracker/scripts/ralph/afk-ralph.sh
 - A **Mother repo** produces exactly one **`.sandcastle/`** folder which is copied (not symlinked or installed) into each **Target project**.
 - A **Target project**'s **Loop** picks one **Issue** at a time and runs an **Implementer**, then a **Reviewer**, optionally a **Recovery**.
 - Each agent run emits one **Verdict**. The Loop reads the Verdict to decide whether to merge, retry, or escalate.
-- The **Old path / fallback loop** in `src/loop/` shares its helpers (`src/state/`, `src/verdicts/`, `src/migrations/`) with the new `.sandcastle/main.mts` — the helpers exist in both `src/` and `.sandcastle/lib/` as duplicates so neither path depends on the other.
+- The shared utility modules (`src/state/`, `src/verdicts/`, `src/migrations/`, `src/types.ts`) exist as duplicates of `.sandcastle/lib/{state,verdicts,migrations,types}.ts`. The duplication was created so the (now-archived) v1 orchestrator and the live `.sandcastle/main.mts` could evolve independently. Today only the live tests under `tests/` import from `src/`; production runtime imports from `.sandcastle/lib/`. Deduplicating the two trees is a follow-up cleanup item — both copies must move together when schemas change (see commits `db5358a`, `a9f2f14` for examples of dual-edit pairs).
 
 ## Flagged ambiguities
 

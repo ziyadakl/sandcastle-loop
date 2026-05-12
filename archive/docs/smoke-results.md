@@ -1,5 +1,13 @@
 # Smoke harness — what it proves, what it doesn't
 
+> **Frozen reference (2026-05-11):** This document describes the v1 smoke
+> harness, now at `archive/tests/smoke/run-smoke.ts` (moved by commit
+> `76de6fa`). The harness is no longer wired into `npm run smoke` and the
+> tests it covered were against the archived `archive/loop/run.ts`
+> orchestrator. The live orchestrator (`.sandcastle/main.mts`) is exercised
+> by the test suites under `tests/main.test.ts` and `tests/diagnose.test.ts`
+> instead. Nothing below should be taken as current behavior.
+
 The smoke harness lives at `tests/smoke/run-smoke.ts` and runs in under a
 second. It exists to prove the wiring of the v1.1 loop is correct without
 ever calling Claude or starting a container.

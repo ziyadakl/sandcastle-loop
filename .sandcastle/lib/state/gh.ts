@@ -35,7 +35,7 @@ const DEFAULT_BACKOFFS_MS: readonly number[] = [500, 1500, 4000];
  * just emit a loud stderr WARN whenever a list call returns exactly 100
  * results so the silent loss becomes loud and operators can manually requeue.
  *
- * Exported so `src/loop/run.ts:defaultListInProgressIssues` can use the same
+ * Exported so `archive/loop/run.ts:defaultListInProgressIssues` (frozen v1) can use the same
  * helper rather than duplicating the message string.
  */
 export function warnIfHitLimit(count: number, fn: string): void {

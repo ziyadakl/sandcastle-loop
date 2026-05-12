@@ -8,7 +8,7 @@
  *      `STORY_COMPLETE` envelope whose `e2eAssertionLine` matches any of the
  *      patterns here.
  *
- *   2. `src/loop/briefing.ts` — the reviewer prompt's "EVIDENCE QUOTE — STRICT
+ *   2. `archive/loop/briefing.ts` (frozen v1 reference) — the reviewer prompt's "EVIDENCE QUOTE — STRICT
  *      verification" block lists the forbidden patterns in human-readable form
  *      so the reviewer rejects identical lines.
  *

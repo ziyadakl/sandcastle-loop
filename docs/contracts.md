@@ -111,7 +111,16 @@ function withSingleInstance<T>(lockPath: string, fn: () => Promise<T>): Promise<
 
 ---
 
-## Track E — `src/recovery/` and `src/migrations/`
+## Track E — Recovery (archived) and migrations
+
+> **Status (2026-05-11):** The recovery ladder described below now lives at
+> `archive/recovery/ladder.ts` and is frozen reference, not live code (moved
+> by commit `76de6fa`). The live recovery path is `runRecovery` in
+> `.sandcastle/main.mts` — a single Opus pass, no ladder. The three
+> actionable diagnose patterns documented below were ported to
+> `.sandcastle/lib/diagnose.ts` and feed the recovery prompt as a hint
+> (commit `4a791fa`); the Sonnet→Opus escalation and host-side fix execution
+> were not ported.
 
 ### Recovery ladder (`./ladder`)
 

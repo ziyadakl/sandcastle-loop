@@ -1304,7 +1304,7 @@ async function runImplementer(
   }
   // Sandcastle's r.stdout is the parsed `result.result` from claude's final
   // stream event — already-extracted assistant text, NOT raw stream-json
-  // envelopes. The old src/loop/agents.ts and src/planner/planner.ts both
+  // envelopes. The archived archive/loop/agents.ts and archive/planner/planner.ts both
   // handle this with a dual-mode try (stream-json first, then fall back to
   // `alreadyAssistantText: true`). Without the fallback every implementer
   // run throws "no assistant text could be extracted" and triggers recovery,
