@@ -31,7 +31,7 @@ import {
   PlannerError,
   type PlannerInput,
   type PlannerOutput,
-} from "../src/planner/index.js";
+} from "../planner/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers

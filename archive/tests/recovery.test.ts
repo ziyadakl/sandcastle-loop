@@ -21,10 +21,10 @@ import type {
 import {
   runRecoveryLadder,
   runRecoveryDiagnosisOrEscalate,
-} from "../src/recovery/ladder.js";
-import { diagnoseHaltCause } from "../src/recovery/diagnose.js";
-import { quarantineStory } from "../src/recovery/quarantine.js";
-import type { IterationContext, Story } from "../src/types.js";
+} from "../recovery/ladder.js";
+import { diagnoseHaltCause } from "../recovery/diagnose.js";
+import { quarantineStory } from "../recovery/quarantine.js";
+import type { IterationContext, Story } from "../../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures

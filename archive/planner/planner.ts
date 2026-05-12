@@ -30,7 +30,7 @@
 import { z } from "zod";
 import { claudeCode } from "@ai-hero/sandcastle";
 import type { Sandbox } from "@ai-hero/sandcastle";
-import { parseVerdict, VerdictParseError } from "../verdicts/index.js";
+import { parseVerdict, VerdictParseError } from "../../src/verdicts/index.js";
 
 // ---------------------------------------------------------------------------
 // Schema — the load-bearing contract with the loop

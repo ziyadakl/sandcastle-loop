@@ -9,8 +9,8 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { buildImplementerBriefing } from "../src/loop/briefing.js";
-import type { IssueRef } from "../src/loop/briefing.js";
+import { buildImplementerBriefing } from "../loop/briefing.js";
+import type { IssueRef } from "../loop/briefing.js";
 
 const stubIssue: IssueRef = {
   number: 42,

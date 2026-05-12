@@ -37,14 +37,14 @@ import { claudeCode, type Sandbox } from "@ai-hero/sandcastle";
 import {
   extractMarker,
   MarkerNotFoundError,
-} from "../verdicts/parse.js";
-import { RECOVERY_MARKERS } from "../verdicts/markers.js";
-import { RecoveryDecisionSchema } from "../verdicts/schemas.js";
+} from "../../src/verdicts/parse.js";
+import { RECOVERY_MARKERS } from "../../src/verdicts/markers.js";
+import { RecoveryDecisionSchema } from "../../src/verdicts/schemas.js";
 import type {
   IterationContext,
   ModelTier,
   RecoveryDecision,
-} from "../types.js";
+} from "../../src/types.js";
 import {
   diagnoseHaltCause,
   type Diagnosis,

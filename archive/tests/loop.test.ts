@@ -37,7 +37,7 @@ import type {
   ReviewerVerdict,
   FixerVerdict,
   LoopConfig,
-} from "../src/types.js";
+} from "../../src/types.js";
 
 // ---- Mocks (must be hoisted via vi.hoisted to satisfy vi.mock factory rule) -
 
@@ -236,7 +236,7 @@ const {
 } = mocks;
 
 // ---- After-mock imports -----------------------------------------------------
-import { runLoop } from "../src/loop/run.js";
+import { runLoop } from "../loop/run.js";
 
 // ---- Test helpers -----------------------------------------------------------
 

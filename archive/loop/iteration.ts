@@ -51,8 +51,8 @@ import type {
   LoopConfig,
   ModelTier,
   Story,
-} from "../types.js";
-import { MarkerNotFoundError } from "../verdicts/index.js";
+} from "../../src/types.js";
+import { MarkerNotFoundError } from "../../src/verdicts/index.js";
 import {
   runImplementer,
   runReviewer,
@@ -73,7 +73,7 @@ import {
   claimViaLabel,
   markDoneViaLabel,
   quarantineViaLabel,
-} from "../state/index.js";
+} from "../../src/state/index.js";
 
 // Track E — V1-D refactor: the multi-step recovery ladder is replaced by the
 // new diagnosis-first ladder, exposed as runRecoveryDiagnosisOrEscalate. Same
@@ -82,7 +82,7 @@ import {
 import { runRecoveryDiagnosisOrEscalate } from "../recovery/index.js";
 
 // Track F — drizzle migration auto-applier via the barrel.
-import { applyMigrationsBetween } from "../migrations/index.js";
+import { applyMigrationsBetween } from "../../src/migrations/index.js";
 
 // Planner — runs once per loop wake-up; the loop walks `priorityOrder` and
 // skips issues with open blockers per `dependencies`.

@@ -40,7 +40,7 @@ import type {
   FixerVerdict,
   ModelTier,
   LoopConfig,
-} from "../types.js";
+} from "../../src/types.js";
 import {
   extractMarker,
   parseVerdict,
@@ -50,7 +50,7 @@ import {
   IMPLEMENTER_MARKERS,
   REVIEWER_MARKERS,
   FIXER_MARKERS,
-} from "../verdicts/index.js";
+} from "../../src/verdicts/index.js";
 
 const MODEL_IDS: Record<ModelTier, string> = {
   haiku: "claude-haiku-4-5",

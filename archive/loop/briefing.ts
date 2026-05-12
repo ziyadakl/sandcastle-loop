@@ -16,8 +16,8 @@
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Story } from "../types.js";
-import { FORBIDDEN_LINES_PROMPT_TEXT } from "../verdicts/forbidden-lines.js";
+import type { Story } from "../../src/types.js";
+import { FORBIDDEN_LINES_PROMPT_TEXT } from "../../src/verdicts/forbidden-lines.js";
 
 /**
  * Driver-fetched GitHub issue snapshot. The driver pre-fetches this once at

@@ -14,7 +14,7 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { IterationResult } from "../../src/types.js";
+import type { IterationResult } from "../../../src/types.js";
 import type {
   MockCallRecord,
   MockSandbox,

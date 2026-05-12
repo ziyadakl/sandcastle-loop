@@ -13,5 +13,6 @@
     "lib": ["ES2022"],
     "types": ["node"]
   },
-  "include": ["src/**/*", "tests/**/*", ".sandcastle/**/*.mts", ".sandcastle/**/*.ts"]
+  "include": ["src/**/*", "tests/**/*", ".sandcastle/**/*.mts", ".sandcastle/**/*.ts"],
+  "exclude": ["archive/**"]
 }

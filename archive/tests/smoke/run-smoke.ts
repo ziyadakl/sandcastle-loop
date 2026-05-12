@@ -38,15 +38,15 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { customAlphabet } from "nanoid";
 
-import { runLoop } from "../../src/loop/index.js";
-import type { RunLoopOptions } from "../../src/loop/index.js";
-import type { IssueRef } from "../../src/loop/index.js";
-import type { ReadyIssueSummary } from "../../src/state/index.js";
+import { runLoop } from "../../loop/index.js";
+import type { RunLoopOptions } from "../../loop/index.js";
+import type { IssueRef } from "../../loop/index.js";
+import type { ReadyIssueSummary } from "../../../src/state/index.js";
 import type {
   PlannerInput,
   PlannerOutput,
-} from "../../src/planner/index.js";
-import type { IterationResult, LoopConfig } from "../../src/types.js";
+} from "../../planner/index.js";
+import type { IterationResult, LoopConfig } from "../../../src/types.js";
 
 import {
   createMockSandbox,

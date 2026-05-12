@@ -22,8 +22,8 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { quarantineStoryInPrd } from "../state/index.js";
-import type { Story } from "../types.js";
+import { quarantineStoryInPrd } from "../../src/state/index.js";
+import type { Story } from "../../src/types.js";
 
 const execFileP = promisify(execFile);
 

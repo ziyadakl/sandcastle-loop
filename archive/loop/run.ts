@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import { createSandbox } from "@ai-hero/sandcastle";
 import type { Sandbox } from "@ai-hero/sandcastle";
-import type { IterationResult, LoopConfig } from "../types.js";
+import type { IterationResult, LoopConfig } from "../../src/types.js";
 import { runIteration } from "./iteration.js";
 import type { AgentRunner } from "./iteration.js";
 import type { IssueRef } from "./briefing.js";
@@ -49,7 +49,7 @@ import {
   warnIfHitLimit,
   LABEL_IN_PROGRESS,
   LABEL_READY,
-} from "../state/index.js";
+} from "../../src/state/index.js";
 import { runPlanner } from "../planner/index.js";
 import type { PlannerOutput } from "../planner/index.js";
 
