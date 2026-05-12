@@ -780,6 +780,21 @@ describe("sandcastle-loop main.mts — loadDotenv chain", () => {
       expect(process.env.ANTHROPIC_API_KEY).toBe("back\\slash");
     });
   });
+
+  it("single-pass replace: \\\\n resolves to literal backslash + n, not newline", () => {
+    // Regression guard: a future refactor to sequential .replace() calls
+    // (first \\ → \, then \n → LF) would silently emit a newline here.
+    // Single-pass regex must consume \\ before the n is reconsidered.
+    withTempDirs(({ repoRoot }) => {
+      writeFileSync(
+        path.join(repoRoot, ".env"),
+        'KIMI_API_KEY="a\\\\nb"\n',
+      );
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("a\\nb");
+      expect(process.env.KIMI_API_KEY).not.toContain("\n");
+    });
+  });
 });
 
 describe("sandcastle-loop — provider env injection (SDK workaround)", () => {
