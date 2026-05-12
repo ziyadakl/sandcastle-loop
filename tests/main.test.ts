@@ -27,6 +27,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   runMain,
   parsePlan,
@@ -34,6 +36,7 @@ import {
   preflight,
   loadDotenv,
   isTransientServerError,
+  ensureStagingWorktree,
   __resetTransientStateForTests,
   type Deps,
   type RalphArgs,
@@ -491,7 +494,7 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     // (clean assertion target) rather than a missing-mock error from a
     // stray recovery call.
     const result = await runMain(
-      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      baseArgs({ iterations: 2, recoveryEnabled: false, stagingEnabled: false }),
       b.deps,
     );
 
@@ -651,7 +654,7 @@ describe("sandcastle-loop main.mts — one-shot --issue mode", () => {
     // One-shot mode replays the same fixed plan every iteration. Cap at 1
     // to avoid running it again — and accept exitCode 2 (out of cycles)
     // which is the documented "still ran fine, just time's up" outcome.
-    const result = await runMain(baseArgs({ issue: 71, iterations: 1 }), b.deps);
+    const result = await runMain(baseArgs({ issue: 71, iterations: 1, stagingEnabled: false }), b.deps);
 
     expect(result.exitCode).toBe(2);
     expect(result.shippedIssues).toEqual([71]);
@@ -1319,6 +1322,89 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
       }
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("sandcastle-loop main.mts — staging worktree", () => {
+  // Helper: initialise a real git repo with one commit on `main`.
+  function initTempRepo(): { repoRoot: string; cleanup: () => void } {
+    const tmp = mkdtempSync(path.join(tmpdir(), "sc-staging-"));
+    const repoRoot = tmp;
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const run = (...args: string[]): void => {
+      execFileSync("git", args, { cwd: repoRoot, env: gitEnv, stdio: "ignore" });
+    };
+    run("init", "-q", "-b", "main");
+    // Need real config for commit to land.
+    run("config", "user.email", "test@example.com");
+    run("config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    run("add", "README.md");
+    run("commit", "-q", "-m", "init");
+    return {
+      repoRoot,
+      cleanup: () => rmSync(tmp, { recursive: true, force: true }),
+    };
+  }
+
+  it("creates the staging worktree + integration-candidate branch when neither exists", async () => {
+    const { repoRoot, cleanup } = initTempRepo();
+    try {
+      const logs: string[] = [];
+      const stagingPath = await ensureStagingWorktree(repoRoot, "main", (l) => logs.push(l));
+      expect(stagingPath).toBe(path.join(repoRoot, ".sandcastle/worktrees/staging"));
+      expect(existsSync(stagingPath)).toBe(true);
+      // HEAD inside the staging worktree must be on integration-candidate.
+      const head = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+        cwd: stagingPath,
+        encoding: "utf8",
+      }).trim();
+      expect(head).toBe("integration-candidate");
+      expect(logs.some((l) => l.includes("[staging] worktree ready at"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("is idempotent — second call returns the same path without duplicating worktrees", async () => {
+    const { repoRoot, cleanup } = initTempRepo();
+    try {
+      const first = await ensureStagingWorktree(repoRoot, "main", () => {});
+      const second = await ensureStagingWorktree(repoRoot, "main", () => {});
+      expect(second).toBe(first);
+      // git worktree list should show launch + staging only (2 entries).
+      const wtList = execFileSync("git", ["worktree", "list"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      });
+      const lines = wtList.trim().split("\n").filter((l) => l.length > 0);
+      expect(lines.length).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("throws with recovery instruction when launch worktree is on integration-candidate", async () => {
+    const { repoRoot, cleanup } = initTempRepo();
+    try {
+      // Put the launch worktree HEAD on integration-candidate to simulate
+      // a previously-buggy run that left it parked there.
+      execFileSync("git", ["checkout", "-q", "-b", "integration-candidate"], {
+        cwd: repoRoot,
+        stdio: "ignore",
+      });
+      await expect(
+        ensureStagingWorktree(repoRoot, "main", () => {}),
+      ).rejects.toThrow(/integration-candidate.*git checkout/i);
+    } finally {
+      cleanup();
     }
   });
 });

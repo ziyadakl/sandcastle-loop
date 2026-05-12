@@ -25,7 +25,7 @@
 
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -177,6 +177,14 @@ export interface SandboxRunSpec {
 
 export interface TopLevelRunSpec extends SandboxRunSpec {
   readonly mounts?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[];
+  /**
+   * Override the working directory for this top-level run. Used by the merger
+   * to run inside the dedicated staging worktree at
+   * `<repoRoot>/.sandcastle/worktrees/staging` rather than the launch worktree
+   * — prevents the merger from leaving the launch HEAD parked on
+   * `integration-candidate` across iterations (see ensureStagingWorktree).
+   */
+  readonly cwd?: string;
 }
 
 export interface CreateSandboxSpec {
@@ -816,6 +824,20 @@ function buildGitEnv(): Record<string, string> {
 /** Persistent staging branch name. Reused across iterations. */
 const STAGING_BRANCH = "integration-candidate";
 
+/**
+ * Absolute path to the dedicated staging worktree. Set by
+ * `ensureStagingWorktree` during the CLI boot sequence (after preflight,
+ * before `runMain`). The merger phase runs with this as its cwd so the launch
+ * worktree's HEAD is never written to. Empty string when staging hasn't been
+ * wired (e.g. unit tests that drive `runMain` directly without booting).
+ */
+let stagingWorktreePath = "";
+
+/** Test seam: reset module-level staging path. Used by unit tests only. */
+export function __setStagingWorktreePathForTests(p: string): void {
+  stagingWorktreePath = p;
+}
+
 interface GitRunResult {
   ok: boolean;
   stdout: string;
@@ -848,20 +870,28 @@ function resolveRefSha(repoRoot: string, ref: string): string {
 }
 
 /**
- * Reset the staging branch to the integration tip and check it out.
+ * Reset the staging worktree to the integration tip.
  *
- * - If staging exists and its current tip was left by a failed iteration
- *   (caller passes `failureTagIteration > 0`), tag the tip first as
- *   `bad-merge-iter-<N>` so evidence is preserved without leaking branches.
- * - Force-update staging to point at the current integration tip (this is
- *   how we avoid the stale-local-ref problem if integration moved).
- * - Check out staging so subsequent merge ops land there.
+ * The staging worktree (`<repoRoot>/.sandcastle/worktrees/staging`) is
+ * permanently checked out on `integration-candidate` by design (see
+ * `ensureStagingWorktree`), so we use `git reset --hard` inside that worktree
+ * rather than `git branch -f` against the launch worktree. The latter failed
+ * on iter 2+ when the launch worktree was still parked on
+ * `integration-candidate` from the prior iteration's `git checkout` —
+ * structurally impossible now that the launch worktree is never written to.
  *
- * Returns the integration tip SHA on success, "" on any failure (caller
- * logs and decides whether to fall back).
+ * - If staging's current tip was left by a failed iteration (caller passes
+ *   `failureTagIteration > 0`), tag the tip first as `bad-merge-iter-<N>` so
+ *   evidence is preserved without leaking branches.
+ * - `git -C <stagingPath> reset --hard <integrationTip>` aligns the staging
+ *   worktree (and its branch ref) with integration.
+ *
+ * Returns the integration tip SHA on success. Throws on any failure — the
+ * caller is responsible for surfacing that to the outer pipeline catch.
  */
-function resetStagingToIntegrationTip(
+export function resetStagingToIntegrationTip(
   repoRoot: string,
+  stagingPath: string,
   integrationBranch: string,
   failureTagIteration: number | null,
   log: (s: string) => void,
@@ -869,10 +899,9 @@ function resetStagingToIntegrationTip(
 ): string {
   const integrationTip = resolveRefSha(repoRoot, integrationBranch);
   if (integrationTip === "") {
-    logError(
-      `staging-reset: cannot resolve integration branch '${integrationBranch}' — staging not reset`,
+    throw new Error(
+      `staging-reset: cannot resolve integration branch '${integrationBranch}'`,
     );
-    return "";
   }
   const stagingTip = resolveRefSha(repoRoot, STAGING_BRANCH);
   if (stagingTip !== "" && failureTagIteration !== null && failureTagIteration > 0) {
@@ -885,20 +914,121 @@ function resetStagingToIntegrationTip(
       // Non-fatal — proceed with reset.
     }
   }
-  // Force-update staging to integration tip. `git branch -f` works whether
-  // staging exists or not (creates if absent).
-  const reset = runGit(repoRoot, "branch", "-f", STAGING_BRANCH, integrationTip);
+  // Hard-reset the staging worktree to the integration tip. Because the
+  // staging worktree owns `integration-candidate`'s HEAD, no other worktree
+  // can contend; this is structurally race-free.
+  const reset = runGit(stagingPath, "reset", "--hard", integrationTip);
   if (!reset.ok) {
-    logError(`staging-reset: 'git branch -f ${STAGING_BRANCH} ${integrationTip}' failed: ${reset.stderr}`);
-    return "";
-  }
-  const checkout = runGit(repoRoot, "checkout", STAGING_BRANCH);
-  if (!checkout.ok) {
-    logError(`staging-reset: 'git checkout ${STAGING_BRANCH}' failed: ${checkout.stderr}`);
-    return "";
+    throw new Error(
+      `staging-reset: 'git -C ${stagingPath} reset --hard ${integrationTip}' failed: ${reset.stderr}`,
+    );
   }
   log(`staging-reset: ${STAGING_BRANCH} → ${integrationTip.slice(0, 8)} (from ${integrationBranch})`);
   return integrationTip;
+}
+
+/**
+ * Ensure a dedicated worktree exists at `<repoRoot>/.sandcastle/worktrees/staging`
+ * checked out on `integration-candidate`. This is the merger's exclusive
+ * workspace — the launch worktree is never written to by the loop.
+ *
+ * Idempotent: returns the staging path if it already exists and is valid.
+ * Repairs broken state by force-removing the bad worktree and re-creating.
+ *
+ * Throws with a recovery instruction if the launch worktree itself is on
+ * `integration-candidate` (from a previously-buggy run that left HEAD parked
+ * there) — fixing that requires manual `git checkout` because git refuses to
+ * create a second worktree on a branch already checked out elsewhere.
+ */
+export async function ensureStagingWorktree(
+  repoRoot: string,
+  baseBranch: string,
+  log: (line: string) => void,
+): Promise<string> {
+  const stagingPath = path.join(repoRoot, ".sandcastle/worktrees/staging");
+
+  // 1. If the staging path already exists, see if it's still a valid worktree
+  //    on integration-candidate. If yes, fast-return. If broken, repair.
+  if (existsSync(stagingPath)) {
+    const head = runGit(stagingPath, "rev-parse", "--abbrev-ref", "HEAD");
+    if (head.ok && head.stdout === STAGING_BRANCH) {
+      log(`[staging] worktree ready at ${stagingPath}`);
+      return stagingPath;
+    }
+    log(
+      `[staging] worktree at ${stagingPath} is in unexpected state ` +
+        `(HEAD=${head.ok ? head.stdout : "<unresolvable>"}); force-removing and re-creating`,
+    );
+    const remove = runGit(repoRoot, "worktree", "remove", "--force", ".sandcastle/worktrees/staging");
+    if (!remove.ok) {
+      throw new Error(
+        `ensureStagingWorktree: failed to remove broken staging worktree: ${remove.stderr}`,
+      );
+    }
+  }
+
+  // 2. Before creating: check that integration-candidate isn't already
+  //    checked out in another worktree (specifically: the launch worktree
+  //    from a previously-buggy run). If it is, abort with a recovery hint.
+  const list = runGit(repoRoot, "worktree", "list", "--porcelain");
+  if (list.ok) {
+    // Porcelain format: blocks separated by blank lines, each block has
+    //   worktree <path>
+    //   HEAD <sha>
+    //   branch refs/heads/<name>
+    const blocks = list.stdout.split("\n\n");
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      let wtPath = "";
+      let branchRef = "";
+      for (const ln of lines) {
+        if (ln.startsWith("worktree ")) wtPath = ln.slice("worktree ".length).trim();
+        else if (ln.startsWith("branch ")) branchRef = ln.slice("branch ".length).trim();
+      }
+      if (
+        branchRef === `refs/heads/${STAGING_BRANCH}` &&
+        wtPath !== "" &&
+        path.resolve(wtPath) !== path.resolve(stagingPath)
+      ) {
+        throw new Error(
+          `Launch worktree HEAD is on ${STAGING_BRANCH} (from a previously-buggy run). ` +
+            `Run \`git checkout ${baseBranch}\` in the launch worktree and re-run the loop. ` +
+            `See commit <this-fix-sha> for context.`,
+        );
+      }
+    }
+  }
+
+  // 3. If integration-candidate branch doesn't exist locally, create it
+  //    pointing at the base branch.
+  const verify = runGit(repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${STAGING_BRANCH}`);
+  if (!verify.ok) {
+    const create = runGit(repoRoot, "branch", STAGING_BRANCH, baseBranch);
+    if (!create.ok) {
+      throw new Error(
+        `ensureStagingWorktree: failed to create ${STAGING_BRANCH} branch from ${baseBranch}: ${create.stderr}`,
+      );
+    }
+    log(`[staging] created ${STAGING_BRANCH} branch from ${baseBranch}`);
+  }
+
+  // 4. Create the worktree. `git worktree add` creates parent dirs as needed.
+  //    Ensure the parent exists for completeness (older gits may not auto-mkdir).
+  mkdirSync(path.dirname(stagingPath), { recursive: true });
+  const add = runGit(
+    repoRoot,
+    "worktree",
+    "add",
+    ".sandcastle/worktrees/staging",
+    STAGING_BRANCH,
+  );
+  if (!add.ok) {
+    throw new Error(
+      `ensureStagingWorktree: 'git worktree add' failed: ${add.stderr}`,
+    );
+  }
+  log(`[staging] worktree ready at ${stagingPath}`);
+  return stagingPath;
 }
 
 /**
@@ -1067,7 +1197,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       // monorepo and trips workspace catalog errors.
       const result = await sandcastle.run({
         sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
-        cwd: args.repoRoot,
+        cwd: spec.cwd ?? args.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
         agent: sandcastle.claudeCode(spec.model, { env: envForModel(spec.model) }),
@@ -1394,6 +1524,7 @@ const MAX_DEFERRALS = 3;
 export function __resetTransientStateForTests(): void {
   fallbackHistory.clear();
   deferralCounts.clear();
+  stagingWorktreePath = "";
 }
 function recentFallbacks(key: string): number[] {
   const now = Date.now();
@@ -2103,30 +2234,36 @@ export async function runMain(
         .join("\n");
 
       // Staging prelude (default). Tag the previous iteration's bad staging
-      // tip if the last iteration left one, then force-update staging to
-      // the current integration tip and check it out so the merger lands
+      // tip if the last iteration left one, then hard-reset the dedicated
+      // staging worktree to the current integration tip so the merger lands
       // its work on `integration-candidate` rather than directly on the
-      // integration branch.
-      let stagingActive = false;
+      // integration branch. The staging worktree (set up at boot by
+      // `ensureStagingWorktree`) is permanently checked out on
+      // `integration-candidate`, so this is structurally race-free across
+      // iterations — unlike the prior `git branch -f` against the launch
+      // worktree which collided with itself on iter 2+.
       if (args.stagingEnabled) {
-        const tip = resetStagingToIntegrationTip(
+        if (stagingWorktreePath === "") {
+          throw new Error(
+            `staging is enabled but stagingWorktreePath is unset — ensureStagingWorktree() must be called during boot before runMain. ` +
+              `If you're invoking runMain from a test, call __setStagingWorktreePathForTests() first or set stagingEnabled: false.`,
+          );
+        }
+        resetStagingToIntegrationTip(
           args.repoRoot,
+          stagingWorktreePath,
           args.branch,
           lastFailedStagingIteration,
           (s) => deps.log(s),
           (s) => deps.logError(s),
         );
-        if (tip === "") {
-          deps.logError(
-            `staging reset failed — falling back to direct merge into ${args.branch} for iteration ${it}`,
-          );
-        } else {
-          stagingActive = true;
-          // Reset succeeded, so any prior failure is now preserved as a tag;
-          // clear the cross-iteration marker.
-          lastFailedStagingIteration = null;
-        }
+        lastFailedStagingIteration = null;
       }
+      // Under the structural fix (ensureStagingWorktree + throw-on-failure
+      // in the prelude above), `args.stagingEnabled` is the authoritative
+      // signal — there's no longer a "staging requested but degraded"
+      // intermediate state. Keep this alias for downstream readability.
+      const stagingActive = args.stagingEnabled;
 
       let mergerOk = true;
       try {
@@ -2136,6 +2273,7 @@ export async function runMain(
           model: args.mergerModel,
           promptFile: "./.sandcastle/merge-prompt.md",
           idleTimeoutSeconds: args.implementerTimeoutSec,
+          cwd: stagingActive ? stagingWorktreePath : undefined,
           promptArgs: {
             ITERATION: String(it),
             BRANCHES: branchesArg,
@@ -2178,6 +2316,7 @@ export async function runMain(
             model,
             promptFile: "./.sandcastle/post-merge-review-prompt.md",
             idleTimeoutSeconds: args.reviewerTimeoutSec,
+            cwd: stagingActive ? stagingWorktreePath : undefined,
             promptArgs: {
               ITERATION: String(it),
               MERGE_DEPTH: String(mergedBranches.length),
@@ -2217,6 +2356,7 @@ export async function runMain(
           model: args.postMergeReviewerModel,
           promptFile: "./.sandcastle/post-merge-review-prompt.md",
           idleTimeoutSeconds: args.reviewerTimeoutSec,
+          cwd: stagingActive ? stagingWorktreePath : undefined,
           promptArgs: {
             ITERATION: String(it),
             MERGE_DEPTH: String(mergedBranches.length),
@@ -2259,6 +2399,7 @@ export async function runMain(
             model: fixerModel,
             promptFile: "./.sandcastle/post-merge-fix-prompt.md",
             idleTimeoutSeconds: args.implementerTimeoutSec,
+            cwd: stagingWorktreePath,
             promptArgs: {
               ITERATION: String(it),
               INTEGRATION_BRANCH: args.branch,
@@ -2428,6 +2569,26 @@ if (isMain()) {
     }
 
     const deps = buildDefaultDeps(args);
+
+    // Set up the dedicated staging worktree before runMain so the merger
+    // phase always has a valid cwd that ISN'T the launch worktree. This is
+    // load-bearing: without it the merger writes to the launch HEAD and
+    // strands every post-iter-1 commit on `integration-candidate`.
+    if (args.stagingEnabled) {
+      try {
+        stagingWorktreePath = await ensureStagingWorktree(
+          args.repoRoot,
+          args.branch,
+          deps.log,
+        );
+      } catch (err) {
+        process.stderr.write(
+          `staging worktree setup failed:\n  - ${(err as Error).message}\n`,
+        );
+        process.exit(2);
+      }
+    }
+
     try {
       const result = await runMain(args, deps);
       process.exit(result.exitCode);
