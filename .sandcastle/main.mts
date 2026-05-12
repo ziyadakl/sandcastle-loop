@@ -1794,11 +1794,14 @@ async function runIssuePipeline(
                 reviewErrMsg,
               );
               if (deferred) return deferred;
-              // fall through to quarantine on budget exhaustion
+              ctx.deps.logError(
+                `[issue=${ctx.issueNumber}] recovery-reviewer threw transient ${reviewErrMsg} but defer budget exhausted — quarantining`,
+              );
+            } else {
+              ctx.deps.logError(
+                `[issue=${ctx.issueNumber}] recovery-reviewer threw: ${reviewErrMsg} — quarantining`,
+              );
             }
-            ctx.deps.logError(
-              `[issue=${ctx.issueNumber}] recovery-reviewer threw: ${reviewErrMsg} — quarantining`,
-            );
           }
         }
 

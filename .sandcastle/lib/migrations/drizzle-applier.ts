@@ -343,9 +343,11 @@ export function isDrizzleMigrationPath(p: string): boolean {
  *     `.db/migrations/0001_init.sql` is still detected.
  */
 const SKIP_DIRS = new Set([
+  // version control + sandcastle internals
   "node_modules",
   ".git",
   ".sandcastle",
+  // common hidden build/cache dirs
   ".next",
   ".turbo",
   ".vercel",
@@ -357,6 +359,16 @@ const SKIP_DIRS = new Set([
   ".parcel-cache",
   ".yarn",
   ".pnpm-store",
+  // common visible build/output/vendor dirs — without these, a project that
+  // ships compiled migrations under `dist/db/migrations/` would false-positive
+  // on stale copied output instead of authoritative source migrations.
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  "target",
+  "vendor",
+  "tmp",
 ]);
 
 export function listMigrationsOnDisk(repoRoot: string): string[] {
