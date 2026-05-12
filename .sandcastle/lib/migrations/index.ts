@@ -8,6 +8,7 @@ export {
   applyMigrationsBetween,
   classifyPsqlErrors,
   isDrizzleMigrationPath,
+  listMigrationsOnDisk,
   splitSqlStatements,
   BENIGN_ALREADY_EXISTS_REGEX,
 } from "./drizzle-applier.js";

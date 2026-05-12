@@ -31,6 +31,7 @@ import {
   runMain,
   parsePlan,
   parseRalphArgs,
+  preflight,
   loadDotenv,
   isTransientServerError,
   __resetTransientStateForTests,
@@ -1171,5 +1172,56 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(507);
     expect(b.state.releases[1]!.reason).toMatch(/attempt 1\/3/);
+  });
+});
+
+describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
+  // Default stub injections: every gate except the DB-URL one passes, so the
+  // DB-URL gate is the only thing that can toggle ok/errors. Tests then vary
+  // listMigrations and getEnv to drive the new check.
+  function preflightWith(over: {
+    migrations?: string[];
+    dbUrl?: string | undefined;
+  }) {
+    return preflight(baseArgs(), {
+      exec: () => ({ ok: true }),
+      fileExists: () => true,
+      listMigrations: () => over.migrations ?? [],
+      getEnv: (k) => (k === "DATABASE_URL" ? over.dbUrl : undefined),
+    });
+  }
+
+  it("fails when migrations exist on disk and DATABASE_URL is unset", () => {
+    const res = preflightWith({
+      migrations: ["db/migrations/0001_init.sql"],
+      dbUrl: undefined,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+    expect(res.errors.join("\n")).toMatch(/0001_init\.sql/);
+  });
+
+  it("fails when migrations exist on disk and DATABASE_URL is blank", () => {
+    const res = preflightWith({
+      migrations: ["db/migrations/0001_init.sql"],
+      dbUrl: "   ",
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+  });
+
+  it("passes when migrations exist on disk and DATABASE_URL is set", () => {
+    const res = preflightWith({
+      migrations: ["db/migrations/0001_init.sql"],
+      dbUrl: "postgres://fake@localhost/db",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("passes when no migrations exist, regardless of DATABASE_URL", () => {
+    const res = preflightWith({ migrations: [], dbUrl: undefined });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
   });
 });

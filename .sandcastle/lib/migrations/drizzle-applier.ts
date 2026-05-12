@@ -28,7 +28,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readdirSync } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
@@ -321,6 +321,49 @@ export function isDrizzleMigrationPath(p: string): boolean {
   if (!p.includes("/migrations/")) return false;
   const base = path.basename(p);
   return /^[0-9]{4}_.+\.sql$/.test(base);
+}
+
+/**
+ * Walk `repoRoot` and return any on-disk file that satisfies
+ * `isDrizzleMigrationPath`. Pure filesystem scan — no git, no SQL exec — so
+ * it's safe to call at loop startup before any commits exist.
+ *
+ * Synchronous so it can run inside `preflight()` alongside the other sync
+ * checks (`existsSync`, `execFileSync`). The walk skips `node_modules`,
+ * `.git`, dot-directories, and `.sandcastle/worktrees` to keep it cheap on
+ * repos with many vendored files.
+ */
+export function listMigrationsOnDisk(repoRoot: string): string[] {
+  const out: string[] = [];
+  function walk(dir: string): void {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (
+          ent.name === "node_modules" ||
+          ent.name === ".git" ||
+          ent.name.startsWith(".")
+        ) {
+          continue;
+        }
+        if (full.includes(`${path.sep}.sandcastle${path.sep}worktrees`)) {
+          continue;
+        }
+        walk(full);
+      } else if (ent.isFile()) {
+        const rel = path.relative(repoRoot, full);
+        if (isDrizzleMigrationPath(rel)) out.push(rel);
+      }
+    }
+  }
+  walk(repoRoot);
+  return out;
 }
 
 /**

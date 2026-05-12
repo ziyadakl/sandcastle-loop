@@ -43,7 +43,10 @@ import {
 } from "./lib/state/index.js";
 import { parseVerdict, extractMarker } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
-import { applyMigrationsBetween } from "./lib/migrations/index.js";
+import {
+  applyMigrationsBetween,
+  listMigrationsOnDisk,
+} from "./lib/migrations/index.js";
 import { models } from "./models.js";
 import {
   envForModel,
@@ -619,6 +622,8 @@ export interface PreflightResult {
 export function preflight(args: RalphArgs, opts: {
   exec?: (bin: string, args: readonly string[]) => { ok: boolean; stderr?: string };
   fileExists?: (p: string) => boolean;
+  listMigrations?: (repoRoot: string) => string[];
+  getEnv?: (key: string) => string | undefined;
 } = {}): PreflightResult {
   const errors: string[] = [];
   const exec =
@@ -661,6 +666,23 @@ export function preflight(args: RalphArgs, opts: {
   // 5. docker daemon
   const dk = exec("docker", ["info"]);
   if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
+
+  // 6. DATABASE_URL required when drizzle migrations exist on disk. Fail at
+  // boot, not mid-iteration after a model call has already burned tokens.
+  const listMigrations = opts.listMigrations ?? listMigrationsOnDisk;
+  const getEnv = opts.getEnv ?? ((k) => process.env[k]);
+  const migrations = listMigrations(args.repoRoot);
+  if (migrations.length > 0) {
+    const dbUrl = (getEnv("DATABASE_URL") ?? "").trim();
+    if (dbUrl === "") {
+      errors.push(
+        `DATABASE_URL is not set, but this project has ${migrations.length} ` +
+          `drizzle migration file(s) on disk (e.g. ${migrations[0]}). The ` +
+          `migration applier will fail mid-pipeline. Set DATABASE_URL=... in ` +
+          `<repoRoot>/.env (project-specific) before running the loop.`,
+      );
+    }
+  }
 
   return { ok: errors.length === 0, errors };
 }
