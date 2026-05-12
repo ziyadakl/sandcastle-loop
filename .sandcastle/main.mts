@@ -1749,27 +1749,65 @@ async function runIssuePipeline(
         const postSha = sandbox.worktreePath
           ? await ctx.deps.captureSha(sandbox.worktreePath)
           : "";
-        const summary =
-          `[issue=${ctx.issueNumber}] shipped via sandcastle-loop recovery ` +
-          `(commit ${postSha}, branch ${ctx.issue.branch})`;
-        try {
-          // Under staging, keep `in-progress` until the merger / staging
-          // flow takes over. Under --no-staging, flip immediately.
-          if (!ctx.args.stagingEnabled) {
-            await ctx.deps.markDone(ctx.issueNumber, summary);
+
+        // Review recovery's output before shipping. The implementer path is
+        // always reviewed; until now, recovery output went straight to the
+        // merger unreviewed. That let a recovery papering over a config
+        // failure (or hallucinating an irrelevant "fix") merge garbage. Run
+        // the same reviewer pass — same prompt, same marker set — and
+        // quarantine on HAS_BLOCKERS rather than ship.
+        //
+        // Skipped when postSha is empty (no worktree available, e.g. in
+        // dry-run / mocked paths); the legacy ship path runs as before.
+        let recoveryApproved = postSha === "";
+        if (postSha !== "") {
+          try {
+            const rrev = await runReviewer(
+              sandbox,
+              ctx,
+              postSha,
+              undefined,
+              undefined,
+              { name: "recovery-reviewer" },
+            );
+            if (rrev.marker === "ALL_CLEAR") {
+              recoveryApproved = true;
+            } else {
+              ctx.deps.log(
+                `[issue=${ctx.issueNumber}] recovery-reviewer marker=${rrev.marker} — quarantining instead of shipping`,
+              );
+            }
+          } catch (e) {
+            ctx.deps.logError(
+              `[issue=${ctx.issueNumber}] recovery-reviewer threw: ${(e as Error).message} — quarantining`,
+            );
           }
-          deferralCounts.delete(ctx.issueNumber);
-          return {
-            status: "ok",
-            finalMarker: "RECOVERY_COMPLETE",
-            postSha,
-          };
-        } catch (e) {
-          ctx.deps.logError(
-            `markDone after recovery failed: ${(e as Error).message}`,
-          );
-          // Fall through to quarantine.
         }
+
+        if (recoveryApproved) {
+          const summary =
+            `[issue=${ctx.issueNumber}] shipped via sandcastle-loop recovery ` +
+            `(commit ${postSha}, branch ${ctx.issue.branch})`;
+          try {
+            // Under staging, keep `in-progress` until the merger / staging
+            // flow takes over. Under --no-staging, flip immediately.
+            if (!ctx.args.stagingEnabled) {
+              await ctx.deps.markDone(ctx.issueNumber, summary);
+            }
+            deferralCounts.delete(ctx.issueNumber);
+            return {
+              status: "ok",
+              finalMarker: "RECOVERY_COMPLETE",
+              postSha,
+            };
+          } catch (e) {
+            ctx.deps.logError(
+              `markDone after recovery failed: ${(e as Error).message}`,
+            );
+            // Fall through to quarantine.
+          }
+        }
+        // Recovery review rejected or threw — fall through to quarantine.
       } else if (
         rec.marker === "ERRORED" &&
         isTransientError(rec.errorMsg ?? "")

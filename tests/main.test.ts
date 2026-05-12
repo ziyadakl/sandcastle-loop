@@ -504,13 +504,14 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(recoveryCalls).toEqual([]);
   });
 
-  it("--recovery on: implementer error → recovery RECOVERY_COMPLETE → markDone (no quarantine)", async () => {
+  it("--recovery on: implementer error → recovery RECOVERY_COMPLETE → recovery-reviewer ALL_CLEAR → markDone (no quarantine)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([{ id: "71", title: "recover", branch: "agent/issue-71" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
     b.enqueue("recovery", { stdout: "fixed it up\n\nRECOVERY_COMPLETE" });
+    b.enqueue("recovery-reviewer", { stdout: "looks good\n\nALL_CLEAR" });
     b.enqueue("planner", { stdout: plannerStdout([]) });
     b.enqueue("merger", { stdout: "merged" });
     b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
@@ -530,6 +531,40 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
       (c) => c.spec.name === "recovery",
     );
     expect(recoveryCalls).toHaveLength(1);
+    // Confirm the recovery-reviewer pass actually fired.
+    const recoveryReviewerCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery-reviewer",
+    );
+    expect(recoveryReviewerCalls).toHaveLength(1);
+  });
+
+  it("--recovery on: recovery RECOVERY_COMPLETE → recovery-reviewer HAS_BLOCKERS → quarantines (no ship)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "72", title: "bad recover", branch: "agent/issue-72" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("recovery", { stdout: "papered over it\n\nRECOVERY_COMPLETE" });
+    b.enqueue("recovery-reviewer", {
+      stdout: "this fix is bogus\n\nHAS_BLOCKERS",
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([]);
+    expect(b.state.marksDone).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(72);
+    // Reviewer fired exactly once on the recovery output.
+    const recoveryReviewerCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery-reviewer",
+    );
+    expect(recoveryReviewerCalls).toHaveLength(1);
   });
 });
 
