@@ -10,6 +10,12 @@ ISSUE_NUMBER: {{ISSUE_NUMBER}}
 BRANCH: {{BRANCH}}
 REASON (from the orchestrator): {{REASON}}
 
+## Diagnosed starting move
+
+{{DIAGNOSE_HINT}}
+
+If the section above is empty or whitespace, ignore it. Otherwise treat it as a HIGH-confidence pre-recovery shortcut. Run the command via bash inside the sandbox, confirm exit 0, then re-attempt the previously failing step BEFORE attempting any deeper investigation. If the diagnosed fix does not unstick the run, proceed with the normal recovery procedure below.
+
 # THE ISSUE — pre-loaded for you (do NOT re-fetch)
 
 <issue-spec>

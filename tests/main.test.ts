@@ -538,6 +538,37 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(recoveryReviewerCalls).toHaveLength(1);
   });
 
+  it("--recovery on: diagnosed migration error feeds DIAGNOSE_HINT into recovery promptArgs", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "73", title: "migration halt", branch: "agent/issue-73" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: "",
+      throw: new Error(`PostgresError: relation "foo" does not exist`),
+    });
+    b.enqueue("recovery", { stdout: "ran the migration\n\nRECOVERY_COMPLETE" });
+    b.enqueue("recovery-reviewer", { stdout: "looks good\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+    await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true, stagingEnabled: false }),
+      b.deps,
+    );
+
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(1);
+    const hint = recoveryCalls[0]!.spec.promptArgs?.DIAGNOSE_HINT ?? "";
+    expect(hint.length).toBeGreaterThan(0);
+    expect(hint).toContain("pnpm db:migrate");
+  });
+
   it("--recovery on: recovery RECOVERY_COMPLETE → recovery-reviewer HAS_BLOCKERS → quarantines (no ship)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {

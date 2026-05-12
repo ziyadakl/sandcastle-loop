@@ -48,6 +48,7 @@ import {
   listMigrationsOnDisk,
 } from "./lib/migrations/index.js";
 import { models } from "./models.js";
+import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   envForModel,
   defaultCodingModelFor,
@@ -1496,6 +1497,7 @@ async function runRecovery(
   sb: SandboxHandle,
   ctx: PipelineCtx,
   reason: string,
+  diagnoseHint = "",
 ): Promise<{
   marker: "RECOVERY_COMPLETE" | "HALT" | "ERRORED";
   errorMsg?: string;
@@ -1512,6 +1514,7 @@ async function runRecovery(
         ISSUE_NUMBER: String(ctx.issueNumber),
         BRANCH: ctx.issue.branch,
         REASON: reason.slice(0, 500),
+        DIAGNOSE_HINT: diagnoseHint,
       },
     });
     const marker = extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
@@ -1744,7 +1747,18 @@ async function runIssuePipeline(
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] --recovery on — attempting one recovery pass`,
       );
-      const rec = await runRecovery(sandbox, ctx, errMsg);
+      const diagnosis = diagnoseHaltCause(errMsg);
+      if (diagnosis) {
+        ctx.deps.log(
+          `[issue=${ctx.issueNumber}] diagnose: ${diagnosis.cause} — hinting recovery`,
+        );
+      }
+      const rec = await runRecovery(
+        sandbox,
+        ctx,
+        errMsg,
+        diagnosis?.hint ?? "",
+      );
       if (rec.marker === "RECOVERY_COMPLETE") {
         const postSha = sandbox.worktreePath
           ? await ctx.deps.captureSha(sandbox.worktreePath)
