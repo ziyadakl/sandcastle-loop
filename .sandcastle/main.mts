@@ -561,8 +561,9 @@ function parseEnvFileInto(filePath: string): Record<string, true> {
  * Order:
  *   1. process.env (shell exports — implicit; we never overwrite)
  *   2. $SANDCASTLE_ENV_FILE if set (escape hatch for secret-manager piping)
- *   3. <repoRoot>/.env (project-local override)
- *   4. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
+ *   3. <repoRoot>/.sandcastle/.env (sandcastle-specific overrides)
+ *   4. <repoRoot>/.env (project-local override)
+ *   5. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
  *      (host-level default — write once per machine)
  *
  * The host-level path means a user can put `KIMI_API_KEY` once in
@@ -579,6 +580,10 @@ export function loadDotenv(repoRoot: string): void {
   if (explicit && explicit.trim() !== "") {
     sources.push({ label: "$SANDCASTLE_ENV_FILE", path: explicit });
   }
+  sources.push({
+    label: "<repoRoot>/.sandcastle/.env",
+    path: path.join(repoRoot, ".sandcastle", ".env"),
+  });
   sources.push({ label: "<repoRoot>/.env", path: path.join(repoRoot, ".env") });
   const xdg = process.env.XDG_CONFIG_HOME;
   const hostDir =
@@ -1031,12 +1036,44 @@ export async function ensureStagingWorktree(
   return stagingPath;
 }
 
+interface WorktreeEntry {
+  path: string;
+  branch: string | null;
+}
+
 /**
- * Fast-forward `integrationBranch` to the staging tip. Uses
- * `git update-ref` so we don't have to switch branches first.
+ * Parse `git worktree list --porcelain` output. Blocks are separated by
+ * blank lines; each block has `worktree <path>` and (for attached HEADs)
+ * `branch refs/heads/<name>`. Detached HEADs omit the branch line.
+ */
+export function parseWorktreeList(stdout: string): WorktreeEntry[] {
+  const entries: WorktreeEntry[] = [];
+  for (const block of stdout.split(/\n\s*\n/)) {
+    let wtPath = "";
+    let branch: string | null = null;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length).trim();
+      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).trim();
+    }
+    if (wtPath !== "") entries.push({ path: wtPath, branch });
+  }
+  return entries;
+}
+
+/**
+ * Fast-forward `integrationBranch` to the staging tip.
+ *
+ * If a worktree has `integrationBranch` checked out (typical case — the
+ * launch worktree usually does), we `git merge --ff-only` inside that
+ * worktree so HEAD + index + working tree all advance together. Using a
+ * bare `git update-ref` here would silently strand the working tree on
+ * the old snapshot — see commit history for the disk-drift incident.
+ *
+ * If the branch is not checked out anywhere, fall back to `update-ref`.
+ *
  * Returns true on success.
  */
-function fastForwardIntegration(
+export function fastForwardIntegration(
   repoRoot: string,
   integrationBranch: string,
   log: (s: string) => void,
@@ -1061,6 +1098,26 @@ function fastForwardIntegration(
         `human triage required`,
     );
     return false;
+  }
+  const listed = runGit(repoRoot, "worktree", "list", "--porcelain");
+  if (!listed.ok) {
+    logError(`fast-forward: worktree list failed: ${listed.stderr}`);
+    return false;
+  }
+  const liveWorktree = parseWorktreeList(listed.stdout).find(
+    (w) => w.branch === `refs/heads/${integrationBranch}`,
+  );
+  if (liveWorktree) {
+    const ff = runGit(liveWorktree.path, "merge", "--ff-only", stagingTip);
+    if (!ff.ok) {
+      logError(`fast-forward: merge --ff-only in ${liveWorktree.path} failed: ${ff.stderr}`);
+      return false;
+    }
+    log(
+      `fast-forward (via worktree merge in ${liveWorktree.path}): ` +
+        `${integrationBranch} ${integrationTip.slice(0, 8)} → ${stagingTip.slice(0, 8)}`,
+    );
+    return true;
   }
   const update = runGit(
     repoRoot,

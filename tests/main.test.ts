@@ -24,7 +24,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -37,6 +37,8 @@ import {
   loadDotenv,
   isTransientServerError,
   ensureStagingWorktree,
+  fastForwardIntegration,
+  parseWorktreeList,
   __resetTransientStateForTests,
   type Deps,
   type RalphArgs,
@@ -723,8 +725,9 @@ describe("sandcastle-loop main.mts — parseRalphArgs", () => {
 
 describe("sandcastle-loop main.mts — loadDotenv chain", () => {
   // The chain (first hit per-key wins, lower fills gaps):
-  //   1. process.env  2. $SANDCASTLE_ENV_FILE  3. <repoRoot>/.env
-  //   4. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
+  //   1. process.env  2. $SANDCASTLE_ENV_FILE  3. <repoRoot>/.sandcastle/.env
+  //   4. <repoRoot>/.env
+  //   5. $XDG_CONFIG_HOME/sandcastle/.env or ~/.config/sandcastle/.env
 
   function withTempDirs(fn: (dirs: {
     repoRoot: string;
@@ -848,6 +851,33 @@ describe("sandcastle-loop main.mts — loadDotenv chain", () => {
       expect(process.env.KIMI_API_KEY).toBe("line1\nline2");
       expect(process.env.GLM_API_KEY).toBe("line1\\nline2");
       expect(process.env.ANTHROPIC_API_KEY).toBe("back\\slash");
+    });
+  });
+
+  it("<repoRoot>/.sandcastle/.env wins over <repoRoot>/.env for same key", () => {
+    withTempDirs(({ repoRoot }) => {
+      mkdirSync(path.join(repoRoot, ".sandcastle"), { recursive: true });
+      writeFileSync(
+        path.join(repoRoot, ".sandcastle", ".env"),
+        "KIMI_API_KEY=from-sandcastle\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "KIMI_API_KEY=from-project\n");
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-sandcastle");
+    });
+  });
+
+  it("<repoRoot>/.sandcastle/.env fills gaps left by project .env", () => {
+    withTempDirs(({ repoRoot }) => {
+      mkdirSync(path.join(repoRoot, ".sandcastle"), { recursive: true });
+      writeFileSync(
+        path.join(repoRoot, ".sandcastle", ".env"),
+        "KIMI_API_KEY=from-sandcastle\n",
+      );
+      writeFileSync(path.join(repoRoot, ".env"), "GH_TOKEN=from-project\n");
+      loadDotenv(repoRoot);
+      expect(process.env.KIMI_API_KEY).toBe("from-sandcastle");
+      expect(process.env.GH_TOKEN).toBe("from-project");
     });
   });
 
@@ -1406,5 +1436,127 @@ describe("sandcastle-loop main.mts — staging worktree", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
+  function initRepoForFastForward(): {
+    repoRoot: string;
+    gitEnv: NodeJS.ProcessEnv;
+    cleanup: () => void;
+  } {
+    const tmp = mkdtempSync(path.join(tmpdir(), "sc-ff-"));
+    const repoRoot = tmp;
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const run = (...args: string[]): void => {
+      execFileSync("git", args, { cwd: repoRoot, env: gitEnv, stdio: "ignore" });
+    };
+    run("init", "-q", "-b", "main");
+    run("config", "user.email", "test@example.com");
+    run("config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    run("add", "README.md");
+    run("commit", "-q", "-m", "init");
+    return { repoRoot, gitEnv, cleanup: () => rmSync(tmp, { recursive: true, force: true }) };
+  }
+
+  // Regression guard for the disk-drift incident: bare `git update-ref` advanced
+  // HEAD on the launch worktree while leaving the working tree on the old snapshot.
+  // After the fix, fastForwardIntegration must use `merge --ff-only` inside any
+  // worktree that has the target branch checked out, so disk advances with HEAD.
+  it("advances HEAD AND working tree in a worktree that has the target branch checked out", () => {
+    const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repoRoot, env: gitEnv, encoding: "utf8" }).trim();
+
+      git("branch", "feat-x");
+      git("branch", "integration-candidate");
+      git("checkout", "-q", "integration-candidate");
+      writeFileSync(path.join(repoRoot, "finance.ts"), "export const TOTAL = 42;\n");
+      git("add", "finance.ts");
+      git("commit", "-q", "-m", "add finance.ts to integration-candidate");
+      const candidateTip = git("rev-parse", "HEAD");
+      git("checkout", "-q", "feat-x");
+      expect(existsSync(path.join(repoRoot, "finance.ts"))).toBe(false);
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const ok = fastForwardIntegration(
+        repoRoot,
+        "feat-x",
+        (s) => logs.push(s),
+        (s) => errors.push(s),
+      );
+
+      expect(errors).toEqual([]);
+      expect(ok).toBe(true);
+      expect(git("rev-parse", "HEAD")).toBe(candidateTip);
+      expect(existsSync(path.join(repoRoot, "finance.ts"))).toBe(true);
+      expect(readFileSync(path.join(repoRoot, "finance.ts"), "utf8")).toBe(
+        "export const TOTAL = 42;\n",
+      );
+      expect(logs.some((l) => l.includes("via worktree merge"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to update-ref when the target branch is not checked out anywhere", () => {
+    const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repoRoot, env: gitEnv, encoding: "utf8" }).trim();
+
+      git("branch", "feat-x");
+      git("branch", "integration-candidate");
+      git("checkout", "-q", "integration-candidate");
+      writeFileSync(path.join(repoRoot, "finance.ts"), "x\n");
+      git("add", "finance.ts");
+      git("commit", "-q", "-m", "advance");
+      const candidateTip = git("rev-parse", "HEAD");
+      git("checkout", "-q", "main");
+
+      const logs: string[] = [];
+      const ok = fastForwardIntegration(repoRoot, "feat-x", (s) => logs.push(s), () => {});
+      expect(ok).toBe(true);
+      expect(git("rev-parse", "refs/heads/feat-x")).toBe(candidateTip);
+      expect(logs.some((l) => l.includes("via worktree merge"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  describe("parseWorktreeList", () => {
+    it("parses attached and detached worktrees", () => {
+      const stdout = [
+        "worktree /path/main",
+        "HEAD abc123",
+        "branch refs/heads/main",
+        "",
+        "worktree /path/staging",
+        "HEAD def456",
+        "branch refs/heads/integration-candidate",
+        "",
+        "worktree /path/detached",
+        "HEAD 789aaa",
+        "detached",
+      ].join("\n");
+      expect(parseWorktreeList(stdout)).toEqual([
+        { path: "/path/main", branch: "refs/heads/main" },
+        { path: "/path/staging", branch: "refs/heads/integration-candidate" },
+        { path: "/path/detached", branch: null },
+      ]);
+    });
+
+    it("returns an empty array for empty input", () => {
+      expect(parseWorktreeList("")).toEqual([]);
+    });
   });
 });
