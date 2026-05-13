@@ -155,6 +155,7 @@ Use these 9 markers in order:
 [STEP 3/9] Write code (GREEN) — for bug-fix stories: diagnose root cause + fix in src/
 [STEP 4/9] Typecheck / lint (use the project's own checker — mypy, tsc, cargo check, etc.)
 [STEP 5/9] Unit tests
+[STEP 5.5/9] Simplify pass — invoke /simplify on changed code (see STEP 5.5/9 rules below)
 [STEP 6/9] Full test run (red→green check on bug-fix stories — see STEP 6/9 rules below)
 [STEP 7/9] Migration
 [STEP 8/9] Append progress log
@@ -172,6 +173,31 @@ display follows whichever step you most recently announced.
 
 These markers are how the loop driver renders status to the operator. Do
 NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
+
+# STEP 5.5/9 (Simplify) — rules
+
+After unit tests are green and BEFORE the full test run, invoke the
+`/simplify` skill on the code you changed in this iteration. The skill
+reviews changed code for reuse, quality, and efficiency and fixes anything
+it finds.
+
+Why here: simplify may edit code. Running it after unit tests confirms you
+started from a working baseline; running it before the full test run means
+the final test pass was executed against the simplified code, not a
+pre-simplified draft.
+
+If `/simplify` makes ANY edits:
+
+- Re-emit `[STEP 4/9]` and re-run typecheck/lint.
+- Re-emit `[STEP 5/9]` and re-run unit tests.
+- Only proceed to STEP 6/9 once both are green again.
+
+If `/simplify` returns with no edits, emit
+`[STEP 5.5/9] SKIP — no simplifications found` and continue to STEP 6/9.
+
+Do NOT use `/simplify` as an excuse to refactor unrelated code. The skill
+operates on the diff for THIS iteration only. If it tries to wander into
+files you didn't touch, stop it.
 
 # STEP 6/9 (Tests) — non-negotiable rules
 
