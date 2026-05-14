@@ -1356,6 +1356,62 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
   });
 });
 
+describe("sandcastle-loop main.mts — sandbox image preflight", () => {
+  // Regression guard: iteration 1 used to crash with "Image not found" on a
+  // fresh worktree because preflight only checked `docker info`. Preflight
+  // now also verifies `docker image inspect <imageName>` and produces a
+  // clear build command when missing.
+  it("fails with a clear build command when the named image isn't on disk", () => {
+    const res = preflight(baseArgs({ imageName: "sandcastle:test-proj" }), {
+      exec: (bin, a) => {
+        if (bin === "docker" && a[0] === "image" && a[1] === "inspect") {
+          return { ok: false, stderr: "Error: No such image" };
+        }
+        return { ok: true };
+      },
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(
+      /sandbox image 'sandcastle:test-proj' not found locally/,
+    );
+    expect(res.errors.join("\n")).toMatch(/build-image --image-name sandcastle:test-proj/);
+  });
+
+  it("passes when the named image exists", () => {
+    const res = preflight(baseArgs({ imageName: "sandcastle:test-proj" }), {
+      exec: () => ({ ok: true }),
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("skips the image check when docker daemon itself is down (avoids redundant errors)", () => {
+    const res = preflight(baseArgs({ imageName: "sandcastle:test-proj" }), {
+      exec: (bin, a) => {
+        if (bin === "docker" && a[0] === "info") {
+          return { ok: false, stderr: "Cannot connect to the Docker daemon" };
+        }
+        if (bin === "docker" && a[0] === "image" && a[1] === "inspect") {
+          throw new Error("image check should not run when daemon is down");
+        }
+        return { ok: true };
+      },
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/docker info failed/);
+    expect(res.errors.join("\n")).not.toMatch(/sandbox image/);
+  });
+});
+
 describe("sandcastle-loop main.mts — staging worktree", () => {
   // Helper: initialise a real git repo with one commit on `main`.
   function initTempRepo(): { repoRoot: string; cleanup: () => void } {

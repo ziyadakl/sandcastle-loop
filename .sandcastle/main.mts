@@ -681,7 +681,23 @@ export function preflight(args: RalphArgs, opts: {
   const dk = exec("docker", ["info"]);
   if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
 
-  // 6. DATABASE_URL required when drizzle migrations exist on disk. Fail at
+  // 6. project's sandbox image exists locally. Without this check, iteration
+  // 1 immediately fails with "Image '<name>' not found locally" after the
+  // planner has already booted — wasted setup + confusing first-run UX on
+  // any fresh worktree or post-`docker prune` machine. Catch at boot
+  // instead and point the user at the build command.
+  if (dk.ok) {
+    const img = exec("docker", ["image", "inspect", args.imageName]);
+    if (!img.ok) {
+      errors.push(
+        `sandbox image '${args.imageName}' not found locally. Build it with: ` +
+          `node_modules/.bin/sandcastle docker build-image --image-name ` +
+          `${args.imageName} --dockerfile .sandcastle/Dockerfile`,
+      );
+    }
+  }
+
+  // 7. DATABASE_URL required when drizzle migrations exist on disk. Fail at
   // boot, not mid-iteration after a model call has already burned tokens.
   const listMigrations = opts.listMigrations ?? listMigrationsOnDisk;
   const getEnv = opts.getEnv ?? ((k) => process.env[k]);
