@@ -386,6 +386,57 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.marksDone).toEqual([]);
   });
 
+  // Regression for the affinity-tracker "no commits" pattern: implementers
+  // on multi-surface stories would write real code, hit a budget-burning
+  // step (slow e2e, install failure, network blip), and exit before the
+  // STEP 9 final commit. Two failure modes ganged up:
+  //   (1) `r.commits.length === 0` → runImplementer threw "implementer
+  //       made no commits", losing the work.
+  //   (2) When the implementer correctly emitted <promise>HALT</promise>
+  //       for a real blocker, parseVerdict still demanded a JSON envelope
+  //       and threw "no fenced ```json``` block", burning a recovery pass.
+  // STEP 3.5 (commit 0663182) commits a WIP checkpoint right after writing
+  // code, so r.commits has at least one entry. The HALT gate (commit
+  // 37e1e27) skips parseVerdict when the marker is HALT. This test wires
+  // both regressions together — implementer reports ONE WIP commit and a
+  // HALT marker, pipeline must survive to quarantine cleanly.
+  it("WIP checkpoint + HALT marker: pipeline survives 'no commits' + missing-envelope regression and quarantines cleanly", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "200", title: "no-commits regression", branch: "agent/issue-200" },
+      ]),
+    });
+    // Implementer ends with <promise>HALT</promise> and reports EXACTLY ONE
+    // commit — the STEP 3.5 WIP checkpoint. No JSON envelope: HALT path
+    // doesn't carry one (per implement-prompt step 8 contract).
+    b.enqueue("implementer", {
+      stdout:
+        "Cannot install workspace deps — pnpm install blocked inside sandbox " +
+        "(sandcastle-loop git dep requires GH creds). Implementation code is " +
+        "committed in the WIP checkpoint above; install side cannot proceed.\n\n" +
+        "<promise>HALT</promise>",
+      commits: [{ sha: "wip-checkpoint-200" }],
+    });
+    // Reviewer reads the WIP commit (no certification block) → HAS_BLOCKERS.
+    // With retry disabled, the pipeline quarantines after this single pass.
+    b.enqueue("reviewer", {
+      stdout: "Commit body has no certification block.\n\nHAS_BLOCKERS",
+    });
+    // Iter 2 sees an empty plan and exits cleanly.
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, retryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(200);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
   it("implementer error quarantines the issue (no recovery ladder)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
