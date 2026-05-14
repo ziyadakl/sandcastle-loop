@@ -155,6 +155,48 @@ display follows whichever step you most recently announced.
 These markers are how the loop driver renders status to the operator. Do
 NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
 
+# Iteration safety — non-negotiable across all steps
+
+These rules cut across every step. Breaking either of them is a HARD
+finding for the reviewer.
+
+## Destructive operations — audit first, never default
+
+Do NOT run destructive operations as a way to "unstick" something. Stop
+and HALT (step 8) instead. The default answer for any of these is "no":
+
+- `rm -rf` on anything outside the file you just wrote
+- `git reset --hard`, `git checkout -- .`, `git clean -f`, `git restore .`
+- `git push --force` / `--force-with-lease`
+- `git rebase` of commits you didn't author this iteration
+- `git branch -D` of any branch other than a sub-worktree you own
+- dropping or truncating database tables, `DROP SCHEMA`, `TRUNCATE`
+- deleting `node_modules`, `dist`, `.next`, lockfiles
+- killing processes you didn't start
+- `--no-verify` on git operations to skip hooks
+
+If your reasoning chain reaches "I'll just `rm -rf` and start over," that
+is the signal to HALT and surface the underlying problem to the operator.
+The reviewer will flag any destructive command that appears in your tool-
+use history without explicit spec authorization.
+
+## Install failures — surface, do not work around
+
+If `pnpm install` / `npm install` / `yarn install` / `pip install` /
+`cargo build` fails, you do NOT work around it. Specifically forbidden:
+
+- `--force`, `--legacy-peer-deps`, `--no-engine-strict`, `--ignore-scripts`
+- deleting `node_modules` and reinstalling to "see if it fixes itself"
+- editing `pnpm-lock.yaml` / `package-lock.json` by hand
+- downgrading or upgrading a dep just to make the install pass
+- adding `pnpm.overrides` / `resolutions` blocks without spec instruction
+
+These workarounds hide real dependency-graph problems and produce
+non-reproducible builds. HALT with the install command's stderr in the
+commit body and let the operator decide. The exception: the issue spec
+explicitly tells you to add a dep or change a version — then do that
+specific change and only that change.
+
 # STEP 3.5/9 (Checkpoint commit) — rules
 
 After writing the implementation code in STEP 3 and BEFORE running
