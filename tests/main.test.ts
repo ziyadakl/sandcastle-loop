@@ -435,6 +435,14 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(200);
     expect(b.state.marksDone).toEqual([]);
+    // CRITICAL: assert the quarantine reason mentions HAS_BLOCKERS. If the
+    // HALT gate ever regresses, parseVerdict will throw on the missing
+    // envelope, runImplementer will re-throw, and the pipeline will
+    // quarantine via the implementer-error path — same final count, but
+    // the reason text will differ (and won't match HAS_BLOCKERS). This
+    // assertion is what makes the test load-bearing for BOTH fixes
+    // simultaneously, not just for "any path that quarantines."
+    expect(b.state.quarantines[0]!.reason).toMatch(/HAS_BLOCKERS/);
   });
 
   it("implementer error quarantines the issue (no recovery ladder)", async () => {
