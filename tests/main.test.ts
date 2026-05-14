@@ -122,6 +122,15 @@ function buildDeps(opts: {
   /** If true, release() throws — exercises the release-failure fallthrough
    *  to quarantine. */
   releaseThrows?: boolean;
+  /** Stub return for validateMigrationJournal. Empty array (default) means
+   *  every new migration is registered. Override to exercise the staleness
+   *  gate in shipAfterMigrations. */
+  unregisteredMigrations?: readonly {
+    file: string;
+    expectedTag: string;
+    journalPath: string;
+    journalMissing: boolean;
+  }[];
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -198,6 +207,11 @@ function buildDeps(opts: {
         return { applied: 0, realErrors: [{ msg: "fake migration failure" }] };
       }
       return { applied: 0, realErrors: [] };
+    },
+    async validateMigrationJournal(_repoRoot, _preSha, _postSha) {
+      // Default: nothing unregistered. Specific journal-staleness tests
+      // can override this stub via opts.unregisteredMigrations.
+      return opts.unregisteredMigrations ?? [];
     },
     async captureSha(_w) {
       const v = shas[shaIdx % shas.length] ?? "sha-x";
@@ -443,6 +457,57 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     // assertion is what makes the test load-bearing for BOTH fixes
     // simultaneously, not just for "any path that quarantines."
     expect(b.state.quarantines[0]!.reason).toMatch(/HAS_BLOCKERS/);
+  });
+
+  // Regression for the affinity-tracker "stale Drizzle journal" pattern:
+  // implementer writes 0060_*.sql, applies it via psql, tests pass on dev,
+  // BUT doesn't register the file in packages/db/migrations/meta/_journal.json.
+  // Recovery agent marks "recovered — work already committed" without fixing
+  // the journal. drizzle-kit migrate later silently skips the file in prod /
+  // downstream consumers. The shipAfterMigrations gate (commit pending)
+  // fails the iteration before applyMigrations runs.
+  it("stale journal: unregistered migration file fails the iteration before applyMigrations runs", async () => {
+    const b = buildDeps({
+      // 50/50 mock SHAs so preSha !== postSha → migration check fires.
+      shas: ["pre-sha", "post-sha"],
+      unregisteredMigrations: [
+        {
+          file: "packages/db/migrations/0060_budget_notifications.sql",
+          expectedTag: "0060_budget_notifications",
+          journalPath: "packages/db/migrations/meta/_journal.json",
+          journalMissing: false,
+        },
+      ],
+    });
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "210", title: "adds untracked migration", branch: "agent/issue-210" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 210 }),
+      commits: [{ sha: "wip-210" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, retryEnabled: false }),
+      b.deps,
+    );
+
+    // ALL_CLEAR reviewer routes to shipAfterMigrations. The journal gate
+    // throws BEFORE applyMigrations runs (assert it never got called),
+    // pipeline catches the error and quarantines the issue with a
+    // journal-specific reason.
+    expect(result.exitCode).toBe(0);
+    expect(b.state.migrationsCalls).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(210);
+    expect(b.state.quarantines[0]!.reason).toMatch(
+      /0060_budget_notifications|journal/i,
+    );
+    expect(b.state.marksDone).toEqual([]);
   });
 
   it("implementer error quarantines the issue (no recovery ladder)", async () => {

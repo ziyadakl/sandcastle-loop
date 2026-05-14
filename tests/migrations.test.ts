@@ -15,6 +15,7 @@ import {
   classifyPsqlErrors,
   isDrizzleMigrationPath,
   splitSqlStatements,
+  validateJournalRegistration,
   BENIGN_ALREADY_EXISTS_REGEX,
   type ExecRunner,
 } from "../src/migrations/drizzle-applier.js";
@@ -320,5 +321,182 @@ describe("applyMigrationsBetween", () => {
     expect(result.applied).toBe(1);
     // Only one psql call — seed.sql was filtered out
     expect(calls.filter((c) => c.bin === "psql")).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateJournalRegistration — Drizzle journal-staleness gate
+// ---------------------------------------------------------------------------
+// Regression for the affinity-tracker pattern: implementer writes a new
+// `0060_*.sql`, applies it via psql, tests pass on dev, but the journal
+// stays at idx 36 / tag "0059_money_goals_team_scope". drizzle-kit migrate
+// silently skips the unregistered file in downstream consumers and the
+// breakage recurs because the recovery agent marks "recovered — work
+// already committed" without fixing the journal.
+
+describe("validateJournalRegistration", () => {
+  it("returns empty when no new migrations were added between commits", async () => {
+    const { exec } = recordingExec({
+      git: () => ({ stdout: "" }), // no added files
+    });
+    const root = await makeRepoWithMigrations({});
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("returns empty when every new migration has a matching journal entry", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0060_budget_notifications.sql":
+        "CREATE TABLE budget_notifications (id int);",
+      "packages/db/migrations/meta/_journal.json": JSON.stringify({
+        version: "7",
+        dialect: "postgresql",
+        entries: [
+          { idx: 36, version: "7", when: 1_700_000_000_000, tag: "0059_prior", breakpoints: true },
+          {
+            idx: 37,
+            version: "7",
+            when: 1_700_000_001_000,
+            tag: "0060_budget_notifications",
+            breakpoints: true,
+          },
+        ],
+      }),
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "packages/db/migrations/0060_budget_notifications.sql\n" };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("flags a new SQL file whose tag is missing from the journal", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0060_budget_notifications.sql": "CREATE TABLE x;",
+      "packages/db/migrations/meta/_journal.json": JSON.stringify({
+        version: "7",
+        entries: [
+          { idx: 36, tag: "0059_prior", when: 1_700_000_000_000, breakpoints: true },
+        ],
+      }),
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "packages/db/migrations/0060_budget_notifications.sql\n" };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]!.file).toBe(
+      "packages/db/migrations/0060_budget_notifications.sql",
+    );
+    expect(result[0]!.expectedTag).toBe("0060_budget_notifications");
+    expect(result[0]!.journalPath).toBe(
+      "packages/db/migrations/meta/_journal.json",
+    );
+    expect(result[0]!.journalMissing).toBe(false);
+  });
+
+  it("flags a new SQL file when the journal file itself is missing", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0001_init.sql": "CREATE TABLE x;",
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "packages/db/migrations/0001_init.sql\n" };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]!.journalMissing).toBe(true);
+  });
+
+  it("handles monorepo layouts (apps/api/migrations/...) — journal path derived from migration path", async () => {
+    const root = await makeRepoWithMigrations({
+      "apps/api/migrations/0042_add_users.sql": "CREATE TABLE users;",
+      "apps/api/migrations/meta/_journal.json": JSON.stringify({
+        entries: [{ idx: 0, tag: "0042_add_users" }],
+      }),
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "apps/api/migrations/0042_add_users.sql\n" };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("flags multiple unregistered files in one batch (idempotent over the list)", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0060_a.sql": "CREATE TABLE a;",
+      "packages/db/migrations/0061_b.sql": "CREATE TABLE b;",
+      "packages/db/migrations/meta/_journal.json": JSON.stringify({
+        entries: [{ idx: 36, tag: "0059_prior" }],
+      }),
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return {
+            stdout:
+              "packages/db/migrations/0060_a.sql\npackages/db/migrations/0061_b.sql\n",
+          };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toHaveLength(2);
+    expect(result.map((u) => u.expectedTag).sort()).toEqual([
+      "0060_a",
+      "0061_b",
+    ]);
+  });
+
+  it("treats malformed journal JSON as a registration failure (defensive)", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0001_init.sql": "CREATE TABLE x;",
+      "packages/db/migrations/meta/_journal.json": "{ this is not valid JSON",
+    });
+    const { exec } = recordingExec({
+      git: (args) => {
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "packages/db/migrations/0001_init.sql\n" };
+        }
+        return { stdout: "" };
+      },
+    });
+    const result = await validateJournalRegistration(root, "pre", "post", {
+      _exec: exec,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]!.journalMissing).toBe(false);
   });
 });

@@ -421,6 +421,16 @@ start it; the loop never manages the dev server.
    you should still apply it yourself before e2e so your tests actually
    exercise the new schema.
 
+   **AND register the migration in the Drizzle journal.** A new
+   `<NNNN>_<tag>.sql` file on disk is NOT enough — `drizzle-kit migrate`
+   reads `packages/db/migrations/meta/_journal.json` to decide what to
+   apply. Run `pnpm drizzle-kit generate` (or whatever the project's
+   drizzle-kit command is) so the journal gains a `{ idx, tag,
+   "<NNNN>_<tag>" }` entry for your new file. Verify by `cat`'ing the
+   journal and grepping for your tag. **The loop's post-commit gate will
+   fail the iteration if the journal is stale** — applying psql alone
+   without updating the journal silently breaks deployment to prod.
+
 5. APPEND a line to progress.txt:
    `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} <one-line>" >> progress.txt`.
    Append-only — do NOT rewrite the whole file or you lose prior

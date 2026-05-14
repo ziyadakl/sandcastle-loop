@@ -28,7 +28,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, readdirSync } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
@@ -324,6 +324,79 @@ export function isDrizzleMigrationPath(p: string): boolean {
 }
 
 /**
+ * Walk `repoRoot` and return any on-disk file that satisfies
+ * `isDrizzleMigrationPath`. Pure filesystem scan — no git, no SQL exec — so
+ * it's safe to call at loop startup before any commits exist.
+ *
+ * Synchronous so it can run inside `preflight()` alongside the other sync
+ * checks (`existsSync`, `execFileSync`).
+ *
+ * Defensive bits worth knowing about:
+ *   - Symlinks are skipped entirely (Dirent.isSymbolicLink). Otherwise a
+ *     cycle (e.g. a vendored repo with `node_modules/foo -> ../..`) would
+ *     blow the stack at boot.
+ *   - Returned relative paths are normalized to forward slashes before being
+ *     passed to `isDrizzleMigrationPath`, which hardcodes `/migrations/` /
+ *     `/meta/` substrings. Otherwise Windows hosts would always return [].
+ *   - Skip list is an explicit denylist of known-large dirs, not a blanket
+ *     `startsWith(".")`, so a project that puts migrations under e.g.
+ *     `.db/migrations/0001_init.sql` is still detected.
+ */
+const SKIP_DIRS = new Set([
+  // version control + sandcastle internals
+  "node_modules",
+  ".git",
+  ".sandcastle",
+  // common hidden build/cache dirs
+  ".next",
+  ".turbo",
+  ".vercel",
+  ".cache",
+  ".svelte-kit",
+  ".nuxt",
+  ".output",
+  ".expo",
+  ".parcel-cache",
+  ".yarn",
+  ".pnpm-store",
+  // common visible build/output/vendor dirs — without these, a project that
+  // ships compiled migrations under `dist/db/migrations/` would false-positive
+  // on stale copied output instead of authoritative source migrations.
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  "target",
+  "vendor",
+  "tmp",
+]);
+
+export function listMigrationsOnDisk(repoRoot: string): string[] {
+  const out: string[] = [];
+  function walk(dir: string): void {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (ent.isSymbolicLink()) continue;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (SKIP_DIRS.has(ent.name)) continue;
+        walk(full);
+      } else if (ent.isFile()) {
+        const rel = path.relative(repoRoot, full).split(path.sep).join("/");
+        if (isDrizzleMigrationPath(rel)) out.push(rel);
+      }
+    }
+  }
+  walk(repoRoot);
+  return out;
+}
+
+/**
  * Run `git diff --name-only --diff-filter=A {pre}..{post} -- "*.sql"` and
  * return repo-relative paths in commit order.
  */
@@ -501,4 +574,105 @@ export async function applyMigrationsBetween(
   }
 
   return { applied, benignSkipped, realErrors };
+}
+
+// ---------------------------------------------------------------------------
+// Journal-registration validator
+// ---------------------------------------------------------------------------
+
+/**
+ * A new migration file added between two commits that is NOT registered in
+ * the matching drizzle `meta/_journal.json`. Drizzle's host-side
+ * `drizzle-kit migrate` reads the journal; an unregistered file is silently
+ * skipped at deployment time even though our host-side applier (which reads
+ * SQL files directly) ran it on dev. The breakage surfaces later as a
+ * missing-table / missing-column error on prod or on the next consumer's
+ * `drizzle-kit migrate`.
+ *
+ * The recovery agent has been observed marking these "recovered — work
+ * already committed" without fixing the journal, so the breakage recurs
+ * iteration after iteration. This validator is the structural gate.
+ */
+export interface UnregisteredMigration {
+  /** Repo-relative path to the new migration file. */
+  readonly file: string;
+  /** Tag the journal would need to register (basename without `.sql`). */
+  readonly expectedTag: string;
+  /** Repo-relative path to the journal that should have contained it. */
+  readonly journalPath: string;
+  /** True when the journal file itself is missing. */
+  readonly journalMissing: boolean;
+}
+
+/**
+ * For each new `*.sql` migration added between `preSha` and `postSha`,
+ * verify there's a matching entry (`entry.tag === "<basename minus .sql>"`)
+ * in `<same-migrations-dir>/meta/_journal.json`. Returns the list of files
+ * that did NOT have a matching entry — empty list means everything is
+ * registered cleanly.
+ *
+ * Pure-detection: no throws on SQL errors, no DB calls. Throws only when
+ * git fails (same surface as `applyMigrationsBetween`).
+ */
+export async function validateJournalRegistration(
+  repoRoot: string,
+  preSha: string,
+  postSha: string,
+  options: { _exec?: ExecRunner } = {},
+): Promise<UnregisteredMigration[]> {
+  if (preSha === postSha) return [];
+
+  const exec: ExecRunner = options._exec ?? defaultExecRunner;
+  const allAdded = await listAddedSqlFiles(repoRoot, preSha, postSha, exec);
+  const migrations = allAdded.filter(isDrizzleMigrationPath);
+  if (migrations.length === 0) return [];
+
+  const unregistered: UnregisteredMigration[] = [];
+  for (const mig of migrations) {
+    // Each Drizzle migration lives in <dir>/<idx>_<tag>.sql; the journal
+    // lives at <dir>/meta/_journal.json. derive both from the migration's
+    // path so we work for any monorepo layout (apps/api/migrations/...,
+    // packages/db/migrations/..., db/migrations/..., etc.).
+    const dir = path.dirname(mig);
+    const journalPath = `${dir}/meta/_journal.json`;
+    const expectedTag = path.basename(mig).replace(/\.sql$/, "");
+    const journalAbs = path.isAbsolute(journalPath)
+      ? journalPath
+      : path.join(repoRoot, journalPath);
+    let raw: string;
+    try {
+      raw = await fs.readFile(journalAbs, "utf8");
+    } catch {
+      unregistered.push({
+        file: mig,
+        expectedTag,
+        journalPath,
+        journalMissing: true,
+      });
+      continue;
+    }
+    let parsed: { entries?: { tag?: string }[] };
+    try {
+      parsed = JSON.parse(raw) as { entries?: { tag?: string }[] };
+    } catch {
+      unregistered.push({
+        file: mig,
+        expectedTag,
+        journalPath,
+        journalMissing: false,
+      });
+      continue;
+    }
+    const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+    const found = entries.some((e) => e?.tag === expectedTag);
+    if (!found) {
+      unregistered.push({
+        file: mig,
+        expectedTag,
+        journalPath,
+        journalMissing: false,
+      });
+    }
+  }
+  return unregistered;
 }

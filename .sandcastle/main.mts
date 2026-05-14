@@ -46,6 +46,7 @@ import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import {
   applyMigrationsBetween,
   listMigrationsOnDisk,
+  validateJournalRegistration,
 } from "./lib/migrations/index.js";
 import { models } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
@@ -245,6 +246,24 @@ export interface Deps {
     preSha: string,
     postSha: string,
   ): Promise<{ applied: number; realErrors: readonly { msg: string }[] }>;
+  /**
+   * Validate that every new <NNNN>_*.sql migration added between two SHAs
+   * has a matching tag in <same-dir>/meta/_journal.json. Returns the list
+   * of unregistered files (empty = all good). Tests can stub this; in
+   * production it delegates to validateJournalRegistration.
+   */
+  validateMigrationJournal(
+    repoRoot: string,
+    preSha: string,
+    postSha: string,
+  ): Promise<
+    readonly {
+      file: string;
+      expectedTag: string;
+      journalPath: string;
+      journalMissing: boolean;
+    }[]
+  >;
   /** Capture the current HEAD SHA inside the sandbox worktree. */
   captureSha(worktreePath: string): Promise<string>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
@@ -1357,6 +1376,9 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         realErrors: r.realErrors.map((e) => ({ msg: e.msg })),
       };
     },
+    async validateMigrationJournal(repoRoot, preSha, postSha) {
+      return await validateJournalRegistration(repoRoot, preSha, postSha);
+    },
     async captureSha(worktreePath) {
       try {
         return execFileSync("git", ["rev-parse", "HEAD"], {
@@ -1759,6 +1781,32 @@ async function shipAfterMigrations(
   finalMarker: string,
 ): Promise<IssueOutcome> {
   if (preSha !== "" && postSha !== "" && preSha !== postSha) {
+    // Drizzle journal-registration gate. If the implementer added a new
+    // <NNNN>_*.sql migration on disk but forgot to register it in
+    // packages/db/migrations/meta/_journal.json, drizzle-kit migrate will
+    // silently skip the file in downstream consumers / production, even
+    // though the host-side applier runs the SQL directly. Recovery agents
+    // have been observed marking these "recovered" without fixing the
+    // journal — the breakage recurs iteration after iteration. Fail loudly
+    // here, before applyMigrations even runs.
+    const unregistered = await ctx.deps.validateMigrationJournal(
+      ctx.args.repoRoot,
+      preSha,
+      postSha,
+    );
+    if (unregistered.length > 0) {
+      const lines = unregistered.map(
+        (u) =>
+          `  - ${u.file} (expected tag '${u.expectedTag}' in ${u.journalPath}` +
+          `${u.journalMissing ? " — journal MISSING" : ""})`,
+      );
+      throw new Error(
+        `migrations: ${unregistered.length} new SQL file(s) on disk are NOT ` +
+          `registered in their Drizzle journal. drizzle-kit migrate will skip ` +
+          `them in production. Regenerate the journal with \`pnpm drizzle-kit ` +
+          `generate\` or restore the entries manually:\n${lines.join("\n")}`,
+      );
+    }
     const mres = await ctx.deps.applyMigrations(
       ctx.args.repoRoot,
       preSha,

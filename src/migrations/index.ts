@@ -8,7 +8,9 @@ export {
   applyMigrationsBetween,
   classifyPsqlErrors,
   isDrizzleMigrationPath,
+  listMigrationsOnDisk,
   splitSqlStatements,
+  validateJournalRegistration,
   BENIGN_ALREADY_EXISTS_REGEX,
 } from "./drizzle-applier.js";
 
@@ -17,4 +19,5 @@ export type {
   ApplyMigrationsResult,
   ExecRunner,
   MigrationRealError,
+  UnregisteredMigration,
 } from "./drizzle-applier.js";
