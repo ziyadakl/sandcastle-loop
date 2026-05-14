@@ -12,6 +12,8 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
 import {
   IMPLEMENTER_MARKERS,
   REVIEWER_MARKERS,
@@ -24,6 +26,8 @@ import {
   RecoveryDecisionSchema,
   extractMarker,
   extractAssistantText,
+  extractAllJsonFences,
+  extractJsonCandidate,
   parseVerdict,
   MarkerNotFoundError,
   VerdictParseError,
@@ -653,7 +657,7 @@ describe("parseVerdict", () => {
 
   it("parses already-extracted assistant text", () => {
     const payload = { marker: "FIXED", commitSha: "abc1", notes: "ok" };
-    const text = `Done.\n\n${JSON.stringify(payload)}\n\nFIXED\n`;
+    const text = `Done.\n\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\`\n\nFIXED\n`;
     expect(
       parseVerdict(text, FixerVerdictSchema, { alreadyAssistantText: true })
         .marker,
@@ -717,5 +721,180 @@ describe("parseVerdict", () => {
       const e = err as VerdictParseError;
       expect(e.rawText).toContain("MAYBE_CLEAR");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractAllJsonFences (last-fence-first) + extractJsonCandidate without
+// brace-walker. Synthetic + fixture-driven coverage for the prior brace-walk
+// regression that mis-parsed `style={{ transform }}` prose as a JSON object
+// and grabbed earlier "progress summary" fenced blocks instead of the real
+// envelope.
+// ---------------------------------------------------------------------------
+
+describe("extractAllJsonFences", () => {
+  it("returns blocks in reverse source order (last fence first)", () => {
+    const text = [
+      "prose",
+      "```json",
+      '{"first": true}',
+      "```",
+      "more prose",
+      "```json",
+      '{"second": true}',
+      "```",
+    ].join("\n");
+    expect(extractAllJsonFences(text)).toEqual([
+      '{"second": true}',
+      '{"first": true}',
+    ]);
+  });
+
+  it("accepts json, JSON, and jsonc info-strings", () => {
+    const text = [
+      "```json",
+      '{"a":1}',
+      "```",
+      "```JSON",
+      '{"b":2}',
+      "```",
+      "```jsonc",
+      '{"c":3}',
+      "```",
+    ].join("\n");
+    expect(extractAllJsonFences(text)).toEqual([
+      '{"c":3}',
+      '{"b":2}',
+      '{"a":1}',
+    ]);
+  });
+
+  it("returns empty array when no fences exist", () => {
+    expect(extractAllJsonFences("just prose with { braces } but no fence")).toEqual([]);
+  });
+
+  it("ignores braces inside prose (no brace-walking)", () => {
+    // The whole point of the regression: prose `style={{ transform }}` used
+    // to be picked up by the brace-walker. Now there's no fence → no
+    // candidate.
+    const text = "Inline `style={{ transform }}` could become Tailwind.";
+    expect(extractJsonCandidate(text)).toBeNull();
+  });
+});
+
+describe("parseVerdict — fenced-block strategy (envelope-extraction regression)", () => {
+  it("returns the LAST fenced block when both fenced blocks would parse but only one is the real envelope", () => {
+    const text = [
+      "Story progress:",
+      "```json",
+      '{"marker":"STORY_COMPLETE","storyType":"ui","e2eRequired":false,"e2eActuallyRan":false,"testCommandUsed":null,"e2eAssertionLine":null,"outputNotFiltered":true,"testReachedFeature":true}',
+      "```",
+      "More prose.",
+      "```json",
+      '{"marker":"STORY_COMPLETE","storyType":"backend-only","e2eRequired":false,"e2eActuallyRan":false,"testCommandUsed":null,"e2eAssertionLine":null,"outputNotFiltered":true,"testReachedFeature":true}',
+      "```",
+      "STORY_COMPLETE",
+    ].join("\n");
+    const parsed = parseVerdict(text, ImplementerOutputSchema, {
+      alreadyAssistantText: true,
+    });
+    expect(parsed.storyType).toBe("backend-only"); // last fence wins
+  });
+
+  it("falls through to an earlier fence when the last fence fails schema validation", () => {
+    const text = [
+      "```json",
+      '{"marker":"STORY_COMPLETE","storyType":"ui","e2eRequired":false,"e2eActuallyRan":false,"testCommandUsed":null,"e2eAssertionLine":null,"outputNotFiltered":true,"testReachedFeature":true}',
+      "```",
+      "trailing noise:",
+      "```json",
+      '{"this":"is not the envelope, missing required fields"}',
+      "```",
+    ].join("\n");
+    const parsed = parseVerdict(text, ImplementerOutputSchema, {
+      alreadyAssistantText: true,
+    });
+    expect(parsed.marker).toBe("STORY_COMPLETE");
+  });
+
+  it("throws with fence-count detail when no fence validates", () => {
+    const text = [
+      "```json",
+      '{"this":"is junk"}',
+      "```",
+      "```json",
+      '{"also":"junk"}',
+      "```",
+    ].join("\n");
+    try {
+      parseVerdict(text, ImplementerOutputSchema, { alreadyAssistantText: true });
+      expect.fail("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(VerdictParseError);
+      const e = err as VerdictParseError;
+      expect(e.message).toMatch(/Found 2 fenced json block/);
+    }
+  });
+
+  it("throws clear error when no fenced json block exists at all", () => {
+    expect(() =>
+      parseVerdict("just prose, no fence anywhere.", ImplementerOutputSchema, {
+        alreadyAssistantText: true,
+      }),
+    ).toThrow(/fenced ```json/);
+  });
+});
+
+describe("parseVerdict — captured-fixture regressions (#123, #131, #132)", () => {
+  const FIXTURE_DIR = path.join(__dirname, "fixtures", "envelope-parse");
+
+  // Fixtures are full sandcastle driver logs. parseVerdict in main.mts is
+  // invoked once per implementer attempt (attempt 1, then attempt 2 on
+  // retry). The driver writes "Agent started\n...\nAgent stopped\n" around
+  // each attempt's output, concatenating multiple attempts into one log.
+  // We extract the LAST attempt's slice — that's the one whose envelope
+  // would have shipped or HALTed.
+  function loadFixture(issue: number): string {
+    const raw = readFileSync(
+      path.join(FIXTURE_DIR, `agent-issue-${issue}-implementer.log`),
+      "utf-8",
+    );
+    const startMarker = "Agent started\n";
+    const stopMarker = "\nAgent stopped";
+    const startIdx = raw.lastIndexOf(startMarker);
+    if (startIdx === -1) {
+      throw new Error(`fixture ${issue}: could not locate Agent started`);
+    }
+    const stopIdx = raw.indexOf(stopMarker, startIdx);
+    if (stopIdx === -1) {
+      throw new Error(`fixture ${issue}: no Agent stopped after last Agent started`);
+    }
+    return raw.slice(startIdx + startMarker.length, stopIdx);
+  }
+
+  it("#123 — duplicate fenced ```json``` blocks: validates against the real (last) envelope, not the progress-summary block", () => {
+    const text = loadFixture(123);
+    const parsed = parseVerdict(text, ImplementerOutputSchema, {
+      alreadyAssistantText: true,
+    });
+    expect(parsed.marker).toBe("STORY_COMPLETE");
+  });
+
+  it("#131 — HALT path with no envelope: extractMarker returns HALT so the loop gate can skip parseVerdict (parseVerdict itself would correctly refuse to find a fence)", () => {
+    const text = loadFixture(131);
+    expect(extractMarker(text, IMPLEMENTER_MARKERS)).toBe("HALT");
+    // Without the HALT gate in main.mts, parseVerdict on this fixture would
+    // throw — that's exactly the bug the gate at main.mts:1530 prevents.
+    expect(() =>
+      parseVerdict(text, ImplementerOutputSchema, { alreadyAssistantText: true }),
+    ).toThrow(VerdictParseError);
+  });
+
+  it("#132 — brace-in-prose (`style={{ transform }}`): real envelope at the end validates; the prose braces are invisible to the fenced-block extractor", () => {
+    const text = loadFixture(132);
+    const parsed = parseVerdict(text, ImplementerOutputSchema, {
+      alreadyAssistantText: true,
+    });
+    expect(parsed.marker).toBe("STORY_COMPLETE");
   });
 });

@@ -39,6 +39,8 @@ export type {
 export {
   extractMarker,
   extractAssistantText,
+  extractAllJsonFences,
+  extractJsonCandidate,
   parseVerdict,
   MarkerNotFoundError,
   VerdictParseError,

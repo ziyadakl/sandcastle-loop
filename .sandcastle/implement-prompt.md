@@ -453,6 +453,12 @@ The envelope format is a fenced code block tagged `json` placed
 or after the fenced JSON block is fine — the parser locates the fenced
 block and reads its contents directly, ignoring surrounding prose.
 
+**The certification envelope must be the LAST fenced `json` block in your
+final message.** Earlier fenced `json` blocks (for example, story-by-story
+progress summaries) are tried against the schema only as a fallback if the
+last block fails to validate — emitting them adds noise. Prefer markdown
+tables or bullet lists for summaries.
+
 ```json
 {
   "marker": "STORY_COMPLETE",

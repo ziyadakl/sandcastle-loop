@@ -259,16 +259,44 @@ export interface ParseVerdictOptions {
 }
 
 /**
+ * Return every fenced ```json``` block in the text, **last fence first**.
+ * Accepts info-strings `json`, `JSON`, and `jsonc`. The opening fence may
+ * carry trailing whitespace before the newline; the closing fence may carry
+ * leading whitespace before the backticks.
+ *
+ * The implement prompt directs agents to put the certification envelope
+ * "immediately before your final marker," so the last fenced block is the
+ * canonical envelope. Earlier fenced blocks (e.g. story-by-story progress
+ * summaries) get tried only as fallback by `parseVerdict` if the last
+ * block fails schema validation.
+ */
+export function extractAllJsonFences(text: string): string[] {
+  const fenceRegex = /```(?:json|JSON|jsonc)[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/g;
+  const blocks: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = fenceRegex.exec(text)) !== null) {
+    blocks.push(m[1].trim());
+  }
+  return blocks.reverse();
+}
+
+/**
  * Pull a JSON object substring out of arbitrary text. Strategy:
  *   1. If `tag` is provided, look for the inner content of `<tag>...</tag>`
  *      (case-sensitive; matches bash conventions).
- *   2. Otherwise, find the first `{` and walk braces (respecting strings)
- *      until the matching `}`. This handles JSON embedded in markdown like
- *      ```json { ... } ``` or surrounded by prose.
+ *   2. Otherwise, return the LAST fenced ```json``` block in the text.
  *
- * Returns null if no candidate is found.
+ * The previous behaviour brace-walked from the first `{`, which matched
+ * prose like `style={{ transform }}` and earlier-emitted JSON like
+ * progress summaries — producing "Zod schema validation failed" errors on
+ * perfectly valid runs (#132, #123). Brace-walking has been removed: if
+ * an agent emits no fenced block, that is a real prompt-following failure
+ * that should surface, not be silently patched over.
+ *
+ * Returns null if no candidate is found. Callers wanting fallback through
+ * earlier fenced blocks should use `extractAllJsonFences` directly.
  */
-function extractJsonCandidate(text: string, tag?: string): string | null {
+export function extractJsonCandidate(text: string, tag?: string): string | null {
   if (tag !== undefined && tag.length > 0) {
     // Build the regex without using `.` across newlines via `[\s\S]` so we
     // don't depend on a specific runtime's `s` flag support.
@@ -280,41 +308,8 @@ function extractJsonCandidate(text: string, tag?: string): string | null {
     if (end === -1) return null;
     return text.slice(start + open.length, end).trim();
   }
-
-  // Brace-walking JSON-finder.
-  const firstBrace = text.indexOf("{");
-  if (firstBrace === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = firstBrace; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (ch === "\\") {
-        escape = true;
-        continue;
-      }
-      if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        return text.slice(firstBrace, i + 1);
-      }
-    }
-  }
-  return null;
+  const fences = extractAllJsonFences(text);
+  return fences.length > 0 ? fences[0] : null;
 }
 
 /**
@@ -350,18 +345,53 @@ export function parseVerdict<T>(
     );
   }
 
-  const candidate = extractJsonCandidate(assistantText, options.jsonTag);
-  if (candidate === null) {
+  // Tagged path: single shot, unchanged from prior behaviour.
+  if (options.jsonTag !== undefined) {
+    const candidate = extractJsonCandidate(assistantText, options.jsonTag);
+    if (candidate === null) {
+      throw new VerdictParseError(
+        `Could not find a JSON object inside <${options.jsonTag}> tags.`,
+        new Error("no json candidate"),
+        assistantText,
+      );
+    }
+    return parseAndValidate(candidate, schema, candidate);
+  }
+
+  // Fenced-block path: try each ```json``` block from last to first. Agents
+  // are instructed to place the envelope "immediately before" their final
+  // marker, so the last fenced block is the canonical envelope. We still
+  // fall through to earlier blocks on validation failure — defends against
+  // an agent that emits a malformed last block but a valid earlier one.
+  const fences = extractAllJsonFences(assistantText);
+  if (fences.length === 0) {
     throw new VerdictParseError(
-      `Could not find a JSON object in assistant text` +
-        (options.jsonTag !== undefined
-          ? ` inside <${options.jsonTag}> tags.`
-          : ` (looked for a top-level { ... } block).`),
-      new Error("no json candidate"),
+      "Could not find a fenced ```json``` block in assistant text.",
+      new Error("no json fence"),
       assistantText,
     );
   }
+  let lastError: VerdictParseError | null = null;
+  for (const fence of fences) {
+    try {
+      return parseAndValidate(fence, schema, fence);
+    } catch (err) {
+      if (err instanceof VerdictParseError) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new VerdictParseError(
+    `Found ${fences.length} fenced json block(s) in assistant text; none matched the schema. ` +
+      `Last error: ${lastError?.message ?? "unknown"}`,
+    lastError ?? new Error("no fence matched schema"),
+    assistantText,
+  );
+}
 
+function parseAndValidate<T>(candidate: string, schema: ZodType<T>, offending: string): T {
   let parsedJson: unknown;
   try {
     parsedJson = JSON.parse(candidate);
@@ -370,16 +400,15 @@ export function parseVerdict<T>(
     throw new VerdictParseError(
       `JSON.parse failed on the extracted candidate: ${cause.message}`,
       cause,
-      candidate,
+      offending,
     );
   }
-
   const result = schema.safeParse(parsedJson);
   if (!result.success) {
     throw new VerdictParseError(
       `Zod schema validation failed: ${result.error.message}`,
       result.error,
-      candidate,
+      offending,
     );
   }
   return result.data;

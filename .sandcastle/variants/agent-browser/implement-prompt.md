@@ -500,6 +500,12 @@ MUST emit a JSON envelope with the 7 fields below. The driver pre-computed
 some of them from the spec; if your answer contradicts the driver's ground
 truth, you are wrong and the reviewer WILL reject the commit.
 
+**The certification envelope must be the LAST fenced `json` block in your
+final message.** Earlier fenced `json` blocks (for example, story-by-story
+progress summaries) are tried against the schema only as a fallback if the
+last block fails to validate — emitting them adds noise. Prefer markdown
+tables or bullet lists for summaries.
+
 The envelope format is a fenced code block tagged `json` placed
 **immediately before** your final marker, like so. Brief narration before
 or after the fenced JSON block is fine — the parser locates the fenced

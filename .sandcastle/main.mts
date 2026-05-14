@@ -41,7 +41,7 @@ import {
   postIssueComment,
   LABEL_READY,
 } from "./lib/state/index.js";
-import { parseVerdict, extractMarker } from "./lib/verdicts/index.js";
+import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import {
   applyMigrationsBetween,
@@ -1513,11 +1513,24 @@ async function runImplementer(
   // run throws "no assistant text could be extracted" and triggers recovery,
   // doubling the per-issue Opus spend. Mirror the established pattern.
   //
-  // Attempt 2 may emit a <rebuttal>...</rebuttal> block instead of a
-  // STORY_COMPLETE envelope (the implementer disagrees with the reviewer).
-  // In that case skip the envelope parse — the caller handles the rebuttal
-  // path by extracting the rebuttal block from stdout.
-  if (!(attemptNumber === 2 && extractRebuttal(r.stdout) !== "")) {
+  // The envelope is only required for STORY_COMPLETE (normal success).
+  // Two paths legitimately skip it:
+  //   - Attempt 2 with a <rebuttal>...</rebuttal> block (implementer
+  //     disagrees with the reviewer; caller handles rebuttal extraction).
+  //   - Any attempt that ends in HALT (per implement-prompt step 8 —
+  //     HALT only requires `<promise>HALT</promise>`, no JSON envelope).
+  //     Without this gate, parseVerdict throws on every HALT and the
+  //     pipeline mis-classifies a clean HALT as an envelope-missing
+  //     failure, burning a recovery pass.
+  const rebuttalPresent = attemptNumber === 2 && extractRebuttal(r.stdout) !== "";
+  const halted = (() => {
+    try {
+      return extractMarker(r.stdout, IMPLEMENTER_MARKERS) === "HALT";
+    } catch {
+      return false;
+    }
+  })();
+  if (!rebuttalPresent && !halted) {
     try {
       parseVerdict(r.stdout, ImplementerOutputSchema);
     } catch {

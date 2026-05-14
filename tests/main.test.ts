@@ -276,11 +276,14 @@ function implementerStdout(opts: {
     testReachedFeature: !isHalt,
   };
   // Pack as a stream-json line so parseVerdict's extractAssistantText picks
-  // it up out of the (synthetic) "assistant" envelope.
+  // it up out of the (synthetic) "assistant" envelope. Wrap the envelope in
+  // a fenced ```json block — parseVerdict now requires a fenced block
+  // (brace-walking removed; see parse.ts).
   const assistantText =
-    "Here is the verdict:\n" +
+    "Here is the verdict:\n\n```json\n" +
     JSON.stringify(envelope, null, 2) +
-    `\n\n${marker}`;
+    "\n```\n\n" +
+    marker;
   const streamLine = JSON.stringify({
     type: "assistant",
     message: { content: [{ type: "text", text: assistantText }] },
@@ -476,9 +479,9 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
       testReachedFeature: true,
     };
     const plainAssistantText =
-      "Here is the verdict:\n" +
+      "Here is the verdict:\n\n```json\n" +
       JSON.stringify(envelope, null, 2) +
-      "\n\nSTORY_COMPLETE";
+      "\n```\n\nSTORY_COMPLETE";
 
     const b = buildDeps();
     b.enqueue("planner", {
