@@ -132,6 +132,7 @@ Use these 9 markers in order:
 [STEP 1/9] Pick issue #{{ISSUE_NUMBER}} — read the issue spec above
 [STEP 2/9] Write failing browser check (SKIP on bug-fix stories — see story-type rubric at top)
 [STEP 3/9] Write code (GREEN) — for bug-fix stories: diagnose root cause + fix in src/
+[STEP 3.5/9] Checkpoint commit — WIP snapshot so work survives if later steps fail (see STEP 3.5/9 rules below)
 [STEP 4/9] Typecheck
 [STEP 5/9] Unit tests
 [STEP 5.5/9] Simplify pass — invoke /simplify on changed code (see STEP 5.5/9 rules below)
@@ -153,6 +154,38 @@ display follows whichever step you most recently announced.
 
 These markers are how the loop driver renders status to the operator. Do
 NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
+
+# STEP 3.5/9 (Checkpoint commit) — rules
+
+After writing the implementation code in STEP 3 and BEFORE running
+typecheck (STEP 4), commit a WIP snapshot of your work. This is a safety
+net — if a later step (a slow agent-browser run, an install failure,
+network timeout, or the iteration budget running out) prevents you from
+reaching STEP 9, the recovery agent finds your in-progress code in git
+instead of starting from scratch.
+
+Run exactly:
+
+```
+git add -A
+git commit -m "RALPH(it={{ITERATION}} issue={{ISSUE_NUMBER}}) WIP: <one-line description of what STEP 3 wrote>"
+```
+
+The `WIP:` infix tells downstream agents (reviewer, merger, recovery)
+that this is unfinished work, not a shippable commit — they will skip the
+e2e certification check on `WIP:` commits and treat them as preserved-
+progress only.
+
+The WIP commit does NOT include the certification block. Only the final
+STEP 9 commit does.
+
+If `git commit` says "nothing to commit," STEP 3 didn't actually change
+any files on disk — go back and write the code. Do not SKIP this step
+with that excuse; the no-changes case is itself a problem worth catching.
+
+STEP 9 still produces a normal final commit on top of this WIP. The PR
+will show two commits per iteration in the normal pass — that is the
+intentional trade for guaranteed work-preservation across failure modes.
 
 # STEP 5.5/9 (Simplify) — rules
 
