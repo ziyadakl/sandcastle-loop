@@ -28,7 +28,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { promises as fs, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
@@ -429,6 +429,51 @@ async function listAddedSqlFiles(
     .filter((s) => s.length > 0);
 }
 
+// Detect parallel-worktree numbering collisions: two migrations whose
+// Drizzle 4-digit prefix is identical. Returns one entry per colliding prefix.
+function detectPrefixCollisions(
+  migrations: readonly string[],
+): { prefix: string; files: string[] }[] {
+  const byPrefix = new Map<string, string[]>();
+  for (const m of migrations) {
+    const base = path.basename(m);
+    const match = /^(\d{4})_/.exec(base);
+    if (!match) continue;
+    const prefix = match[1]!;
+    const list = byPrefix.get(prefix) ?? [];
+    list.push(m);
+    byPrefix.set(prefix, list);
+  }
+  return [...byPrefix.entries()]
+    .filter(([, files]) => files.length > 1)
+    .map(([prefix, files]) => ({ prefix, files }));
+}
+
+// Read a file's content from a git commit object, NOT the working tree. The
+// orchestrator and per-issue agents run in different worktrees that share one
+// object DB — `git show <sha>:<path>` is worktree-independent and avoids the
+// false-ENOENT failures we'd hit if we read via `fs.readFile(repoRoot + path)`
+// while the file actually lives in a sub-worktree's checkout.
+async function readFileFromCommit(
+  repoRoot: string,
+  sha: string,
+  relPath: string,
+  exec: ExecRunner,
+): Promise<{ ok: true; content: string } | { ok: false; msg: string }> {
+  const { stdout, stderr, exitCode } = await exec(
+    "git",
+    ["show", `${sha}:${relPath}`],
+    { cwd: repoRoot, timeout: 30_000 },
+  );
+  if (exitCode !== 0) {
+    return {
+      ok: false,
+      msg: `git show ${sha}:${relPath} failed (rc=${exitCode}): ${(stderr || stdout).trim()}`,
+    };
+  }
+  return { ok: true, content: stdout };
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -491,6 +536,26 @@ export async function applyMigrationsBetween(
     return { applied: 0, benignSkipped: 0, realErrors: [] };
   }
 
+  // Surface parallel-worktree migration-prefix collisions as a real error
+  // before we touch the DB. Two independently-developed issues that both
+  // generate `0061_*.sql` in their own sub-worktrees will get merged into one
+  // commit range and we cannot safely apply both — one would silently overwrite
+  // the other (or one already did at merge time). Caller halts the iteration.
+  const prefixCollisions = detectPrefixCollisions(migrations);
+  if (prefixCollisions.length > 0) {
+    return {
+      applied: 0,
+      benignSkipped: 0,
+      realErrors: prefixCollisions.map(({ prefix, files }) => ({
+        file: files[0]!,
+        stmt: "",
+        msg:
+          `migration prefix collision: ${files.length} files share prefix '${prefix}': ` +
+          `${files.join(", ")}. Renumber one before merging.`,
+      })),
+    };
+  }
+
   if (databaseUrl.length === 0) {
     throw new Error(
       "applyMigrationsBetween: no DATABASE_URL set (and none passed via options.databaseUrl) — " +
@@ -503,20 +568,18 @@ export async function applyMigrationsBetween(
   const realErrors: MigrationRealError[] = [];
 
   for (const mig of migrations) {
-    const abs = path.isAbsolute(mig) ? mig : path.join(repoRoot, mig);
-    let sql: string;
-    try {
-      sql = await fs.readFile(abs, "utf8");
-    } catch (err) {
+    const read = await readFileFromCommit(repoRoot, postSha, mig, exec);
+    if (!read.ok) {
       realErrors.push({
         file: mig,
         stmt: "",
-        msg: `failed to read migration file: ${(err as Error).message}`,
+        msg: `failed to read migration file: ${read.msg}`,
       });
       // A read failure on this migration shouldn't poison subsequent ones —
       // but the caller should treat the iteration as failed regardless.
       continue;
     }
+    const sql = read.content;
 
     const statements = splitSqlStatements(sql);
     for (const stmt of statements) {
@@ -636,13 +699,8 @@ export async function validateJournalRegistration(
     const dir = path.dirname(mig);
     const journalPath = `${dir}/meta/_journal.json`;
     const expectedTag = path.basename(mig).replace(/\.sql$/, "");
-    const journalAbs = path.isAbsolute(journalPath)
-      ? journalPath
-      : path.join(repoRoot, journalPath);
-    let raw: string;
-    try {
-      raw = await fs.readFile(journalAbs, "utf8");
-    } catch {
+    const read = await readFileFromCommit(repoRoot, postSha, journalPath, exec);
+    if (!read.ok) {
       unregistered.push({
         file: mig,
         expectedTag,
@@ -651,6 +709,7 @@ export async function validateJournalRegistration(
       });
       continue;
     }
+    const raw = read.content;
     let parsed: { entries?: { tag?: string }[] };
     try {
       parsed = JSON.parse(raw) as { entries?: { tag?: string }[] };

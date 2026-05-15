@@ -34,13 +34,38 @@ function recordingExec(handler: {
   psql?: (
     args: readonly string[],
   ) => { stdout?: string; stderr?: string; exitCode?: number };
+  // When set, `git show <sha>:<path>` calls are served from this on-disk
+  // tmp root by reading the file at `<gitShowRoot>/<path>`. Mirrors the
+  // production change: the applier and journal validator now read from a
+  // commit object (worktree-independent). Tests still use a tmp dir, but
+  // the dispatch path proves the function asked git, not the FS, for the
+  // content.
+  gitShowRoot?: string;
 }): { exec: ExecRunner; calls: ExecCall[] } {
   const calls: ExecCall[] = [];
   const exec: ExecRunner = async (bin, args) => {
     calls.push({ bin, args: [...args] });
-    if (bin === "git" && handler.git) {
-      const r = handler.git(args);
-      return { stdout: r.stdout, stderr: "", exitCode: r.exitCode ?? 0 };
+    if (bin === "git") {
+      if (handler.gitShowRoot && args[0] === "show") {
+        const spec = args[1] ?? "";
+        const idx = spec.indexOf(":");
+        const rel = idx >= 0 ? spec.slice(idx + 1) : spec;
+        const abs = path.join(handler.gitShowRoot, rel);
+        try {
+          const content = await fs.readFile(abs, "utf8");
+          return { stdout: content, stderr: "", exitCode: 0 };
+        } catch {
+          return {
+            stdout: "",
+            stderr: `fatal: path '${rel}' does not exist`,
+            exitCode: 128,
+          };
+        }
+      }
+      if (handler.git) {
+        const r = handler.git(args);
+        return { stdout: r.stdout, stderr: "", exitCode: r.exitCode ?? 0 };
+      }
     }
     if (bin === "psql" && handler.psql) {
       const r = handler.psql(args);
@@ -193,6 +218,7 @@ describe("applyMigrationsBetween", () => {
     });
 
     const { exec, calls } = recordingExec({
+      gitShowRoot: root,
       git: () => ({
         stdout: "packages/db/migrations/0001_init.sql\n",
       }),
@@ -226,6 +252,7 @@ describe("applyMigrationsBetween", () => {
     });
 
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: () => ({
         stdout: "packages/db/migrations/0002_add_orders.sql\n",
       }),
@@ -254,6 +281,7 @@ describe("applyMigrationsBetween", () => {
     });
 
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: () => ({
         stdout: "packages/db/migrations/0003_seed.sql\n",
       }),
@@ -288,6 +316,7 @@ describe("applyMigrationsBetween", () => {
   it("preSha === postSha: no git diff invoked, returns empty result", async () => {
     const root = await makeRepoWithMigrations({});
     const { exec, calls } = recordingExec({
+      gitShowRoot: root,
       git: () => ({ stdout: "", exitCode: 0 }),
     });
     const result = await applyMigrationsBetween(root, "abc", "abc", {
@@ -304,6 +333,7 @@ describe("applyMigrationsBetween", () => {
       "packages/db/migrations/0004_x.sql": "CREATE TABLE x (id int);",
     });
     const { exec, calls } = recordingExec({
+      gitShowRoot: root,
       git: () => ({
         stdout: [
           "scripts/seed.sql",
@@ -322,6 +352,106 @@ describe("applyMigrationsBetween", () => {
     // Only one psql call — seed.sql was filtered out
     expect(calls.filter((c) => c.bin === "psql")).toHaveLength(1);
   });
+
+  // Regression for the affinity-tracker sub-worktree pattern: the applier used
+  // to read migration SQL via `fs.readFile(repoRoot + path)`, which returns
+  // false ENOENT when `repoRoot` is the orchestrator outer worktree but the
+  // agent's commits live in a per-issue sub-worktree. The fix reads from the
+  // commit object via `git show <postSha>:<path>`, which is worktree-independent.
+  it("reads migration SQL via `git show <postSha>:<path>`, not the working tree", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0010_present.sql": "CREATE TABLE present (id int);",
+    });
+    const { exec, calls } = recordingExec({
+      gitShowRoot: root,
+      git: (args) => {
+        if (args[0] === "diff") {
+          return { stdout: "packages/db/migrations/0010_present.sql\n" };
+        }
+        return { stdout: "" };
+      },
+      psql: () => ({ exitCode: 0 }),
+    });
+    const result = await applyMigrationsBetween(root, "pre", "post-sha", {
+      databaseUrl: "postgres://test",
+      _exec: exec,
+    });
+    expect(result.realErrors).toEqual([]);
+    expect(result.applied).toBe(1);
+    // Proves the dispatch path: a `git show post-sha:packages/db/...` call must
+    // appear in the recorded exec calls. No `fs.readFile`, no path.join with
+    // repoRoot for content reading.
+    const show = calls.find(
+      (c) =>
+        c.bin === "git" &&
+        c.args[0] === "show" &&
+        c.args[1] === "post-sha:packages/db/migrations/0010_present.sql",
+    );
+    expect(show).toBeDefined();
+  });
+
+  // Parallel-worktree numbering hazard: two issues both generated `0061_*.sql`
+  // in their own sub-worktrees. Final commit range contains both files with
+  // the same numeric prefix. Applying one would silently overwrite the other.
+  // The applier returns a clear, structured error before touching the DB.
+  it("detects migration prefix collisions and refuses to apply", async () => {
+    const root = await makeRepoWithMigrations({
+      "packages/db/migrations/0061_goal_milestone.sql": "CREATE TABLE a (id int);",
+      "packages/db/migrations/0061_transaction_notification.sql":
+        "CREATE TABLE b (id int);",
+    });
+    const { exec, calls } = recordingExec({
+      gitShowRoot: root,
+      git: (args) => {
+        if (args[0] === "diff") {
+          return {
+            stdout:
+              "packages/db/migrations/0061_goal_milestone.sql\n" +
+              "packages/db/migrations/0061_transaction_notification.sql\n",
+          };
+        }
+        return { stdout: "" };
+      },
+      psql: () => ({ exitCode: 0 }),
+    });
+    const result = await applyMigrationsBetween(root, "pre", "post", {
+      databaseUrl: "postgres://test",
+      _exec: exec,
+    });
+    expect(result.applied).toBe(0);
+    expect(result.realErrors).toHaveLength(1);
+    expect(result.realErrors[0]!.msg).toMatch(/migration prefix collision/);
+    expect(result.realErrors[0]!.msg).toMatch(/'0061'/);
+    expect(result.realErrors[0]!.msg).toMatch(/0061_goal_milestone\.sql/);
+    expect(result.realErrors[0]!.msg).toMatch(/0061_transaction_notification\.sql/);
+    // Crucially, no psql calls — we refuse before touching the DB.
+    expect(calls.filter((c) => c.bin === "psql")).toHaveLength(0);
+  });
+
+  it("a missing-from-commit migration is reported as a real error (git show ENOENT path)", async () => {
+    const root = await makeRepoWithMigrations({});
+    // Diff claims the file was added, but it's not on disk under gitShowRoot —
+    // so the mock returns the git-show ENOENT rc=128 path. The applier should
+    // surface a structured realError, not throw.
+    const { exec } = recordingExec({
+      gitShowRoot: root,
+      git: (args) => {
+        if (args[0] === "diff") {
+          return { stdout: "packages/db/migrations/0099_phantom.sql\n" };
+        }
+        return { stdout: "" };
+      },
+      psql: () => ({ exitCode: 0 }),
+    });
+    const result = await applyMigrationsBetween(root, "pre", "post", {
+      databaseUrl: "postgres://test",
+      _exec: exec,
+    });
+    expect(result.applied).toBe(0);
+    expect(result.realErrors).toHaveLength(1);
+    expect(result.realErrors[0]!.msg).toMatch(/failed to read migration file/);
+    expect(result.realErrors[0]!.msg).toMatch(/git show/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -336,10 +466,11 @@ describe("applyMigrationsBetween", () => {
 
 describe("validateJournalRegistration", () => {
   it("returns empty when no new migrations were added between commits", async () => {
+    const root = await makeRepoWithMigrations({});
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: () => ({ stdout: "" }), // no added files
     });
-    const root = await makeRepoWithMigrations({});
     const result = await validateJournalRegistration(root, "pre", "post", {
       _exec: exec,
     });
@@ -366,6 +497,7 @@ describe("validateJournalRegistration", () => {
       }),
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return { stdout: "packages/db/migrations/0060_budget_notifications.sql\n" };
@@ -390,6 +522,7 @@ describe("validateJournalRegistration", () => {
       }),
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return { stdout: "packages/db/migrations/0060_budget_notifications.sql\n" };
@@ -416,6 +549,7 @@ describe("validateJournalRegistration", () => {
       "packages/db/migrations/0001_init.sql": "CREATE TABLE x;",
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return { stdout: "packages/db/migrations/0001_init.sql\n" };
@@ -438,6 +572,7 @@ describe("validateJournalRegistration", () => {
       }),
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return { stdout: "apps/api/migrations/0042_add_users.sql\n" };
@@ -460,6 +595,7 @@ describe("validateJournalRegistration", () => {
       }),
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return {
@@ -486,6 +622,7 @@ describe("validateJournalRegistration", () => {
       "packages/db/migrations/meta/_journal.json": "{ this is not valid JSON",
     });
     const { exec } = recordingExec({
+      gitShowRoot: root,
       git: (args) => {
         if (args[0] === "diff" && args.includes("--name-only")) {
           return { stdout: "packages/db/migrations/0001_init.sql\n" };
