@@ -431,6 +431,14 @@ start it; the loop never manages the dev server.
    fail the iteration if the journal is stale** — applying psql alone
    without updating the journal silently breaks deployment to prod.
 
+   **Numbering discipline.** Before you choose your `<NNNN>` prefix,
+   `ls packages/db/migrations/` (or the equivalent dir) on the base
+   branch and use `highest + 1`. Parallel issues sometimes both grab the
+   same number in their separate sub-worktrees; the loop's applier now
+   detects prefix collisions and fails the iteration with a clear error
+   before any psql runs. If you see that error, renumber your migration
+   rather than fighting it.
+
 5. APPEND a line to progress.txt:
    `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} <one-line>" >> progress.txt`.
    Append-only — do NOT rewrite the whole file or you lose prior
