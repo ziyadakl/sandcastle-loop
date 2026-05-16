@@ -437,7 +437,7 @@ function detectPrefixCollisions(
   const byPrefix = new Map<string, string[]>();
   for (const m of migrations) {
     const base = path.basename(m);
-    const match = /^(\d{4})_/.exec(base);
+    const match = /^(\d{4,})_/.exec(base);
     if (!match) continue;
     const prefix = match[1]!;
     const list = byPrefix.get(prefix) ?? [];
