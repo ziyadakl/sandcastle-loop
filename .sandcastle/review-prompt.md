@@ -56,10 +56,14 @@ sentences) why the rebuttal didn't change your mind.
 </branch-patch>
 
 # E2E LOG — only present if the implementer ran playwright
+# Bounded to the last 50KB. Huge logs (e.g. failing tests with deep stack
+# traces and screenshot blobs) used to blow the reviewer's context window
+# at ~116k tokens and crash this prompt with "Prompt is too long" — the
+# tail keeps the actually-useful tail-of-run output (failures, summary).
 
 <e2e-log>
 
-!`if [ -f /tmp/ralph-e2e-it{{ITERATION}}.log ]; then cat /tmp/ralph-e2e-it{{ITERATION}}.log; else echo "(no /tmp/ralph-e2e-it{{ITERATION}}.log present — implementer did not run playwright)"; fi`
+!`if [ -f /tmp/ralph-e2e-it{{ITERATION}}.log ]; then SIZE=$(wc -c < /tmp/ralph-e2e-it{{ITERATION}}.log); if [ "$SIZE" -gt 50000 ]; then echo "[e2e log truncated — original size ${SIZE} bytes, showing last 50000]"; tail -c 50000 /tmp/ralph-e2e-it{{ITERATION}}.log; else cat /tmp/ralph-e2e-it{{ITERATION}}.log; fi; else echo "(no /tmp/ralph-e2e-it{{ITERATION}}.log present — implementer did not run playwright)"; fi`
 
 </e2e-log>
 
