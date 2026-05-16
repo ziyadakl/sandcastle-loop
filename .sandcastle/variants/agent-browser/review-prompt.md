@@ -215,10 +215,45 @@ Beyond the execution-evidence check above, evaluate the diff for:
 Skip cosmetic / SOFT findings entirely — DO NOT block on naming, comment
 phrasing, or "prefer this pattern" suggestions.
 
+# CATEGORY SWEEP — required output before the final marker
+
+Reviewers that find one issue and stop produce ping-pong retry cycles —
+round 1 surfaces bug A, the implementer fixes A, round 2 surfaces bug B
+that was always there, and the ticket bounces to needs-human even though
+both bugs were findable in one pass. To prevent that, before you emit
+the final marker you MUST output exactly the block below, with one line
+per category. Choices per line:
+
+- `ok` — you looked at this category and found nothing wrong.
+- `n/a (<one-line reason>)` — the category does not apply to this diff
+  (e.g. `n/a (no schema changes in diff)`). Be specific about why.
+- `<one-line finding>` — quote the issue in one sentence. Classify it
+  HARD / MEDIUM / SOFT in the full review above.
+
+A finding in any one category is fine. The point of the sweep is to
+make "I didn't look at the other categories" impossible — every line
+must be present, even if just to say `ok`.
+
+```
+CATEGORY SWEEP:
+- Execution evidence: <ok | n/a (...) | <finding>>
+- Spec fit: <ok | n/a (...) | <finding>>
+- Test coverage: <ok | n/a (...) | <finding>>
+- Type safety: <ok | n/a (...) | <finding>>
+- Security: <ok | n/a (...) | <finding>>
+- Error handling: <ok | n/a (...) | <finding>>
+- Edge cases: <ok | n/a (...) | <finding>>
+SWEEP COMPLETE.
+```
+
+SOFT findings appear in the sweep for completeness but do NOT trigger
+`HAS_BLOCKERS`. Only HARD and MEDIUM findings block.
+
 # OUTPUT FORMAT
 
 First, output the line: `[STEP 1/1] Review` (this is required — the loop
-driver uses it to render status). Then do the review. End with one of:
+driver uses it to render status). Then do the review (prose findings).
+Then output the CATEGORY SWEEP block defined above. Then emit one of:
 
 - `ALL_CLEAR` — no HARD or MEDIUM concerns. (Cosmetic SOFT findings are
   fine; do not block on them.)
