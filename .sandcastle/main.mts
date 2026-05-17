@@ -1849,11 +1849,17 @@ export function extractCategorySweep(
 
 /**
  * Decide whether the implementer demonstrably resolved every category
- * the reviewer flagged in round 1. Returns true iff every category that
- * was a "finding" in `sweep1` is now "ok" or "n/a" in `sweep2`. When
- * true, round 2's HAS_BLOCKERS findings are genuinely new — round 1's
- * complaints got fixed and the reviewer surfaced a different bug. The
- * loop grants a third attempt instead of waking the user.
+ * the reviewer flagged in round 1. Returns true iff round 1 had at
+ * least one structured finding AND every such finding is now "ok" or
+ * "n/a" in round 2. When true, round 2's HAS_BLOCKERS findings are
+ * genuinely new -- round 1's complaints got fixed and the reviewer
+ * surfaced a different bug. The loop grants a third attempt instead
+ * of waking the user.
+ *
+ * An empty sweep1 (zero "finding" entries) is NOT evidence of progress:
+ * the reviewer emitted HAS_BLOCKERS in round 1, so something was wrong,
+ * but the sweep didn't classify it. Granting a third attempt on that
+ * basis would be a vacuous freebie. Deny instead.
  *
  * Conservative on missing data: a category that was a finding in round 1
  * but is absent from round 2's sweep counts as unresolved.
@@ -1862,13 +1868,48 @@ export function priorFindingsResolved(
   sweep1: ReadonlyMap<string, SweepStatus>,
   sweep2: ReadonlyMap<string, SweepStatus>,
 ): boolean {
+  let sawRound1Finding = false;
   for (const [cat, status] of sweep1.entries()) {
     if (status !== "finding") continue;
+    sawRound1Finding = true;
     const next = sweep2.get(cat);
     if (next === undefined) return false;
     if (next === "finding") return false;
   }
+  // Vacuous case: round 1 had no structured findings to clear, so we
+  // have no positive evidence of progress -- deny the grant.
+  if (!sawRound1Finding) return false;
   return true;
+}
+
+/**
+ * Diagnose why the third-attempt grant was denied. Returns a short
+ * human-readable reason that operators auditing a quarantine can read
+ * in the log to understand which of the four denial paths tripped.
+ * Used purely for logging; the gate decision itself runs on the
+ * returned boolean from `priorFindingsResolved`.
+ */
+export function thirdAttemptDenyReason(
+  sweep1: ReadonlyMap<string, SweepStatus> | null,
+  sweep2: ReadonlyMap<string, SweepStatus> | null,
+): string {
+  if (sweep1 === null) return "sweep1 unparsable";
+  if (sweep2 === null) return "sweep2 unparsable";
+  // Re-derive: any round-1 finding category that is still a finding
+  // (or absent) in round 2 is the recurring blocker.
+  for (const [cat, status] of sweep1.entries()) {
+    if (status !== "finding") continue;
+    const next = sweep2.get(cat);
+    if (next === undefined) {
+      return `category ${JSON.stringify(cat)} was a round-1 finding but is absent from round-2 sweep`;
+    }
+    if (next === "finding") {
+      return `category ${JSON.stringify(cat)} was a finding in both rounds (recurring blocker)`;
+    }
+  }
+  // No recurring blocker found -- the only remaining denial cause is
+  // an empty sweep1 (no structured findings to clear).
+  return "round-1 sweep had zero structured findings (vacuous)";
 }
 
 /** Negative guard shared by both transient-error predicates: permanent errors
@@ -2253,22 +2294,18 @@ async function runIssuePipeline(
       sweep2 !== null &&
       priorFindingsResolved(sweep1, sweep2);
 
+    if (!grantRound3) {
+      // Surface the denial reason so an operator auditing a quarantine
+      // can tell which of the four denial paths tripped: sweep1
+      // unparsable, sweep2 unparsable, recurring blocker (same category
+      // a finding in both rounds), or vacuous round-1 sweep.
+      const reason = thirdAttemptDenyReason(sweep1, sweep2);
+      ctx.deps.log(
+        `[issue=${ctx.issueNumber}] round-3 grant denied: ${reason}`,
+      );
+    }
+
     if (grantRound3) {
-      // Vacuous-true sanity log: if sweep1 had zero findings yet round 1
-      // emitted HAS_BLOCKERS, the reviewer's prose and sweep disagree —
-      // priorFindingsResolved still returns true (nothing to compare),
-      // so the grant fires, but the operator should know the reviewer
-      // produced a contradictory verdict that we're papering over.
-      const round1FindingCount = [...sweep1!.values()].filter(
-        (s) => s === "finding",
-      ).length;
-      if (round1FindingCount === 0) {
-        ctx.deps.log(
-          `[issue=${ctx.issueNumber}] WARNING: round-1 reviewer emitted ` +
-            `HAS_BLOCKERS but its CATEGORY SWEEP had zero findings — ` +
-            `granting attempt 3 vacuously. Reviewer prose/sweep disagree.`,
-        );
-      }
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] reviewer attempt 2 HAS_BLOCKERS but ` +
           `round-1 categories resolved — granting attempt 3 on ` +

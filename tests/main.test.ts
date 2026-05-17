@@ -2208,13 +2208,23 @@ describe("priorFindingsResolved", () => {
     expect(priorFindingsResolved(r1, r2)).toBe(false);
   });
 
-  it("true: round 1 had only ok/n/a — vacuously resolved", () => {
+  it("false: round 1 had only ok/n/a — empty sweep1 is NOT evidence of progress", () => {
+    // Previously this case granted vacuously. New policy: an empty
+    // sweep1 (no structured findings to clear) means we have no
+    // positive evidence the implementer made progress, so we deny
+    // the third attempt instead of gifting a freebie.
     const r1 = new Map([
       ["spec fit", "ok" as const],
       ["test coverage", "n/a" as const],
     ]);
     const r2 = new Map([["type safety", "finding" as const]]);
-    expect(priorFindingsResolved(r1, r2)).toBe(true);
+    expect(priorFindingsResolved(r1, r2)).toBe(false);
+  });
+
+  it("false: completely empty sweep1 → deny", () => {
+    const r1 = new Map<string, "ok" | "n/a" | "finding">();
+    const r2 = new Map([["spec fit", "finding" as const]]);
+    expect(priorFindingsResolved(r1, r2)).toBe(false);
   });
 
   it("n/a in round 2 counts as resolved for a round-1 finding", () => {
