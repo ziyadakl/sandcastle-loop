@@ -17,6 +17,7 @@ import {
   splitSqlStatements,
   validateJournalRegistration,
   BENIGN_ALREADY_EXISTS_REGEX,
+  _createExecRunner,
   type ExecRunner,
 } from "../src/migrations/drizzle-applier.js";
 
@@ -635,5 +636,59 @@ describe("validateJournalRegistration", () => {
     });
     expect(result).toHaveLength(1);
     expect(result[0]!.journalMissing).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// defaultExecRunner maxBuffer overflow — adversarial-review finding #5
+// ---------------------------------------------------------------------------
+// `git show <sha>:<huge-migration>` previously truncated at 16 MiB and the
+// applier silently applied half a file. The runner now (a) bumps the cap to
+// 256 MiB, and (b) surfaces ERR_CHILD_PROCESS_STDIO_MAXBUFFER as a failed
+// exec with an explicit stderr instead of returning partial stdout.
+
+describe("defaultExecRunner maxBuffer overflow guard", () => {
+  it("converts ERR_CHILD_PROCESS_STDIO_MAXBUFFER into a failed exec with explicit stderr", async () => {
+    // Fake execFileP that mimics Node's behavior when stdout exceeds maxBuffer.
+    const fakeExecFileP = async () => {
+      const err = Object.assign(new Error("stdout maxBuffer length exceeded"), {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        stdout: "",
+        stderr: "",
+      });
+      throw err;
+    };
+    const runner = _createExecRunner(64, fakeExecFileP);
+    const r = await runner("git", ["show", "abc:big.sql"], { cwd: "/tmp" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("exceeded maxBuffer");
+  });
+
+  it("converts a successful return whose stdout exactly equals maxBuffer into the same failure (defensive)", async () => {
+    // If stdout fills the buffer to the byte and the child exits cleanly,
+    // some Node versions return success rather than throw. We refuse it.
+    const fakeExecFileP = async (
+      _bin: string,
+      _args: string[],
+      opts: { maxBuffer?: number },
+    ) => {
+      const filler = "a".repeat(opts.maxBuffer ?? 0);
+      return { stdout: filler, stderr: "" };
+    };
+    const runner = _createExecRunner(128, fakeExecFileP);
+    const r = await runner("git", ["show", "abc:huge.sql"], { cwd: "/tmp" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("exceeded maxBuffer");
+  });
+
+  it("passes stdout through untouched when it's shorter than maxBuffer", async () => {
+    const fakeExecFileP = async () => ({ stdout: "hello", stderr: "" });
+    const runner = _createExecRunner(128, fakeExecFileP);
+    const r = await runner("git", ["show", "abc:tiny.sql"], { cwd: "/tmp" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("hello");
+    expect(r.stderr).toBe("");
   });
 });

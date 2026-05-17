@@ -63,7 +63,7 @@ sentences) why the rebuttal didn't change your mind.
 
 <e2e-log>
 
-!`if [ -f /tmp/ralph-e2e-it{{ITERATION}}.log ]; then SIZE=$(wc -c < /tmp/ralph-e2e-it{{ITERATION}}.log); if [ "$SIZE" -gt 50000 ]; then echo "[e2e log truncated — original size ${SIZE} bytes, showing last 50000]"; tail -c 50000 /tmp/ralph-e2e-it{{ITERATION}}.log; else cat /tmp/ralph-e2e-it{{ITERATION}}.log; fi; else echo "(no /tmp/ralph-e2e-it{{ITERATION}}.log present — implementer did not run playwright)"; fi`
+!`if [ -f /tmp/ralph-e2e-it{{ITERATION}}.log ]; then node -e "const fs=require('fs');const p='/tmp/ralph-e2e-it{{ITERATION}}.log';const s=fs.readFileSync(p,'utf8');const LIMIT=50000;if(s.length>LIMIT){const nl=s.indexOf('\n',s.length-LIMIT);const cut=nl>=0?nl+1:s.length-LIMIT;process.stdout.write('[e2e log truncated — original size '+Buffer.byteLength(s,'utf8')+' bytes, '+s.length+' chars, showing last '+(s.length-cut)+' chars from newline boundary]\n'+s.slice(cut));}else{process.stdout.write(s);}"; else echo "(no /tmp/ralph-e2e-it{{ITERATION}}.log present — implementer did not run playwright)"; fi`
 
 </e2e-log>
 

@@ -478,33 +478,94 @@ async function readFileFromCommit(
 // Public API
 // ---------------------------------------------------------------------------
 
-const defaultExecRunner: ExecRunner = async (bin, args, opts) => {
-  try {
-    const { stdout, stderr } = await execFileP(bin, [...args], {
-      cwd: opts.cwd,
-      env: opts.env,
-      timeout: opts.timeout,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return { stdout, stderr, exitCode: 0 };
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & {
-      stdout?: string;
-      stderr?: string;
-      code?: number | string;
-    };
-    const exitCode =
-      typeof e.code === "number" ? e.code : e.code === undefined ? 1 : 1;
-    return {
-      stdout: typeof e.stdout === "string" ? e.stdout : "",
-      stderr:
-        typeof e.stderr === "string"
-          ? e.stderr
-          : e.message ?? "execFile failed",
-      exitCode,
-    };
-  }
-};
+// Bumped from 16 MiB → 256 MiB. The smaller cap silently truncated the
+// stdout of `git show <sha>:<huge-migration>.sql` once we hit a real-world
+// migration in the multi-megabyte range, and the caller had no way to know
+// it was applying half a file. 256 MiB gives plenty of headroom for any
+// realistic migration. If something *does* exceed it we now fail loud
+// (see ERR_CHILD_PROCESS_STDIO_MAXBUFFER handling in the catch).
+const DEFAULT_EXEC_MAX_BUFFER = 256 * 1024 * 1024;
+
+const MAXBUFFER_OVERFLOW_MSG =
+  "git/exec output exceeded maxBuffer (256 MiB) — refusing to apply potentially-truncated content";
+
+/**
+ * Internal exec-runner factory. The default production runner uses
+ * `DEFAULT_EXEC_MAX_BUFFER` (256 MiB); the test seam overrides this so
+ * tests can exercise the overflow / truncation branches without producing
+ * 256 MiB of output.
+ *
+ * The `_execFileP` parameter is also an injection point for tests — by
+ * default it's the promisified `node:child_process.execFile`; tests pass
+ * a fake that throws `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` or returns a
+ * stdout-equal-to-maxBuffer payload to drive the overflow paths.
+ */
+type ExecFileP = (
+  bin: string,
+  args: string[],
+  opts: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    timeout?: number;
+    maxBuffer?: number;
+  },
+) => Promise<{ stdout: string; stderr: string }>;
+
+export function _createExecRunner(
+  maxBuffer: number,
+  execFilePImpl: ExecFileP = execFileP as unknown as ExecFileP,
+): ExecRunner {
+  return async (bin, args, opts) => {
+    try {
+      const { stdout, stderr } = await execFilePImpl(bin, [...args], {
+        cwd: opts.cwd,
+        env: opts.env,
+        timeout: opts.timeout,
+        maxBuffer,
+      });
+      // Defensive: if stdout exactly equals the maxBuffer length, treat it as
+      // truncation. execFile's contract is to throw ERR_CHILD_PROCESS_STDIO_MAXBUFFER
+      // when overflow is detected, but in some Node versions / edge cases the
+      // detection has been observed to round-trip without throwing if the child
+      // exits right as the buffer fills. Refuse to return potentially-truncated
+      // content as success.
+      if (typeof stdout === "string" && stdout.length === maxBuffer) {
+        return { stdout: "", stderr: MAXBUFFER_OVERFLOW_MSG, exitCode: 1 };
+      }
+      return { stdout, stderr, exitCode: 0 };
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & {
+        stdout?: string;
+        stderr?: string;
+        code?: number | string;
+      };
+      // Explicit overflow path: surface as a failed exec with a clear stderr,
+      // not as silently-truncated stdout. The caller (readFileFromCommit)
+      // reports this as a real error and the iteration fails instead of
+      // half-applying a migration.
+      if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+        return { stdout: "", stderr: MAXBUFFER_OVERFLOW_MSG, exitCode: 1 };
+      }
+      const exitCode =
+        typeof e.code === "number" ? e.code : e.code === undefined ? 1 : 1;
+      return {
+        stdout: typeof e.stdout === "string" ? e.stdout : "",
+        stderr:
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.message ?? "execFile failed",
+        exitCode,
+      };
+    }
+  };
+}
+
+const defaultExecRunner: ExecRunner = _createExecRunner(DEFAULT_EXEC_MAX_BUFFER);
+
+// Exported for tests only — production code uses applyMigrationsBetween /
+// validateJournalRegistration which inject _exec for tests but fall back to
+// defaultExecRunner in real use.
+export const _defaultExecRunnerForTests: ExecRunner = defaultExecRunner;
 
 /**
  * Detect new migration files added between `preSha` and `postSha`, then run
