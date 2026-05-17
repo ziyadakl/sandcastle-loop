@@ -42,6 +42,7 @@ import {
   serializeDotenv,
   extractCategorySweep,
   priorFindingsResolved,
+  WRITE_PROJECT_DOTENV_COMMAND,
   __resetTransientStateForTests,
   type Deps,
   type RalphArgs,
@@ -52,6 +53,8 @@ import {
   type SandboxHandle,
 } from "../.sandcastle/main.mjs";
 import { envForModel } from "../.sandcastle/providers.js";
+import { parse as parseDotenv } from "dotenv";
+import { expand as expandDotenv } from "dotenv-expand";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1752,47 +1755,25 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Mirrors the documented behavior of the real `dotenv` npm package +
- * `dotenv-expand` (used by `dotenv-cli`), not our serializer:
+ * Round-trip through the REAL `dotenv` + `dotenv-expand` libraries. The
+ * previous incarnation of this test used a hand-rolled parser that
+ * mirrored the serializer's escape table — a "test of self" that
+ * silently agreed with serializer bugs. Using the real libraries means
+ * the test fails when our output diverges from what production consumers
+ * (dotenv-cli, Next.js, etc.) would parse.
  *
- *  1. dotenv strips the surrounding single quotes. Single-quoted values
- *     are taken as LITERAL — no escape processing happens here.
- *  2. dotenv-expand then walks the value: it substitutes `$VAR` /
- *     `${VAR}` against `process.env`, and treats `\$` as an escape
- *     (stripping the backslash, leaving the `$` literal).
- *
- * Crucial test-design note: this parser deliberately does NOT share
- * implementation with serializeDotenv. A test parser that mirrors the
- * encoder is a "test of self" — the previous version silently agreed
- * with serializeDotenv's bugs because both used the same escape table.
+ * dotenv-expand v11 mutates the `parsed` object in place and returns
+ * `{ parsed }`. The signature accepts `{ parsed, processEnv }`.
  */
-function parseDotenvLikeRealConsumer(
+function parseWithRealDotenv(
   content: string,
   processEnv: Record<string, string> = {},
 ): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of content.split(/\r?\n/)) {
-    if (line.length === 0 || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq);
-    let val = line.slice(eq + 1);
-    // Strip single quotes (no escape processing inside).
-    if (val.startsWith("'") && val.endsWith("'") && val.length >= 2) {
-      val = val.slice(1, -1);
-    }
-    // dotenv-expand pass: $VAR / ${VAR} → process.env lookup. \$ → $.
-    val = val.replace(
-      /\\\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-      (m, brace?: string, bare?: string) => {
-        if (m.startsWith("\\$")) return "$";
-        const name = brace ?? bare ?? "";
-        return processEnv[name] ?? "";
-      },
-    );
-    out[key] = val;
-  }
-  return out;
+  const parsed = parseDotenv(Buffer.from(content));
+  const expanded =
+    expandDotenv({ parsed, processEnv } as Parameters<typeof expandDotenv>[0])
+      .parsed ?? {};
+  return expanded;
 }
 
 describe("serializeDotenv", () => {
@@ -1811,7 +1792,7 @@ describe("serializeDotenv", () => {
     // backslashes through untouched.
     const out = serializeDotenv({ WINPATH: "C:\\Users\\agent" });
     expect(out).toBe("WINPATH='C:\\Users\\agent'\n");
-    expect(parseDotenvLikeRealConsumer(out).WINPATH).toBe("C:\\Users\\agent");
+    expect(parseWithRealDotenv(out).WINPATH).toBe("C:\\Users\\agent");
   });
 
   it("escapes $ so dotenv-expand doesn't substitute against process.env", () => {
@@ -1822,24 +1803,24 @@ describe("serializeDotenv", () => {
     const out = serializeDotenv({ TOKEN: "$PATH-not-expanded" });
     expect(out).toBe("TOKEN='\\$PATH-not-expanded'\n");
     expect(
-      parseDotenvLikeRealConsumer(out, { PATH: "/usr/bin:/bin" }).TOKEN,
+      parseWithRealDotenv(out, { PATH: "/usr/bin:/bin" }).TOKEN,
     ).toBe("$PATH-not-expanded");
   });
 
   it("escapes $ in bcrypt-style hashes (real-world case)", () => {
     const hash = "$2b$12$Kix5/qPwYABCDEFGHIJKLMabcdefghijklmnopqrstuvwx";
     const out = serializeDotenv({ BCRYPT_HASH: hash });
-    expect(parseDotenvLikeRealConsumer(out, {}).BCRYPT_HASH).toBe(hash);
+    expect(parseWithRealDotenv(out, {}).BCRYPT_HASH).toBe(hash);
   });
 
   it("survives values containing = (base64-ish)", () => {
     const out = serializeDotenv({ B64: "abc=def==" });
-    expect(parseDotenvLikeRealConsumer(out).B64).toBe("abc=def==");
+    expect(parseWithRealDotenv(out).B64).toBe("abc=def==");
   });
 
   it("survives values containing # (don't parse as comments)", () => {
     const out = serializeDotenv({ HASH: "value#with-hash" });
-    expect(parseDotenvLikeRealConsumer(out).HASH).toBe("value#with-hash");
+    expect(parseWithRealDotenv(out).HASH).toBe("value#with-hash");
   });
 
   it("throws on single-quote-bearing values (not representable)", () => {
@@ -1868,9 +1849,68 @@ describe("serializeDotenv", () => {
       AIRTABLE_API_KEY: "patABC.def123",
       WEBHOOK_SIGNING: "whsec_$abc$def",
     };
-    expect(parseDotenvLikeRealConsumer(serializeDotenv(record))).toEqual(
+    expect(parseWithRealDotenv(serializeDotenv(record))).toEqual(
       record,
     );
+  });
+
+  it("empty value round-trips as empty", () => {
+    const out = serializeDotenv({ EMPTY: "" });
+    expect(parseWithRealDotenv(out)).toEqual({ EMPTY: "" });
+  });
+
+  it("inner whitespace inside single quotes is preserved", () => {
+    const out = serializeDotenv({ PAD: "  needstrim  " });
+    expect(parseWithRealDotenv(out).PAD).toBe("  needstrim  ");
+  });
+
+  it("trailing backslash round-trips literally", () => {
+    const out = serializeDotenv({ TRAIL: "x\\" });
+    expect(parseWithRealDotenv(out).TRAIL).toBe("x\\");
+  });
+
+  it("embedded ${VAR} stays literal (escaped $)", () => {
+    const out = serializeDotenv({ LIT: "${FOO}-suffix" });
+    expect(
+      parseWithRealDotenv(out, { FOO: "should-not-substitute" }).LIT,
+    ).toBe("${FOO}-suffix");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDefaultDeps writeProjectDotenv hook — structural assertions on the
+// shell command that materializes `.env` inside the sandbox at boot.
+// ---------------------------------------------------------------------------
+
+describe("buildDefaultDeps writeProjectDotenv hook", () => {
+  const cmd = WRITE_PROJECT_DOTENV_COMMAND;
+
+  it("creates the file with mode 0o600 atomically (no separate chmod)", () => {
+    // Either `0o600` or its decimal equivalent (384) is acceptable in the
+    // serialized command string.
+    expect(/0o600|384/.test(cmd)).toBe(true);
+    expect(cmd.includes("mode")).toBe(true);
+    expect(cmd.includes("chmod 600")).toBe(false);
+  });
+
+  it("backs up an existing .env to .env.sandcastle-bak.<ts> before writing", () => {
+    expect(cmd.includes("existsSync")).toBe(true);
+    expect(cmd.includes("renameSync")).toBe(true);
+    // The literal `'.sandcastle-bak.'` is concatenated with `p` (= `.env`)
+    // at runtime; assert the suffix literal that appears in the command.
+    expect(cmd.includes(".sandcastle-bak.")).toBe(true);
+  });
+
+  it("writes from process.env.SANDCASTLE_PROJECT_DOTENV via writeFileSync", () => {
+    expect(cmd.includes("writeFileSync")).toBe(true);
+    expect(cmd.includes("process.env.SANDCASTLE_PROJECT_DOTENV")).toBe(true);
+  });
+
+  it("does NOT use a shell redirect to .env", () => {
+    // The user's global CLAUDE.md forbids shell-redirect-to-.env; that
+    // pattern is what destroyed a `.env` on a VPS once. The node -e form
+    // routes the bytes through fs.writeFileSync instead.
+    expect(cmd.includes("> .env")).toBe(false);
   });
 });
 

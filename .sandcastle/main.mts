@@ -818,6 +818,43 @@ export function serializeDotenv(env: Record<string, string>): string {
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
 
+/**
+ * Shell command run inside the sandbox at boot to materialize `.env` from
+ * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
+ * properties (atomic 0o600, backup-on-existing, no shell redirection)
+ * without spinning up a real container.
+ *
+ * Behavior:
+ *   1. If `.env` already exists, rename it to
+ *      `.env.sandcastle-bak.<ISO-timestamp-safe>` (colons + dots in the
+ *      timestamp are replaced with `-` so the filename is valid on every
+ *      target FS).
+ *   2. Write `process.env.SANDCASTLE_PROJECT_DOTENV` (or empty string
+ *      fallback) to `.env` with `mode: 0o600` — the kernel applies the
+ *      mode at create time via open(2), so there is no permissive-mode
+ *      window between create and chmod.
+ *
+ * Implemented as `node -e` rather than shell because:
+ *   - `printf %s > .env` is a shell redirect to `.env`, which the user's
+ *     global CLAUDE.md forbids (RTK destroyed a `.env` on a VPS once via
+ *     a similar pattern).
+ *   - `chmod 600` after-create has a brief race window.
+ *   - Node's `fs.writeFileSync` with `mode: 0o600` is atomic w.r.t. mode.
+ *
+ * Uses `require('fs')` (not ESM imports) because `node -e` doesn't do
+ * ESM cleanly.
+ */
+export const WRITE_PROJECT_DOTENV_COMMAND =
+  `node -e "` +
+  `const fs=require('fs');` +
+  `const p='.env';` +
+  `if(fs.existsSync(p)){` +
+  `const ts=new Date().toISOString().replace(/[:.]/g,'-');` +
+  `fs.renameSync(p,p+'.sandcastle-bak.'+ts);` +
+  `}` +
+  `fs.writeFileSync(p,process.env.SANDCASTLE_PROJECT_DOTENV||'',{mode:0o600});` +
+  `"`;
+
 function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
   try {
@@ -1301,13 +1338,21 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // script). dotenv-cli errors out on a missing file and the dev server
   // never starts → playwright bounces the iteration even when the agent's
   // code is correct. Materializing the file from env vars keeps secrets
-  // out of the shell command string itself (printf reads from the env
-  // var, which docker populates over a separate channel). chmod 600
-  // because the file now contains POSTGRES_URL etc. for the iteration's
-  // lifetime.
+  // out of the shell command string itself (the JS reads from the env
+  // var, which docker populates over a separate channel).
+  //
+  // We use `node -e` instead of `printf %s > .env && chmod 600 .env` for
+  // two reasons:
+  //   (a) atomic 0o600 at creation — `fs.writeFileSync` with `mode: 0o600`
+  //       hands the kernel the mode in the open(2) call, so there's no
+  //       window where the file exists with a permissive default mode
+  //       between create and chmod. The old shell pattern had a race.
+  //   (b) backup-on-existing — if a project ships its own `.env` (or a
+  //       previous iteration left one behind), rename it to
+  //       `.env.sandcastle-bak.<ISO-timestamp>` before writing fresh so
+  //       we never silently clobber operator-authored content.
   const writeProjectDotenv = {
-    command:
-      'printf %s "$SANDCASTLE_PROJECT_DOTENV" > .env && chmod 600 .env',
+    command: WRITE_PROJECT_DOTENV_COMMAND,
   };
   const hooks = {
     sandbox: {
