@@ -748,6 +748,36 @@ export function preflight(args: RalphArgs, opts: {
  * Format: KEY=VALUE per line, `#` comments, blank lines skipped, single-
  * or double-quoted values stripped. Multi-line values are not supported.
  */
+/**
+ * Serialize a `KEY → value` record back into dotenv format suitable for
+ * writing as a `.env` file. Every value is emitted as `KEY="value"` with
+ * standard double-quote escapes (`\\` → backslash, `\"` → quote, `\n` →
+ * newline, `\r` → CR, `\t` → tab). Consumers like dotenv-cli and the
+ * popular `dotenv` npm package both interpret these the same way.
+ *
+ * Why this exists: the orchestrator passes `projectEnv` to the agent
+ * sandbox as docker env vars. That populates `process.env` inside the
+ * container — but some consumer projects (e.g. affinity-tracker's
+ * `apps/nextjs/package.json` `with-env` script) invoke `dotenv-cli` to
+ * read a literal `.env` file. Without one on disk, the dev server
+ * refuses to start and playwright e2e bounces the iteration. So we
+ * materialize a `.env` from `projectEnv` inside the sandbox at boot.
+ */
+export function serializeDotenv(env: Record<string, string>): string {
+  const escape = (val: string): string =>
+    val
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t");
+  const lines: string[] = [];
+  for (const key of Object.keys(env)) {
+    lines.push(`${key}="${escape(env[key]!)}"`);
+  }
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+}
+
 function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
   try {
@@ -1224,8 +1254,25 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // because there's no TTY to confirm. The hook runs non-interactively
   // by definition, so the install hangs/exits without restoring the
   // per-package workspace symlinks (apps/nextjs/node_modules etc.).
+  // The first hook writes a `.env` file from $SANDCASTLE_PROJECT_DOTENV
+  // (populated below from the host's project .env files) BEFORE pnpm
+  // install runs. Why: many target repos invoke `dotenv-cli -e ../../.env`
+  // to launch their dev server (e.g. apps/nextjs/package.json's `with-env`
+  // script). dotenv-cli errors out on a missing file and the dev server
+  // never starts → playwright bounces the iteration even when the agent's
+  // code is correct. Materializing the file from env vars keeps secrets
+  // out of the shell command string itself (printf reads from the env
+  // var, which docker populates over a separate channel). chmod 600
+  // because the file now contains POSTGRES_URL etc. for the iteration's
+  // lifetime.
+  const writeProjectDotenv = {
+    command:
+      'printf %s "$SANDCASTLE_PROJECT_DOTENV" > .env && chmod 600 .env',
+  };
   const hooks = {
-    sandbox: { onSandboxReady: [{ command: "CI=true pnpm install" }] },
+    sandbox: {
+      onSandboxReady: [writeProjectDotenv, { command: "CI=true pnpm install" }],
+    },
   } as const;
   const copyToWorktree = ["node_modules"];
 
@@ -1259,7 +1306,16 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
   // the orchestrator's git identity).
   const gitEnv = buildGitEnv();
   const projectEnv = readProjectEnv(args.repoRoot);
-  const containerEnv = { ...projectEnv, ...gitEnv };
+  // Serialize the project's .env contents so the onSandboxReady hook can
+  // write a literal .env file inside the container at boot. Doing it via
+  // an env var (instead of a shell heredoc inside the hook command) keeps
+  // secrets out of the command string we log. See `writeProjectDotenv`
+  // above for the full rationale.
+  const containerEnv: Record<string, string> = {
+    ...projectEnv,
+    ...gitEnv,
+    SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
+  };
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -1486,7 +1542,7 @@ async function runImplementer(
   sb: SandboxHandle,
   ctx: PipelineCtx,
   opts: {
-    attemptNumber?: 1 | 2;
+    attemptNumber?: 1 | 2 | 3;
     model?: string;
     reviewerFeedback?: string;
   } = {},
@@ -1504,7 +1560,12 @@ async function runImplementer(
   const r = await runWithRateLimitFallback(
     (model) =>
       sb.run({
-        name: attemptNumber === 1 ? "implementer" : "implementer-retry",
+        name:
+          attemptNumber === 1
+            ? "implementer"
+            : attemptNumber === 3
+              ? "implementer-retry-2"
+              : "implementer-retry",
         maxIterations: 100,
         model,
         promptFile: "./.sandcastle/implement-prompt.md",
@@ -1544,7 +1605,7 @@ async function runImplementer(
   //     Without this gate, parseVerdict throws on every HALT and the
   //     pipeline mis-classifies a clean HALT as an envelope-missing
   //     failure, burning a recovery pass.
-  const rebuttalPresent = attemptNumber === 2 && extractRebuttal(r.stdout) !== "";
+  const rebuttalPresent = attemptNumber >= 2 && extractRebuttal(r.stdout) !== "";
   const halted = (() => {
     try {
       return extractMarker(r.stdout, IMPLEMENTER_MARKERS) === "HALT";
@@ -1574,6 +1635,75 @@ async function runImplementer(
 function extractRebuttal(stdout: string): string {
   const m = stdout.match(/<rebuttal>([\s\S]*?)<\/rebuttal>/);
   return m ? (m[1] ?? "").trim() : "";
+}
+
+/** A single category's outcome in the reviewer's CATEGORY SWEEP block. */
+export type SweepStatus = "ok" | "n/a" | "finding";
+
+/**
+ * Parse the reviewer's CATEGORY SWEEP block. The block appears between
+ * "CATEGORY SWEEP:" and "SWEEP COMPLETE." with one bullet per category:
+ * `- Spec fit: ok` / `- Spec fit: n/a (...)` / `- Spec fit: <finding>`.
+ * Returns a Map keyed on the lowercased, trimmed category name. Returns
+ * null when the block is missing, empty, or unparsable — callers fall
+ * back to current (non-sweep-aware) behavior on null. This conservative
+ * fallback matters: a malformed sweep should never accidentally grant
+ * extra retries.
+ */
+export function extractCategorySweep(
+  stdout: string,
+): Map<string, SweepStatus> | null {
+  const startIdx = stdout.indexOf("CATEGORY SWEEP:");
+  if (startIdx < 0) return null;
+  const endIdx = stdout.indexOf("SWEEP COMPLETE.", startIdx);
+  if (endIdx < 0) return null;
+  const block = stdout.slice(startIdx, endIdx);
+  const out = new Map<string, SweepStatus>();
+  for (const line of block.split(/\r?\n/)) {
+    const m = /^\s*-\s*([^:]+):\s*(.+)$/.exec(line);
+    if (!m) continue;
+    const category = m[1]!.trim().toLowerCase();
+    const valRaw = m[2]!.trim();
+    const valLower = valRaw.toLowerCase();
+    // Skip the literal template placeholder — the reviewer left the
+    // example shape in place instead of filling it in. Treat as
+    // unparsable rather than silently classifying as "finding".
+    if (valRaw.startsWith("<") && valRaw.endsWith(">")) continue;
+    let status: SweepStatus;
+    if (valLower === "ok" || valLower === "ok." || /^ok[\s.,]/.test(valLower)) {
+      status = "ok";
+    } else if (valLower.startsWith("n/a")) {
+      status = "n/a";
+    } else {
+      status = "finding";
+    }
+    out.set(category, status);
+  }
+  return out.size > 0 ? out : null;
+}
+
+/**
+ * Decide whether the implementer demonstrably resolved every category
+ * the reviewer flagged in round 1. Returns true iff every category that
+ * was a "finding" in `sweep1` is now "ok" or "n/a" in `sweep2`. When
+ * true, round 2's HAS_BLOCKERS findings are genuinely new — round 1's
+ * complaints got fixed and the reviewer surfaced a different bug. The
+ * loop grants a third attempt instead of waking the user.
+ *
+ * Conservative on missing data: a category that was a finding in round 1
+ * but is absent from round 2's sweep counts as unresolved.
+ */
+export function priorFindingsResolved(
+  sweep1: ReadonlyMap<string, SweepStatus>,
+  sweep2: ReadonlyMap<string, SweepStatus>,
+): boolean {
+  for (const [cat, status] of sweep1.entries()) {
+    if (status !== "finding") continue;
+    const next = sweep2.get(cat);
+    if (next === undefined) return false;
+    if (next === "finding") return false;
+  }
+  return true;
 }
 
 /** Negative guard shared by both transient-error predicates: permanent errors
@@ -1934,6 +2064,72 @@ async function runIssuePipeline(
 
     if (review2.marker === "ALL_CLEAR") {
       return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
+    }
+
+    // Phase 2e: third-attempt grant. Round 2 still says HAS_BLOCKERS,
+    // but if the implementer demonstrably resolved every category that
+    // round 1 flagged, round 2's findings are genuinely new (different
+    // categories) and the system is making progress — grant one more
+    // implementer+reviewer pass instead of quarantining. Recurring
+    // findings (same category flagged in both rounds) still bounce,
+    // because that signals the implementer is stuck.
+    //
+    // Conservative fallback: if either sweep is missing or unparsable,
+    // skip the grant and quarantine as before. A malformed sweep must
+    // NEVER produce a free extra retry.
+    const sweep1 = extractCategorySweep(review1.stdout);
+    const sweep2 = extractCategorySweep(review2.stdout);
+    const grantRound3 =
+      sweep1 !== null &&
+      sweep2 !== null &&
+      priorFindingsResolved(sweep1, sweep2);
+
+    if (grantRound3) {
+      ctx.deps.log(
+        `[issue=${ctx.issueNumber}] reviewer attempt 2 HAS_BLOCKERS but ` +
+          `round-1 categories resolved — granting attempt 3 on ` +
+          `${implEscalations[0]}`,
+      );
+      const impl3 = await runImplementer(sandbox, ctx, {
+        attemptNumber: 3,
+        model: implEscalations[0],
+        reviewerFeedback: review2.stdout,
+      });
+      const rebuttal3 = extractRebuttal(impl3.stdout);
+      const postSha3 = sandbox.worktreePath
+        ? await ctx.deps.captureSha(sandbox.worktreePath)
+        : impl3.commits[impl3.commits.length - 1]?.sha ?? postSha;
+      postSha = postSha3;
+      ctx.deps.log(
+        `[issue=${ctx.issueNumber}] running reviewer attempt 3 on ` +
+          `${revEscalations[0]}${rebuttal3 ? " (with implementer rebuttal)" : ""}`,
+      );
+      const review3 = await runReviewer(
+        sandbox,
+        ctx,
+        postSha,
+        undefined,
+        revEscalations[0],
+        {
+          implementerRebuttal: rebuttal3,
+          name: "reviewer-retry-2",
+        },
+      );
+      if (review3.marker === "ALL_CLEAR") {
+        return await shipAfterMigrations(
+          ctx,
+          sandbox,
+          preSha,
+          postSha,
+          "ALL_CLEAR",
+        );
+      }
+      const reason3 =
+        `[issue=${ctx.issueNumber}] reviewer marked ${review3.marker} after ` +
+        `third attempt — quarantining for human triage.`;
+      deferralCounts.delete(ctx.issueNumber);
+      await ctx.deps.quarantine(ctx.issueNumber, reason3);
+      return { status: "quarantined", finalMarker: review3.marker, postSha };
     }
 
     const reason =

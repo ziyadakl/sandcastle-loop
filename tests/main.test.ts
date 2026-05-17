@@ -39,6 +39,9 @@ import {
   ensureStagingWorktree,
   fastForwardIntegration,
   parseWorktreeList,
+  serializeDotenv,
+  extractCategorySweep,
+  priorFindingsResolved,
   __resetTransientStateForTests,
   type Deps,
   type RalphArgs,
@@ -1741,5 +1744,371 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
     it("returns an empty array for empty input", () => {
       expect(parseWorktreeList("")).toEqual([]);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serializeDotenv — projectEnv → sandbox .env (b) materialization
+// ---------------------------------------------------------------------------
+
+// Mirror of the double-quote-escape semantics used by both dotenv-cli and
+// the `dotenv` npm package. Tests round-trip serializeDotenv against this
+// to prove the .env we write into the container will read back correctly
+// on the consumer side.
+function parseDotenvForTest(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of content.split(/\r?\n/)) {
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq);
+    let val = line.slice(eq + 1);
+    if (val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
+      val = val.slice(1, -1).replace(/\\([\\"nrt])/g, (_m, ch: string) => {
+        if (ch === "n") return "\n";
+        if (ch === "r") return "\r";
+        if (ch === "t") return "\t";
+        if (ch === '"') return '"';
+        return "\\";
+      });
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+describe("serializeDotenv", () => {
+  it("empty record → empty string", () => {
+    expect(serializeDotenv({})).toBe("");
+  });
+
+  it("simple key/value emits double-quoted form with trailing newline", () => {
+    expect(serializeDotenv({ FOO: "bar" })).toBe('FOO="bar"\n');
+  });
+
+  it("escapes embedded double quotes", () => {
+    const out = serializeDotenv({ MSG: 'he said "hi"' });
+    expect(out).toBe('MSG="he said \\"hi\\""\n');
+    expect(parseDotenvForTest(out).MSG).toBe('he said "hi"');
+  });
+
+  it("escapes backslashes — won't accidentally inject escape sequences", () => {
+    const out = serializeDotenv({ WINPATH: "C:\\Users\\agent" });
+    expect(out).toContain('WINPATH="C:\\\\Users\\\\agent"');
+    expect(parseDotenvForTest(out).WINPATH).toBe("C:\\Users\\agent");
+  });
+
+  it("escapes newlines so multi-line values stay on one logical line", () => {
+    const out = serializeDotenv({ MULTILINE: "line1\nline2" });
+    expect(out).toContain("\\n");
+    expect(out.split("\n").filter((l) => l.length > 0)).toHaveLength(1);
+    expect(parseDotenvForTest(out).MULTILINE).toBe("line1\nline2");
+  });
+
+  it("does NOT expand $VAR-style references — values stay literal", () => {
+    const out = serializeDotenv({ TOKEN: "$PATH-not-expanded" });
+    expect(out).toBe('TOKEN="$PATH-not-expanded"\n');
+    expect(parseDotenvForTest(out).TOKEN).toBe("$PATH-not-expanded");
+  });
+
+  it("survives values containing = (base64-ish)", () => {
+    const out = serializeDotenv({ B64: "abc=def==" });
+    expect(parseDotenvForTest(out).B64).toBe("abc=def==");
+  });
+
+  it("survives values containing # (don't parse as comments)", () => {
+    const out = serializeDotenv({ HASH: "value#with-hash" });
+    expect(parseDotenvForTest(out).HASH).toBe("value#with-hash");
+  });
+
+  it("round-trips a realistic multi-key project env", () => {
+    const record = {
+      POSTGRES_URL:
+        "postgresql://user:p@ss%23word@localhost:5432/db?sslmode=require",
+      AUTH_SECRET: "ABCdef==/+random",
+      NEXT_PUBLIC_SUPABASE_URL: "https://x.supabase.co",
+      AIRTABLE_API_KEY: "patABC.def123",
+    };
+    expect(parseDotenvForTest(serializeDotenv(record))).toEqual(record);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractCategorySweep — reviewer CATEGORY SWEEP block parser
+// ---------------------------------------------------------------------------
+
+describe("extractCategorySweep", () => {
+  it("parses a clean sweep with all three statuses", () => {
+    const stdout = [
+      "Review prose ...",
+      "",
+      "CATEGORY SWEEP:",
+      "- Spec fit: ok",
+      "- Test coverage: n/a (no new test files)",
+      "- Type safety: missing return annotation on getUser at line 42",
+      "SWEEP COMPLETE.",
+      "",
+      "HAS_BLOCKERS",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout);
+    expect(sweep).not.toBeNull();
+    expect(sweep!.get("spec fit")).toBe("ok");
+    expect(sweep!.get("test coverage")).toBe("n/a");
+    expect(sweep!.get("type safety")).toBe("finding");
+  });
+
+  it("returns null when CATEGORY SWEEP: marker is missing", () => {
+    expect(extractCategorySweep("Some review prose.\nHAS_BLOCKERS")).toBeNull();
+  });
+
+  it("returns null when SWEEP COMPLETE. marker is missing (truncated)", () => {
+    const stdout = "CATEGORY SWEEP:\n- Spec fit: ok\n[output cut here]";
+    expect(extractCategorySweep(stdout)).toBeNull();
+  });
+
+  it("treats verbatim template placeholders as unparsable (skipped)", () => {
+    // Reviewer pasted the example shape instead of filling it in.
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: <ok | n/a (...) | <finding>>",
+      "- Type safety: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout);
+    expect(sweep).not.toBeNull();
+    expect(sweep!.has("spec fit")).toBe(false);
+    expect(sweep!.get("type safety")).toBe("ok");
+  });
+
+  it("returns null on a sweep block with no valid lines", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: <ok | n/a (...) | <finding>>",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)).toBeNull();
+  });
+});
+
+// Build a minimal reviewer stdout that includes a CATEGORY SWEEP block.
+// `findings` is a map of category → finding text (omit a category to mark
+// it `ok`). All categories listed in the active reviewer prompt appear.
+function reviewerStdoutWithSweep(opts: {
+  prose?: string;
+  findings: Record<string, string>;
+  marker: "ALL_CLEAR" | "HAS_BLOCKERS";
+}): string {
+  const categories = [
+    "Execution evidence",
+    "Spec fit",
+    "Test coverage",
+    "Type safety",
+    "Security",
+    "Error handling",
+    "Edge cases",
+  ];
+  const lines: string[] = [];
+  if (opts.prose) lines.push(opts.prose, "");
+  lines.push("CATEGORY SWEEP:");
+  for (const cat of categories) {
+    const lookup = cat.toLowerCase();
+    const finding = opts.findings[lookup];
+    lines.push(`- ${cat}: ${finding ?? "ok"}`);
+  }
+  lines.push("SWEEP COMPLETE.", "", opts.marker);
+  return lines.join("\n");
+}
+
+describe("priorFindingsResolved", () => {
+  it("true: every round-1 finding is ok-or-n/a in round 2 (no overlap)", () => {
+    const r1 = new Map([
+      ["spec fit", "finding" as const],
+      ["test coverage", "ok" as const],
+    ]);
+    const r2 = new Map([
+      ["spec fit", "ok" as const],
+      ["test coverage", "ok" as const],
+      ["type safety", "finding" as const], // a NEW finding — grant round 3
+    ]);
+    expect(priorFindingsResolved(r1, r2)).toBe(true);
+  });
+
+  it("false: same category still flagged in round 2 — implementer is stuck", () => {
+    const r1 = new Map([["type safety", "finding" as const]]);
+    const r2 = new Map([["type safety", "finding" as const]]);
+    expect(priorFindingsResolved(r1, r2)).toBe(false);
+  });
+
+  it("false: round-1 category absent from round-2 sweep (conservative)", () => {
+    const r1 = new Map([["security", "finding" as const]]);
+    const r2 = new Map([["spec fit", "ok" as const]]);
+    expect(priorFindingsResolved(r1, r2)).toBe(false);
+  });
+
+  it("true: round 1 had only ok/n/a — vacuously resolved", () => {
+    const r1 = new Map([
+      ["spec fit", "ok" as const],
+      ["test coverage", "n/a" as const],
+    ]);
+    const r2 = new Map([["type safety", "finding" as const]]);
+    expect(priorFindingsResolved(r1, r2)).toBe(true);
+  });
+
+  it("n/a in round 2 counts as resolved for a round-1 finding", () => {
+    const r1 = new Map([["test coverage", "finding" as const]]);
+    const r2 = new Map([
+      ["test coverage", "n/a" as const],
+      ["security", "finding" as const],
+    ]);
+    expect(priorFindingsResolved(r1, r2)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Third-attempt grant — pipeline integration
+// ---------------------------------------------------------------------------
+// Regression for the #151 pattern: round 1 finds bug A, implementer fixes A,
+// round 2 finds bug B that was always there. Without the grant, the ticket
+// bounces to needs-human even though the implementer made real progress. With
+// the grant, the loop tries once more and often ships.
+
+describe("sandcastle-loop main.mts — third-attempt grant", () => {
+  it("ships after round 3 when round 2's findings are in different categories than round 1", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "151", title: "scope toggle", branch: "agent/issue-151" },
+      ]),
+    });
+    // Round 1: type-safety finding.
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 151 }),
+      commits: [{ sha: "round1" }],
+    });
+    b.enqueue("reviewer", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "type safety": "missing return type on toggle helper" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 2: implementer fixed type-safety, reviewer surfaces a NEW
+    // category (spec fit). priorFindingsResolved → true → grant round 3.
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 151 }),
+      commits: [{ sha: "round2" }],
+    });
+    b.enqueue("reviewer-retry", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "spec fit": "missing .refine() per acceptance criteria" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 3: implementer fixes spec-fit, reviewer ships.
+    b.enqueue("implementer-retry-2", {
+      stdout: implementerStdout({ ghIssue: 151 }),
+      commits: [{ sha: "round3" }],
+    });
+    b.enqueue("reviewer-retry-2", {
+      stdout: reviewerStdoutWithSweep({ findings: {}, marker: "ALL_CLEAR" }),
+    });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([151]);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.marksDone).toHaveLength(1);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names).toContain("implementer-retry-2");
+    expect(names).toContain("reviewer-retry-2");
+  });
+
+  it("quarantines after round 2 when the same category still has a finding (implementer is stuck)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "152", title: "stuck issue", branch: "agent/issue-152" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 152 }),
+      commits: [{ sha: "round1" }],
+    });
+    b.enqueue("reviewer", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "type safety": "missing return type" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 152 }),
+      commits: [{ sha: "round2" }],
+    });
+    // Round 2: SAME category still flagged → no round 3, quarantine.
+    b.enqueue("reviewer-retry", {
+      stdout: reviewerStdoutWithSweep({
+        findings: {
+          "type safety": "still missing return type, plus a new cast bug",
+        },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(152);
+    expect(b.state.quarantines[0]!.reason).toMatch(/escalated retry/);
+    // Crucially: no third attempt was made.
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names).not.toContain("implementer-retry-2");
+  });
+
+  it("quarantines after round 2 when either sweep is missing (conservative fallback)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "153", title: "no sweep", branch: "agent/issue-153" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 153 }),
+      commits: [{ sha: "round1" }],
+    });
+    // Reviewer emits HAS_BLOCKERS without a CATEGORY SWEEP block. The
+    // grant logic must NOT fire — a missing sweep should never produce
+    // a free extra retry.
+    b.enqueue("reviewer", {
+      stdout: "Plain prose review, no sweep block.\nHAS_BLOCKERS",
+    });
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 153 }),
+      commits: [{ sha: "round2" }],
+    });
+    b.enqueue("reviewer-retry", {
+      stdout: "Still broken, also no sweep.\nHAS_BLOCKERS",
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(b.state.quarantines).toHaveLength(1);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names).not.toContain("implementer-retry-2");
   });
 });
