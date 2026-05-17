@@ -2054,6 +2054,103 @@ describe("extractCategorySweep", () => {
     ].join("\n");
     expect(extractCategorySweep(stdout)!.get("type safety")).toBe("ok");
   });
+
+  it("tolerates a bolded header `**CATEGORY SWEEP:**`", () => {
+    const stdout = [
+      "**CATEGORY SWEEP:**",
+      "- Spec fit: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("spec fit")).toBe("ok");
+  });
+
+  it("tolerates a mixed-case header `Category Sweep:`", () => {
+    const stdout = [
+      "Category Sweep:",
+      "- Spec fit: ok",
+      "Sweep complete.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("spec fit")).toBe("ok");
+  });
+
+  it("tolerates a trailing space before the header colon", () => {
+    const stdout = [
+      "CATEGORY SWEEP :",
+      "- Spec fit: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("spec fit")).toBe("ok");
+  });
+
+  it("strips markdown emphasis from a bolded category name", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- **Spec fit**: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout)!;
+    expect(sweep.has("spec fit")).toBe(true);
+    expect(sweep.get("spec fit")).toBe("ok");
+    // No leftover asterisks in the key.
+    expect([...sweep.keys()].some((k) => k.includes("*"))).toBe(false);
+  });
+
+  it("splits on the LAST `: ` so category names containing a colon parse", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Type safety (RFC: 1234): ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout)!;
+    expect(sweep.get("type safety (rfc: 1234)")).toBe("ok");
+  });
+
+  it("duplicate category, weaker first → strictest replaces existing", () => {
+    const logs: string[] = [];
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: ok",
+      "- Spec fit: missing the refine() per spec",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout, (m) => logs.push(m))!;
+    expect(sweep.get("spec fit")).toBe("finding");
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("spec fit");
+    expect(logs[0]).toContain("ok");
+    expect(logs[0]).toContain("finding");
+  });
+
+  it("duplicate category, stronger first → existing kept, still logs", () => {
+    const logs: string[] = [];
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: missing the refine() per spec",
+      "- Spec fit: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout, (m) => logs.push(m))!;
+    expect(sweep.get("spec fit")).toBe("finding");
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("spec fit");
+    expect(logs[0]).toContain("ok");
+    expect(logs[0]).toContain("finding");
+  });
+
+  it("mid-block prose echo of `SWEEP COMPLETE.` does NOT terminate parsing", () => {
+    // Reviewer's finding body mentions the marker mid-text; the
+    // terminator regex requires the whole trimmed line to match, so
+    // parsing continues to the real terminator.
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Type safety: finding — body mentions SWEEP COMPLETE. but mid-line",
+      "- Spec fit: ok",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout)!;
+    expect(sweep.get("type safety")).toBe("finding");
+    expect(sweep.get("spec fit")).toBe("ok");
+  });
 });
 
 // Build a minimal reviewer stdout that includes a CATEGORY SWEEP block.

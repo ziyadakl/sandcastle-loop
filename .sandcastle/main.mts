@@ -1749,23 +1749,38 @@ export type SweepStatus = "ok" | "n/a" | "finding";
  */
 export function extractCategorySweep(
   stdout: string,
+  logError: (msg: string) => void = () => {},
 ): Map<string, SweepStatus> | null {
   // Anchor both markers to a line start so a prose mention like
   // "the CATEGORY SWEEP: block below" doesn't shift the parse window.
+  // Header / terminator detection is case-insensitive and tolerates
+  // surrounding markdown emphasis (`**`, `__`, backticks) and an
+  // optional space before the colon — reviewers paste bolded headers
+  // surprisingly often.
+  const isHeader = (line: string) =>
+    /^[*_`]*\s*category\s+sweep\s*:\s*[*_`]*\s*$/i.test(line.trim());
+  const isTerminator = (line: string) =>
+    /^[*_`]*\s*sweep\s+complete\s*\.\s*[*_`]*\s*$/i.test(line.trim());
+
   const lines = stdout.split(/\r?\n/);
   let startIdx = -1;
   let endIdx = -1;
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i]!.trim();
-    if (startIdx < 0 && line === "CATEGORY SWEEP:") {
+    if (startIdx < 0 && isHeader(lines[i]!)) {
       startIdx = i;
-    } else if (startIdx >= 0 && line.startsWith("SWEEP COMPLETE.")) {
+    } else if (startIdx >= 0 && isTerminator(lines[i]!)) {
       endIdx = i;
       break;
     }
   }
   if (startIdx < 0 || endIdx < 0) return null;
   const out = new Map<string, SweepStatus>();
+  // Severity ranking for the strictest-wins duplicate-category rule.
+  const rank: Record<SweepStatus, number> = {
+    finding: 2,
+    "n/a": 1,
+    ok: 0,
+  };
   // Recognised template placeholders (left verbatim by a reviewer that
   // didn't fill the line in). Anything else inside `<...>` is treated as
   // a compact finding.
@@ -1775,11 +1790,24 @@ export function extractCategorySweep(
     "<ok|n/a(...)|<finding>>",
   ]);
   for (let i = startIdx + 1; i < endIdx; i += 1) {
-    const m = /^\s*-\s*([^:]+):\s*(.+)$/.exec(lines[i]!);
-    if (!m) continue;
-    const category = m[1]!.trim().toLowerCase();
-    const valRaw = m[2]!.trim();
+    // Split the bullet on its LAST `: ` so category names containing a
+    // colon (e.g. `Type safety (RFC: 1234): ok`) parse correctly. The
+    // status token never contains `: ` because we strip the bullet body
+    // first and only the trailing status remains.
+    const bulletMatch = /^\s*-\s*(.+)$/.exec(lines[i]!);
+    if (!bulletMatch) continue;
+    const body = bulletMatch[1]!;
+    const lastColon = body.lastIndexOf(": ");
+    if (lastColon < 0) continue;
+    const rawCategory = body.slice(0, lastColon);
+    const valRaw = body.slice(lastColon + 2).trim();
     if (TEMPLATE_PLACEHOLDERS.has(valRaw.toLowerCase())) continue;
+    // Strip surrounding markdown emphasis from the category name before
+    // lowercasing. `**Spec fit**` → `spec fit`.
+    const category = rawCategory
+      .replace(/^[\s*_`]+|[\s*_`]+$/g, "")
+      .toLowerCase();
+    if (category.length === 0) continue;
     const valLower = valRaw.toLowerCase();
     let status: SweepStatus;
     if (valLower === "ok" || valLower === "ok.") {
@@ -1793,6 +1821,26 @@ export function extractCategorySweep(
       status = "n/a";
     } else {
       status = "finding";
+    }
+    // Duplicate-category resolution: strictest wins. If the existing
+    // status outranks (or matches) the new one, keep existing; otherwise
+    // replace. Either way, log the conflict — duplicate category lines
+    // are a reviewer-prompt-violation that should surface to operators.
+    if (out.has(category)) {
+      const existing = out.get(category)!;
+      if (rank[status] > rank[existing]) {
+        logError(
+          `category=${JSON.stringify(category)} ` +
+            `existing=${existing} new=${status} — strictest-wins replaces existing`,
+        );
+        out.set(category, status);
+      } else {
+        logError(
+          `category=${JSON.stringify(category)} ` +
+            `existing=${existing} new=${status} — strictest-wins keeps existing`,
+        );
+      }
+      continue;
     }
     out.set(category, status);
   }
@@ -2194,8 +2242,12 @@ async function runIssuePipeline(
     // Conservative fallback: if either sweep is missing or unparsable,
     // skip the grant and quarantine as before. A malformed sweep must
     // NEVER produce a free extra retry.
-    const sweep1 = extractCategorySweep(review1.stdout);
-    const sweep2 = extractCategorySweep(review2.stdout);
+    const sweepLogError = (msg: string): void =>
+      ctx.deps.logError(
+        `[issue=${ctx.issueNumber}] CATEGORY SWEEP duplicate: ${msg}`,
+      );
+    const sweep1 = extractCategorySweep(review1.stdout, sweepLogError);
+    const sweep2 = extractCategorySweep(review2.stdout, sweepLogError);
     const grantRound3 =
       sweep1 !== null &&
       sweep2 !== null &&
