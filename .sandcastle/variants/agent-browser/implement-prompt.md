@@ -20,6 +20,16 @@ still on the branch — the worktree was NOT reset between attempts. The
 reviewer rejected the previous attempt; the verbatim reviewer output is in
 the `<reviewer-feedback>` block below. Read it carefully.
 
+If `ATTEMPT_NUMBER` is `3`, **this is your final shot.** Round 2 already
+resolved every category that round 1 flagged — round 2's reviewer then
+found NEW issues in different categories (that's why you were granted
+this extra attempt instead of bouncing to needs-human). Both prior sets
+of commits are still on the branch. The `<reviewer-feedback>` block
+below contains ONLY round 2's review (round 1 has been superseded). If
+you can't resolve round 2's findings now, the orchestrator will quarantine
+the ticket — there is no attempt 4. If round 2's complaint is genuinely
+mistaken, a `<rebuttal>` is still allowed; pick it deliberately.
+
 You have two choices on a retry:
 
 1. **Fix the feedback.** Append a new commit on top of the existing branch

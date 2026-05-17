@@ -107,8 +107,20 @@ export interface RalphArgs {
    * implementer pass on `models.implementer.escalations[0]` (with the
    * reviewer's feedback in-prompt) followed by a second reviewer pass on
    * `models.reviewer.escalations[0]`. ALL_CLEAR at any point ships
-   * immediately. Set to false (via `--no-retry`) to fall back to the legacy
-   * one-shot behavior (HAS_BLOCKERS → quarantine immediately).
+   * immediately.
+   *
+   * On round-2 HAS_BLOCKERS, the loop optionally grants a third attempt:
+   * if both rounds' CATEGORY SWEEP blocks parse AND every category that
+   * was a "finding" in round 1 is now "ok" or "n/a" in round 2, the
+   * implementer demonstrably resolved everything the reviewer asked
+   * about — round 2's complaints are genuinely new and progress is
+   * real, so we try once more rather than bouncing to needs-human. A
+   * malformed or missing sweep in either round skips the grant
+   * (conservative fallback; never produce a free retry on a parse
+   * failure). Round 3 HAS_BLOCKERS → quarantine; there is no round 4.
+   *
+   * Set to false (via `--no-retry`) to fall back to one-shot behavior
+   * (any HAS_BLOCKERS → quarantine immediately).
    */
   retryEnabled: boolean;
   /**
@@ -750,30 +762,58 @@ export function preflight(args: RalphArgs, opts: {
  */
 /**
  * Serialize a `KEY → value` record back into dotenv format suitable for
- * writing as a `.env` file. Every value is emitted as `KEY="value"` with
- * standard double-quote escapes (`\\` → backslash, `\"` → quote, `\n` →
- * newline, `\r` → CR, `\t` → tab). Consumers like dotenv-cli and the
- * popular `dotenv` npm package both interpret these the same way.
+ * writing as a `.env` file in the agent sandbox. Uses **single-quoted**
+ * values throughout — `KEY='value'`. Why single-quoted, not double:
  *
- * Why this exists: the orchestrator passes `projectEnv` to the agent
- * sandbox as docker env vars. That populates `process.env` inside the
- * container — but some consumer projects (e.g. affinity-tracker's
- * `apps/nextjs/package.json` `with-env` script) invoke `dotenv-cli` to
- * read a literal `.env` file. Without one on disk, the dev server
- * refuses to start and playwright e2e bounces the iteration. So we
- * materialize a `.env` from `projectEnv` inside the sandbox at boot.
+ * - The real `dotenv` npm package (used by `dotenv-cli` and dotenv-expand)
+ *   only expands `\n` and `\r` inside double-quoted values. `\\`, `\"`,
+ *   and `\t` are left LITERAL. That means a naive double-quoted
+ *   `WINPATH="C:\\Users\\agent"` reads back as `C:\\Users\\agent`
+ *   (doubled backslashes) — silent corruption.
+ * - dotenv-expand expands `$VAR` / `${VAR}` against `process.env` in
+ *   both quote styles. The escape is `\$`. Without escaping, a value
+ *   containing `$PATH` becomes the host's literal PATH.
+ *
+ * Single-quoted values are taken LITERAL by dotenv (no escape
+ *   processing), and `\$` still suppresses dotenv-expand. The single
+ *   restriction: dotenv has no way to embed a single quote inside a
+ *   single-quoted value, so we throw on `'` (vanishingly rare in real
+ *   secrets, would silently corrupt otherwise).
+ *
+ * Mitigating context: the orchestrator already passes every projectEnv
+ * key to the container via docker `env:` → `process.env`. `dotenv-cli`
+ * defaults to `override: false`, so file values do NOT clobber the
+ * already-populated process.env. The file's PRIMARY job is to exist
+ * so `dotenv-cli -e ../../.env` doesn't error out. Correct content is
+ * a defensive backstop in case the consumer toggles `override: true`.
  */
 export function serializeDotenv(env: Record<string, string>): string {
-  const escape = (val: string): string =>
-    val
-      .replace(/\\/g, "\\\\")
-      .replace(/"/g, '\\"')
-      .replace(/\n/g, "\\n")
-      .replace(/\r/g, "\\r")
-      .replace(/\t/g, "\\t");
   const lines: string[] = [];
   for (const key of Object.keys(env)) {
-    lines.push(`${key}="${escape(env[key]!)}"`);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(
+        `serializeDotenv: invalid key ${JSON.stringify(key)} — must match ` +
+          `/^[A-Za-z_][A-Za-z0-9_]*$/`,
+      );
+    }
+    const val = env[key]!;
+    if (val.includes("'")) {
+      throw new Error(
+        `serializeDotenv: value for ${key} contains a single quote — not ` +
+          `representable in single-quoted dotenv form`,
+      );
+    }
+    if (/[\r\n]/.test(val)) {
+      throw new Error(
+        `serializeDotenv: value for ${key} contains a newline — not ` +
+          `representable on one line`,
+      );
+    }
+    // Escape `$` → `\$` so dotenv-expand doesn't substitute against the
+    // process env. Inside single quotes the backslash is preserved by
+    // dotenv's parser, then stripped by dotenv-expand when it sees `\$`.
+    const escaped = val.replace(/\$/g, "\\$");
+    lines.push(`${key}='${escaped}'`);
   }
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
@@ -1642,37 +1682,69 @@ export type SweepStatus = "ok" | "n/a" | "finding";
 
 /**
  * Parse the reviewer's CATEGORY SWEEP block. The block appears between
- * "CATEGORY SWEEP:" and "SWEEP COMPLETE." with one bullet per category:
- * `- Spec fit: ok` / `- Spec fit: n/a (...)` / `- Spec fit: <finding>`.
+ * a line that IS exactly `CATEGORY SWEEP:` and one that starts with
+ * `SWEEP COMPLETE.`. One bullet per category:
+ * `- Spec fit: ok` / `- Spec fit: n/a (...)` / `- Spec fit: <finding text>`.
  * Returns a Map keyed on the lowercased, trimmed category name. Returns
  * null when the block is missing, empty, or unparsable — callers fall
- * back to current (non-sweep-aware) behavior on null. This conservative
- * fallback matters: a malformed sweep should never accidentally grant
- * extra retries.
+ * back to (non-sweep-aware) behavior on null. This conservative fallback
+ * matters: a malformed sweep should never accidentally grant extra retries.
+ *
+ * Classification is INTENTIONALLY strict (not permissive):
+ * - `ok` only matches when the value is exactly `ok`, `ok.`, or `ok
+ *   (parenthetical)`. A value like `ok — actually there's a bug` is a
+ *   finding, NOT ok. An LLM reviewer that hedges with a leading `ok`
+ *   should not get its real complaint silently classified resolved.
+ * - `n/a` only matches when followed by `.`, end-of-string, or `(...)`.
+ *   Same rationale.
+ * - The placeholder-skip only matches the literal template emitted by
+ *   the reviewer prompt (`<ok | n/a (...) | <finding>>`). A reviewer
+ *   using `<one-line finding>` notation is treated as a real finding,
+ *   not as an unfilled template.
  */
 export function extractCategorySweep(
   stdout: string,
 ): Map<string, SweepStatus> | null {
-  const startIdx = stdout.indexOf("CATEGORY SWEEP:");
-  if (startIdx < 0) return null;
-  const endIdx = stdout.indexOf("SWEEP COMPLETE.", startIdx);
-  if (endIdx < 0) return null;
-  const block = stdout.slice(startIdx, endIdx);
+  // Anchor both markers to a line start so a prose mention like
+  // "the CATEGORY SWEEP: block below" doesn't shift the parse window.
+  const lines = stdout.split(/\r?\n/);
+  let startIdx = -1;
+  let endIdx = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!.trim();
+    if (startIdx < 0 && line === "CATEGORY SWEEP:") {
+      startIdx = i;
+    } else if (startIdx >= 0 && line.startsWith("SWEEP COMPLETE.")) {
+      endIdx = i;
+      break;
+    }
+  }
+  if (startIdx < 0 || endIdx < 0) return null;
   const out = new Map<string, SweepStatus>();
-  for (const line of block.split(/\r?\n/)) {
-    const m = /^\s*-\s*([^:]+):\s*(.+)$/.exec(line);
+  // Recognised template placeholders (left verbatim by a reviewer that
+  // didn't fill the line in). Anything else inside `<...>` is treated as
+  // a compact finding.
+  const TEMPLATE_PLACEHOLDERS = new Set([
+    "<ok | n/a (...) | <finding>>",
+    "<ok | n/a (…) | <finding>>",
+    "<ok|n/a(...)|<finding>>",
+  ]);
+  for (let i = startIdx + 1; i < endIdx; i += 1) {
+    const m = /^\s*-\s*([^:]+):\s*(.+)$/.exec(lines[i]!);
     if (!m) continue;
     const category = m[1]!.trim().toLowerCase();
     const valRaw = m[2]!.trim();
+    if (TEMPLATE_PLACEHOLDERS.has(valRaw.toLowerCase())) continue;
     const valLower = valRaw.toLowerCase();
-    // Skip the literal template placeholder — the reviewer left the
-    // example shape in place instead of filling it in. Treat as
-    // unparsable rather than silently classifying as "finding".
-    if (valRaw.startsWith("<") && valRaw.endsWith(">")) continue;
     let status: SweepStatus;
-    if (valLower === "ok" || valLower === "ok." || /^ok[\s.,]/.test(valLower)) {
+    if (valLower === "ok" || valLower === "ok.") {
       status = "ok";
-    } else if (valLower.startsWith("n/a")) {
+    } else if (/^ok\s*\(.*\)\.?$/i.test(valRaw)) {
+      // `ok (parenthetical explanation)` — still ok.
+      status = "ok";
+    } else if (valLower === "n/a" || valLower === "n/a.") {
+      status = "n/a";
+    } else if (/^n\/a\s*\(.*\)\.?$/i.test(valRaw)) {
       status = "n/a";
     } else {
       status = "finding";
@@ -2085,6 +2157,21 @@ async function runIssuePipeline(
       priorFindingsResolved(sweep1, sweep2);
 
     if (grantRound3) {
+      // Vacuous-true sanity log: if sweep1 had zero findings yet round 1
+      // emitted HAS_BLOCKERS, the reviewer's prose and sweep disagree —
+      // priorFindingsResolved still returns true (nothing to compare),
+      // so the grant fires, but the operator should know the reviewer
+      // produced a contradictory verdict that we're papering over.
+      const round1FindingCount = [...sweep1!.values()].filter(
+        (s) => s === "finding",
+      ).length;
+      if (round1FindingCount === 0) {
+        ctx.deps.log(
+          `[issue=${ctx.issueNumber}] WARNING: round-1 reviewer emitted ` +
+            `HAS_BLOCKERS but its CATEGORY SWEEP had zero findings — ` +
+            `granting attempt 3 vacuously. Reviewer prose/sweep disagree.`,
+        );
+      }
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] reviewer attempt 2 HAS_BLOCKERS but ` +
           `round-1 categories resolved — granting attempt 3 on ` +

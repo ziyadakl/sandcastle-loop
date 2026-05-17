@@ -1751,11 +1751,25 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
 // serializeDotenv — projectEnv → sandbox .env (b) materialization
 // ---------------------------------------------------------------------------
 
-// Mirror of the double-quote-escape semantics used by both dotenv-cli and
-// the `dotenv` npm package. Tests round-trip serializeDotenv against this
-// to prove the .env we write into the container will read back correctly
-// on the consumer side.
-function parseDotenvForTest(content: string): Record<string, string> {
+/**
+ * Mirrors the documented behavior of the real `dotenv` npm package +
+ * `dotenv-expand` (used by `dotenv-cli`), not our serializer:
+ *
+ *  1. dotenv strips the surrounding single quotes. Single-quoted values
+ *     are taken as LITERAL — no escape processing happens here.
+ *  2. dotenv-expand then walks the value: it substitutes `$VAR` /
+ *     `${VAR}` against `process.env`, and treats `\$` as an escape
+ *     (stripping the backslash, leaving the `$` literal).
+ *
+ * Crucial test-design note: this parser deliberately does NOT share
+ * implementation with serializeDotenv. A test parser that mirrors the
+ * encoder is a "test of self" — the previous version silently agreed
+ * with serializeDotenv's bugs because both used the same escape table.
+ */
+function parseDotenvLikeRealConsumer(
+  content: string,
+  processEnv: Record<string, string> = {},
+): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of content.split(/\r?\n/)) {
     if (line.length === 0 || line.startsWith("#")) continue;
@@ -1763,15 +1777,19 @@ function parseDotenvForTest(content: string): Record<string, string> {
     if (eq <= 0) continue;
     const key = line.slice(0, eq);
     let val = line.slice(eq + 1);
-    if (val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
-      val = val.slice(1, -1).replace(/\\([\\"nrt])/g, (_m, ch: string) => {
-        if (ch === "n") return "\n";
-        if (ch === "r") return "\r";
-        if (ch === "t") return "\t";
-        if (ch === '"') return '"';
-        return "\\";
-      });
+    // Strip single quotes (no escape processing inside).
+    if (val.startsWith("'") && val.endsWith("'") && val.length >= 2) {
+      val = val.slice(1, -1);
     }
+    // dotenv-expand pass: $VAR / ${VAR} → process.env lookup. \$ → $.
+    val = val.replace(
+      /\\\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+      (m, brace?: string, bare?: string) => {
+        if (m.startsWith("\\$")) return "$";
+        const name = brace ?? bare ?? "";
+        return processEnv[name] ?? "";
+      },
+    );
     out[key] = val;
   }
   return out;
@@ -1782,54 +1800,77 @@ describe("serializeDotenv", () => {
     expect(serializeDotenv({})).toBe("");
   });
 
-  it("simple key/value emits double-quoted form with trailing newline", () => {
-    expect(serializeDotenv({ FOO: "bar" })).toBe('FOO="bar"\n');
+  it("simple key/value emits single-quoted form with trailing newline", () => {
+    expect(serializeDotenv({ FOO: "bar" })).toBe("FOO='bar'\n");
   });
 
-  it("escapes embedded double quotes", () => {
-    const out = serializeDotenv({ MSG: 'he said "hi"' });
-    expect(out).toBe('MSG="he said \\"hi\\""\n');
-    expect(parseDotenvForTest(out).MSG).toBe('he said "hi"');
-  });
-
-  it("escapes backslashes — won't accidentally inject escape sequences", () => {
+  it("backslashes pass through literally (single quotes don't escape)", () => {
+    // BLOCKER-1 regression: the prior double-quoted serializer emitted
+    // `WINPATH="C:\\Users\\agent"`, which real dotenv read back as
+    // `C:\\Users\\agent` (doubled backslashes). Single-quoted form passes
+    // backslashes through untouched.
     const out = serializeDotenv({ WINPATH: "C:\\Users\\agent" });
-    expect(out).toContain('WINPATH="C:\\\\Users\\\\agent"');
-    expect(parseDotenvForTest(out).WINPATH).toBe("C:\\Users\\agent");
+    expect(out).toBe("WINPATH='C:\\Users\\agent'\n");
+    expect(parseDotenvLikeRealConsumer(out).WINPATH).toBe("C:\\Users\\agent");
   });
 
-  it("escapes newlines so multi-line values stay on one logical line", () => {
-    const out = serializeDotenv({ MULTILINE: "line1\nline2" });
-    expect(out).toContain("\\n");
-    expect(out.split("\n").filter((l) => l.length > 0)).toHaveLength(1);
-    expect(parseDotenvForTest(out).MULTILINE).toBe("line1\nline2");
-  });
-
-  it("does NOT expand $VAR-style references — values stay literal", () => {
+  it("escapes $ so dotenv-expand doesn't substitute against process.env", () => {
+    // BLOCKER-2 regression: previously `TOKEN="$PATH"` was empirically
+    // expanded to the host PATH by dotenv-cli's built-in dotenv-expand.
+    // The new serializer prepends `\` to every `$`; dotenv-expand strips
+    // the backslash and leaves the `$VAR` literal.
     const out = serializeDotenv({ TOKEN: "$PATH-not-expanded" });
-    expect(out).toBe('TOKEN="$PATH-not-expanded"\n');
-    expect(parseDotenvForTest(out).TOKEN).toBe("$PATH-not-expanded");
+    expect(out).toBe("TOKEN='\\$PATH-not-expanded'\n");
+    expect(
+      parseDotenvLikeRealConsumer(out, { PATH: "/usr/bin:/bin" }).TOKEN,
+    ).toBe("$PATH-not-expanded");
+  });
+
+  it("escapes $ in bcrypt-style hashes (real-world case)", () => {
+    const hash = "$2b$12$Kix5/qPwYABCDEFGHIJKLMabcdefghijklmnopqrstuvwx";
+    const out = serializeDotenv({ BCRYPT_HASH: hash });
+    expect(parseDotenvLikeRealConsumer(out, {}).BCRYPT_HASH).toBe(hash);
   });
 
   it("survives values containing = (base64-ish)", () => {
     const out = serializeDotenv({ B64: "abc=def==" });
-    expect(parseDotenvForTest(out).B64).toBe("abc=def==");
+    expect(parseDotenvLikeRealConsumer(out).B64).toBe("abc=def==");
   });
 
   it("survives values containing # (don't parse as comments)", () => {
     const out = serializeDotenv({ HASH: "value#with-hash" });
-    expect(parseDotenvForTest(out).HASH).toBe("value#with-hash");
+    expect(parseDotenvLikeRealConsumer(out).HASH).toBe("value#with-hash");
   });
 
-  it("round-trips a realistic multi-key project env", () => {
+  it("throws on single-quote-bearing values (not representable)", () => {
+    expect(() => serializeDotenv({ KEY: "he said 'hi'" })).toThrow(
+      /single quote/,
+    );
+  });
+
+  it("throws on newline-bearing values", () => {
+    expect(() => serializeDotenv({ KEY: "line1\nline2" })).toThrow(/newline/);
+  });
+
+  it("throws on keys that aren't valid dotenv identifiers", () => {
+    expect(() => serializeDotenv({ "BAD KEY": "x" })).toThrow(/invalid key/);
+    expect(() => serializeDotenv({ "1STARTS_NUMERIC": "x" })).toThrow(
+      /invalid key/,
+    );
+  });
+
+  it("round-trips a realistic multi-key project env through the real-consumer parser", () => {
     const record = {
       POSTGRES_URL:
         "postgresql://user:p@ss%23word@localhost:5432/db?sslmode=require",
       AUTH_SECRET: "ABCdef==/+random",
       NEXT_PUBLIC_SUPABASE_URL: "https://x.supabase.co",
       AIRTABLE_API_KEY: "patABC.def123",
+      WEBHOOK_SIGNING: "whsec_$abc$def",
     };
-    expect(parseDotenvForTest(serializeDotenv(record))).toEqual(record);
+    expect(parseDotenvLikeRealConsumer(serializeDotenv(record))).toEqual(
+      record,
+    );
   });
 });
 
@@ -1887,6 +1928,91 @@ describe("extractCategorySweep", () => {
       "SWEEP COMPLETE.",
     ].join("\n");
     expect(extractCategorySweep(stdout)).toBeNull();
+  });
+
+  // Adversarial: a reviewer hedging with `ok — but actually X is broken` used
+  // to silently classify as ok because the regex was `/^ok[\s.,]/`. The new
+  // strict parser treats anything after `ok` other than `.` or `(...)` as a
+  // finding — the reviewer's complaint isn't lost.
+  it("`ok — actually there's a bug` classifies as a finding, not ok", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Type safety: ok — actually there's a bug at line 42",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("type safety")).toBe("finding");
+  });
+
+  it("`ok, but worth noting X` classifies as a finding", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: ok, but missing the refine() per spec",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("spec fit")).toBe("finding");
+  });
+
+  it("`ok (parenthetical explanation)` stays classified as ok", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Spec fit: ok (acceptance criteria fully covered)",
+      "- Test coverage: ok.",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout)!;
+    expect(sweep.get("spec fit")).toBe("ok");
+    expect(sweep.get("test coverage")).toBe("ok");
+  });
+
+  it("`n/a — actually this matters` classifies as a finding, not n/a", () => {
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Security: n/a — wait, the new endpoint takes user input",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("security")).toBe("finding");
+  });
+
+  it("compact `<finding text>` notation classifies as a finding, not skipped", () => {
+    // Previously the placeholder-skip rule ate any value wrapped in <...>,
+    // silently dropping real findings written in compact form. Now only the
+    // literal template placeholder is skipped.
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Type safety: <missing return type on toggle helper>",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("type safety")).toBe("finding");
+  });
+
+  it("ignores prose mentions of `CATEGORY SWEEP:` before the real block", () => {
+    // `indexOf` on the bare string would lock onto the prose mention and
+    // try to parse review prose as bullets. Line-anchored matching skips it.
+    const stdout = [
+      "I'll discuss the CATEGORY SWEEP: block below in detail.",
+      "Review prose continues here.",
+      "",
+      "CATEGORY SWEEP:",
+      "- Spec fit: ok",
+      "- Test coverage: missing tests for the new branch",
+      "SWEEP COMPLETE.",
+    ].join("\n");
+    const sweep = extractCategorySweep(stdout)!;
+    expect(sweep.get("spec fit")).toBe("ok");
+    expect(sweep.get("test coverage")).toBe("finding");
+  });
+
+  it("ignores prose mentions of `SWEEP COMPLETE.` AFTER the real block", () => {
+    // Conversely, a prose mention after the real block shouldn't matter
+    // because parsing already terminated at the first SWEEP COMPLETE.
+    const stdout = [
+      "CATEGORY SWEEP:",
+      "- Type safety: ok",
+      "SWEEP COMPLETE.",
+      "",
+      "Note: the SWEEP COMPLETE. marker above is the load-bearing one.",
+    ].join("\n");
+    expect(extractCategorySweep(stdout)!.get("type safety")).toBe("ok");
   });
 });
 
@@ -2024,6 +2150,63 @@ describe("sandcastle-loop main.mts — third-attempt grant", () => {
     expect(result.shippedIssues).toEqual([151]);
     expect(b.state.quarantines).toEqual([]);
     expect(b.state.marksDone).toHaveLength(1);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names).toContain("implementer-retry-2");
+    expect(names).toContain("reviewer-retry-2");
+  });
+
+  it("round 3 still HAS_BLOCKERS → quarantines (deferral counter reset, ship blocked)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "159", title: "round-3-fails", branch: "agent/issue-159" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 159 }),
+      commits: [{ sha: "r1" }],
+    });
+    b.enqueue("reviewer", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "type safety": "missing return type" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 2: type-safety resolved, new spec-fit finding → grants round 3.
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 159 }),
+      commits: [{ sha: "r2" }],
+    });
+    b.enqueue("reviewer-retry", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "spec fit": "missing acceptance criterion" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 3 implementer runs but reviewer-retry-2 still finds an issue.
+    b.enqueue("implementer-retry-2", {
+      stdout: implementerStdout({ ghIssue: 159 }),
+      commits: [{ sha: "r3" }],
+    });
+    b.enqueue("reviewer-retry-2", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { security: "fresh issue uncovered on attempt 3" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([]);
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(159);
+    expect(b.state.quarantines[0]!.reason).toMatch(/third attempt/);
+    // Round 3 actually ran (regression guard).
     const names = b.state.runCalls.map((c) => c.spec.name);
     expect(names).toContain("implementer-retry-2");
     expect(names).toContain("reviewer-retry-2");
