@@ -971,6 +971,9 @@ function buildGitEnv(): Record<string, string> {
 /** Persistent staging branch name. Reused across iterations. */
 const STAGING_BRANCH = "integration-candidate";
 
+/** `git branch --merged` format flag — emit short refnames (no leading "* "). */
+const GIT_BRANCH_FORMAT_ARG = "--format=%(refname:short)";
+
 /**
  * Absolute path to the dedicated staging worktree. Set by
  * `ensureStagingWorktree` during the CLI boot sequence (after preflight,
@@ -1613,6 +1616,214 @@ interface IssueOutcome {
   finalMarker?: string;
   /** Most recent commit SHA on the branch, if any. */
   postSha?: string;
+}
+
+/**
+ * Returns the subset of `candidateBranches` that are reachable from `launchBranch`
+ * — i.e. branches whose tips git considers merged. Always prefer this over
+ * trusting the merger's output text: a partial merger (some conflicts skipped)
+ * can report success while leaving branches unmerged.
+ *
+ * Read-only — never mutates repo state.
+ */
+export function verifyLandedBranches(
+  repoRoot: string,
+  launchBranch: string,
+  candidateBranches: readonly string[],
+  warn: (msg: string) => void,
+): readonly string[] {
+  if (candidateBranches.length === 0) return [];
+  let mergedOutput: string;
+  try {
+    mergedOutput = execFileSync(
+      "git",
+      ["branch", "--merged", launchBranch, GIT_BRANCH_FORMAT_ARG],
+      { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+  } catch (err) {
+    warn(
+      `verifyLandedBranches: git branch --merged ${launchBranch} failed: ${(err as Error).message}`,
+    );
+    return [];
+  }
+  const mergedSet = new Set(
+    mergedOutput
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  return candidateBranches.filter((b) => mergedSet.has(b));
+}
+
+/**
+ * Per-branch cleanup for the sandcastle loop.
+ *
+ * Side effects: removes the sub-worktree at
+ * `.sandcastle/worktrees/<wtName>` AND deletes the local branch
+ * `<branch>`. Both are mutations on the repo at `repoRoot`.
+ *
+ * Order is LOAD-BEARING — `git worktree remove` MUST run before
+ * `git branch -d`. Reverse order silently no-ops: `git branch -d`
+ * refuses to delete a branch that is currently checked out in ANY
+ * worktree, and our setup always has the branch checked out in its
+ * sub-worktree. Do NOT add a "branch only" fast path.
+ *
+ * `--force` is a FALLBACK ONLY. First try a clean `git worktree
+ * remove <path>`. Escalate to `--force` only when (a) the clean
+ * remove fails AND (b) `git status --porcelain` inside the worktree
+ * is empty (i.e. the working tree is clean and git is just being
+ * cautious about something benign like a dangling registration).
+ *
+ * The branch delete uses SHA-pinned `git update-ref -d` rather than
+ * `git branch -d`. `branch -d` performs its own HEAD-based merge
+ * check internally, which has the same false-negative as the old
+ * pre-check whenever repoRoot's HEAD isn't on `launchBranch`. The
+ * two-step safety net (pre-check merged-status against `launchBranch`,
+ * then `update-ref -d <ref> <expected-sha>`) provides equivalent
+ * guarantees: merge-safety from the pre-check, ref-race-safety from
+ * the SHA pin. Never `branch -D` — that's an unguarded escalation.
+ *
+ * Best-effort: never throws. Returns one of:
+ *   "ok"                       — both steps succeeded
+ *   "skipped-unmerged"         — branch isn't reachable from launchBranch
+ *   "skipped-worktree-error"   — worktree remove failed AND we
+ *                                couldn't proceed to branch delete
+ *   "skipped-branch-error"     — worktree removed but branch delete
+ *                                had an unexpected error
+ *
+ * The caller emits the result to logs and proceeds to the next branch.
+ */
+export function cleanupIssueBranch(
+  repoRoot: string,
+  branch: string,
+  launchBranch: string,
+  warn: (msg: string) => void,
+):
+  | "ok"
+  | "skipped-unmerged"
+  | "skipped-worktree-error"
+  | "skipped-branch-error" {
+  const wtName = branch.replace(/\//g, "-");
+  const wtPath = `.sandcastle/worktrees/${wtName}`;
+
+  // Step 1: worktree remove (clean first, --force only on clean-but-busy).
+  try {
+    execFileSync("git", ["worktree", "remove", wtPath], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch (err1) {
+    // Clean remove failed. Try --force only if the working tree is clean.
+    let canForce = false;
+    try {
+      const status = execFileSync("git", ["status", "--porcelain"], {
+        cwd: path.join(repoRoot, wtPath),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      canForce = status.trim().length === 0;
+    } catch {
+      // Worktree dir or registration missing; let prune handle it below.
+    }
+    if (canForce) {
+      try {
+        execFileSync("git", ["worktree", "remove", "--force", wtPath], {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch (err2) {
+        warn(
+          `worktree remove --force ${wtPath} failed: ${(err2 as Error).message}`,
+        );
+        return "skipped-worktree-error";
+      }
+    } else {
+      // Try a prune in case the registration is just dangling, then retry.
+      try {
+        execFileSync("git", ["worktree", "prune"], {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        // ignore — prune is best-effort
+      }
+      try {
+        execFileSync("git", ["worktree", "remove", wtPath], {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        warn(`worktree remove ${wtPath} failed: ${(err1 as Error).message}`);
+        // Continue to branch delete anyway — registration may be gone already.
+      }
+    }
+  }
+
+  // Step 2: SHA-pinned branch delete.
+  //
+  // Pre-check merge status against `launchBranch` (NOT HEAD): the
+  // pipeline calls us from `args.repoRoot`, where HEAD usually matches
+  // the launch branch but doesn't have to. The FF step
+  // (`fastForwardIntegration`) falls back to `git update-ref` when the
+  // launch branch isn't checked out anywhere, which leaves repoRoot's
+  // HEAD pointed at some other branch. Using HEAD here would falsely
+  // report "not merged" and skip cleanup of branches that DID land.
+  //
+  // We then delete via SHA-pinned `update-ref -d` rather than
+  // `branch -d`, because `branch -d` performs the same HEAD-based
+  // merge check internally — i.e. it has the same bug we just fixed
+  // in the pre-check. The SHA pin keeps the "don't clobber a
+  // concurrently-moved ref" safety that `branch -d` would otherwise
+  // provide. Together the pre-check (merge-safety) and the SHA pin
+  // (ref-race-safety) match what plain `branch -d` gave us when HEAD
+  // was guaranteed to be on launchBranch.
+  // Verify the branch actually exists locally before trying merge-checks.
+  // A missing branch != unmerged — distinguish so the warn is accurate.
+  let branchSha = "";
+  try {
+    branchSha = execFileSync(
+      "git",
+      ["rev-parse", "--verify", `refs/heads/${branch}`],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    ).trim();
+  } catch {
+    warn(`branch ${branch} does not exist locally; nothing to delete`);
+    return "skipped-branch-error";
+  }
+  let isMerged = false;
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", branch, launchBranch], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    isMerged = true;
+  } catch {
+    isMerged = false;
+  }
+  if (!isMerged) {
+    warn(
+      `branch delete ${branch} refused: not fully merged into ${launchBranch}`,
+    );
+    return "skipped-unmerged";
+  }
+  try {
+    execFileSync(
+      "git",
+      ["update-ref", "-d", `refs/heads/${branch}`, branchSha],
+      {
+        cwd: repoRoot,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    return "ok";
+  } catch (err) {
+    warn(`update-ref -d ${branch} failed: ${(err as Error).message}`);
+    return "skipped-branch-error";
+  }
 }
 
 interface PipelineCtx {
@@ -2977,17 +3188,18 @@ export async function runMain(
       }
 
       // Promotion / quarantine decision.
+      let ffSucceeded = false;
       if (stagingActive) {
         if (postMergeMarker === "POST_MERGE_ALL_CLEAR" && mergerOk) {
           // Fast-forward integration, then promote all merged-to-staging
           // issues to done.
-          const ff = fastForwardIntegration(
+          ffSucceeded = fastForwardIntegration(
             args.repoRoot,
             args.branch,
             (s) => deps.log(s),
             (s) => deps.logError(s),
           );
-          if (ff) {
+          if (ffSucceeded) {
             const summary =
               `[ralph it=${it}] integration ${args.branch} fast-forwarded; ` +
               `staging certified by post-merge reviewer`;
@@ -3036,25 +3248,52 @@ export async function runMain(
         }
       }
 
-      // Phase 5: cleanup stale per-issue sub-worktrees, gated on the
-      // post-merge reviewer's verdict. ALL_CLEAR means the merge is
-      // certified — the per-issue scaffolding has done its job and can be
-      // safely garbage-collected. ISSUES_FOUND, no marker, or any error
-      // above → leave the worktrees in place for human inspection.
-      if (postMergeMarker === "POST_MERGE_ALL_CLEAR") {
-        for (const issue of mergedBranches) {
-          const wtName = issue.branch.replace(/\//g, "-");
-          const wtPath = `.sandcastle/worktrees/${wtName}`;
-          try {
-            execFileSync("git", ["worktree", "remove", "--force", wtPath], {
-              cwd: args.repoRoot,
-              stdio: ["ignore", "pipe", "pipe"],
-            });
-            deps.log(`cleaned up worktree ${wtPath}`);
-          } catch (err) {
-            deps.logError(
-              `worktree cleanup failed for ${wtPath}: ${(err as Error).message}`,
+      // Phase 5: cleanup of per-issue sub-worktrees AND agent/issue-N
+      // branches for issues that successfully landed THIS iteration.
+      //
+      // Gate logic (both conditions required):
+      //   1. The specific issue's outcome.status === "ok".
+      //      Quarantined / errored / deferred issues keep their branch
+      //      and sub-worktree as forensic evidence.
+      //   2. Mode-dependent timing:
+      //      - stagingActive: AFTER post-merge review passes AND the FF
+      //        to the launch branch succeeded.
+      //      - !stagingActive: immediately after merger commits. Post-
+      //        merge review is advisory in --no-staging and does NOT
+      //        gate cleanup.
+      //
+      // Truth source for "which branches landed": git's own --merged
+      // check, NOT the merger's output text. Partial merges (some
+      // conflicts skipped) can report success while leaving branches
+      // unmerged.
+      const cleanupGate = stagingActive
+        ? postMergeMarker === "POST_MERGE_ALL_CLEAR" && mergerOk && ffSucceeded
+        : mergerOk;
+      if (cleanupGate) {
+        const okIssues = completed.filter((c) => c.outcome.status === "ok");
+        const candidateBranches = okIssues.map((c) => c.issue.branch);
+        const landedBranches = verifyLandedBranches(
+          args.repoRoot,
+          args.branch,
+          candidateBranches,
+          (w) => deps.logError(`cleanup WARN: ${w}`),
+        );
+        if (landedBranches.length === 0) {
+          deps.log(
+            `cleanup: no agent/issue-* branches verified as merged into ${args.branch}; skipping`,
+          );
+        } else {
+          deps.log(
+            `cleanup: removing ${landedBranches.length} worktree+branch pair(s) for landed issues`,
+          );
+          for (const branch of landedBranches) {
+            const result = cleanupIssueBranch(
+              args.repoRoot,
+              branch,
+              args.branch,
+              (w) => deps.logError(`cleanup WARN: ${w}`),
             );
+            deps.log(`cleanup ${branch}: ${result}`);
           }
         }
       }
