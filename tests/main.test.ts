@@ -259,6 +259,7 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     recoveryModel: "claude-opus-4-7",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
+    hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,

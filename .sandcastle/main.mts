@@ -91,6 +91,18 @@ export interface RalphArgs {
   recoveryModel: string;
   implementerTimeoutSec: number;
   reviewerTimeoutSec: number;
+  /**
+   * Outer wall-clock ceiling around every SDK `run` / `handle.run` call.
+   * Independent of the SDK's own idle timer, which resets on every
+   * stdout line and so can be evaded by an agent that emits trickle
+   * output while making no real progress (observed: tsc retry loops
+   * after a host-level OOM kills the tsc child silently). When the
+   * ceiling fires, an `AbortSignal` is raised; the SDK kills the
+   * in-flight agent subprocess and rejects with the abort reason.
+   * Set high enough that legitimate slow runs aren't false-killed
+   * (default 3600s = 60 min, ~3x the implementer idle timeout).
+   */
+  hardCeilingSec: number;
   consecutiveFailureLimit: number;
   logFile?: string;
   dryRun: boolean;
@@ -322,6 +334,12 @@ Optional:
   --recovery-model M            Default: from .sandcastle/models.ts (recovery.default). Used by the recovery pass.
   --implementer-timeout-sec N   Default: 1200.
   --reviewer-timeout-sec N      Default: 600.
+  --hard-ceiling-sec N      Outer wall-clock ceiling per SDK call. Fires
+                            independently of the SDK's idle timer (which
+                            resets on every output line and can be
+                            evaded by trickle output during an OOM hang).
+                            When it fires, the in-flight agent is
+                            aborted. Default: 3600 (60 min).
   --consecutive-failure-limit N Default: 3.
   --log-file PATH           Tee output to this file.
   --dry-run                 Skip claim/quarantine/markDone side effects.
@@ -387,6 +405,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "recovery-model": { type: "string" },
       "implementer-timeout-sec": { type: "string" },
       "reviewer-timeout-sec": { type: "string" },
+      "hard-ceiling-sec": { type: "string" },
       "consecutive-failure-limit": { type: "string" },
       "log-file": { type: "string" },
       "dry-run": { type: "boolean" },
@@ -459,6 +478,9 @@ export function parseRalphArgs(argv: readonly string[]): {
         values["reviewer-timeout-sec"],
         "--reviewer-timeout-sec",
       ) ?? 600,
+    hardCeilingSec:
+      parsePositiveInt(values["hard-ceiling-sec"], "--hard-ceiling-sec") ??
+      3600,
     consecutiveFailureLimit:
       parsePositiveInt(
         values["consecutive-failure-limit"],
@@ -521,6 +543,7 @@ function defaultArgs(): RalphArgs {
     recoveryModel: models.recovery.default,
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
+    hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
     dryRun: false,
     recoveryEnabled: true,
@@ -1319,6 +1342,35 @@ function makeLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Outer wall-clock watchdog around an SDK call. The SDK's own idle timer
+ * resets on every output line, so an agent stuck in a trickle-output loop
+ * (observed on affinity-tracker: tsc retries after a host-level OOM kills
+ * the tsc child silently — the loop driver only sees the agent emit small
+ * reasoning tokens forever) can hang for hours. This ceiling fires
+ * regardless of output activity. The SDK accepts `signal: AbortSignal`;
+ * on abort it kills the in-flight agent subprocess and rejects with the
+ * signal's reason.
+ *
+ * Exported for unit testing. Production wiring is in {@link buildDefaultDeps}
+ * which captures `args.hardCeilingSec` into a closure that calls this.
+ */
+export function withHardCeiling<T>(
+  ceilingMs: number,
+  label: string,
+  invoke: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new Error(
+        `hard ceiling: ${label} exceeded ${(ceilingMs / 1000).toFixed(0)}s wall-clock — SDK idle timer never fired (likely OOM-of-child or trickle-output hang)`,
+      ),
+    );
+  }, ceilingMs);
+  return invoke(controller.signal).finally(() => clearTimeout(timer));
+}
+
+/**
  * Build the production {@link Deps} bag — wires sandcastle.run /
  * sandcastle.createSandbox / src/state/gh.ts wrappers / src/migrations/.
  *
@@ -1423,6 +1475,12 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
     "<promise>HALT</promise>",
   ];
 
+  const ceilingMs = args.hardCeilingSec * 1000;
+  const withCeiling = <T,>(
+    label: string,
+    invoke: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => withHardCeiling(ceilingMs, label, invoke);
+
   return {
     async run(spec) {
       // Top-level runs (planner, merger) don't need `pnpm install` — the
@@ -1431,17 +1489,22 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       // time on a fresh sandbox because it doesn't get copyToWorktree's
       // node_modules so the install starts from scratch on a 1.7 GB
       // monorepo and trips workspace catalog errors.
-      const result = await sandcastle.run({
-        sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
-        cwd: spec.cwd ?? args.repoRoot,
-        name: spec.name,
-        maxIterations: spec.maxIterations ?? 1,
-        agent: sandcastle.claudeCode(spec.model, { env: envForModel(spec.model) }),
-        promptFile: spec.promptFile,
-        promptArgs: spec.promptArgs,
-        idleTimeoutSeconds: spec.idleTimeoutSeconds,
-        completionSignal,
-      });
+      const result = await withCeiling(
+        `top-level run "${spec.name}"`,
+        (signal) =>
+          sandcastle.run({
+            sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
+            cwd: spec.cwd ?? args.repoRoot,
+            name: spec.name,
+            maxIterations: spec.maxIterations ?? 1,
+            agent: sandcastle.claudeCode(spec.model, { env: envForModel(spec.model) }),
+            promptFile: spec.promptFile,
+            promptArgs: spec.promptArgs,
+            idleTimeoutSeconds: spec.idleTimeoutSeconds,
+            completionSignal,
+            signal,
+          }),
+      );
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
@@ -1468,15 +1531,20 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         branch: handle.branch,
         worktreePath: handle.worktreePath,
         run: async (opts) => {
-          const r = await handle.run({
-            name: opts.name,
-            maxIterations: opts.maxIterations ?? 1,
-            agent: sandcastle.claudeCode(opts.model, { env: envForModel(opts.model) }),
-            promptFile: opts.promptFile,
-            promptArgs: opts.promptArgs,
-            idleTimeoutSeconds: opts.idleTimeoutSeconds,
-            completionSignal,
-          });
+          const r = await withCeiling(
+            `sandbox run "${opts.name}"`,
+            (signal) =>
+              handle.run({
+                name: opts.name,
+                maxIterations: opts.maxIterations ?? 1,
+                agent: sandcastle.claudeCode(opts.model, { env: envForModel(opts.model) }),
+                promptFile: opts.promptFile,
+                promptArgs: opts.promptArgs,
+                idleTimeoutSeconds: opts.idleTimeoutSeconds,
+                completionSignal,
+                signal,
+              }),
+          );
           return { stdout: r.stdout, commits: r.commits };
         },
         close: () => handle.close(),

@@ -355,9 +355,24 @@ start it; the loop never manages the dev server.
 2. Plan your approach. If the change is more than a couple of files, sketch
    it out before writing code.
 
-3. Run the project's verification commands. ALL must pass before you commit:
-   - `npm run typecheck` (or `pnpm typecheck`, whichever the repo uses)
-   - `npm run test` (or `pnpm vitest run`, etc.)
+3. Run the project's verification commands. ALL must pass before you commit.
+   **Prefer narrow scope by default** to keep memory pressure low. A
+   whole-repo typecheck in a constrained container can OOM-kill tsc
+   silently — the kernel kills the child while the SDK still sees the
+   agent emitting tokens, so the idle timer never fires and the run
+   hangs for hours. Figure out which packages your changes actually
+   touched — `git diff --name-only HEAD~1` if you've made one commit
+   this iteration, or `git log --name-only --pretty=format: -n N` for
+   the last N commits. Then:
+   - For multi-package workspaces (pnpm/npm/yarn), typecheck only the
+     changed packages plus reverse-dependents — e.g.
+     `pnpm --filter <pkg>^... typecheck`. Only fall back to whole-repo
+     typecheck if your changes touch more than three packages or files
+     outside any package.
+   - Same principle for tests: run the changed package's tests first;
+     expand only if shared infrastructure was touched.
+   - For single-package projects, the project's standard typecheck/test
+     commands are fine.
 
 4. **MIGRATION** — If you wrote a SQL file under `packages/db/migrations/`
    in this iteration, you MUST apply it to the dev database BEFORE running
