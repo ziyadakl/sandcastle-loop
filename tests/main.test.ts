@@ -265,6 +265,7 @@ function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
     recoveryEnabled: true,
     retryEnabled: true,
     stagingEnabled: true,
+    allowDirtySandcastle: false,
     ...over,
   };
 }
@@ -1525,6 +1526,8 @@ describe("sandcastle-loop main.mts — sandbox image preflight", () => {
     expect(res.errors).toEqual([]);
   });
 
+  // Sandcastle-source dirty-check tests live just below in their own block.
+
   it("skips the image check when docker daemon itself is down (avoids redundant errors)", () => {
     const res = preflight(baseArgs({ imageName: "sandcastle:test-proj" }), {
       exec: (bin, a) => {
@@ -1543,6 +1546,82 @@ describe("sandcastle-loop main.mts — sandbox image preflight", () => {
     expect(res.ok).toBe(false);
     expect(res.errors.join("\n")).toMatch(/docker info failed/);
     expect(res.errors.join("\n")).not.toMatch(/sandbox image/);
+  });
+});
+
+describe("sandcastle-loop main.mts — .sandcastle/main.mts dirty-check preflight", () => {
+  // The dirty-check refuses to launch when `.sandcastle/main.mts` has
+  // uncommitted changes vs HEAD. It guards against the "patched locally
+  // but never propagated upstream" failure mode that has bitten the
+  // loop twice (`.pnpm-store/` gitignore slip, worktree pre-clean slip).
+  // baseArgs() defaults `allowDirtySandcastle: true` so other tests are
+  // not coupled to this gate; these tests opt in by overriding it.
+
+  // `exec` mock that only fails the dirty-check call. All other gates
+  // pass (gh auth, docker info, docker image inspect, ...).
+  function execWithDirtyCheck(dirty: boolean) {
+    return (bin: string, a: readonly string[]) => {
+      if (
+        bin === "git" &&
+        a.includes("diff") &&
+        a.includes("--quiet") &&
+        a.includes(".sandcastle/main.mts")
+      ) {
+        return dirty ? { ok: false, stderr: "" } : { ok: true };
+      }
+      return { ok: true };
+    };
+  }
+
+  it("fails when .sandcastle/main.mts is dirty vs HEAD (default strict)", () => {
+    const res = preflight(baseArgs({ allowDirtySandcastle: false }), {
+      exec: execWithDirtyCheck(true),
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(
+      /uncommitted changes in \.sandcastle\/main\.mts/,
+    );
+    expect(res.errors.join("\n")).toMatch(/--allow-dirty-sandcastle/);
+  });
+
+  it("passes when .sandcastle/main.mts is clean vs HEAD", () => {
+    const res = preflight(baseArgs({ allowDirtySandcastle: false }), {
+      exec: execWithDirtyCheck(false),
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("skips the dirty-check entirely when allowDirtySandcastle is true", () => {
+    let dirtyCheckCalled = false;
+    const res = preflight(baseArgs({ allowDirtySandcastle: true }), {
+      exec: (bin, a) => {
+        if (
+          bin === "git" &&
+          a[0] === "diff" &&
+          a[1] === "--quiet" &&
+          a.includes(".sandcastle/main.mts")
+        ) {
+          dirtyCheckCalled = true;
+          // If anything DID call us, simulate a dirty state to prove
+          // we didn't observe it.
+          return { ok: false, stderr: "" };
+        }
+        return { ok: true };
+      },
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(dirtyCheckCalled).toBe(false);
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
   });
 });
 

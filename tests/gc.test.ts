@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   cleanupIssueBranch,
   verifyLandedBranches,
+  worktreePathFor,
 } from "../.sandcastle/main.mjs";
 
 function git(cwd: string, ...args: string[]): string {
@@ -184,5 +185,28 @@ describe("cleanupIssueBranch", () => {
     expect(result).toBe("skipped-branch-error");
     expect(warnings.length).toBeGreaterThan(0);
     expect(warnings.some((w) => w.includes("does not exist"))).toBe(true);
+  });
+});
+
+describe("worktreePathFor", () => {
+  // This helper MUST stay in sync with `@ai-hero/sandcastle/dist/
+  // WorktreeManager.js` — both our `createSandbox` pre-clean guard and
+  // `cleanupIssueBranch` derive paths from it, so the formula bridges
+  // our code and the SDK. Pin the contract: forward slashes become
+  // dashes; no other transforms.
+  it("converts forward slashes to dashes for typical agent branches", () => {
+    expect(worktreePathFor("agent/issue-100")).toBe(
+      ".sandcastle/worktrees/agent-issue-100",
+    );
+  });
+
+  it("collapses multiple path segments to a flat dash-separated name", () => {
+    expect(worktreePathFor("feat/foo/bar")).toBe(
+      ".sandcastle/worktrees/feat-foo-bar",
+    );
+  });
+
+  it("returns a branch name unchanged when it contains no slashes", () => {
+    expect(worktreePathFor("main")).toBe(".sandcastle/worktrees/main");
   });
 });

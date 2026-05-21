@@ -25,7 +25,7 @@
 
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -167,6 +167,17 @@ export interface RalphArgs {
    * which is never the image we just built. Override with `--image-name`.
    */
   imageName: string;
+  /**
+   * When true, the preflight `git diff --quiet HEAD -- .sandcastle/main.mts`
+   * check is skipped (a warning is logged instead). The check exists to
+   * prevent the "patched locally but never committed" failure mode that
+   * has bitten the loop twice in a row: a downstream fix gets shipped in a
+   * consumer's vendored copy of main.mts but never propagated upstream, so
+   * the next `/sandcastle-update` clobbers the patch. Default false —
+   * strictness is the norm; the flag exists for legitimate
+   * "tweak-then-test-then-commit" workflows in the template repo itself.
+   */
+  allowDirtySandcastle: boolean;
 }
 
 /**
@@ -414,6 +425,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
       "image-name": { type: "string" },
+      "allow-dirty-sandcastle": { type: "boolean" },
       "help": { type: "boolean" },
     },
   });
@@ -495,6 +507,7 @@ export function parseRalphArgs(argv: readonly string[]): {
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
+    allowDirtySandcastle: values["allow-dirty-sandcastle"] === true,
   };
   return { args, showHelp: false };
 }
@@ -550,6 +563,7 @@ function defaultArgs(): RalphArgs {
     retryEnabled: true,
     stagingEnabled: true,
     imageName: defaultImageName(process.cwd()),
+    allowDirtySandcastle: false,
   };
 }
 
@@ -764,6 +778,41 @@ export function preflight(args: RalphArgs, opts: {
           `drizzle migration file(s) on disk (e.g. ${migrations[0]}). The ` +
           `migration applier will fail mid-pipeline. Set DATABASE_URL=... in ` +
           `<repoRoot>/.env (project-specific) before running the loop.`,
+      );
+    }
+  }
+
+  // 8. Sandcastle source code dirty-check. Refuse-launch when
+  // `.sandcastle/main.mts` has uncommitted modifications vs HEAD. This
+  // is the discipline guard against the "patched locally but never
+  // propagated upstream" failure mode that has bitten the loop twice
+  // (the `.pnpm-store/` gitignore slip and the worktree pre-clean slip
+  // — both shipped to consumers via in-place edits and never made it
+  // back into the template). Either commit before launching, or opt
+  // out with `--allow-dirty-sandcastle` (the bypass-warn at the CLI
+  // entry surfaces the opt-out so it doesn't silently become habit).
+  if (!args.allowDirtySandcastle) {
+    // `-C args.repoRoot` is load-bearing: the default `exec` inherits
+    // process.cwd() (see line ~700), but `--repo-root` is allowed to
+    // diverge from cwd. Without -C, a launch from a different working
+    // directory would silently check the wrong repo and either
+    // false-negative (report clean) or false-positive (report dirty
+    // against an unrelated repo).
+    const dirty = exec("git", [
+      "-C",
+      args.repoRoot,
+      "diff",
+      "--quiet",
+      "HEAD",
+      "--",
+      ".sandcastle/main.mts",
+    ]);
+    if (!dirty.ok) {
+      errors.push(
+        "uncommitted changes in .sandcastle/main.mts — commit before " +
+          "launching (prevents 'patched locally but never propagated' " +
+          "incidents). Bypass with --allow-dirty-sandcastle if you really " +
+          "mean it (and own propagating the patch upstream yourself).",
       );
     }
   }
@@ -1508,6 +1557,44 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
+      // Pre-clean any stale worktree from a prior killed iteration. The
+      // SDK's `cp -R src dest` (`CopyToWorktree.js:29,32`) has no
+      // pre-clean: if `dest` already exists, `cp -R` recurses into it,
+      // building `dest/node_modules/node_modules/...` until disk
+      // exhaustion. Real bug — bit affinity-tracker iteration 1 of the
+      // budgeting branch. The SDK's `WorktreeManager.create()` handles a
+      // missing path correctly via plain `git worktree add`, so this
+      // guard hands it a clean slate. Three-tier fallback covers:
+      //   1. Registered worktree (normal post-killed-iteration state)
+      //      → `git worktree remove --force` clears reg + dir.
+      //   2. Orphan dir git doesn't know about → `rmSync` removes it.
+      //   3. Dangling registration with no dir → `git worktree prune`
+      //      clears the registration so a fresh `add` succeeds.
+      const wtPath = path.join(
+        args.repoRoot,
+        worktreePathFor(spec.branch),
+      );
+      if (existsSync(wtPath)) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", wtPath],
+            { cwd: args.repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+          );
+        } catch {
+          rmSync(wtPath, { recursive: true, force: true });
+        }
+      }
+      try {
+        execFileSync("git", ["worktree", "prune"], {
+          cwd: args.repoRoot,
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        // Best-effort; a fresh `git worktree add` will surface a
+        // clearer error if the registration is still wrong.
+      }
+
       // Work around the SDK bug where createSandbox hardcodes
       // agentProviderEnv: {}, dropping per-call env injection. We bake the
       // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
@@ -1724,6 +1811,18 @@ export function verifyLandedBranches(
 }
 
 /**
+ * Repo-relative path where the SDK provisions a per-branch git worktree.
+ *
+ * MUST stay in sync with `@ai-hero/sandcastle/dist/WorktreeManager.js`
+ * (forward slashes become dashes). Both our pre-clean guard in
+ * `createSandbox` and `cleanupIssueBranch` derive paths from this helper
+ * so the two consumers can't drift from each other or from the SDK.
+ */
+export function worktreePathFor(branch: string): string {
+  return `.sandcastle/worktrees/${branch.replace(/\//g, "-")}`;
+}
+
+/**
  * Per-branch cleanup for the sandcastle loop.
  *
  * Side effects: removes the sub-worktree at
@@ -1771,8 +1870,7 @@ export function cleanupIssueBranch(
   | "skipped-unmerged"
   | "skipped-worktree-error"
   | "skipped-branch-error" {
-  const wtName = branch.replace(/\//g, "-");
-  const wtPath = `.sandcastle/worktrees/${wtName}`;
+  const wtPath = worktreePathFor(branch);
 
   // Step 1: worktree remove (clean first, --force only on clean-but-busy).
   try {
@@ -3361,7 +3459,17 @@ export async function runMain(
               args.branch,
               (w) => deps.logError(`cleanup WARN: ${w}`),
             );
-            deps.log(`cleanup ${branch}: ${result}`);
+            // A `skipped-*` outcome means the worktree dir or its branch
+            // could not be removed. The createSandbox pre-clean now
+            // self-heals stale worktrees on the next iteration, so this
+            // is not a correctness failure — but the user still needs to
+            // know cleanup didn't run to completion. Promote to error
+            // level so the line stands out in logs.
+            if (result.startsWith("skipped-")) {
+              deps.logError(`cleanup ${branch}: ${result}`);
+            } else {
+              deps.log(`cleanup ${branch}: ${result}`);
+            }
           }
         }
       }
@@ -3424,6 +3532,16 @@ if (isMain()) {
       process.stderr.write(`pre-flight checks failed:\n`);
       for (const e of pre.errors) process.stderr.write(`  - ${e}\n`);
       process.exit(2);
+    }
+
+    if (args.allowDirtySandcastle) {
+      // Make the bypass loud so it doesn't quietly become habit.
+      process.stderr.write(
+        "WARN: launched with --allow-dirty-sandcastle. The " +
+          ".sandcastle/main.mts dirty-check was skipped. Verify your " +
+          "local changes are committed before the next /sandcastle-update " +
+          "or they will be clobbered.\n",
+      );
     }
 
     const deps = buildDefaultDeps(args);

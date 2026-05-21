@@ -5,3 +5,4 @@ dist/
 !tests/fixtures/**/*.log
 .tsbuildinfo
 prd.json.lock
+.pnpm-store/
