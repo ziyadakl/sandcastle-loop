@@ -1928,6 +1928,12 @@ interface IssueOutcome {
   finalMarker?: string;
   /** Most recent commit SHA on the branch, if any. */
   postSha?: string;
+  /** Skills invoked by the implementer attempt whose code actually shipped
+   *  (the one whose commits are now on the branch the merger picks up).
+   *  Empty for non-"ok" outcomes and for the recovery ok-path (recovery
+   *  does not capture skills). Surfaced to the post-merge reviewer so the
+   *  rollup audit can enforce skill discipline across the integrated set. */
+  skillsInvoked?: readonly string[];
 }
 
 /**
@@ -2670,6 +2676,7 @@ async function shipAfterMigrations(
   preSha: string,
   postSha: string,
   finalMarker: string,
+  skillsInvoked: readonly string[] = [],
 ): Promise<IssueOutcome> {
   if (preSha !== "" && postSha !== "" && preSha !== postSha) {
     // Drizzle journal-registration gate. If the implementer added a new
@@ -2727,7 +2734,7 @@ async function shipAfterMigrations(
     await ctx.deps.markDone(ctx.issueNumber, summary);
   }
   deferralCounts.delete(ctx.issueNumber);
-  return { status: "ok", finalMarker, postSha };
+  return { status: "ok", finalMarker, postSha, skillsInvoked };
 }
 
 /**
@@ -2773,7 +2780,14 @@ async function runIssuePipeline(
     });
 
     if (review1.marker === "ALL_CLEAR") {
-      return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
+      return await shipAfterMigrations(
+        ctx,
+        sandbox,
+        preSha,
+        postSha,
+        "ALL_CLEAR",
+        impl1.skillsInvoked,
+      );
     }
 
     // Reviewer attempt 1 marked HAS_BLOCKERS. Decide retry vs quarantine.
@@ -2827,7 +2841,14 @@ async function runIssuePipeline(
     });
 
     if (review2.marker === "ALL_CLEAR") {
-      return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
+      return await shipAfterMigrations(
+        ctx,
+        sandbox,
+        preSha,
+        postSha,
+        "ALL_CLEAR",
+        impl2.skillsInvoked,
+      );
     }
 
     // Phase 2e: third-attempt grant. Round 2 still says HAS_BLOCKERS,
@@ -2902,6 +2923,7 @@ async function runIssuePipeline(
           preSha,
           postSha,
           "ALL_CLEAR",
+          impl3.skillsInvoked,
         );
       }
       const reason3 =
@@ -3474,8 +3496,39 @@ export async function runMain(
       // Phase 4: post-merge review. Under staging, the verdict GATES the
       // fast-forward of the integration branch and triggers the fixer
       // ladder. Under --no-staging, it stays advisory (today's behavior).
+      // Render the per-issue skill-invocation map for the post-merge reviewer
+      // prompt. The post-merge audit sees, per issue, which skills the shipped
+      // implementer actually invoked (or that none were captured) — enabling
+      // the same skill-discipline checks at the rollup level that the per-issue
+      // reviewer already does. Built once per iteration and reused by both the
+      // first-pass and (if it runs) the escalated reviewer pass.
+      const skillsInvokedByIssue = new Map<string, readonly string[]>();
+      for (const c of completed) {
+        if (c.outcome.status === "ok") {
+          skillsInvokedByIssue.set(
+            String(c.issue.id),
+            c.outcome.skillsInvoked ?? [],
+          );
+        }
+      }
+      const renderSkillsInvokedByIssue = (
+        m: ReadonlyMap<string, readonly string[]>,
+      ): string =>
+        m.size === 0
+          ? "(no skill data captured)"
+          : Array.from(m.entries())
+              .map(
+                ([id, skills]) =>
+                  `#${id}: ${skills.length === 0 ? "(none)" : skills.join(", ")}`,
+              )
+              .join("\n");
+
       const runPostMergeReviewer = async (
         model: string,
+        skillsInvokedByIssueArg: ReadonlyMap<
+          string,
+          readonly string[]
+        > = new Map(),
       ): Promise<string> => {
         try {
           const r = await deps.run({
@@ -3491,6 +3544,9 @@ export async function runMain(
               INTEGRATION_BRANCH: args.branch,
               BRANCHES: branchesArg,
               ISSUES: issuesArg,
+              SKILLS_INVOKED_BY_ISSUE: renderSkillsInvokedByIssue(
+                skillsInvokedByIssueArg,
+              ),
             },
           });
           const marker = extractMarker(r.stdout, [
@@ -3531,6 +3587,8 @@ export async function runMain(
             INTEGRATION_BRANCH: args.branch,
             BRANCHES: branchesArg,
             ISSUES: issuesArg,
+            SKILLS_INVOKED_BY_ISSUE:
+              renderSkillsInvokedByIssue(skillsInvokedByIssue),
           },
         });
         postMergeMarker = extractMarker(r.stdout, [
@@ -3589,7 +3647,10 @@ export async function runMain(
           deps.log(
             `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,
           );
-          postMergeMarker = await runPostMergeReviewer(reviewerEscModel);
+          postMergeMarker = await runPostMergeReviewer(
+            reviewerEscModel,
+            skillsInvokedByIssue,
+          );
         }
       }
 
