@@ -1,108 +1,255 @@
 /**
- * Tests for skill-discipline enforcement: per-implementer collection of
- * `Skill()` tool-call invocations from the SDK agent stream, used as
- * host-computed ground truth for the reviewer.
+ * Tests for skill-discipline enforcement.
+ *
+ * `extractSkillInvocationsFromSession` parses the captured Claude Code
+ * session JSONL produced by `@ai-hero/sandcastle`'s orchestrator (exposed
+ * as `IterationResult.sessionFilePath`). It returns the ordered list of
+ * `Skill()` tool-call invocations so the reviewer prompt has host-computed
+ * ground truth rather than self-reported claims from the implementer.
+ *
+ * The prior implementation relied on the SDK's `onAgentStreamEvent`
+ * callback, which is fed by `parseStreamJsonLine` in
+ * `node_modules/@ai-hero/sandcastle/dist/AgentProvider.js`. That function
+ * hardcodes a `TOOL_ARG_FIELDS` allowlist of `Bash`, `WebSearch`,
+ * `WebFetch`, `Agent` — every other `tool_use` block (including `Skill`)
+ * is silently dropped before a `tool_call` event ever fires. These tests
+ * exercise the JSONL parser end-to-end so we know the skill list reaching
+ * the reviewer is real.
+ *
+ * `filterPlanByTypeLabels` is exercised separately at the bottom of the
+ * file (unchanged by the JSONL refactor — kept here for cohesion).
  */
-import { describe, it, expect } from "vitest";
-import { collectSkillInvocations } from "../.sandcastle/main.mjs";
-import { filterPlanByTypeLabels } from "../.sandcastle/main.mjs";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  extractSkillInvocationsFromSession,
+  filterPlanByTypeLabels,
+} from "../.sandcastle/main.mjs";
 
-describe("collectSkillInvocations", () => {
-  it("returns a collector with empty list before any events", () => {
-    const c = collectSkillInvocations();
-    expect(c.invoked).toEqual([]);
+describe("extractSkillInvocationsFromSession", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sandcastle-skill-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
   });
 
-  it("appends the skill name when a Skill toolCall fires", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: 'skill: "glass-morphism"',
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual(["glass-morphism"]);
+  const writeFixture = (name: string, lines: readonly string[]): string => {
+    const p = join(dir, name);
+    writeFileSync(p, lines.join("\n"), "utf8");
+    return p;
+  };
+
+  it("returns [] when sessionFilePath is undefined", () => {
+    expect(extractSkillInvocationsFromSession(undefined)).toEqual([]);
   });
 
-  it("ignores non-Skill tool calls", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "toolCall",
-      name: "Bash",
-      formattedArgs: 'command: "ls"',
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual([]);
+  it("returns [] when the file does not exist", () => {
+    const ghost = join(dir, "does-not-exist.jsonl");
+    expect(extractSkillInvocationsFromSession(ghost)).toEqual([]);
   });
 
-  it("ignores text events", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "text",
-      message: "hello",
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual([]);
+  it("returns [] for an empty file", () => {
+    const p = writeFixture("empty.jsonl", []);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([]);
   });
 
-  it("preserves invocation order", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: 'skill: "impeccable"',
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: 'skill: "layout"',
-      iteration: 2,
-      timestamp: new Date(),
-    });
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: 'skill: "polish"',
-      iteration: 3,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual(["impeccable", "layout", "polish"]);
+  it("returns [] when the file has no Skill tool_use blocks", () => {
+    const p = writeFixture("no-skills.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "thinking..." },
+            {
+              type: "tool_use",
+              name: "Bash",
+              input: { command: "ls" },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { content: [{ type: "tool_result", content: "ok" }] },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([]);
   });
 
-  it("parses skill names from different formattedArgs shapes", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: "skill: 'critique'",
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: "skill: `audit`",
-      iteration: 2,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual(["critique", "audit"]);
+  it("extracts a single Skill invocation", () => {
+    const p = writeFixture("one-skill.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          id: "msg_x",
+          content: [
+            { type: "text", text: "I'll use the skill." },
+            {
+              type: "tool_use",
+              id: "toolu_x",
+              name: "Skill",
+              input: { skill: "glass-morphism" },
+            },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([
+      "glass-morphism",
+    ]);
   });
 
-  it("falls back to raw args when parsing fails", () => {
-    const c = collectSkillInvocations();
-    c.onEvent({
-      type: "toolCall",
-      name: "Skill",
-      formattedArgs: "unrecognized-format",
-      iteration: 1,
-      timestamp: new Date(),
-    });
-    expect(c.invoked).toEqual(["unrecognized-format"]);
+  it("preserves the order of multiple Skill invocations across lines", () => {
+    const p = writeFixture("multi-skill.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "impeccable" } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "layout" } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "polish" } },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([
+      "impeccable",
+      "layout",
+      "polish",
+    ]);
+  });
+
+  it("returns only Skill names from a mixed tool_use stream, in order", () => {
+    const p = writeFixture("mixed.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Bash", input: { command: "pwd" } },
+            { type: "tool_use", name: "Skill", input: { skill: "critique" } },
+            {
+              type: "tool_use",
+              name: "Read",
+              input: { file_path: "/a/b.ts" },
+            },
+            { type: "tool_use", name: "Skill", input: { skill: "audit" } },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([
+      "critique",
+      "audit",
+    ]);
+  });
+
+  it("skips malformed JSON lines and still extracts Skill names from valid lines", () => {
+    const p = writeFixture("malformed.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "first" } },
+          ],
+        },
+      }),
+      "this is not json {{{",
+      "{\"type\": \"assistant\", \"message\": {\"content\": [", // truncated
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "second" } },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([
+      "first",
+      "second",
+    ]);
+  });
+
+  it("finds a Skill tool_use at a non-first position in the content array", () => {
+    const p = writeFixture("not-first.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "ok" },
+            { type: "text", text: "still thinking" },
+            { type: "tool_use", name: "Bash", input: { command: "ls" } },
+            {
+              type: "tool_use",
+              name: "Skill",
+              input: { skill: "trailing-skill" },
+            },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual([
+      "trailing-skill",
+    ]);
+  });
+
+  it("ignores non-assistant message types (user/system)", () => {
+    const p = writeFixture("non-assistant.jsonl", [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "x" }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", content: "irrelevant" }],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: "only-one" } },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual(["only-one"]);
+  });
+
+  it("ignores Skill tool_use blocks with non-string skill input", () => {
+    const p = writeFixture("bad-skill-input.jsonl", [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Skill", input: { skill: 42 } },
+            { type: "tool_use", name: "Skill", input: {} },
+            {
+              type: "tool_use",
+              name: "Skill",
+              input: { skill: "valid-one" },
+            },
+          ],
+        },
+      }),
+    ]);
+    expect(extractSkillInvocationsFromSession(p)).toEqual(["valid-one"]);
   });
 });
 

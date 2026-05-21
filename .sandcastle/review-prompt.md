@@ -79,8 +79,8 @@ diff above:
 - **COMMIT_TOUCHED_UI**: does the diff modify any `.tsx` / `.jsx` / `.vue`
   file under `apps/`? Compute this from the diff above.
 - **SKILLS_INVOKED**: the host extracted every `Skill()` tool call the
-  implementer made during its run, via the SDK's `onAgentStreamEvent`
-  hook. This is the authoritative list:
+  implementer made during its run by parsing the captured Claude Code
+  session JSONL. This is the authoritative list:
 
   <skills-invoked>
   {{SKILLS_INVOKED}}

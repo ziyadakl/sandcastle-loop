@@ -24,8 +24,8 @@ You are inspecting `integration-candidate` (the working tree's HEAD).
 # SKILLS INVOKED PER ISSUE (host-extracted, authoritative)
 
 The orchestrator captured every `Skill()` tool call each implementer
-made via the SDK's `onAgentStreamEvent` hook. This is authoritative —
-implementers cannot fake or omit entries:
+made by parsing the captured Claude Code session JSONL. This is
+authoritative — implementers cannot fake or omit entries:
 
 <skills-invoked-by-issue>
 {{SKILLS_INVOKED_BY_ISSUE}}

@@ -29,7 +29,6 @@ import { existsSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
-import type { AgentStreamEvent } from "@ai-hero/sandcastle";
 import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
@@ -194,6 +193,18 @@ export interface RalphArgs {
 export interface RunHandle {
   readonly stdout: string;
   readonly commits: readonly { sha: string }[];
+  /**
+   * Per-iteration session-capture metadata, threaded straight through from the
+   * SDK's `SandboxRunResult.iterations` (see
+   * `node_modules/@ai-hero/sandcastle/dist/createSandbox.d.ts:71`). Only the
+   * `sessionFilePath` is consumed today — by
+   * {@link extractSkillInvocationsFromSession} in {@link runImplementer} —
+   * so we narrow the seam to that field. Optional because legacy test mocks
+   * return `{ stdout, commits }` without iteration data, and because the SDK
+   * leaves `sessionFilePath` undefined when capture is disabled or the
+   * provider is non-Claude.
+   */
+  readonly iterations?: readonly { readonly sessionFilePath?: string }[];
 }
 
 export interface SandboxHandle {
@@ -211,20 +222,6 @@ export interface SandboxRunSpec {
   readonly promptFile: string;
   readonly promptArgs?: Record<string, string>;
   readonly idleTimeoutSeconds?: number;
-  /**
-   * Optional per-run callback invoked for each SDK agent stream event (text
-   * chunk or tool call). Used by {@link runImplementer} to feed a
-   * {@link collectSkillInvocations} collector so the host can build the
-   * SKILLS_INVOKED ground-truth list passed downstream to the reviewer.
-   *
-   * The seam stays SDK-agnostic: the production wiring (in
-   * {@link buildDefaultDeps}) translates this into the SDK's
-   * `logging: { type: "file", path, onAgentStreamEvent }` shape. When
-   * undefined, the SDK's default logging shape is used unchanged. Errors
-   * thrown by the callback are swallowed by the SDK, so a parser bug here
-   * cannot kill a run.
-   */
-  readonly onAgentStreamEvent?: (event: AgentStreamEvent) => void;
 }
 
 export interface TopLevelRunSpec extends SandboxRunSpec {
@@ -1420,51 +1417,81 @@ function makeLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Skill-discipline collector (SDK toolCall stream → ground truth for reviewer)
+// Skill-discipline extractor (raw session JSONL → ground truth for reviewer)
 // ---------------------------------------------------------------------------
 
 /**
- * Per-implementer-run collector for `Skill()` tool-call invocations from the
- * SDK agent stream. The SDK exposes a `toolCall` event with the tool name
- * and a `formattedArgs` string; we filter for `name === "Skill"` and extract
- * the skill name from the args.
- *
- * The collected `invoked` array becomes the `SKILLS_INVOKED` ground-truth
- * field passed to the reviewer prompt. It is host-computed, not
+ * Extract every `Skill()` tool-call invocation from a captured Claude Code
+ * session JSONL file. The returned array becomes the `SKILLS_INVOKED`
+ * ground-truth field passed to the reviewer prompt — host-computed, not
  * self-reported by the implementer, so the implementer cannot lie about
  * which skills it invoked.
  *
- * Parsing strategy: `formattedArgs` typically looks like `skill: "glass-morphism"`.
- * We try double-quoted, single-quoted, and backtick variants. If none match,
- * we record the raw args so the reviewer at least sees something is there
- * — silent drops would hide bugs in the parser as bugs in the implementer.
+ * Why parse the raw JSONL instead of using the SDK's `onAgentStreamEvent`
+ * callback (which is the natural-looking path)? Because that callback is
+ * fed by `parseStreamJsonLine` in `@ai-hero/sandcastle`'s `AgentProvider.js`,
+ * which carries a hardcoded `TOOL_ARG_FIELDS` allowlist of `Bash`,
+ * `WebSearch`, `WebFetch`, `Agent`. Any `tool_use` block whose `name` is
+ * NOT in that map is silently dropped before a `tool_call` event ever
+ * fires. `Skill` is not in the allowlist, so the callback yielded zero
+ * `Skill` events in production and `SKILLS_INVOKED` was always
+ * `(none invoked)`. The orchestrator's session-JSONL capture (see
+ * `IterationResult.sessionFilePath` from the SDK's `Orchestrator.d.ts`)
+ * holds the unfiltered `tool_use` blocks — exactly the data we need.
+ *
+ * Shape we walk:
+ *   {"type":"assistant","message":{"content":[
+ *     {"type":"text","text":"..."},
+ *     {"type":"tool_use","name":"Skill","input":{"skill":"glass-morphism"}}
+ *   ]}}
+ *
+ * Robustness contract:
+ *   - undefined `sessionFilePath` or non-existent file → `[]` (capture is
+ *     opt-in on the SDK side; we never want to throw here).
+ *   - Malformed JSON lines are skipped silently — partial logs from a
+ *     killed agent are common in this codebase.
+ *   - Order of invocation is preserved across the entire file (and across
+ *     iterations if the SDK appends multiple to one file).
  */
-export function collectSkillInvocations(): {
-  readonly invoked: string[];
-  readonly onEvent: (event: AgentStreamEvent) => void;
-} {
-  const invoked: string[] = [];
-  const parseSkillName = (formattedArgs: string): string => {
-    const patterns = [
-      /skill\s*:\s*"([^"]+)"/,
-      /skill\s*:\s*'([^']+)'/,
-      /skill\s*:\s*`([^`]+)`/,
-    ];
-    for (const p of patterns) {
-      const m = formattedArgs.match(p);
-      if (m && m[1]) return m[1];
+export function extractSkillInvocationsFromSession(
+  sessionFilePath: string | undefined,
+): readonly string[] {
+  if (sessionFilePath === undefined) return [];
+  if (!existsSync(sessionFilePath)) return [];
+  let raw: string;
+  try {
+    raw = readFileSync(sessionFilePath, "utf8");
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    if (!trimmed.startsWith("{")) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue; // partial / corrupt line — skip silently
     }
-    return formattedArgs;
-  };
-  return {
-    invoked,
-    onEvent: (event) => {
-      if (event.type !== "toolCall") return;
-      if (event.name !== "Skill") return;
-      const name = parseSkillName(event.formattedArgs ?? "");
-      invoked.push(name);
-    },
-  };
+    if (typeof obj !== "object" || obj === null) continue;
+    const o = obj as { type?: unknown; message?: unknown };
+    if (o.type !== "assistant") continue;
+    const message = o.message as { content?: unknown } | null | undefined;
+    if (!message || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (typeof block !== "object" || block === null) continue;
+      const b = block as { type?: unknown; name?: unknown; input?: unknown };
+      if (b.type !== "tool_use") continue;
+      if (b.name !== "Skill") continue;
+      const input = b.input as { skill?: unknown } | null | undefined;
+      if (input && typeof input.skill === "string") {
+        out.push(input.skill);
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -1745,29 +1772,6 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         branch: handle.branch,
         worktreePath: handle.worktreePath,
         run: async (opts) => {
-          // When a stream-event callback is supplied (e.g. by runImplementer's
-          // skill-invocation collector), we must materialise the SDK's
-          // `logging` discriminated union — `LoggingOption` requires
-          // `{ type: "file", path }` whenever `onAgentStreamEvent` is set
-          // (run.d.ts:75-91). The SDK only auto-generates the log path when
-          // `logging` is omitted entirely, so we have to pick one here.
-          // `buildLogFilename` is not in the public re-exports, so we use a
-          // simple deterministic path under `.sandcastle/logs/` that mirrors
-          // the SDK's own default location. When no callback is supplied,
-          // leave `logging` undefined so the SDK keeps its auto-path
-          // behaviour (and the existing log files land where users expect).
-          const logging = opts.onAgentStreamEvent
-            ? ({
-                type: "file" as const,
-                path: path.join(
-                  args.repoRoot,
-                  ".sandcastle",
-                  "logs",
-                  `${handle.branch}-${opts.name}.log`,
-                ),
-                onAgentStreamEvent: opts.onAgentStreamEvent,
-              })
-            : undefined;
           const r = await withCeiling(
             `sandbox run "${opts.name}"`,
             (signal) =>
@@ -1780,10 +1784,19 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
                 idleTimeoutSeconds: opts.idleTimeoutSeconds,
                 completionSignal,
                 signal,
-                ...(logging ? { logging } : {}),
               }),
           );
-          return { stdout: r.stdout, commits: r.commits };
+          // Forward the SDK's per-iteration session-capture metadata. Only
+          // `sessionFilePath` is consumed downstream (by
+          // extractSkillInvocationsFromSession in runImplementer) — see the
+          // seam definition on `RunHandle.iterations` for why we narrow.
+          return {
+            stdout: r.stdout,
+            commits: r.commits,
+            iterations: r.iterations.map((it) => ({
+              sessionFilePath: it.sessionFilePath,
+            })),
+          };
         },
         close: () => handle.close(),
       };
@@ -2186,13 +2199,6 @@ async function runImplementer(
   // further fallback — it just throws and the pipeline catch handles it.
   const fallbackModel =
     attemptNumber === 1 ? models.implementer.escalations[0] : undefined;
-  // Collect Skill() tool-call invocations from the SDK agent stream so the
-  // host can build the SKILLS_INVOKED ground-truth field for the downstream
-  // reviewer. Created OUTSIDE the rate-limit-fallback lambda so primary and
-  // fallback attempts both accumulate into the same list — the reviewer
-  // wants to see what skills were touched regardless of which model attempt
-  // ultimately produced the work.
-  const collector = collectSkillInvocations();
   const r = await runWithRateLimitFallback(
     (model) =>
       sb.run({
@@ -2214,7 +2220,6 @@ async function runImplementer(
           ATTEMPT_NUMBER: String(attemptNumber),
           REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
         },
-        onAgentStreamEvent: collector.onEvent,
       }),
     primaryModel,
     fallbackModel,
@@ -2222,6 +2227,19 @@ async function runImplementer(
     `implementer (issue=${ctx.issueNumber})`,
     "implementer",
   );
+  // Extract Skill() invocations from the SDK's captured session JSONL — see
+  // extractSkillInvocationsFromSession for why we cannot use the SDK's
+  // `onAgentStreamEvent` callback for this (the AgentProvider allowlist
+  // silently drops every Skill tool_use block). We walk each iteration's
+  // sessionFilePath so primary and fallback attempts (and any
+  // multi-iteration runs) all contribute, in the order the implementer
+  // invoked them. Missing iterations array (legacy test mocks) yields [].
+  const skillsInvoked: string[] = [];
+  for (const it of r.iterations ?? []) {
+    for (const name of extractSkillInvocationsFromSession(it.sessionFilePath)) {
+      skillsInvoked.push(name);
+    }
+  }
   if (requireCommits && r.commits.length === 0) {
     throw new Error("implementer made no commits");
   }
@@ -2259,7 +2277,7 @@ async function runImplementer(
       });
     }
   }
-  return { ...r, skillsInvoked: collector.invoked };
+  return { ...r, skillsInvoked };
 }
 
 /**
