@@ -46,6 +46,19 @@ needed.
 
 # YOUR JOB — in this exact order
 
+## 0. Read project rules (BEFORE any recovery work)
+
+If `SANDCASTLE.md` exists at the repo root:
+
+1. Read `SANDCASTLE.md`.
+2. Find the section matching this ticket's `type:` label.
+3. List Required tools.
+4. Before making any code change, invoke each Required tool via
+   `Skill(skill="<name>")`. Recovery is not exempt from skill
+   discipline — the same standard applies as on the original pass.
+
+If SANDCASTLE.md does not exist, skip this step.
+
 ## 1. Inspect what's there
 
 The recent commits and git status are above. Run additional `git diff` /
