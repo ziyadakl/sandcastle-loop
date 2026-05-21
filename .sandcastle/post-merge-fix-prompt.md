@@ -45,6 +45,25 @@ staging is certified.
 
 # YOUR JOB — in this exact order
 
+## 0. Read project rules (BEFORE any fix work)
+
+If `SANDCASTLE.md` exists at the repo root:
+
+1. Read `SANDCASTLE.md`.
+2. Identify the `type:` label of EACH issue you are fixing (they are
+   listed in the rollup context above).
+3. For each issue, find its category section in SANDCASTLE.md and
+   list Required tools.
+4. Before making any code fix, invoke each Required tool via
+   `Skill(skill="<name>")` — same as the original implementer was
+   required to do. Your fixes must follow the same skill discipline
+   as the original work, not bypass it.
+5. If `tool:audit` or `tool:critique` is on any issue, apply the
+   act-on-findings rule: invoke the tool, read findings, fix P0/P1
+   in your diff before declaring done.
+
+If SANDCASTLE.md does not exist, skip this step and proceed.
+
 ## 1. Triage the feedback
 
 Read every concern. Identify whether the fix is local (a single file edit),
