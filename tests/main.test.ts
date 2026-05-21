@@ -250,10 +250,21 @@ function buildDeps(opts: {
   };
 }
 
+// runMain now acquires a real single-instance file lock at startup
+// (`<repoRoot>/.sandcastle/.loop.lock`, via proper-lockfile) so two parallel
+// loops on the same checkout can't race on the in-progress label state.
+// The previous test default `repoRoot: "/repo"` is not writable, so the
+// lock acquisition would fail and runMain would return exitCode 1 before
+// running any pipeline. Anchor every baseArgs call to a real tmpdir
+// instead. Per-file module-level (not per-test) is intentional — tests in
+// this file run sequentially within vitest, so the lock is released
+// between calls and we don't need per-test directories.
+const TEST_REPO_ROOT = mkdtempSync(path.join(tmpdir(), "sandcastle-main-test-"));
+
 function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
   return {
     iterations: 1,
-    repoRoot: "/repo",
+    repoRoot: TEST_REPO_ROOT,
     branch: "feature/work",
     label: "ready-for-agent",
     maxConcurrent: 3,

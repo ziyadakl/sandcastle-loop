@@ -806,3 +806,133 @@ describe("startup reconciliation — releases orphaned in-progress issues", () =
     ).toBe(true);
   });
 });
+
+describe("sandbox-health stall-streak detector", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sandcastle-stall-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Hard-ceiling message matches main.mts STALL_RE — kept as a constant so
+  // a test failure with a near-miss message is obviously about the regex
+  // rather than the streak logic.
+  const STALL_MSG =
+    "hard ceiling: implementer exceeded 1200s wall-clock — SDK idle timer never fired (likely OOM-of-child or trickle-output hang)";
+
+  it("three consecutive all-stall iterations → exits with code 2 + restart-docker message", async () => {
+    const b = buildGateDeps({ listIssuesByLabel: async () => [] });
+    // Each of the 3 iterations: planner picks one issue, implementer throws
+    // a stall-shaped error → catch detects stalled=true → quarantine.
+    for (let i = 1; i <= 3; i++) {
+      const id = String(900 + i);
+      b.enqueue("planner", {
+        stdout: gatePlannerStdout([
+          { id, title: `stall ${i}`, branch: `agent/issue-${id}` },
+        ]),
+      });
+      b.enqueue("implementer", { throw: new Error(STALL_MSG) });
+    }
+
+    // iterations=5 to prove the detector exits BEFORE iterations 4 and 5
+    // would have run.
+    const result = await runMain(
+      gateBaseArgs({ iterations: 5, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(2);
+    expect(result.iterationsRun).toBe(3);
+    // Three quarantines (one per iteration) — confirms the pipeline
+    // actually reached its quarantine path each time, not some earlier
+    // exit.
+    expect(b.state.quarantines.sort((a, b) => a - b)).toEqual([901, 902, 903]);
+    // The error log carries the canonical "restart docker" wording so an
+    // operator scrolling the loop output sees what to do next.
+    expect(
+      b.state.errors.some(
+        (e) =>
+          /sandbox-health:\s+3 consecutive iterations stalled/.test(e) &&
+          /restart docker/i.test(e),
+      ),
+    ).toBe(true);
+  });
+
+  it("stall iteration then HAS_BLOCKERS iteration → streak resets (HAS_BLOCKERS is not a stall)", async () => {
+    const b = buildGateDeps({ listIssuesByLabel: async () => [] });
+
+    // Iter 1: implementer stalls → quarantine, stalled=true → streak=1.
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "911", title: "iter 1 stalls", branch: "agent/issue-911" },
+      ]),
+    });
+    b.enqueue("implementer", { throw: new Error(STALL_MSG) });
+
+    // Iter 2: implementer returns HALT, reviewer marks HAS_BLOCKERS → also
+    // quarantines, but stalled remains undefined (catch path NOT taken;
+    // straight reviewer-rejection path returns stalled-less outcome).
+    // Streak should reset to 0.
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "912", title: "iter 2 HAS_BLOCKERS", branch: "agent/issue-912" },
+      ]),
+    });
+    enqueueQuarantinePipeline(b);
+
+    // Iter 3: empty plan → clean exit.
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 5, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // No threshold-trip error message — proves the streak didn't reach 3.
+    expect(
+      b.state.errors.some((e) =>
+        /sandbox-health:\s+3 consecutive iterations stalled/.test(e),
+      ),
+    ).toBe(false);
+    // The reset log fires in iteration 2 — proves the detector actually
+    // saw iter 1 as a stall, then iter 2 cleared the streak.
+    expect(
+      b.state.logs.some((l) =>
+        /sandbox-health:\s+stall streak reset at 1/.test(l),
+      ),
+    ).toBe(true);
+  });
+
+  it("one all-stall iteration alone → streak=1, loop continues to next iteration (no premature exit)", async () => {
+    const b = buildGateDeps({ listIssuesByLabel: async () => [] });
+
+    // Iter 1: stall → streak=1 but BELOW the threshold of 3.
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "921", title: "single stall", branch: "agent/issue-921" },
+      ]),
+    });
+    b.enqueue("implementer", { throw: new Error(STALL_MSG) });
+
+    // Iter 2: empty plan → clean exit (no more pipelines to run).
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 5, repoRoot: dir }),
+      b.deps,
+    );
+
+    // Crucial: exit 0, NOT 2. A single stall must not trip the breaker.
+    expect(result.exitCode).toBe(0);
+    expect(result.iterationsRun).toBe(2);
+    // The streak-increment log confirms the detector ran and counted 1.
+    expect(
+      b.state.logs.some((l) =>
+        /sandbox-health:\s+iteration 1 all-stalled \(streak 1\/3\)/.test(l),
+      ),
+    ).toBe(true);
+  });
+});

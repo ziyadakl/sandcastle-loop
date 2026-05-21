@@ -43,4 +43,4 @@ export {
 } from "./gh.js";
 export type { ReadyIssueSummary, LabelledIssueSummary } from "./gh.js";
 
-export { withPrdLock, withSingleInstance } from "./locks.js";
+export { withPrdLock, withSingleInstance, acquireSingleInstanceLock } from "./locks.js";

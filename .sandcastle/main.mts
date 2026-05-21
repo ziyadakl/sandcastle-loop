@@ -41,6 +41,7 @@ import {
   postIssueComment,
   listIssuesByLabel,
   LABEL_READY,
+  acquireSingleInstanceLock,
 } from "./lib/state/index.js";
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
@@ -2424,6 +2425,32 @@ const fallbackHistory = new Map<string, number[]>();
 const deferralCounts = new Map<number, number>();
 const MAX_DEFERRALS = 3;
 
+/**
+ * Stall-shape error matcher. An error message matches when the underlying
+ * failure was the sandbox going unresponsive (SDK idle timer firing, host
+ * wall-clock watchdog firing, or a node-level ETIMEDOUT on supporting
+ * calls) — distinct from a code-level failure like "reviewer marked
+ * HAS_BLOCKERS" or "test assertion failed". Used in two places:
+ *   1. The per-issue pipeline catch (around runIssuePipeline) sets
+ *      IssueOutcome.stalled when this matches the thrown error.
+ *   2. The outer runMain loop checks per-iteration rejection reasons
+ *      against the same regex so pre-pipeline failures (claim hangs,
+ *      etc.) also count toward the stall streak.
+ * Kept as a single module constant so the two call sites can't drift.
+ *
+ * Patterns:
+ *   - "hard ceiling"            — withHardCeiling watchdog (see line ~1449)
+ *   - "agent idle for"          — SDK AgentIdleTimeoutError message stem
+ *                                  (`Agent idle for N seconds — no output
+ *                                  received`, see Orchestrator.js line ~34)
+ *   - "AgentIdleTimeoutError"   — SDK error tag, in case the message text
+ *                                  changes upstream but the class name stays
+ *   - "no output received"      — secondary SDK phrase, defensive
+ *   - "ETIMEDOUT"               — node net-level timeout (rare here)
+ */
+const STALL_RE =
+  /hard ceiling|agent idle for|AgentIdleTimeoutError|no output received|ETIMEDOUT/i;
+
 /** Test-only: clear module-level transient-state maps. Production never calls
  * this; tests use it in `beforeEach` so prior tests' fallback-breaker or
  * defer-counter state can't bleed into ordering-sensitive cases. */
@@ -2856,20 +2883,9 @@ async function runIssuePipeline(
     // Stall detection: surface "the sandbox stopped responding" failures
     // distinctly from "the spec was bad" failures so runMain can pause
     // the loop after a streak (sandbox-level problem, not code-level).
-    // Patterns:
-    //   - "hard ceiling"          — host watchdog (withHardCeiling at line ~1449)
-    //   - "agent idle for"        — SDK AgentIdleTimeoutError message stem
-    //                                (`Agent idle for N seconds — no output received...`,
-    //                                see node_modules/@ai-hero/sandcastle/dist/Orchestrator.js)
-    //   - "AgentIdleTimeoutError" — SDK error tag, in case the message text
-    //                                changes upstream but the class name stays
-    //   - "no output received"    — secondary SDK phrase, defensive
-    //   - "ETIMEDOUT"             — node net-level timeout (rare here but
-    //                                conceivable for gh / docker calls)
-    const stalled =
-      /hard ceiling|agent idle for|AgentIdleTimeoutError|no output received|ETIMEDOUT/i.test(
-        errMsg,
-      );
+    // Pattern lives in module-level STALL_RE — see definition for which
+    // error messages count.
+    const stalled = STALL_RE.test(errMsg);
     ctx.deps.log(
       `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} stalled=${stalled} msg=${JSON.stringify(errMsg)}`,
     );
@@ -3129,43 +3145,71 @@ export async function runMain(
     );
   }
 
+  // Single-instance lock — refuse to start a second loop on the same
+  // checkout. Without this guard, two parallel loops will race on the
+  // `in-progress` label: loop B's startup reconciliation (below) would
+  // release issues loop A is mid-pipeline on, causing double-claim of
+  // partial work or silent quarantine. The sandcastle-run skill ALSO
+  // checks via pgrep, but that's bypassable (direct `node main.mts`
+  // invocation, or worktree-rooted re-launch outside the skill); the
+  // in-process lock is the canonical guard. proper-lockfile reclaims
+  // after 60s of staleness so a crashed prior run doesn't permanently
+  // wedge restarts.
+  const loopLockPath = path.join(
+    args.repoRoot,
+    ".sandcastle",
+    ".loop.lock",
+  );
+  let releaseLoopLock: (() => Promise<void>) | undefined;
+  try {
+    releaseLoopLock = await acquireSingleInstanceLock(loopLockPath);
+  } catch (err) {
+    deps.logError(
+      `[startup] ${(err as Error).message} A second loop on the same checkout would race with the in-progress label state — refusing to start.`,
+    );
+    return {
+      exitCode: 1,
+      iterationsRun: 0,
+      shippedIssues: [],
+      quarantinedIssues: [],
+    };
+  }
+
   // Startup reconciliation: a previous loop that was killed (Ctrl-C, OOM,
   // host reboot) leaves issues stuck on `in-progress`. Without this step,
   // the new loop's planner sees those issues as unavailable (already
   // claimed) and silently skips them — or worse, the planner's blocker
   // resolution can read "issue absent from ready-for-agent → resolved"
-  // and dispatch dependents prematurely. The sandcastle-run preflight
-  // refuses to launch when another loop is running for this checkout,
-  // so by invariant any `in-progress` label at startup is orphaned.
-  // Release them back to `ready-for-agent` so the planner can re-claim.
-  if (!args.dryRun) {
-    try {
-      const stale = await deps.listIssuesByLabel("in-progress");
-      if (stale.length > 0) {
-        deps.log(
-          `startup reconciliation: ${stale.length} orphaned in-progress issue(s) — releasing back to ready-for-agent`,
-        );
-        for (const issue of stale) {
-          try {
-            await deps.release(
-              issue.number,
-              `[sandcastle startup-reconcile] orphaned in-progress label from a prior killed run — released for re-claim by the new loop`,
-            );
-            deps.log(`  released #${issue.number}: ${issue.title}`);
-          } catch (err) {
-            deps.logError(
-              `  failed to release #${issue.number}: ${(err as Error).message} — leaving as-is, planner will skip`,
-            );
-          }
-        }
-      } else {
-        deps.log(`startup reconciliation: no orphaned in-progress issues`);
-      }
-    } catch (err) {
+  // and dispatch dependents prematurely. Now safe to release unconditionally
+  // because the single-instance lock above guarantees no parallel loop holds
+  // its own issues on `in-progress`. The deps.release stub short-circuits
+  // under --dry-run with a log entry, so no extra guard needed here.
+  try {
+    const stale = await deps.listIssuesByLabel("in-progress");
+    if (stale.length > 0) {
       deps.log(
-        `startup reconciliation skipped: listIssuesByLabel failed: ${(err as Error).message}`,
+        `startup reconciliation: ${stale.length} orphaned in-progress issue(s) — releasing back to ready-for-agent`,
       );
+      for (const issue of stale) {
+        try {
+          await deps.release(
+            issue.number,
+            `[sandcastle startup-reconcile] orphaned in-progress label from a prior killed run — released for re-claim by the new loop`,
+          );
+          deps.log(`  released #${issue.number}: ${issue.title}`);
+        } catch (err) {
+          deps.logError(
+            `  failed to release #${issue.number}: ${(err as Error).message} — leaving as-is, planner will skip`,
+          );
+        }
+      }
+    } else {
+      deps.log(`startup reconciliation: no orphaned in-progress issues`);
     }
+  } catch (err) {
+    deps.log(
+      `startup reconciliation skipped: listIssuesByLabel failed: ${(err as Error).message}`,
+    );
   }
 
   // Graceful shutdown: register once. We don't abort in-flight gh calls;
@@ -3226,11 +3270,14 @@ export async function runMain(
         }
         // Truncation halt: when the planner sees its all-open-issues list
         // hit the 200-entry cap, blocker resolution is unreliable. The
-        // planner emits `<truncation-halt/>` in its reasoning + an empty
-        // plan. We have to catch this BEFORE the empty-plan exit below
-        // (line ~3209) so the operator gets a distinct error rather than
-        // the routine "no claimable issues — exiting cleanly" message.
-        if (/<truncation-halt\/>/i.test(plannerStdout)) {
+        // planner emits `<truncation-halt/>` on a line by itself in its
+        // reasoning + an empty plan. The prompt mandates "on a line by
+        // itself" specifically so we can detect it without false-
+        // positiving on issue bodies that happen to mention the sentinel
+        // in a different context (e.g. an issue ABOUT this very feature
+        // — its body would appear in the planner's <issues-json> input
+        // and could be echoed in reasoning).
+        if (/^\s*<truncation-halt\/>\s*$/im.test(plannerStdout)) {
           deps.logError(
             `planner: all-open-issues snapshot hit the 200-entry cap. Blocker resolution is unreliable; halting to avoid out-of-order dispatch. Raise the --limit in .sandcastle/plan-prompt.md's <all-open-issues> block (or close some issues) before re-running.`,
           );
@@ -3392,13 +3439,11 @@ export async function runMain(
           }
           // Pre-pipeline rejection — claim failure, etc. Count it as a
           // stall only if its own error message matches the stall pattern;
-          // a gh-auth failure shouldn't count. Kept in sync with the
-          // pipeline-catch regex above.
+          // a gh-auth failure shouldn't count. Uses module-level STALL_RE
+          // so this and the pipeline-catch site can't drift.
           const msg =
             s.reason instanceof Error ? s.reason.message : String(s.reason);
-          return /hard ceiling|agent idle for|AgentIdleTimeoutError|no output received|ETIMEDOUT/i.test(
-            msg,
-          );
+          return STALL_RE.test(msg);
         });
       if (iterationStalled) {
         stalledStreak += 1;
@@ -3839,6 +3884,17 @@ export async function runMain(
   } finally {
     process.off("SIGINT", sigintHandler);
     process.off("SIGTERM", sigtermHandler);
+    if (releaseLoopLock) {
+      try {
+        await releaseLoopLock();
+      } catch (err) {
+        // Best-effort — the 60s stale TTL on proper-lockfile means a
+        // failed release here won't permanently wedge the next restart.
+        deps.logError(
+          `release loop lock failed: ${(err as Error).message} (lock will auto-expire in 60s)`,
+        );
+      }
+    }
   }
 }
 

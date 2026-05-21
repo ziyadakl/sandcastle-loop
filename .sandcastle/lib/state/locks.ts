@@ -83,6 +83,38 @@ export async function withSingleInstance<T>(
   }
 }
 
+/**
+ * Acquire the same single-instance lock as `withSingleInstance` but return
+ * the release function so the caller can manage lifetime manually. Use this
+ * when wrapping the entire body of a long-running driver (e.g. `runMain`)
+ * in `withSingleInstance` would require restructuring around an existing
+ * try/finally that's already handling other cleanup (signal handlers, etc).
+ *
+ * Throws with the same `another loop is running` message as
+ * `withSingleInstance` on ELOCKED — callers should distinguish that case
+ * from real errors and exit cleanly rather than re-throwing.
+ */
+export async function acquireSingleInstanceLock(
+  lockPath: string,
+): Promise<() => Promise<void>> {
+  await ensureFileExists(lockPath);
+  try {
+    return await lockfile.lock(lockPath, {
+      realpath: false,
+      retries: 0,
+      stale: 60_000,
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOCKED") {
+      throw new Error(
+        `acquireSingleInstanceLock: another loop is running (lock at ${lockPath} is held). Stop the other loop or wait for it to finish.`,
+      );
+    }
+    throw err;
+  }
+}
+
 async function ensureFileExists(p: string): Promise<void> {
   try {
     await fs.access(p);
