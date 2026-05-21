@@ -27,7 +27,7 @@ type RoleConfig = {
 
 export const models = {
   planner:           { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
-  implementer:       { default: "claude-sonnet-4-6", escalations: ["claude-opus-4-7[1m]"] },
+  implementer:       { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
   reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
   merger:            { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
   postMergeReviewer: { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
