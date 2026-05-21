@@ -78,6 +78,17 @@ diff above:
   a `playwright test` command? Compute this from the issue spec above.
 - **COMMIT_TOUCHED_UI**: does the diff modify any `.tsx` / `.jsx` / `.vue`
   file under `apps/`? Compute this from the diff above.
+- **SKILLS_INVOKED**: the host extracted every `Skill()` tool call the
+  implementer made during its run, via the SDK's `onAgentStreamEvent`
+  hook. This is the authoritative list:
+
+  <skills-invoked>
+  {{SKILLS_INVOKED}}
+  </skills-invoked>
+
+  You cannot trust the implementer's own claim about what it invoked —
+  trust only this block. If the value is `(none invoked)`, no skills
+  were called.
 - **OUTPUT_SUPPRESSION_EVIDENCE**: scan the commit body and progress.txt
   (in the diff above) for any of these patterns: `| grep -v`, `| sed`,
   `| awk`, `--reporter=dot` (when not in spec), `--quiet`, `> /dev/null`,
@@ -206,6 +217,37 @@ A finding in any one category is fine. The point of the sweep is to
 make "I didn't look at the other categories" impossible — every line
 must be present, even if just to say `ok`.
 
+Category-specific guidance:
+
+- **Spec fit**: does the diff implement the issue's acceptance criteria?
+  Missing requirements or scope creep?
+- **Test coverage**: do new/changed behaviours have tests that actually
+  exercise the change?
+- **Type safety**: unsafe casts, `any` types, unchecked assumptions?
+- **Security**: injection vulnerabilities, credential leaks, etc.?
+- **Error handling**: failure paths with no fallback or logging?
+- **Edge cases**: off-by-one, empty arrays, null inputs, concurrent access?
+- **Skill discipline**: only if SANDCASTLE.md exists at the repo root.
+
+  1. Read SANDCASTLE.md.
+  2. Find the section matching this ticket's `type:` label (visible
+     in the issue spec's labels).
+  3. List the Required tools for that section. Add any tools required
+     by `tool:Y` labels on this ticket.
+  4. Compare to SKILLS_INVOKED above. If any Required tool is missing
+     from SKILLS_INVOKED, emit a finding:
+     `Required: [list]. Invoked: [list]. Missing: [list].`
+  5. If `tool:audit` was present, scan the implementer's transcript
+     for audit's P0/P1 findings and verify the diff resolves them.
+     Same for `tool:critique`. If unfixed P0/P1 remain, emit a
+     finding.
+  6. If SANDCASTLE.md does not exist or has no section matching the
+     ticket's type, mark this category `n/a`.
+
+  A missing Required tool is a HARD finding — emit HAS_BLOCKERS.
+  Over-invocation (extra tools beyond required) is never a finding;
+  only under-invocation is.
+
 ```
 CATEGORY SWEEP:
 - Execution evidence: <ok | n/a (...) | <finding>>
@@ -215,6 +257,7 @@ CATEGORY SWEEP:
 - Security: <ok | n/a (...) | <finding>>
 - Error handling: <ok | n/a (...) | <finding>>
 - Edge cases: <ok | n/a (...) | <finding>>
+- Skill discipline: <ok | n/a (...) | <finding>>
 SWEEP COMPLETE.
 ```
 
