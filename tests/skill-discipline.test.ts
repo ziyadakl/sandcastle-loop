@@ -27,6 +27,16 @@ import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
 } from "../.sandcastle/lib/skill-discipline.js";
+import {
+  runMain,
+  type Deps,
+  type RalphArgs,
+  type SandboxRunSpec,
+  type TopLevelRunSpec,
+  type CreateSandboxSpec,
+  type RunHandle,
+  type SandboxHandle,
+} from "../.sandcastle/main.mjs";
 
 describe("extractSkillInvocationsFromSession", () => {
   let dir: string;
@@ -307,5 +317,375 @@ describe("filterPlanByTypeLabels", () => {
     const r = filterPlanByTypeLabels(issues, labelLookup, false);
     expect(r.kept).toEqual(issues);
     expect(r.excluded).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration tests for the orchestrator gate
+// ---------------------------------------------------------------------------
+//
+// These exercise the actual `runMain` branch that fetches labels via
+// `deps.listIssuesByLabel` and filters the planner's picks before they reach
+// `deps.claim`. The unit tests above cover the filter in isolation; the gate
+// has its own logic (existsSync(SANDCASTLE.md), the `plan.length > 0` guard,
+// the fail-loud throw on listIssuesByLabel failure) that none of them touch
+// — which is precisely the surface where the last critical review finding
+// (silent zero-issue iteration on gh-auth failure) lived.
+//
+// The harness is a minimal hand-rolled `Deps` stub. It doesn't try to mirror
+// the full mock surface from `tests/main.test.ts` — we only need claim spies,
+// a configurable `listIssuesByLabel`, and just-enough run/sandbox stubs to
+// let dispatched issues run through to a clean quarantine (HAS_BLOCKERS
+// reviewer with retry+recovery off). "Dispatched" is observed via
+// `deps.claim` calls — that's the first thing `runMain` does after the gate
+// passes (see line 3237 of main.mts).
+
+interface GateRunCall {
+  readonly name: string;
+  readonly kind: "top-level" | "sandbox";
+}
+
+interface GateMockState {
+  claims: number[];
+  runCalls: GateRunCall[];
+  listLabelCalls: string[];
+  quarantines: number[];
+  logs: string[];
+  errors: string[];
+}
+
+interface GateDepsBuilder {
+  readonly state: GateMockState;
+  readonly deps: Deps;
+  enqueue(name: string, outcome: GateRunOutcome): void;
+}
+
+interface GateRunOutcome {
+  readonly stdout: string;
+  readonly commits?: readonly { sha: string }[];
+  readonly throw?: Error;
+}
+
+interface GateBuildOpts {
+  /** Stub for `deps.listIssuesByLabel`. Default returns `[]`. */
+  readonly listIssuesByLabel?: (
+    label: string,
+  ) => Promise<readonly { number: number; title: string; labels: readonly string[] }[]>;
+}
+
+function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
+  const state: GateMockState = {
+    claims: [],
+    runCalls: [],
+    listLabelCalls: [],
+    quarantines: [],
+    logs: [],
+    errors: [],
+  };
+  const queues = new Map<string, GateRunOutcome[]>();
+
+  const popOutcome = (name: string): GateRunOutcome => {
+    const q = queues.get(name);
+    if (!q || q.length === 0) {
+      throw new Error(
+        `gate-mock deps: no queued outcome for run name=${name}`,
+      );
+    }
+    return q.shift()!;
+  };
+
+  const handleOutcome = (outcome: GateRunOutcome): RunHandle => {
+    if (outcome.throw) throw outcome.throw;
+    return { stdout: outcome.stdout, commits: outcome.commits ?? [] };
+  };
+
+  const deps: Deps = {
+    async run(spec: TopLevelRunSpec): Promise<RunHandle> {
+      state.runCalls.push({ name: spec.name, kind: "top-level" });
+      return handleOutcome(popOutcome(spec.name));
+    },
+    async createSandbox(spec: CreateSandboxSpec): Promise<SandboxHandle> {
+      const branch = spec.branch;
+      const handle: SandboxHandle = {
+        branch,
+        worktreePath: "/mock/worktree",
+        async run(rspec: SandboxRunSpec): Promise<RunHandle> {
+          state.runCalls.push({ name: rspec.name, kind: "sandbox" });
+          return handleOutcome(popOutcome(rspec.name));
+        },
+        async close() {
+          return {};
+        },
+      };
+      return handle;
+    },
+    async claim(n) {
+      state.claims.push(n);
+    },
+    async markDone(_n, _summary) {
+      // unused — gate tests route every dispatched issue to quarantine.
+    },
+    async markMergedToStaging(_n) {
+      // unused
+    },
+    async promoteStagingToDone(_ns, _summary) {
+      return { failed: [] };
+    },
+    async quarantine(n, _reason) {
+      state.quarantines.push(n);
+    },
+    async release(_n, _reason) {
+      // unused
+    },
+    async comment(_n, _body) {
+      // unused
+    },
+    async listIssuesByLabel(label) {
+      state.listLabelCalls.push(label);
+      if (opts.listIssuesByLabel) return opts.listIssuesByLabel(label);
+      return [];
+    },
+    async applyMigrations(_repoRoot, _preSha, _postSha) {
+      return { applied: 0, realErrors: [] };
+    },
+    async validateMigrationJournal(_repoRoot, _preSha, _postSha) {
+      return [];
+    },
+    async captureSha(_w) {
+      return "sha-x";
+    },
+    log(line) {
+      state.logs.push(line);
+    },
+    logError(line) {
+      state.errors.push(line);
+    },
+  };
+
+  return {
+    state,
+    deps,
+    enqueue(name, outcome) {
+      const q = queues.get(name) ?? [];
+      q.push(outcome);
+      queues.set(name, q);
+    },
+  };
+}
+
+function gateBaseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
+  return {
+    iterations: 1,
+    repoRoot: "/repo",
+    branch: "feature/work",
+    label: "ready-for-agent",
+    maxConcurrent: 3,
+    imageName: "sandcastle:test",
+    plannerModel: "claude-opus-4-7",
+    implementerModel: "claude-sonnet-4-6",
+    reviewerModel: "claude-haiku-4-5",
+    mergerModel: "claude-opus-4-7",
+    postMergeReviewerModel: "claude-opus-4-7",
+    recoveryModel: "claude-opus-4-7",
+    implementerTimeoutSec: 1200,
+    reviewerTimeoutSec: 600,
+    hardCeilingSec: 3600,
+    consecutiveFailureLimit: 99,
+    dryRun: false,
+    // The whole point: retry/recovery off so an implementer error or a
+    // HAS_BLOCKERS reviewer routes straight to quarantine with no further
+    // queue plumbing required.
+    recoveryEnabled: false,
+    retryEnabled: false,
+    stagingEnabled: false,
+    allowDirtySandcastle: false,
+    ...over,
+  };
+}
+
+function gatePlannerStdout(
+  issues: { id: string; title: string; branch: string }[],
+): string {
+  return `<plan>${JSON.stringify({ issues })}</plan>`;
+}
+
+/**
+ * Queue the per-issue pipeline for an issue that the gate keeps. The pipeline
+ * routes to quarantine via HAS_BLOCKERS on the first reviewer pass — no retry,
+ * no recovery, no merger required. We only care that `deps.claim(n)` fires;
+ * how the pipeline ends is irrelevant to the gate assertions.
+ */
+function enqueueQuarantinePipeline(b: GateDepsBuilder): void {
+  b.enqueue("implementer", {
+    stdout:
+      "Cannot reach the feature.\n\n<promise>HALT</promise>",
+    commits: [{ sha: "wip-checkpoint" }],
+  });
+  b.enqueue("reviewer", {
+    stdout: "Commit body has no certification block.\n\nHAS_BLOCKERS",
+  });
+}
+
+describe("orchestrator gate — runMain integration", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sandcastle-gate-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const writeSandcastleMd = (): void => {
+    writeFileSync(
+      join(dir, "SANDCASTLE.md"),
+      "# Skill discipline\nEnforced.\n",
+      "utf8",
+    );
+  };
+
+  it("no SANDCASTLE.md → all planner-picked issues dispatched, listIssuesByLabel not called", async () => {
+    const b = buildGateDeps({
+      // If the gate is wrongly entered when SANDCASTLE.md is absent, this
+      // throw makes the regression loud (the assertion below also catches
+      // it, but the throw turns a silent skip into an immediate failure).
+      listIssuesByLabel: async () => {
+        throw new Error("gate must not call listIssuesByLabel without SANDCASTLE.md");
+      },
+    });
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "501", title: "alpha", branch: "agent/issue-501" },
+        { id: "502", title: "beta", branch: "agent/issue-502" },
+      ]),
+    });
+    enqueueQuarantinePipeline(b);
+    enqueueQuarantinePipeline(b);
+    // Iteration 2 plans empty → clean exit.
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 2, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.listLabelCalls).toEqual([]);
+    expect(b.state.claims.sort((a, b) => a - b)).toEqual([501, 502]);
+  });
+
+  it("SANDCASTLE.md exists, all picks have type: labels → all dispatched", async () => {
+    writeSandcastleMd();
+    const b = buildGateDeps({
+      listIssuesByLabel: async () => [
+        {
+          number: 601,
+          title: "ui ticket",
+          labels: ["ready-for-agent", "type:new-component"],
+        },
+        {
+          number: 602,
+          title: "backend ticket",
+          labels: ["ready-for-agent", "type:backend"],
+        },
+      ],
+    });
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "601", title: "ui ticket", branch: "agent/issue-601" },
+        { id: "602", title: "backend ticket", branch: "agent/issue-602" },
+      ]),
+    });
+    enqueueQuarantinePipeline(b);
+    enqueueQuarantinePipeline(b);
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 2, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.listLabelCalls).toEqual(["ready-for-agent"]);
+    expect(b.state.claims.sort((a, b) => a - b)).toEqual([601, 602]);
+  });
+
+  it("SANDCASTLE.md exists, picks missing type: → only labeled dispatched, excluded ones logged with reason", async () => {
+    writeSandcastleMd();
+    const b = buildGateDeps({
+      listIssuesByLabel: async () => [
+        {
+          number: 701,
+          title: "ui ticket",
+          labels: ["ready-for-agent", "type:bugfix-ui"],
+        },
+        {
+          number: 702,
+          title: "no type label",
+          labels: ["ready-for-agent"],
+        },
+        {
+          number: 703,
+          title: "backend ticket",
+          labels: ["ready-for-agent", "type:backend"],
+        },
+      ],
+    });
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "701", title: "ui ticket", branch: "agent/issue-701" },
+        { id: "702", title: "no type label", branch: "agent/issue-702" },
+        { id: "703", title: "backend ticket", branch: "agent/issue-703" },
+      ]),
+    });
+    // Only #701 and #703 are kept by the gate, so only two pipelines run.
+    enqueueQuarantinePipeline(b);
+    enqueueQuarantinePipeline(b);
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 2, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.listLabelCalls).toEqual(["ready-for-agent"]);
+    expect(b.state.claims.sort((a, b) => a - b)).toEqual([701, 703]);
+    expect(b.state.claims).not.toContain(702);
+    // The orchestrator logs an explicit `skipping issue #N — <reason>` line
+    // for every excluded issue (see runMain around line 3319). A future
+    // refactor that drops the log silently would still keep dispatch
+    // correct but would harm operator visibility — keep the assertion to
+    // anchor the contract.
+    expect(
+      b.state.logs.some((l) => /skipping issue #702 — missing type: label/.test(l)),
+    ).toBe(true);
+  });
+
+  it("SANDCASTLE.md exists, listIssuesByLabel throws → fails loud with SKILL_DISCIPLINE_GATE_FAILURE prefix", async () => {
+    writeSandcastleMd();
+    const b = buildGateDeps({
+      listIssuesByLabel: async () => {
+        throw new Error("gh auth flaky: token expired");
+      },
+    });
+    b.enqueue("planner", {
+      stdout: gatePlannerStdout([
+        { id: "801", title: "anything", branch: "agent/issue-801" },
+      ]),
+    });
+
+    // The throw must escape runMain (no swallowing catch upstream — outer is
+    // `try { ... } finally { ... }`, no catch). Anything quieter — a logged
+    // warning + early return 0 — is exactly the regression this test guards
+    // against.
+    await expect(
+      runMain(gateBaseArgs({ iterations: 1, repoRoot: dir }), b.deps),
+    ).rejects.toThrow(/^SKILL_DISCIPLINE_GATE_FAILURE:/);
+    // No claim should have fired: the gate failed before dispatch.
+    expect(b.state.claims).toEqual([]);
+    // logError must carry the same prefixed message so operators can grep.
+    expect(
+      b.state.errors.some((e) => /^SKILL_DISCIPLINE_GATE_FAILURE:/.test(e)),
+    ).toBe(true);
   });
 });
