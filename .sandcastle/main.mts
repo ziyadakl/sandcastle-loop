@@ -3541,13 +3541,20 @@ export async function runMain(
               )
               .join("\n");
 
+      // Shared runner for both the default-model first pass and the
+      // escalated re-run after the fixer. Returns BOTH marker and stdout
+      // — the fixer pass needs stdout (verbatim reviewer concerns), so a
+      // marker-only helper forced an inline duplicate. On a thrown call
+      // we log loudly and return empty strings so the caller falls
+      // through to the same "no marker emitted" path it would have taken
+      // for a non-emitting reviewer; the iteration loop continues.
       const runPostMergeReviewer = async (
         model: string,
         skillsInvokedByIssueArg: ReadonlyMap<
           string,
           readonly string[]
         > = new Map(),
-      ): Promise<string> => {
+      ): Promise<{ marker: string; stdout: string }> => {
         try {
           const r = await deps.run({
             name: "post-merge-reviewer",
@@ -3574,54 +3581,21 @@ export async function runMain(
           deps.log(
             `post-merge review: ${marker || "(no marker emitted)"}`,
           );
-          // Capture the reviewer's stdout so the fixer can read its
-          // concerns verbatim — the marker is just the verdict, the BODY
-          // is what the fixer needs.
-          return marker;
+          return { marker, stdout: r.stdout };
         } catch (err) {
           deps.logError(
-            `post-merge review threw: ${(err as Error).message}`,
+            `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
           );
-          return "";
+          return { marker: "", stdout: "" };
         }
       };
 
-      // First pass uses the default model. We need access to stdout for the
-      // fixer pass below, so re-implement the call inline rather than using
-      // the helper above.
-      let postMergeMarker = "";
-      let postMergeFeedback = "";
-      try {
-        const r = await deps.run({
-          name: "post-merge-reviewer",
-          maxIterations: 1,
-          model: args.postMergeReviewerModel,
-          promptFile: "./.sandcastle/post-merge-review-prompt.md",
-          idleTimeoutSeconds: args.reviewerTimeoutSec,
-          cwd: stagingActive ? stagingWorktreePath : undefined,
-          promptArgs: {
-            ITERATION: String(it),
-            MERGE_DEPTH: String(mergedBranches.length),
-            INTEGRATION_BRANCH: args.branch,
-            BRANCHES: branchesArg,
-            ISSUES: issuesArg,
-            SKILLS_INVOKED_BY_ISSUE:
-              renderSkillsInvokedByIssue(skillsInvokedByIssue),
-          },
-        });
-        postMergeMarker = extractMarker(r.stdout, [
-          "POST_MERGE_ALL_CLEAR",
-          "POST_MERGE_ISSUES_FOUND",
-        ] as const);
-        postMergeFeedback = r.stdout;
-        deps.log(
-          `post-merge review: ${postMergeMarker || "(no marker emitted)"}`,
+      // First pass uses the default model.
+      let { marker: postMergeMarker, stdout: postMergeFeedback } =
+        await runPostMergeReviewer(
+          args.postMergeReviewerModel,
+          skillsInvokedByIssue,
         );
-      } catch (err) {
-        deps.logError(
-          `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
-        );
-      }
 
       // Fix-ladder. Only runs under staging AND only when the first pass
       // flagged ISSUES_FOUND. Single fix attempt with the escalated fixer
@@ -3665,10 +3639,10 @@ export async function runMain(
           deps.log(
             `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,
           );
-          postMergeMarker = await runPostMergeReviewer(
+          ({ marker: postMergeMarker } = await runPostMergeReviewer(
             reviewerEscModel,
             skillsInvokedByIssue,
-          );
+          ));
         }
       }
 
