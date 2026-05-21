@@ -27,7 +27,18 @@ Here is the current open-issue snapshot (already filtered to label
    resolved and M is eligible. Multiple `Blocked by:` lines stack — ALL must
    be resolved.
 
-3. **Sort eligible issues by:**
+3. **Exclude issues missing a `type:` label (project-rule enforcement).**
+   If a `SANDCASTLE.md` file exists at the repo root, the project uses
+   skill discipline: every dispatchable issue must carry exactly one label
+   starting with `type:` (e.g., `type:new-component`, `type:bugfix-ui`,
+   `type:backend`). Exclude any open issue without exactly one such label.
+   The orchestrator re-validates this on the host side after you emit the
+   plan, so excluding here is an optimization (avoid wasting a dispatch
+   slot on an issue that will be filtered downstream anyway). If no
+   `SANDCASTLE.md` exists, this rule is inert — include all eligible
+   issues regardless.
+
+4. **Sort eligible issues by:**
    - **Priority hint first.** Look in each issue's `labels` for a label
      starting with `priority:` (e.g. `priority:high`, `priority:p0`,
      `priority:1`). Earlier letters / lower numbers win.
@@ -37,12 +48,12 @@ Here is the current open-issue snapshot (already filtered to label
    - **Then by issue number ascending** (older issues first within the same
      priority bucket).
 
-4. **Cap at {{MAX_CONCURRENT}} issues.** Output at most that many. If fewer
+5. **Cap at {{MAX_CONCURRENT}} issues.** Output at most that many. If fewer
    than {{MAX_CONCURRENT}} eligible issues exist, output what you have. If
    ZERO eligible issues exist, output an empty array — the orchestrator
    exits cleanly when it sees that.
 
-5. **Branch name** for each issue: use the format `agent/issue-{number}`
+6. **Branch name** for each issue: use the format `agent/issue-{number}`
    (e.g. `agent/issue-71`).
 
 # OUTPUT
@@ -58,7 +69,7 @@ The shape MUST be exactly:
 </plan>
 
 `id` is a string (decimal digits, no `#` prefix). `title` mirrors the issue's
-GitHub title verbatim. `branch` follows rule 5 above.
+GitHub title verbatim. `branch` follows rule 6 above.
 
 If every open issue is blocked OR there are no `{{LABEL}}` issues, output:
 
