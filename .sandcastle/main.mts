@@ -29,6 +29,7 @@ import { existsSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
+import type { AgentStreamEvent } from "@ai-hero/sandcastle";
 import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
@@ -1391,6 +1392,54 @@ function makeLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
     });
   }
   return limited;
+}
+
+// ---------------------------------------------------------------------------
+// Skill-discipline collector (SDK toolCall stream → ground truth for reviewer)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-implementer-run collector for `Skill()` tool-call invocations from the
+ * SDK agent stream. The SDK exposes a `toolCall` event with the tool name
+ * and a `formattedArgs` string; we filter for `name === "Skill"` and extract
+ * the skill name from the args.
+ *
+ * The collected `invoked` array becomes the `SKILLS_INVOKED` ground-truth
+ * field passed to the reviewer prompt. It is host-computed, not
+ * self-reported by the implementer, so the implementer cannot lie about
+ * which skills it invoked.
+ *
+ * Parsing strategy: `formattedArgs` typically looks like `skill: "glass-morphism"`.
+ * We try double-quoted, single-quoted, and backtick variants. If none match,
+ * we record the raw args so the reviewer at least sees something is there
+ * — silent drops would hide bugs in the parser as bugs in the implementer.
+ */
+export function collectSkillInvocations(): {
+  readonly invoked: string[];
+  readonly onEvent: (event: AgentStreamEvent) => void;
+} {
+  const invoked: string[] = [];
+  const parseSkillName = (formattedArgs: string): string => {
+    const patterns = [
+      /skill\s*:\s*"([^"]+)"/,
+      /skill\s*:\s*'([^']+)'/,
+      /skill\s*:\s*`([^`]+)`/,
+    ];
+    for (const p of patterns) {
+      const m = formattedArgs.match(p);
+      if (m && m[1]) return m[1];
+    }
+    return formattedArgs;
+  };
+  return {
+    invoked,
+    onEvent: (event) => {
+      if (event.type !== "toolCall") return;
+      if (event.name !== "Skill") return;
+      const name = parseSkillName(event.formattedArgs ?? "");
+      invoked.push(name);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
