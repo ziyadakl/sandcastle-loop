@@ -36,6 +36,14 @@ invoked no skills" or "this issue shipped via recovery, which does
 not capture skill invocations." Use the diff and commit messages on
 that issue's branch to distinguish if needed.
 
+A row keyed as `fixer: ...` (no `#` prefix, no issue number) — if
+present — represents the post-merge fixer's `Skill()` invocations
+during its fix pass on `integration-candidate`. The fixer's work
+spans multiple issues in the rollup, so its row is **shared across
+all issues** rather than attributed to one. Apply skill-discipline
+checks to it the same way: every name in this row counts as having
+been invoked while the fixer was working on the rollup.
+
 # Skill discipline check (only if SANDCASTLE.md exists at the repo root)
 
 For each issue in this rollup:
@@ -43,15 +51,22 @@ For each issue in this rollup:
 1. Find its `type:` label.
 2. Look up that section in SANDCASTLE.md.
 3. List Required tools (plus any `tool:Y`-label requirements).
-4. Compare to SKILLS_INVOKED for that issue.
-5. If any Required tool is missing for ANY issue, emit a finding
-   identifying the issue number and the missing tools. Exception:
-   if the missing tools are paired with `#N: (none)` AND the issue's
-   commit history shows a recovery pass, treat this as `n/a` rather
-   than a finding (skill data was not captured for recovery).
+4. Compare to SKILLS_INVOKED for that issue **OR** the `fixer:`
+   row (if present). A Required tool counts as invoked if it
+   appears in EITHER the issue's own per-issue row OR the
+   shared `fixer:` row. The fixer's invocations satisfy any
+   issue's requirements because the fixer touched the rollup
+   on behalf of every involved issue.
+5. If, after consulting both rows, any Required tool is still
+   missing for ANY issue, emit a finding identifying the issue
+   number and the missing tools. Exception: if the missing tools
+   are paired with `#N: (none)` AND no `fixer:` row covers them
+   AND the issue's commit history shows a recovery pass, treat
+   this as `n/a` rather than a finding (skill data was not
+   captured for recovery).
 
-A missing Required tool in ANY issue (not excused by recovery) →
-HAS_BLOCKERS for the rollup.
+A missing Required tool in ANY issue (not excused by the `fixer:`
+row or by recovery) → HAS_BLOCKERS for the rollup.
 
 # THE LAST {{MERGE_DEPTH}} MERGE COMMIT(S) — pre-loaded, do NOT re-fetch
 

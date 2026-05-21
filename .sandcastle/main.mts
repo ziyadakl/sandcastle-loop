@@ -3415,16 +3415,22 @@ export async function runMain(
           );
         }
       }
+      // Render rule: numeric keys (issue IDs) keep the historical `#N:`
+      // prefix so the reviewer prompt's `#N: (none)` language still
+      // matches. Non-numeric keys — currently just `fixer` for the
+      // post-merge-fixer's combined invocations across the rollup —
+      // render as a bare label (`fixer: ...`) so the reviewer can tell
+      // at a glance which row is per-issue vs. shared-across-issues.
       const renderSkillsInvokedByIssue = (
         m: ReadonlyMap<string, readonly string[]>,
       ): string =>
         m.size === 0
           ? "(no skill data captured)"
           : Array.from(m.entries())
-              .map(
-                ([id, skills]) =>
-                  `#${id}: ${skills.length === 0 ? "(none)" : skills.join(", ")}`,
-              )
+              .map(([id, skills]) => {
+                const label = /^\d+$/.test(id) ? `#${id}` : id;
+                return `${label}: ${skills.length === 0 ? "(none)" : skills.join(", ")}`;
+              })
               .join("\n");
 
       // Shared runner for both the default-model first pass and the
@@ -3496,8 +3502,9 @@ export async function runMain(
           `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
         );
         let fixerOk = true;
+        let fixerResult: RunHandle | undefined;
         try {
-          await deps.run({
+          fixerResult = await deps.run({
             name: "post-merge-fixer",
             maxIterations: 1,
             model: fixerModel,
@@ -3519,6 +3526,31 @@ export async function runMain(
           );
         }
         if (fixerOk) {
+          // Capture the fixer's Skill() invocations from its session JSONL
+          // — same pattern as runImplementer (see
+          // extractSkillInvocationsFromSession). The fixer is required
+          // by post-merge-fix-prompt to invoke the same Required tools
+          // as the original implementer for each issue it touches; the
+          // re-review (next call below) needs to see those invocations
+          // to credit them. Without this extraction, the fixer can
+          // comply OR skip with no observable difference at re-review.
+          //
+          // Attribution: the fixer's work spans multiple issues in the
+          // rollup, and the host has no clean way to attribute an
+          // individual tool_use to one of those issues. We stash the
+          // combined list under a synthetic `"fixer"` key — the
+          // reviewer prompt treats this row as shared across all
+          // affected issues (see post-merge-review-prompt.md).
+          const fixerSkillsInvoked: string[] = [];
+          for (const fxIt of fixerResult?.iterations ?? []) {
+            for (const name of extractSkillInvocationsFromSession(
+              fxIt.sessionFilePath,
+            )) {
+              fixerSkillsInvoked.push(name);
+            }
+          }
+          skillsInvokedByIssue.set("fixer", fixerSkillsInvoked);
+
           const reviewerEscModel =
             models.postMergeReviewer.escalations[0] ??
             args.postMergeReviewerModel;
