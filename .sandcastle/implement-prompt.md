@@ -87,6 +87,52 @@ The orchestrator has pre-fetched the issue spec. Read it carefully:
 
 </recent-commits>
 
+# STEP 0 — Read project rules (BEFORE any code work)
+
+If `SANDCASTLE.md` exists at the repo root, this project has opted
+into skill discipline. You MUST follow these steps before writing
+any code:
+
+1. Read `SANDCASTLE.md` at the repo root.
+
+2. This ticket has exactly one `type:X` label (the orchestrator
+   already verified this — if you got dispatched, the label is
+   present). Find that label in your ticket's metadata.
+
+3. In `SANDCASTLE.md`, locate the section matching your `type:X`
+   label. List its "Required" tools. Also list any tools required
+   by `tool:Y` labels on this ticket (search the ticket's labels
+   for any starting with `tool:`).
+
+4. Output a `<skill-plan>` block listing the exact skills you will
+   invoke for this ticket, in the order you'll invoke them. Example:
+
+   ```
+   <skill-plan>
+   - impeccable
+   - layout
+   - clarify
+   - glass-morphism
+   - polish
+   </skill-plan>
+   ```
+
+5. For EACH skill in your plan, invoke it via the Skill tool BEFORE
+   writing any code. Format: `Skill(skill="<name>")`. After
+   invocation, apply the tool's guidance to your work. The
+   orchestrator captures every `Skill()` call you make and forwards
+   the list to the reviewer as authoritative ground truth — you
+   cannot omit a required tool and claim you used it.
+
+6. If `tool:audit` or `tool:critique` is present on this ticket:
+   after invoking the tool, READ its report/findings carefully. Any
+   P0 or P1 severity findings MUST be addressed in your diff before
+   you declare done. The reviewer will verify.
+
+7. If `SANDCASTLE.md` does not exist or has no section matching this
+   ticket's `type:` label, skip this step entirely. Proceed to STEP
+   1 — there is no skill discipline to enforce.
+
 # Story-type rubric — READ FIRST, before [STEP 1/9]
 
 Classify the story by scanning the issue body for a `playwright test` command:
