@@ -1554,8 +1554,11 @@ describe("sandcastle-loop main.mts — .sandcastle/main.mts dirty-check prefligh
   // uncommitted changes vs HEAD. It guards against the "patched locally
   // but never propagated upstream" failure mode that has bitten the
   // loop twice (`.pnpm-store/` gitignore slip, worktree pre-clean slip).
-  // baseArgs() defaults `allowDirtySandcastle: true` so other tests are
-  // not coupled to this gate; these tests opt in by overriding it.
+  // baseArgs() defaults `allowDirtySandcastle: false`. Other preflight
+  // tests pass through this gate because their default `exec` stub
+  // returns `{ ok: true }` for every call — which on the `git diff
+  // --quiet` invocation means "main.mts is clean", so no error is
+  // pushed. These tests opt in explicitly to either state.
 
   // `exec` mock that only fails the dirty-check call. All other gates
   // pass (gh auth, docker info, docker image inspect, ...).

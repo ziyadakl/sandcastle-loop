@@ -378,6 +378,13 @@ Optional:
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
                             matching 'sandcastle docker build-image'.
+  --allow-dirty-sandcastle  Skip the preflight check that refuses launch
+                            when .sandcastle/main.mts has uncommitted
+                            modifications vs HEAD. The check exists to
+                            prevent "patched locally but never propagated
+                            upstream" incidents. When set, a stderr WARN
+                            is emitted so the bypass is visible in logs.
+                            Default: off (strict).
   --help                    Show this message and exit 0.
 
 Exit codes:
@@ -1591,8 +1598,12 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
           stdio: ["ignore", "pipe", "ignore"],
         });
       } catch {
-        // Best-effort; a fresh `git worktree add` will surface a
-        // clearer error if the registration is still wrong.
+        // Best-effort. If a stale registration survives, the SDK's
+        // collision-reuse path (WorktreeManager.js:~120) will hit it
+        // first via `listWorktrees` and then fail loudly when
+        // `hasUncommittedChanges` runs `git status` inside the now-
+        // missing path. The error surfaces — just not through
+        // `worktree add`.
       }
 
       // Work around the SDK bug where createSandbox hardcodes
