@@ -21,6 +21,38 @@ You are inspecting `integration-candidate` (the working tree's HEAD).
 
 {{ISSUES}}
 
+# SKILLS INVOKED PER ISSUE (host-extracted, authoritative)
+
+The orchestrator captured every `Skill()` tool call each implementer
+made via the SDK's `onAgentStreamEvent` hook. This is authoritative —
+implementers cannot fake or omit entries:
+
+<skills-invoked-by-issue>
+{{SKILLS_INVOKED_BY_ISSUE}}
+</skills-invoked-by-issue>
+
+Note: a row rendering as `#N: (none)` may mean either "the implementer
+invoked no skills" or "this issue shipped via recovery, which does
+not capture skill invocations." Use the diff and commit messages on
+that issue's branch to distinguish if needed.
+
+# Skill discipline check (only if SANDCASTLE.md exists at the repo root)
+
+For each issue in this rollup:
+
+1. Find its `type:` label.
+2. Look up that section in SANDCASTLE.md.
+3. List Required tools (plus any `tool:Y`-label requirements).
+4. Compare to SKILLS_INVOKED for that issue.
+5. If any Required tool is missing for ANY issue, emit a finding
+   identifying the issue number and the missing tools. Exception:
+   if the missing tools are paired with `#N: (none)` AND the issue's
+   commit history shows a recovery pass, treat this as `n/a` rather
+   than a finding (skill data was not captured for recovery).
+
+A missing Required tool in ANY issue (not excused by recovery) →
+HAS_BLOCKERS for the rollup.
+
 # THE LAST {{MERGE_DEPTH}} MERGE COMMIT(S) — pre-loaded, do NOT re-fetch
 
 <merge-log>
