@@ -210,6 +210,20 @@ export interface SandboxRunSpec {
   readonly promptFile: string;
   readonly promptArgs?: Record<string, string>;
   readonly idleTimeoutSeconds?: number;
+  /**
+   * Optional per-run callback invoked for each SDK agent stream event (text
+   * chunk or tool call). Used by {@link runImplementer} to feed a
+   * {@link collectSkillInvocations} collector so the host can build the
+   * SKILLS_INVOKED ground-truth list passed downstream to the reviewer.
+   *
+   * The seam stays SDK-agnostic: the production wiring (in
+   * {@link buildDefaultDeps}) translates this into the SDK's
+   * `logging: { type: "file", path, onAgentStreamEvent }` shape. When
+   * undefined, the SDK's default logging shape is used unchanged. Errors
+   * thrown by the callback are swallowed by the SDK, so a parser bug here
+   * cannot kill a run.
+   */
+  readonly onAgentStreamEvent?: (event: AgentStreamEvent) => void;
 }
 
 export interface TopLevelRunSpec extends SandboxRunSpec {
@@ -1678,6 +1692,29 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
         branch: handle.branch,
         worktreePath: handle.worktreePath,
         run: async (opts) => {
+          // When a stream-event callback is supplied (e.g. by runImplementer's
+          // skill-invocation collector), we must materialise the SDK's
+          // `logging` discriminated union — `LoggingOption` requires
+          // `{ type: "file", path }` whenever `onAgentStreamEvent` is set
+          // (run.d.ts:75-91). The SDK only auto-generates the log path when
+          // `logging` is omitted entirely, so we have to pick one here.
+          // `buildLogFilename` is not in the public re-exports, so we use a
+          // simple deterministic path under `.sandcastle/logs/` that mirrors
+          // the SDK's own default location. When no callback is supplied,
+          // leave `logging` undefined so the SDK keeps its auto-path
+          // behaviour (and the existing log files land where users expect).
+          const logging = opts.onAgentStreamEvent
+            ? ({
+                type: "file" as const,
+                path: path.join(
+                  args.repoRoot,
+                  ".sandcastle",
+                  "logs",
+                  `${handle.branch}-${opts.name}.log`,
+                ),
+                onAgentStreamEvent: opts.onAgentStreamEvent,
+              })
+            : undefined;
           const r = await withCeiling(
             `sandbox run "${opts.name}"`,
             (signal) =>
@@ -1690,6 +1727,7 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
                 idleTimeoutSeconds: opts.idleTimeoutSeconds,
                 completionSignal,
                 signal,
+                ...(logging ? { logging } : {}),
               }),
           );
           return { stdout: r.stdout, commits: r.commits };
@@ -2068,7 +2106,11 @@ async function runImplementer(
     model?: string;
     reviewerFeedback?: string;
   } = {},
-): Promise<{ commits: readonly { sha: string }[]; stdout: string }> {
+): Promise<{
+  commits: readonly { sha: string }[];
+  stdout: string;
+  skillsInvoked: readonly string[];
+}> {
   const attemptNumber = opts.attemptNumber ?? 1;
   // Attempt 2 may legitimately produce zero new commits if the implementer
   // emits a <rebuttal> block instead of writing code. Attempt 1 must commit.
@@ -2079,6 +2121,13 @@ async function runImplementer(
   // further fallback — it just throws and the pipeline catch handles it.
   const fallbackModel =
     attemptNumber === 1 ? models.implementer.escalations[0] : undefined;
+  // Collect Skill() tool-call invocations from the SDK agent stream so the
+  // host can build the SKILLS_INVOKED ground-truth field for the downstream
+  // reviewer. Created OUTSIDE the rate-limit-fallback lambda so primary and
+  // fallback attempts both accumulate into the same list — the reviewer
+  // wants to see what skills were touched regardless of which model attempt
+  // ultimately produced the work.
+  const collector = collectSkillInvocations();
   const r = await runWithRateLimitFallback(
     (model) =>
       sb.run({
@@ -2100,6 +2149,7 @@ async function runImplementer(
           ATTEMPT_NUMBER: String(attemptNumber),
           REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
         },
+        onAgentStreamEvent: collector.onEvent,
       }),
     primaryModel,
     fallbackModel,
@@ -2144,7 +2194,7 @@ async function runImplementer(
       });
     }
   }
-  return r;
+  return { ...r, skillsInvoked: collector.invoked };
 }
 
 /**
