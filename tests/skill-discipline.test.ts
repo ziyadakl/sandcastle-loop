@@ -26,7 +26,7 @@ import { join } from "node:path";
 import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
-} from "../.sandcastle/main.mjs";
+} from "../.sandcastle/lib/skill-discipline.js";
 
 describe("extractSkillInvocationsFromSession", () => {
   let dir: string;
