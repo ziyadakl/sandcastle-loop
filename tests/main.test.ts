@@ -207,6 +207,13 @@ function buildDeps(opts: {
     async comment(n, body) {
       state.comments.push({ issueNum: n, body });
     },
+    async listIssuesByLabel(_label) {
+      // Skill-discipline gate is opt-in via SANDCASTLE.md at the repo root.
+      // Existing tests use `repoRoot: "/repo"` which never has the file, so
+      // the orchestrator never calls this path. Tests that exercise the
+      // skill-discipline filter explicitly override this stub.
+      return [];
+    },
     async applyMigrations(repoRoot, preSha, postSha) {
       state.migrationsCalls.push({ repoRoot, preSha, postSha });
       if (opts.migrationsFail) {

@@ -40,6 +40,7 @@ import {
   markMergedToStagingViaLabel,
   promoteAllStagingToDone,
   postIssueComment,
+  listIssuesByLabel,
   LABEL_READY,
 } from "./lib/state/index.js";
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS } from "./lib/verdicts/index.js";
@@ -290,6 +291,16 @@ export interface Deps {
    */
   release(issueNum: number, reason: string): Promise<void>;
   comment(issueNum: number, body: string): Promise<void>;
+  /**
+   * List open issues carrying `label`, returning `{ number, title, labels }`
+   * for each. Used host-side to re-fetch the planner's view of labels so the
+   * orchestrator can enforce `type:`-label discipline without trusting the
+   * planner's (LLM-generated) label claims. Tests inject a stub; production
+   * wraps {@link listIssuesByLabel} from `./lib/state/gh.ts`.
+   */
+  listIssuesByLabel(
+    label: string,
+  ): Promise<readonly { number: number; title: string; labels: readonly string[] }[]>;
   /** Migrations between two SHAs in `repoRoot`. Returns # applied + errors. */
   applyMigrations(
     repoRoot: string,
@@ -1808,6 +1819,12 @@ export function buildDefaultDeps(args: RalphArgs): Deps {
       if (args.dryRun) return dryLog("comment", n, body);
       await postIssueComment(n, body);
     },
+    async listIssuesByLabel(label) {
+      // Read-only; safe under --dry-run. The orchestrator uses this to
+      // re-validate the planner's label claims host-side (SANDCASTLE.md
+      // skill-discipline gate). Returns []` if there are no matches.
+      return await listIssuesByLabel(label);
+    },
     async applyMigrations(repoRoot, preSha, postSha) {
       const r = await applyMigrationsBetween(repoRoot, preSha, postSha);
       return {
@@ -3136,6 +3153,24 @@ export async function runMain(
   // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
   let lastFailedStagingIteration: number | null = null;
 
+  // Skill-discipline opt-in: when `SANDCASTLE.md` exists at the repo root,
+  // the orchestrator re-validates the planner's picked issues against a
+  // host-side label fetch, excluding any that don't carry exactly one
+  // `type:` label. The check is done once at startup (SANDCASTLE.md is a
+  // committed file; it doesn't appear mid-run); the filter itself runs
+  // per-iteration so newly-added `type:` labels are picked up.
+  const sandcastleMdPath = path.join(args.repoRoot, "SANDCASTLE.md");
+  const sandcastleMdExists = existsSync(sandcastleMdPath);
+  if (sandcastleMdExists) {
+    deps.log(
+      `SANDCASTLE.md found at ${sandcastleMdPath} — skill discipline enabled (planner picks re-validated against host-side label fetch)`,
+    );
+  } else {
+    deps.log(
+      `No SANDCASTLE.md at repo root — skill discipline disabled (no type:-label enforcement)`,
+    );
+  }
+
   // Graceful shutdown: register once. We don't abort in-flight gh calls;
   // we set a flag the outer loop checks at iteration boundaries.
   let shuttingDown = false;
@@ -3202,6 +3237,46 @@ export async function runMain(
             shippedIssues,
             quarantinedIssues,
           };
+        }
+
+        // SANDCASTLE.md skill-discipline gate: re-fetch labels host-side
+        // and exclude any picked issue that doesn't carry exactly one
+        // `type:` label. We deliberately do NOT trust the planner's
+        // (LLM-generated) view of labels — the host is authoritative.
+        // Lazy gate: when SANDCASTLE.md is absent OR the plan is empty,
+        // we skip the gh call entirely. This keeps existing tests
+        // (which set repoRoot="/repo", no SANDCASTLE.md) on the no-op
+        // path without needing new mock plumbing.
+        if (sandcastleMdExists && plan.length > 0) {
+          let labelLookup: ReadonlyMap<string, readonly string[]> = new Map();
+          try {
+            const ghPayload = await deps.listIssuesByLabel(args.label);
+            const built = new Map<string, readonly string[]>();
+            for (const item of ghPayload) {
+              built.set(String(item.number), item.labels);
+            }
+            labelLookup = built;
+          } catch (err) {
+            // A gh fetch failure is loud but non-fatal: we fall back to
+            // "no labels known" which means every picked issue will be
+            // excluded as "missing type: label". That's the safe failure
+            // mode — the loop bounces cleanly rather than shipping
+            // unvalidated work.
+            deps.logError(
+              `listIssuesByLabel("${args.label}") failed during skill-discipline gate: ${
+                (err as Error).message
+              } — treating all picked issues as missing labels`,
+            );
+          }
+          const { kept, excluded } = filterPlanByTypeLabels(
+            plan,
+            labelLookup,
+            sandcastleMdExists,
+          );
+          for (const e of excluded) {
+            deps.log(`skipping issue #${e.id} — ${e.reason}`);
+          }
+          plan = [...kept];
         }
       }
 
