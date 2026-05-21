@@ -1456,6 +1456,48 @@ export function collectSkillInvocations(): {
   };
 }
 
+/**
+ * Filter the planner's selected issues to enforce `type:` label discipline.
+ * Only runs when SANDCASTLE.md exists at the repo root — that's the opt-in
+ * signal that the project wants skill discipline enforced.
+ *
+ * Rules:
+ * - Issue MUST carry exactly one label starting with `type:`.
+ * - Zero `type:` labels → excluded with reason "missing type: label".
+ * - Multiple `type:` labels → excluded with reason "multiple type: labels"
+ *   (config error — the user should fix in triage).
+ *
+ * When `sandcastleMdExists` is false, the filter is a no-op (returns all
+ * issues unchanged). This preserves backward compatibility for projects
+ * that haven't adopted SANDCASTLE.md.
+ */
+export function filterPlanByTypeLabels(
+  issues: readonly { readonly id: string; readonly title: string; readonly branch: string }[],
+  labelLookup: ReadonlyMap<string, readonly string[]>,
+  sandcastleMdExists: boolean,
+): {
+  readonly kept: readonly { readonly id: string; readonly title: string; readonly branch: string }[];
+  readonly excluded: readonly { readonly id: string; readonly reason: string }[];
+} {
+  if (!sandcastleMdExists) {
+    return { kept: issues, excluded: [] };
+  }
+  const kept: typeof issues[number][] = [];
+  const excluded: { id: string; reason: string }[] = [];
+  for (const issue of issues) {
+    const labels = labelLookup.get(issue.id) ?? [];
+    const typeLabels = labels.filter((l) => l.startsWith("type:"));
+    if (typeLabels.length === 0) {
+      excluded.push({ id: issue.id, reason: "missing type: label" });
+    } else if (typeLabels.length > 1) {
+      excluded.push({ id: issue.id, reason: "multiple type: labels" });
+    } else {
+      kept.push(issue);
+    }
+  }
+  return { kept, excluded };
+}
+
 // ---------------------------------------------------------------------------
 // Default deps (production wiring)
 // ---------------------------------------------------------------------------

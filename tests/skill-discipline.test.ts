@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { collectSkillInvocations } from "../.sandcastle/main.mjs";
+import { filterPlanByTypeLabels } from "../.sandcastle/main.mjs";
 
 describe("collectSkillInvocations", () => {
   it("returns a collector with empty list before any events", () => {
@@ -102,5 +103,62 @@ describe("collectSkillInvocations", () => {
       timestamp: new Date(),
     });
     expect(c.invoked).toEqual(["unrecognized-format"]);
+  });
+});
+
+describe("filterPlanByTypeLabels", () => {
+  it("includes tickets that have a type: label", () => {
+    const issues = [
+      { id: "71", title: "new ui", branch: "agent/issue-71" },
+    ];
+    const labelLookup = new Map<string, readonly string[]>([
+      ["71", ["ready-for-agent", "type:new-component"]],
+    ]);
+    const r = filterPlanByTypeLabels(issues, labelLookup, true);
+    expect(r.kept).toEqual(issues);
+    expect(r.excluded).toEqual([]);
+  });
+
+  it("excludes tickets missing a type: label when SANDCASTLE.md exists", () => {
+    const issues = [
+      { id: "72", title: "broken backend", branch: "agent/issue-72" },
+    ];
+    const labelLookup = new Map<string, readonly string[]>([
+      ["72", ["ready-for-agent"]],
+    ]);
+    const r = filterPlanByTypeLabels(issues, labelLookup, true);
+    expect(r.kept).toEqual([]);
+    expect(r.excluded).toEqual([
+      { id: "72", reason: "missing type: label" },
+    ]);
+  });
+
+  it("excludes tickets with multiple type: labels (config error)", () => {
+    const issues = [
+      { id: "73", title: "ambiguous", branch: "agent/issue-73" },
+    ];
+    const labelLookup = new Map<string, readonly string[]>([
+      [
+        "73",
+        ["ready-for-agent", "type:new-component", "type:backend"],
+      ],
+    ]);
+    const r = filterPlanByTypeLabels(issues, labelLookup, true);
+    expect(r.kept).toEqual([]);
+    expect(r.excluded).toEqual([
+      { id: "73", reason: "multiple type: labels" },
+    ]);
+  });
+
+  it("does NOT filter when sandcastleMdExists is false (backward compat)", () => {
+    const issues = [
+      { id: "74", title: "no sandcastle", branch: "agent/issue-74" },
+    ];
+    const labelLookup = new Map<string, readonly string[]>([
+      ["74", ["ready-for-agent"]],
+    ]);
+    const r = filterPlanByTypeLabels(issues, labelLookup, false);
+    expect(r.kept).toEqual(issues);
+    expect(r.excluded).toEqual([]);
   });
 });
