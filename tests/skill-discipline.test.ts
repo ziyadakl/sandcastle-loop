@@ -350,6 +350,7 @@ interface GateMockState {
   runCalls: GateRunCall[];
   listLabelCalls: string[];
   quarantines: number[];
+  releases: { issue: number; reason: string }[];
   logs: string[];
   errors: string[];
 }
@@ -379,6 +380,7 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     runCalls: [],
     listLabelCalls: [],
     quarantines: [],
+    releases: [],
     logs: [],
     errors: [],
   };
@@ -434,16 +436,20 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async quarantine(n, _reason) {
       state.quarantines.push(n);
     },
-    async release(_n, _reason) {
-      // unused
+    async release(n, reason) {
+      state.releases.push({ issue: n, reason });
     },
     async comment(_n, _body) {
       // unused
     },
     async listIssuesByLabel(label) {
       state.listLabelCalls.push(label);
-      if (opts.listIssuesByLabel) return opts.listIssuesByLabel(label);
-      return [];
+      if (!opts.listIssuesByLabel) return [];
+      // Real gh filters by label — keep the stub honest so callers like
+      // runMain's startup reconciliation (which queries `in-progress`)
+      // don't see issues that only carry `ready-for-agent`.
+      const all = await opts.listIssuesByLabel(label);
+      return all.filter((issue) => issue.labels.includes(label));
     },
     async applyMigrations(_repoRoot, _preSha, _postSha) {
       return { applied: 0, realErrors: [] };
@@ -569,7 +575,11 @@ describe("orchestrator gate — runMain integration", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(b.state.listLabelCalls).toEqual([]);
+    // Startup reconciliation always queries `in-progress` to release
+    // orphans from a prior killed run; the SANDCASTLE.md gate then
+    // queries `ready-for-agent` only when SANDCASTLE.md exists. No
+    // SANDCASTLE.md here → only the reconciliation call.
+    expect(b.state.listLabelCalls).toEqual(["in-progress"]);
     expect(b.state.claims.sort((a, b) => a - b)).toEqual([501, 502]);
   });
 
@@ -605,7 +615,9 @@ describe("orchestrator gate — runMain integration", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(b.state.listLabelCalls).toEqual(["ready-for-agent"]);
+    // Startup reconciliation prepends `in-progress`; SANDCASTLE.md gate
+    // appends `ready-for-agent`.
+    expect(b.state.listLabelCalls).toEqual(["in-progress", "ready-for-agent"]);
     expect(b.state.claims.sort((a, b) => a - b)).toEqual([601, 602]);
   });
 
@@ -648,7 +660,9 @@ describe("orchestrator gate — runMain integration", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(b.state.listLabelCalls).toEqual(["ready-for-agent"]);
+    // Startup reconciliation prepends `in-progress`; SANDCASTLE.md gate
+    // appends `ready-for-agent`.
+    expect(b.state.listLabelCalls).toEqual(["in-progress", "ready-for-agent"]);
     expect(b.state.claims.sort((a, b) => a - b)).toEqual([701, 703]);
     expect(b.state.claims).not.toContain(702);
     // The orchestrator logs an explicit `skipping issue #N — <reason>` line
@@ -686,6 +700,109 @@ describe("orchestrator gate — runMain integration", () => {
     // logError must carry the same prefixed message so operators can grep.
     expect(
       b.state.errors.some((e) => /^SKILL_DISCIPLINE_GATE_FAILURE:/.test(e)),
+    ).toBe(true);
+  });
+});
+
+describe("startup reconciliation — releases orphaned in-progress issues", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sandcastle-reconcile-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("two orphaned in-progress issues → both released back to ready-for-agent before iteration 1", async () => {
+    // Stub returns orphans only when queried by `in-progress` label (the
+    // helper filters via the issue's own labels — see buildGateDeps).
+    const b = buildGateDeps({
+      listIssuesByLabel: async () => [
+        {
+          number: 401,
+          title: "left in-progress by killed loop",
+          labels: ["in-progress"],
+        },
+        {
+          number: 402,
+          title: "also orphaned",
+          labels: ["in-progress"],
+        },
+      ],
+    });
+    // Iteration 1: planner immediately reports empty plan so the run
+    // exits cleanly after reconciliation runs.
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 1, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // Both orphans released, with a reason mentioning reconciliation so
+    // operators reading the GitHub comment know why their issue bounced.
+    expect(b.state.releases.map((r) => r.issue).sort((a, b) => a - b)).toEqual([
+      401, 402,
+    ]);
+    expect(
+      b.state.releases.every((r) => /startup-reconcile/.test(r.reason)),
+    ).toBe(true);
+    // First listIssuesByLabel call is the reconciliation query.
+    expect(b.state.listLabelCalls[0]).toBe("in-progress");
+  });
+
+  it("no orphans → reconciliation queries `in-progress` but skips releases", async () => {
+    const b = buildGateDeps({
+      // No issues anywhere — reconciliation finds nothing.
+      listIssuesByLabel: async () => [],
+    });
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 1, repoRoot: dir }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toEqual([]);
+    expect(b.state.listLabelCalls).toEqual(["in-progress"]);
+    // Log line confirming the no-orphans path fired (helps operators
+    // tell "reconciliation ran and found nothing" from "reconciliation
+    // never ran" in startup logs).
+    expect(
+      b.state.logs.some((l) =>
+        /startup reconciliation: no orphaned in-progress issues/.test(l),
+      ),
+    ).toBe(true);
+  });
+
+  it("listIssuesByLabel throws → startup continues (don't block the loop on a transient gh failure)", async () => {
+    const b = buildGateDeps({
+      listIssuesByLabel: async () => {
+        throw new Error("gh: transient 502");
+      },
+    });
+    b.enqueue("planner", { stdout: gatePlannerStdout([]) });
+
+    const result = await runMain(
+      gateBaseArgs({ iterations: 1, repoRoot: dir }),
+      b.deps,
+    );
+
+    // Exit clean — reconciliation failure should not crash startup. The
+    // first iteration's planner call will surface the same gh problem
+    // more visibly if it persists.
+    expect(result.exitCode).toBe(0);
+    expect(b.state.releases).toEqual([]);
+    // The skip log carries the underlying error message so an operator
+    // grepping startup logs can see why reconciliation didn't run.
+    expect(
+      b.state.logs.some((l) =>
+        /startup reconciliation skipped: listIssuesByLabel failed: gh: transient 502/.test(
+          l,
+        ),
+      ),
     ).toBe(true);
   });
 });

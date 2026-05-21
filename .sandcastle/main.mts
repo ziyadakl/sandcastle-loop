@@ -1831,6 +1831,14 @@ interface IssueOutcome {
    *  does not capture skills). Surfaced to the post-merge reviewer so the
    *  rollup audit can enforce skill discipline across the integrated set. */
   skillsInvoked?: readonly string[];
+  /** True when the pipeline failed because an SDK call exceeded its idle
+   *  timeout or the host's wall-clock hard ceiling fired. Surfaces stall-
+   *  shaped failures to runMain's sandbox-health detector — a streak of
+   *  iterations where every outcome is `stalled` indicates the sandbox
+   *  itself is sick (orbstack memory pressure, docker degraded, etc.)
+   *  and the loop should pause for operator intervention rather than
+   *  burning more tokens. */
+  stalled?: boolean;
 }
 
 /**
@@ -2845,8 +2853,25 @@ async function runIssuePipeline(
   } catch (err) {
     const errMsg = (err as Error).message;
     const transientVerdict = isTransientError(errMsg);
+    // Stall detection: surface "the sandbox stopped responding" failures
+    // distinctly from "the spec was bad" failures so runMain can pause
+    // the loop after a streak (sandbox-level problem, not code-level).
+    // Patterns:
+    //   - "hard ceiling"          — host watchdog (withHardCeiling at line ~1449)
+    //   - "agent idle for"        — SDK AgentIdleTimeoutError message stem
+    //                                (`Agent idle for N seconds — no output received...`,
+    //                                see node_modules/@ai-hero/sandcastle/dist/Orchestrator.js)
+    //   - "AgentIdleTimeoutError" — SDK error tag, in case the message text
+    //                                changes upstream but the class name stays
+    //   - "no output received"    — secondary SDK phrase, defensive
+    //   - "ETIMEDOUT"             — node net-level timeout (rare here but
+    //                                conceivable for gh / docker calls)
+    const stalled =
+      /hard ceiling|agent idle for|AgentIdleTimeoutError|no output received|ETIMEDOUT/i.test(
+        errMsg,
+      );
     ctx.deps.log(
-      `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} msg=${JSON.stringify(errMsg)}`,
+      `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} stalled=${stalled} msg=${JSON.stringify(errMsg)}`,
     );
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
@@ -3034,10 +3059,10 @@ async function runIssuePipeline(
     const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
-      return { status: "quarantined", finalMarker: "HALT" };
+      return { status: "quarantined", finalMarker: "HALT", stalled };
     } catch (e) {
       ctx.deps.logError(`quarantine failed: ${(e as Error).message}`);
-      return { status: "error", finalMarker: "HALT" };
+      return { status: "error", finalMarker: "HALT", stalled };
     }
   } finally {
     if (sandbox) {
@@ -3076,6 +3101,15 @@ export async function runMain(
   // in a known-bad state, or null if last iteration finished clean. Used to
   // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
   let lastFailedStagingIteration: number | null = null;
+  // Sandbox-health detector: count consecutive iterations where EVERY
+  // outcome was a stall (hard-ceiling fire / SDK idle timeout). When the
+  // sandbox itself is degraded (orbstack memory pressure, docker hung,
+  // network NAT broken) no amount of retrying will help — the loop just
+  // burns tokens producing more stalls. After STALL_STREAK_LIMIT
+  // consecutive all-stall iterations, exit non-zero with a clear "restart
+  // docker, then resume" message rather than continuing to grind.
+  let stalledStreak = 0;
+  const STALL_STREAK_LIMIT = 3;
 
   // Skill-discipline opt-in: when `SANDCASTLE.md` exists at the repo root,
   // the orchestrator re-validates the planner's picked issues against a
@@ -3093,6 +3127,45 @@ export async function runMain(
     deps.log(
       `No SANDCASTLE.md at repo root — skill discipline disabled (no type:-label enforcement)`,
     );
+  }
+
+  // Startup reconciliation: a previous loop that was killed (Ctrl-C, OOM,
+  // host reboot) leaves issues stuck on `in-progress`. Without this step,
+  // the new loop's planner sees those issues as unavailable (already
+  // claimed) and silently skips them — or worse, the planner's blocker
+  // resolution can read "issue absent from ready-for-agent → resolved"
+  // and dispatch dependents prematurely. The sandcastle-run preflight
+  // refuses to launch when another loop is running for this checkout,
+  // so by invariant any `in-progress` label at startup is orphaned.
+  // Release them back to `ready-for-agent` so the planner can re-claim.
+  if (!args.dryRun) {
+    try {
+      const stale = await deps.listIssuesByLabel("in-progress");
+      if (stale.length > 0) {
+        deps.log(
+          `startup reconciliation: ${stale.length} orphaned in-progress issue(s) — releasing back to ready-for-agent`,
+        );
+        for (const issue of stale) {
+          try {
+            await deps.release(
+              issue.number,
+              `[sandcastle startup-reconcile] orphaned in-progress label from a prior killed run — released for re-claim by the new loop`,
+            );
+            deps.log(`  released #${issue.number}: ${issue.title}`);
+          } catch (err) {
+            deps.logError(
+              `  failed to release #${issue.number}: ${(err as Error).message} — leaving as-is, planner will skip`,
+            );
+          }
+        }
+      } else {
+        deps.log(`startup reconciliation: no orphaned in-progress issues`);
+      }
+    } catch (err) {
+      deps.log(
+        `startup reconciliation skipped: listIssuesByLabel failed: ${(err as Error).message}`,
+      );
+    }
   }
 
   // Graceful shutdown: register once. We don't abort in-flight gh calls;
@@ -3146,6 +3219,23 @@ export async function runMain(
           deps.logError(`planner failed: ${(err as Error).message}`);
           return {
             exitCode: 1,
+            iterationsRun,
+            shippedIssues,
+            quarantinedIssues,
+          };
+        }
+        // Truncation halt: when the planner sees its all-open-issues list
+        // hit the 200-entry cap, blocker resolution is unreliable. The
+        // planner emits `<truncation-halt/>` in its reasoning + an empty
+        // plan. We have to catch this BEFORE the empty-plan exit below
+        // (line ~3209) so the operator gets a distinct error rather than
+        // the routine "no claimable issues — exiting cleanly" message.
+        if (/<truncation-halt\/>/i.test(plannerStdout)) {
+          deps.logError(
+            `planner: all-open-issues snapshot hit the 200-entry cap. Blocker resolution is unreliable; halting to avoid out-of-order dispatch. Raise the --limit in .sandcastle/plan-prompt.md's <all-open-issues> block (or close some issues) before re-running.`,
+          );
+          return {
+            exitCode: 2,
             iterationsRun,
             shippedIssues,
             quarantinedIssues,
@@ -3283,6 +3373,56 @@ export async function runMain(
           consecutiveFailures += 1;
           if (Number.isInteger(issueNumber)) lastFailingIssue = issueNumber;
         }
+      }
+
+      // Sandbox-health stall detector. Distinct from the
+      // consecutive-failures circuit breaker below: that one fires on
+      // "the work itself can't be completed" (spec ambiguity, recurring
+      // review failures, etc.). This one fires on "the sandbox itself
+      // isn't responding" (docker hung, orbstack memory pressure, SDK
+      // idle timer firing repeatedly). The fix in the second case is
+      // restarting docker, not closer human review of the spec — so we
+      // separate the two signals and exit with a stall-specific message
+      // rather than a generic "investigate before re-queuing."
+      const iterationStalled =
+        settled.length > 0 &&
+        settled.every((s) => {
+          if (s.status === "fulfilled") {
+            return s.value.outcome.stalled === true;
+          }
+          // Pre-pipeline rejection — claim failure, etc. Count it as a
+          // stall only if its own error message matches the stall pattern;
+          // a gh-auth failure shouldn't count. Kept in sync with the
+          // pipeline-catch regex above.
+          const msg =
+            s.reason instanceof Error ? s.reason.message : String(s.reason);
+          return /hard ceiling|agent idle for|AgentIdleTimeoutError|no output received|ETIMEDOUT/i.test(
+            msg,
+          );
+        });
+      if (iterationStalled) {
+        stalledStreak += 1;
+        deps.log(
+          `sandbox-health: iteration ${it} all-stalled (streak ${stalledStreak}/${STALL_STREAK_LIMIT})`,
+        );
+      } else {
+        if (stalledStreak > 0) {
+          deps.log(
+            `sandbox-health: stall streak reset at ${stalledStreak} (this iteration produced at least one non-stall outcome)`,
+          );
+        }
+        stalledStreak = 0;
+      }
+      if (stalledStreak >= STALL_STREAK_LIMIT) {
+        deps.logError(
+          `sandbox-health: ${stalledStreak} consecutive iterations stalled — every outcome hit the wall-clock hard ceiling or SDK idle timeout. The sandbox itself is likely degraded (orbstack/docker memory pressure, network NAT broken, container daemon hung). Stop the loop, restart docker (on macOS: orbstack), then re-run. Continuing would burn tokens producing more stalls.`,
+        );
+        return {
+          exitCode: 2,
+          iterationsRun,
+          shippedIssues,
+          quarantinedIssues,
+        };
       }
 
       // Circuit breaker.

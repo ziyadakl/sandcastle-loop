@@ -40,9 +40,49 @@ If the section above is empty or whitespace, ignore it. Otherwise treat it as a 
 
 The working tree was left **exactly as the previous attempt left it** —
 partial commits, uncommitted edits, half-written test files. Treat that as
-your starting state. Do NOT `git stash`, `git reset`, or `git clean` to
-"start fresh" — the previous work probably contains 70-90% of what's
-needed.
+your starting state. The previous work probably contains 70-90% of what's
+needed; throwing it away forces you to redo correct code from scratch.
+
+## Destructive operations — non-negotiable
+
+The default answer for any of these is "no", regardless of how stuck the
+previous attempt looks. If your reasoning chain reaches "I'll just wipe
+this and start over," that is the signal to HALT (step 4 below) and
+surface the underlying problem.
+
+Forbidden:
+
+- `git reset --hard`, `git checkout -- .`, `git clean -f`, `git restore .`,
+  `git stash` followed by `drop`
+- `git push --force` / `--force-with-lease` (on any branch)
+- `git rebase` of commits you didn't author this recovery pass
+- `git branch -D` of any branch other than a sub-worktree you own
+- `rm -rf` on anything outside a file you just wrote in this pass
+- deleting `node_modules`, `dist`, `.next`, lockfiles, or `.env`
+- dropping/truncating database tables, `DROP SCHEMA`, `TRUNCATE`
+- killing processes you didn't start
+- `--no-verify` on git operations to skip hooks
+
+The previous attempt's partial commits and uncommitted edits are EVIDENCE
+of how far the work got. Read them with `git log`, `git diff`, `git show
+<sha>` — don't erase them. If you genuinely believe the partial work is
+unrecoverable (which is rare — even a half-written test gives you a head
+start), HALT and let the operator decide whether to discard.
+
+## Before any destructive-adjacent action — cite evidence
+
+If you find yourself about to run any command that would discard partial
+work (even non-forbidden ones like `git checkout <branch>` away from this
+worktree's branch), first write out:
+
+1. WHAT you observed (specific file:line or git log output that proves the
+   partial work is broken/wrong)
+2. WHY the existing work can't be extended (specific test assertion, type
+   error, or contradiction with the spec)
+3. WHAT you're about to do (the exact command)
+
+If you cannot fill in (1) and (2) with concrete evidence, you are guessing
+— and guessing recoveries cause data loss. HALT instead.
 
 # YOUR JOB — in this exact order
 
