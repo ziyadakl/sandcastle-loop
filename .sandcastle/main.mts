@@ -2509,7 +2509,11 @@ async function runReviewer(
   commitSha: string,
   promptFile = "./.sandcastle/review-prompt.md",
   model?: string,
-  opts: { implementerRebuttal?: string; name?: string } = {},
+  opts: {
+    implementerRebuttal?: string;
+    name?: string;
+    skillsInvoked?: readonly string[];
+  } = {},
 ): Promise<{ marker: string; stdout: string }> {
   const primaryModel = model ?? ctx.args.reviewerModel;
   // Only the default reviewer pass gets a rate-limit fallback. The escalated
@@ -2518,6 +2522,7 @@ async function runReviewer(
     primaryModel === ctx.args.reviewerModel
       ? models.reviewer.escalations[0]
       : undefined;
+  const skillsInvoked = opts.skillsInvoked ?? [];
   const r = await runWithRateLimitFallback(
     (m) =>
       sb.run({
@@ -2532,6 +2537,10 @@ async function runReviewer(
           COMMIT_SHA: commitSha,
           BRANCH: ctx.issue.branch,
           IMPLEMENTER_REBUTTAL: opts.implementerRebuttal ?? "",
+          SKILLS_INVOKED:
+            skillsInvoked.length === 0
+              ? "(none invoked)"
+              : skillsInvoked.join(", "),
         },
       }),
     primaryModel,
@@ -2700,7 +2709,9 @@ async function runIssuePipeline(
     // Phase 2b: reviewer attempt 1 (default model). Note: migrations are
     // deferred until AFTER ALL_CLEAR — only the final accepted SQL hits the
     // dev DB, never the intermediate state of a failed first attempt.
-    const review1 = await runReviewer(sandbox, ctx, postSha);
+    const review1 = await runReviewer(sandbox, ctx, postSha, undefined, undefined, {
+      skillsInvoked: impl1.skillsInvoked,
+    });
 
     if (review1.marker === "ALL_CLEAR") {
       return await shipAfterMigrations(ctx, sandbox, preSha, postSha, "ALL_CLEAR");
@@ -2753,6 +2764,7 @@ async function runIssuePipeline(
     const review2 = await runReviewer(sandbox, ctx, postSha, undefined, revEscalations[0], {
       implementerRebuttal: rebuttal,
       name: "reviewer-retry",
+      skillsInvoked: impl2.skillsInvoked,
     });
 
     if (review2.marker === "ALL_CLEAR") {
@@ -2821,6 +2833,7 @@ async function runIssuePipeline(
         {
           implementerRebuttal: rebuttal3,
           name: "reviewer-retry-2",
+          skillsInvoked: impl3.skillsInvoked,
         },
       );
       if (review3.marker === "ALL_CLEAR") {
