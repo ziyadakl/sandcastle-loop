@@ -3297,16 +3297,18 @@ export async function runMain(
             }
             labelLookup = built;
           } catch (err) {
-            // A gh fetch failure is loud but non-fatal: we fall back to
-            // "no labels known" which means every picked issue will be
-            // excluded as "missing type: label". That's the safe failure
-            // mode — the loop bounces cleanly rather than shipping
-            // unvalidated work.
-            deps.logError(
-              `listIssuesByLabel("${args.label}") failed during skill-discipline gate: ${
-                (err as Error).message
-              } — treating all picked issues as missing labels`,
-            );
+            // Fail loud. Previously we logged + fell through with an empty
+            // labelLookup, which made every picked issue look like "missing
+            // type: label", the plan became empty, and the iteration
+            // exited 0 with "no claimable issues — exiting cleanly". For a
+            // non-technical operator that's indistinguishable from a real
+            // empty queue, so a flaky `gh auth` silently halted overnight
+            // work. Re-throw with a distinctive prefix so logs grep cleanly
+            // and the iteration body unwinds to the CLI's fatal handler
+            // (process.exit(1) — loudly visible).
+            const msg = `SKILL_DISCIPLINE_GATE_FAILURE: listIssuesByLabel("${args.label}") failed: ${(err as Error).message}`;
+            deps.logError(msg);
+            throw new Error(msg);
           }
           const { kept, excluded } = filterPlanByTypeLabels(
             plan,
