@@ -61,4 +61,10 @@ describe("restart-detector", () => {
       ".sandcastle/lib/migrations/drizzle-applier.ts",
     );
   });
+
+  it("detects a newly-added lib file that wasn't present at snapshot time", () => {
+    const snap = snapshotImportedFiles(root);
+    writeFileSync(join(root, ".sandcastle/lib/new-helper.ts"), "export {};\n");
+    expect(detectImportedFileChange(root, snap)).toBe(".sandcastle/lib/new-helper.ts");
+  });
 });
