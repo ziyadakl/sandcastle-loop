@@ -361,11 +361,13 @@ interface GateDepsBuilder {
   enqueue(name: string, outcome: GateRunOutcome): void;
 }
 
-interface GateRunOutcome {
-  readonly stdout: string;
-  readonly commits?: readonly { sha: string }[];
-  readonly throw?: Error;
-}
+type GateRunOutcome =
+  | {
+      readonly stdout: string;
+      readonly commits?: readonly { sha: string }[];
+      readonly throw?: undefined;
+    }
+  | { readonly throw: Error };
 
 interface GateBuildOpts {
   /** Stub for `deps.listIssuesByLabel`. Default returns `[]`. */
