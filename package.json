@@ -11,7 +11,7 @@
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit -p .",
     "test": "vitest run",
-    "start": "tsx .sandcastle/main.mts"
+    "start": "bash .sandcastle/sandcastle-wrapper.sh"
   },
   "engines": {
     "node": ">=22"

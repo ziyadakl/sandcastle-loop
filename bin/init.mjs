@@ -66,7 +66,7 @@ function injectIntoProjectPackageJson() {
   const projPkg = JSON.parse(readFileSync(projPkgPath, "utf8"));
 
   projPkg.scripts = projPkg.scripts ?? {};
-  projPkg.scripts.sandcastle = "tsx .sandcastle/main.mts";
+  projPkg.scripts.sandcastle = "bash .sandcastle/sandcastle-wrapper.sh";
 
   projPkg.devDependencies = projPkg.devDependencies ?? {};
   const versions = loadDevDepVersions();
