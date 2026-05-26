@@ -7,6 +7,12 @@
 set -uo pipefail
 
 RESTART_EXIT_CODE=75
+# NOTE: MARKER_FILE is resolved against the wrapper's CWD. If the user
+# passes --repo-root /some/other/path to the orchestrator, the orchestrator
+# writes the marker under that path while the wrapper looks here — the
+# wrapper will exit 1 with "no marker file" instead of restarting. The
+# loud failure is acceptable for the rarely-used --repo-root flag; if this
+# bites in practice, parse --repo-root from "$@" here too.
 MARKER_FILE=".sandcastle/.restart-remaining"
 
 # Runner is overridable via env var (used by tests). Default is the
