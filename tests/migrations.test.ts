@@ -15,6 +15,7 @@ import {
   classifyPsqlErrors,
   isDrizzleMigrationPath,
   splitSqlStatements,
+  toPsqlUri,
   validateJournalRegistration,
   BENIGN_ALREADY_EXISTS_REGEX,
   _createExecRunner,
@@ -690,5 +691,36 @@ describe("defaultExecRunner maxBuffer overflow guard", () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("hello");
     expect(r.stderr).toBe("");
+  });
+});
+
+describe("toPsqlUri", () => {
+  it("strips the Supabase ?workaround query param libpq rejects", () => {
+    const input =
+      "postgres://u:p@host:6543/postgres?workaround=supabase-pooler.vercel";
+    expect(toPsqlUri(input)).toBe("postgres://u:p@host:6543/postgres");
+  });
+
+  it("preserves legitimate libpq params alongside the strip", () => {
+    const input =
+      "postgres://u:p@host:6543/db?sslmode=require&workaround=foo&connect_timeout=5";
+    const out = toPsqlUri(input);
+    expect(out).not.toMatch(/workaround/);
+    expect(out).toMatch(/sslmode=require/);
+    expect(out).toMatch(/connect_timeout=5/);
+  });
+
+  it("returns the input unchanged when no ?workaround is present", () => {
+    const input = "postgres://u:p@host:5432/db?sslmode=require";
+    expect(toPsqlUri(input)).toBe(input);
+  });
+
+  it("returns non-URL DSNs unchanged (keyword/value form)", () => {
+    const input = "host=localhost port=5432 user=u dbname=db";
+    expect(toPsqlUri(input)).toBe(input);
+  });
+
+  it("returns the empty string unchanged", () => {
+    expect(toPsqlUri("")).toBe("");
   });
 });

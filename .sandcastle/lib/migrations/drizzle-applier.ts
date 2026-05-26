@@ -569,6 +569,29 @@ const defaultExecRunner: ExecRunner = _createExecRunner(DEFAULT_EXEC_MAX_BUFFER)
 export const _defaultExecRunnerForTests: ExecRunner = defaultExecRunner;
 
 /**
+ * Strip connection-string query parameters that libpq/psql rejects but the
+ * application's JS driver (postgres-js / @vercel/postgres) tolerates.
+ *
+ * Supabase's Vercel integration appends `?workaround=supabase-pooler.vercel`
+ * to the pooled `POSTGRES_URL`. The JS pooler driver ignores it, but psql
+ * exits 2 with `invalid URI query parameter: "workaround"`, which breaks the
+ * migration applier. We delete only that one param so legitimate libpq params
+ * (sslmode, connect_timeout, …) survive untouched. Non-URL strings (e.g. a
+ * `key=value` keyword/value DSN) are returned unchanged.
+ *
+ * Exported for tests.
+ */
+export function toPsqlUri(databaseUrl: string): string {
+  try {
+    const u = new URL(databaseUrl);
+    u.searchParams.delete("workaround");
+    return u.toString();
+  } catch {
+    return databaseUrl;
+  }
+}
+
+/**
  * Detect new migration files added between `preSha` and `postSha`, then run
  * each statement via `psql -X -v ON_ERROR_STOP=1 -c <stmt>` against
  * `process.env.DATABASE_URL`. Errors are classified as benign (idempotency
@@ -650,14 +673,7 @@ export async function applyMigrationsBetween(
     for (const stmt of statements) {
       const { stdout, stderr, exitCode } = await exec(
         "psql",
-        [
-          "-X",
-          "-v",
-          "ON_ERROR_STOP=1",
-          "-c",
-          stmt,
-          databaseUrl,
-        ],
+        ["-X", "-v", "ON_ERROR_STOP=1", "-c", stmt, toPsqlUri(databaseUrl)],
         {
           env: { ...process.env, PGAPPNAME: "sandcastle-migration-applier" },
           timeout,
