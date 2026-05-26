@@ -404,6 +404,118 @@ describe("sandcastle-loop main.mts — happy path", () => {
   });
 });
 
+describe("sandcastle-loop main.mts — post-merge reviewer stall retry", () => {
+  // Regression for affinity-tracker #197: the post-merge reviewer went
+  // silent past the 600s idle timeout, the SDK aborted it, and the
+  // catch path quarantined perfectly good code. A stall is
+  // environmental (the reviewer never produced a verdict); retry once
+  // on the same model before treating it as a real failure.
+
+  it("stall on first attempt + ALL_CLEAR on retry → no quarantine, issue ships", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "197", title: "stall then recover", branch: "agent/issue-197" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 197 }),
+      commits: [{ sha: "good-sha" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    // First post-merge attempt stalls (SDK idle timeout).
+    b.enqueue("post-merge-reviewer", {
+      stdout: "",
+      throw: new Error("Agent idle for 600 seconds — no output received"),
+    });
+    // Retry succeeds.
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([197]);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([197]);
+    // Two post-merge-reviewer calls prove the retry actually fired.
+    const postMergeCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "post-merge-reviewer",
+    );
+    expect(postMergeCalls).toHaveLength(2);
+  });
+
+  it("stall on both first attempt AND retry → falls through (no third retry)", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "198", title: "persistent stall", branch: "agent/issue-198" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 198 }),
+      commits: [{ sha: "good-sha" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", {
+      stdout: "",
+      throw: new Error("Agent idle for 600 seconds — no output received"),
+    });
+    b.enqueue("post-merge-reviewer", {
+      stdout: "",
+      throw: new Error("AgentIdleTimeoutError"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    // Exactly two attempts — the retry is single-shot.
+    const postMergeCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "post-merge-reviewer",
+    );
+    expect(postMergeCalls).toHaveLength(2);
+  });
+
+  it("non-stall throw (e.g. SDK auth error) → no retry, single attempt", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "199", title: "non-stall error", branch: "agent/issue-199" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 199 }),
+      commits: [{ sha: "good-sha" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", {
+      stdout: "",
+      throw: new Error("Anthropic API: 401 invalid api key"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    // No retry because the throw isn't stall-shaped.
+    const postMergeCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "post-merge-reviewer",
+    );
+    expect(postMergeCalls).toHaveLength(1);
+  });
+});
+
 describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () => {
   it("reviewer HAS_BLOCKERS quarantines the issue, no markDone", async () => {
     const b = buildDeps();

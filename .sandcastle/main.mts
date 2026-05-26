@@ -3638,6 +3638,7 @@ export async function runMain(
           string,
           readonly string[]
         > = new Map(),
+        retryOnStall: boolean = true,
       ): Promise<{ marker: string; stdout: string }> => {
         try {
           const r = await deps.run({
@@ -3667,8 +3668,24 @@ export async function runMain(
           );
           return { marker, stdout: r.stdout };
         } catch (err) {
+          const msg = (err as Error).message;
+          // Stall-class errors (SDK idle timeout, hard ceiling, etc.) are
+          // environmental — the reviewer never got a chance to verdict.
+          // Quarantining merged issues here destroys good code (observed on
+          // affinity-tracker #197). Retry once on the same model before
+          // giving up.
+          if (retryOnStall && STALL_RE.test(msg)) {
+            deps.logError(
+              `post-merge review stalled (${msg}) — retrying once on same model`,
+            );
+            return runPostMergeReviewer(
+              model,
+              skillsInvokedByIssueArg,
+              false,
+            );
+          }
           deps.logError(
-            `post-merge review threw: ${(err as Error).message} — continuing to next iteration`,
+            `post-merge review threw: ${msg} — falling through to quarantine of merged issues`,
           );
           return { marker: "", stdout: "" };
         }
