@@ -23,7 +23,7 @@
  *  10. parsePlan: malformed input throws.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -137,6 +137,9 @@ function buildDeps(opts: {
     journalPath: string;
     journalMissing: boolean;
   }[];
+  /** Optional iteration-start hook. Tests use this to inject mid-run
+   *  filesystem mutations so the restart-detector path can be exercised. */
+  iterationStartHook?: (it: number) => void | Promise<void>;
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -237,6 +240,7 @@ function buildDeps(opts: {
     logError(line) {
       state.errors.push(line);
     },
+    iterationStartHook: opts.iterationStartHook,
   };
 
   return {
@@ -2677,5 +2681,78 @@ describe("sandcastle-loop main.mts — third-attempt grant", () => {
     expect(b.state.quarantines).toHaveLength(1);
     const names = b.state.runCalls.map((c) => c.spec.name);
     expect(names).not.toContain("implementer-retry-2");
+  });
+});
+
+describe("runMain — restart on .sandcastle/** change", () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(path.join(tmpdir(), "scrr-"));
+    // Lay down the tracked files the detector will snapshot at runMain start.
+    mkdirSync(path.join(tmpRoot, ".sandcastle/lib/migrations"), { recursive: true });
+    writeFileSync(path.join(tmpRoot, ".sandcastle/main.mts"), "// stub\n");
+    writeFileSync(path.join(tmpRoot, ".sandcastle/models.ts"), "// stub\n");
+    writeFileSync(path.join(tmpRoot, ".sandcastle/providers.ts"), "// stub\n");
+    writeFileSync(
+      path.join(tmpRoot, ".sandcastle/lib/migrations/drizzle-applier.ts"),
+      "// v1\n",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("exits 75 with remaining-iterations file after a tracked file changes between iterations", async () => {
+    const args = baseArgs({ iterations: 10, repoRoot: tmpRoot });
+    const builder = buildDeps({
+      iterationStartHook: (it: number) => {
+        if (it === 1) {
+          // Simulate a recovery commit landing while the orchestrator was
+          // starting up: mutate a tracked file so the detector fires before
+          // the planner even runs on this first iteration.
+          writeFileSync(
+            path.join(tmpRoot, ".sandcastle/lib/migrations/drizzle-applier.ts"),
+            "// v2 — recovery fix\n",
+          );
+        }
+      },
+    });
+    // No planner outcome needed — the detector fires before the planner runs.
+
+    const result = await runMain(args, builder.deps);
+
+    expect(result.exitCode).toBe(75);
+    expect(result.iterationsRun).toBe(0);
+    const markerPath = path.join(tmpRoot, ".sandcastle/.restart-remaining");
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf8").trim()).toBe("10");
+  });
+
+  it("does NOT exit 75 when no tracked file changes", async () => {
+    const args = baseArgs({ iterations: 2, repoRoot: tmpRoot });
+    const builder = buildDeps({});
+    builder.enqueue("planner", { stdout: plannerStdout([]) });
+    builder.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(args, builder.deps);
+
+    expect(result.exitCode).toBe(0);
+    expect(
+      existsSync(path.join(tmpRoot, ".sandcastle/.restart-remaining")),
+    ).toBe(false);
+  });
+
+  it("honors SANDCASTLE_REMAINING_ITERATIONS env var as override for --iterations", () => {
+    const prev = process.env.SANDCASTLE_REMAINING_ITERATIONS;
+    process.env.SANDCASTLE_REMAINING_ITERATIONS = "7";
+    try {
+      const { args } = parseSandcastleArgs(["--iterations", "100"]);
+      expect(args.iterations).toBe(7);
+    } finally {
+      if (prev === undefined) delete process.env.SANDCASTLE_REMAINING_ITERATIONS;
+      else process.env.SANDCASTLE_REMAINING_ITERATIONS = prev;
+    }
   });
 });

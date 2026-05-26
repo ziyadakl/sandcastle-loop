@@ -25,7 +25,7 @@
 
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -50,6 +50,10 @@ import {
   listMigrationsOnDisk,
   validateJournalRegistration,
 } from "./lib/migrations/index.js";
+import {
+  snapshotImportedFiles,
+  detectImportedFileChange,
+} from "./lib/restart-detector.js";
 import { models } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
@@ -333,11 +337,17 @@ export interface Deps {
   log(line: string): void;
   /** Logger (error-level). */
   logError(line: string): void;
+  /**
+   * Optional iteration-start hook. Production wires this to `undefined`.
+   * Tests use it to inject mid-run filesystem mutations so the restart-
+   * detector path can be exercised without a real recovery agent.
+   */
+  iterationStartHook?: (it: number) => void | Promise<void>;
 }
 
 export interface RunMainResult {
-  /** Process exit code: 0 / 1 / 2 per the spec. */
-  exitCode: 0 | 1 | 2;
+  /** Process exit code: 0 / 1 / 2 per the spec, or 75 for hot-reload restart. */
+  exitCode: 0 | 1 | 2 | 75;
   /** Iterations completed (1-indexed; 0 means we exited before the first cycle). */
   iterationsRun: number;
   /** Counters useful for tests. */
@@ -477,6 +487,16 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     throw new Error("--iterations is required and must be an integer ≥ 1");
   }
 
+  // Env var override: when the sandcastle-wrapper.sh re-launches us after a
+  // hot-reload restart, it sets SANDCASTLE_REMAINING_ITERATIONS so the
+  // --iterations cap is honored across the restart boundary.
+  const envRemaining = process.env.SANDCASTLE_REMAINING_ITERATIONS;
+  const effectiveIterations =
+    envRemaining !== undefined && envRemaining !== ""
+      ? parsePositiveInt(envRemaining, "SANDCASTLE_REMAINING_ITERATIONS") ??
+        iterations
+      : iterations;
+
   const issue =
     values.issue !== undefined
       ? parsePositiveInt(values.issue, "--issue") ?? undefined
@@ -501,7 +521,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       : models.implementer.default);
 
   const args: SandcastleArgs = {
-    iterations,
+    iterations: effectiveIterations,
     issue,
     repoRoot: values["repo-root"] ?? process.cwd(),
     branch: values.branch ?? detectBranchOr("HEAD"),
@@ -3120,6 +3140,7 @@ export async function runMain(
   const quarantinedIssues: number[] = [];
   const deferredIssues: number[] = [];
   let iterationsRun = 0;
+  const importedFilesSnapshot = snapshotImportedFiles(args.repoRoot);
   // Cross-iteration staging state — the iteration number that left staging
   // in a known-bad state, or null if last iteration finished clean. Used to
   // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
@@ -3239,6 +3260,37 @@ export async function runMain(
       if (shuttingDown) break;
       deps.log(`\n=== sandcastle-loop iteration ${it}/${args.iterations} ===`);
       iterationsRun = it;
+
+      // Run the test-injected hook if present (production: undefined). This MUST
+      // fire BEFORE the detector check so tests can simulate a recovery commit.
+      if (deps.iterationStartHook !== undefined) {
+        await deps.iterationStartHook(it);
+      }
+
+      // Hot-reload detector: if any statically-imported file changed on disk
+      // since startup, exit cleanly with code 75 so the wrapper can relaunch.
+      // In production the snapshot was just taken so iteration 1 will always
+      // see no change; skipping it explicitly is not necessary. Tests inject
+      // mutations via iterationStartHook (fired above) to exercise this path.
+      const changed = detectImportedFileChange(args.repoRoot, importedFilesSnapshot);
+      if (changed !== null) {
+        deps.log(
+          `[sandcastle] tracked file changed on disk: ${changed}. ` +
+            `Exiting with code 75 so the wrapper can restart with fresh imports.`,
+        );
+        const remaining = args.iterations - (iterationsRun - 1);
+        writeFileSync(
+          path.join(args.repoRoot, ".sandcastle/.restart-remaining"),
+          String(remaining),
+          "utf8",
+        );
+        return {
+          exitCode: 75,
+          iterationsRun: iterationsRun - 1,
+          shippedIssues,
+          quarantinedIssues,
+        };
+      }
 
       // Phase 1: planner (or one-shot bypass)
       let plan: PlanIssue[];
