@@ -2723,6 +2723,10 @@ describe("runMain — restart on .sandcastle/** change", () => {
 
     const result = await runMain(args, builder.deps);
 
+    // Plan said iterationsRun=1, marker="9" (hook at it=2 after iteration 1
+    // completed). Empty-plan path returns exitCode 0 before reaching iteration
+    // 2, so the hook fires at it=1 instead. Zero iterations completed; the
+    // marker holds the full remaining count.
     expect(result.exitCode).toBe(75);
     expect(result.iterationsRun).toBe(0);
     const markerPath = path.join(tmpRoot, ".sandcastle/.restart-remaining");

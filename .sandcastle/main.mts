@@ -491,10 +491,11 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   // hot-reload restart, it sets SANDCASTLE_REMAINING_ITERATIONS so the
   // --iterations cap is honored across the restart boundary.
   const envRemaining = process.env.SANDCASTLE_REMAINING_ITERATIONS;
+  // parsePositiveInt throws on invalid strings — we want the loud failure.
+  // It only returns null for undefined input, which the outer guard rules out.
   const effectiveIterations =
     envRemaining !== undefined && envRemaining !== ""
-      ? parsePositiveInt(envRemaining, "SANDCASTLE_REMAINING_ITERATIONS") ??
-        iterations
+      ? parsePositiveInt(envRemaining, "SANDCASTLE_REMAINING_ITERATIONS")!
       : iterations;
 
   const issue =
