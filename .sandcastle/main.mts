@@ -800,18 +800,25 @@ export function preflight(args: SandcastleArgs, opts: {
     }
   }
 
-  // 7. DATABASE_URL required when drizzle migrations exist on disk. Fail at
-  // boot, not mid-iteration after a model call has already burned tokens.
+  // 7. DATABASE_URL (or POSTGRES_URL) required when drizzle migrations exist
+  // on disk. Fail at boot, not mid-iteration after a model call has already
+  // burned tokens. The t3-turbo starter template sets POSTGRES_URL by default,
+  // so we accept either — DATABASE_URL wins when both are set.
   const listMigrations = opts.listMigrations ?? listMigrationsOnDisk;
   const getEnv = opts.getEnv ?? ((k) => process.env[k]);
   const migrations = listMigrations(args.repoRoot);
   if (migrations.length > 0) {
-    const dbUrl = (getEnv("DATABASE_URL") ?? "").trim();
+    const dbUrl = (
+      getEnv("DATABASE_URL") ??
+      getEnv("POSTGRES_URL") ??
+      ""
+    ).trim();
     if (dbUrl === "") {
       errors.push(
-        `DATABASE_URL is not set, but this project has ${migrations.length} ` +
-          `drizzle migration file(s) on disk (e.g. ${migrations[0]}). The ` +
-          `migration applier will fail mid-pipeline. Set DATABASE_URL=... in ` +
+        `Neither DATABASE_URL nor POSTGRES_URL is set, but this project has ` +
+          `${migrations.length} drizzle migration file(s) on disk (e.g. ` +
+          `${migrations[0]}). The migration applier will fail mid-pipeline. ` +
+          `Set DATABASE_URL=... (preferred) or POSTGRES_URL=... in ` +
           `<repoRoot>/.env (project-specific) before running the loop.`,
       );
     }

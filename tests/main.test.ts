@@ -1434,12 +1434,17 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
   function preflightWith(over: {
     migrations?: string[];
     dbUrl?: string | undefined;
+    postgresUrl?: string | undefined;
   }) {
     return preflight(baseArgs(), {
       exec: () => ({ ok: true }),
       fileExists: () => true,
       listMigrations: () => over.migrations ?? [],
-      getEnv: (k) => (k === "DATABASE_URL" ? over.dbUrl : undefined),
+      getEnv: (k) => {
+        if (k === "DATABASE_URL") return over.dbUrl;
+        if (k === "POSTGRES_URL") return over.postgresUrl;
+        return undefined;
+      },
     });
   }
 
@@ -1449,7 +1454,9 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
       dbUrl: undefined,
     });
     expect(res.ok).toBe(false);
-    expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+    expect(res.errors.join("\n")).toMatch(
+      /Neither DATABASE_URL nor POSTGRES_URL is set/,
+    );
     expect(res.errors.join("\n")).toMatch(/0001_init\.sql/);
   });
 
@@ -1459,13 +1466,25 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
       dbUrl: "   ",
     });
     expect(res.ok).toBe(false);
-    expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+    expect(res.errors.join("\n")).toMatch(
+      /Neither DATABASE_URL nor POSTGRES_URL is set/,
+    );
   });
 
   it("passes when migrations exist on disk and DATABASE_URL is set", () => {
     const res = preflightWith({
       migrations: ["db/migrations/0001_init.sql"],
       dbUrl: "postgres://fake@localhost/db",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("passes when DATABASE_URL is unset but POSTGRES_URL is set (t3-turbo default)", () => {
+    const res = preflightWith({
+      migrations: ["db/migrations/0001_init.sql"],
+      dbUrl: undefined,
+      postgresUrl: "postgres://fake@localhost/db",
     });
     expect(res.ok).toBe(true);
     expect(res.errors).toEqual([]);
@@ -1490,18 +1509,23 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
         "CREATE TABLE foo (id int);\n",
       );
       const args = baseArgs({ repoRoot: tmp });
-      const prev = process.env.DATABASE_URL;
+      const prevDb = process.env.DATABASE_URL;
+      const prevPg = process.env.POSTGRES_URL;
       delete process.env.DATABASE_URL;
+      delete process.env.POSTGRES_URL;
       try {
         const res = preflight(args, {
           exec: () => ({ ok: true }),
           fileExists: () => true,
         });
         expect(res.ok).toBe(false);
-        expect(res.errors.join("\n")).toMatch(/DATABASE_URL is not set/);
+        expect(res.errors.join("\n")).toMatch(
+          /Neither DATABASE_URL nor POSTGRES_URL is set/,
+        );
         expect(res.errors.join("\n")).toMatch(/0001_init\.sql/);
       } finally {
-        if (prev !== undefined) process.env.DATABASE_URL = prev;
+        if (prevDb !== undefined) process.env.DATABASE_URL = prevDb;
+        if (prevPg !== undefined) process.env.POSTGRES_URL = prevPg;
       }
     } finally {
       rmSync(tmp, { recursive: true, force: true });

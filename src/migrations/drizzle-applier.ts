@@ -61,7 +61,8 @@ export interface ApplyMigrationsResult {
 export interface ApplyMigrationsOptions {
   /**
    * `DATABASE_URL` (or equivalent) to pass to psql. Defaults to
-   * `process.env.DATABASE_URL`. Throws if neither is set.
+   * `process.env.DATABASE_URL` ?? `process.env.POSTGRES_URL`. Throws if
+   * none are set.
    */
   readonly databaseUrl?: string;
   /**
@@ -587,7 +588,10 @@ export async function applyMigrationsBetween(
   }
 
   const databaseUrl =
-    options.databaseUrl ?? process.env.DATABASE_URL ?? "";
+    options.databaseUrl ??
+    process.env.DATABASE_URL ??
+    process.env.POSTGRES_URL ??
+    "";
   const exec: ExecRunner = options._exec ?? defaultExecRunner;
   const timeout = options.perStatementTimeoutMs ?? 60_000;
 
@@ -619,7 +623,7 @@ export async function applyMigrationsBetween(
 
   if (databaseUrl.length === 0) {
     throw new Error(
-      "applyMigrationsBetween: no DATABASE_URL set (and none passed via options.databaseUrl) — " +
+      "applyMigrationsBetween: neither DATABASE_URL nor POSTGRES_URL is set (and none passed via options.databaseUrl) — " +
         `${migrations.length} new migration(s) cannot be applied`,
     );
   }
