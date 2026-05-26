@@ -1,4 +1,4 @@
-# Sandcastle ralph-loop sandbox image — MINIMAL variant.
+# Sandcastle sandcastle-loop sandbox image — MINIMAL variant.
 #
 # This is the per-issue execution container that the orchestrator
 # (`.sandcastle/main.mts`) spins up via the `docker()` factory call.

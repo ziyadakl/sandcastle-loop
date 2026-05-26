@@ -1,6 +1,6 @@
 # Reviewer — iteration {{ITERATION}}, issue #{{ISSUE_NUMBER}}, commit {{COMMIT_SHA}}, branch {{BRANCH}}
 
-You are the code reviewer in an autonomous Ralph loop. The implementer has
+You are the code reviewer in an autonomous Sandcastle loop. The implementer has
 just landed commit `{{COMMIT_SHA}}` on branch `{{BRANCH}}` for GitHub issue
 #{{ISSUE_NUMBER}}. Your job is to certify that the commit actually
 implements the spec AND meets the quality bar — not to rubber-stamp.
@@ -66,7 +66,7 @@ sentences) why the rebuttal didn't change your mind.
 
 <e2e-log>
 
-!`if [ -f /tmp/ralph-e2e-it{{ITERATION}}.log ]; then node -e "const fs=require('fs');const p='/tmp/ralph-e2e-it{{ITERATION}}.log';const s=fs.readFileSync(p,'utf8');const LIMIT=50000;if(s.length>LIMIT){const nl=s.indexOf('\n',s.length-LIMIT);const cut=nl>=0?nl+1:s.length-LIMIT;process.stdout.write('[e2e log truncated — original size '+Buffer.byteLength(s,'utf8')+' bytes, '+s.length+' chars, showing last '+(s.length-cut)+' chars from newline boundary]\n'+s.slice(cut));}else{process.stdout.write(s);}"; else echo "(no /tmp/ralph-e2e-it{{ITERATION}}.log present — implementer did not run agent-browser)"; fi`
+!`if [ -f /tmp/sandcastle-e2e-it{{ITERATION}}.log ]; then node -e "const fs=require('fs');const p='/tmp/sandcastle-e2e-it{{ITERATION}}.log';const s=fs.readFileSync(p,'utf8');const LIMIT=50000;if(s.length>LIMIT){const nl=s.indexOf('\n',s.length-LIMIT);const cut=nl>=0?nl+1:s.length-LIMIT;process.stdout.write('[e2e log truncated — original size '+Buffer.byteLength(s,'utf8')+' bytes, '+s.length+' chars, showing last '+(s.length-cut)+' chars from newline boundary]\n'+s.slice(cut));}else{process.stdout.write(s);}"; else echo "(no /tmp/sandcastle-e2e-it{{ITERATION}}.log present — implementer did not run agent-browser)"; fi`
 
 </e2e-log>
 
@@ -121,7 +121,7 @@ finding regardless of any other evidence. Emit:
 
 If the issue spec's Acceptance section contains an `agent-browser`
 sequence, the implementer was required to run it and save output to
-`/tmp/ralph-e2e-it{{ITERATION}}.log`. Verify:
+`/tmp/sandcastle-e2e-it{{ITERATION}}.log`. Verify:
 
 1. Does the e2e log exist and contain agent-browser output (snapshot
    trees, click/fill confirmations, an `is visible`/`get text` result)?
@@ -150,7 +150,7 @@ The quoted line MUST satisfy ALL of:
   - a snapshot fragment (e.g. `button "Save changes" [ref=e7]`) showing
     the element the story spec describes is present in the rendered
     page.
-- Actually appears in `/tmp/ralph-e2e-it{{ITERATION}}.log`.
+- Actually appears in `/tmp/sandcastle-e2e-it{{ITERATION}}.log`.
 - Is NOT any of these forbidden generic lines:
   - empty or whitespace-only line
   - the snapshot tree's preamble/header lines (e.g. `Page snapshot:`,

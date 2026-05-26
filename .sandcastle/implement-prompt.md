@@ -3,9 +3,9 @@
 This variant uses Playwright pinned to 1.56.x to avoid the Chrome-for-Testing
 memory regression in 1.57+.
 
-# Ralph Implementer Prompt — iteration {{ITERATION}}, GitHub issue #{{ISSUE_NUMBER}}
+# Sandcastle Implementer Prompt — iteration {{ITERATION}}, GitHub issue #{{ISSUE_NUMBER}}
 
-You are the implementer agent in an autonomous Ralph loop. The driver has
+You are the implementer agent in an autonomous Sandcastle loop. The driver has
 already claimed issue #{{ISSUE_NUMBER}} for you (atomically, by flipping the
 GitHub label `ready-for-agent` → `in-progress`) and dispatched you onto branch
 `{{BRANCH}}`. The story title is **{{STORY_TITLE}}**.
@@ -257,7 +257,7 @@ Run exactly:
 
 ```
 git add -A
-git commit -m "RALPH(it={{ITERATION}} issue={{ISSUE_NUMBER}}) WIP: <one-line description of what STEP 3 wrote>"
+git commit -m "SANDCASTLE(it={{ITERATION}} issue={{ISSUE_NUMBER}}) WIP: <one-line description of what STEP 3 wrote>"
 ```
 
 The `WIP:` infix tells downstream agents (reviewer, merger, recovery)
@@ -342,7 +342,7 @@ have verified the feature you wrote actually works end-to-end. If you
 cannot fix the pre-existing condition, HALT.
 
 **Required artifacts.** Save the full playwright output to
-`/tmp/ralph-e2e-it{{ITERATION}}.log`. Detect the project's playwright
+`/tmp/sandcastle-e2e-it{{ITERATION}}.log`. Detect the project's playwright
 config location (search for `playwright.config.{ts,js,mjs}` from repo
 root) and run the project-native invocation — `pnpm exec playwright test`
 in a single-package repo, `pnpm --filter <package-name> exec playwright
@@ -351,7 +351,7 @@ or `npx playwright test` if pnpm isn't used. Use whatever the project's
 own `package.json` scripts or CI config invoke:
 
 ```
-<project's-playwright-invocation> <args from spec> 2>&1 | tee /tmp/ralph-e2e-it{{ITERATION}}.log
+<project's-playwright-invocation> <args from spec> 2>&1 | tee /tmp/sandcastle-e2e-it{{ITERATION}}.log
 ```
 
 **No filtering allowed between playwright and tee.** Run the command EXACTLY
@@ -466,9 +466,9 @@ start it; the loop never manages the dev server.
    AFTER the reviewer says ALL_CLEAR. Your job is to write the code, run
    the tests, append progress, and commit — nothing else.
 
-6. Commit with prefix `RALPH(it={{ITERATION}} issue={{ISSUE_NUMBER}}): `
+6. Commit with prefix `SANDCASTLE(it={{ITERATION}} issue={{ISSUE_NUMBER}}): `
    followed by a short message. The
-   `RALPH(it={{ITERATION}} issue={{ISSUE_NUMBER}}):` prefix is mandatory —
+   `SANDCASTLE(it={{ITERATION}} issue={{ISSUE_NUMBER}}):` prefix is mandatory —
    do NOT use `feat:`, `fix:`, `chore:`, or any conventional-commits prefix.
 
    **The commit body MUST include this exact certification block at the
@@ -483,7 +483,7 @@ start it; the loop never manages the dev server.
    --- e2e verification certification ---
    [ ] story-type: this is a UI story requiring playwright (uncheck if pure-backend / non-UI)
    [ ] migrations applied: I ran `psql -1 -v ON_ERROR_STOP=1 -f` for any new migration in packages/db/migrations/, OR no new migration exists
-   [ ] playwright command from spec was run with output saved to /tmp/ralph-e2e-it{{ITERATION}}.log
+   [ ] playwright command from spec was run with output saved to /tmp/sandcastle-e2e-it{{ITERATION}}.log
    [ ] playwright reported PASSED for the specific test that exercises THIS story's feature (not a tangentially related test)
    [ ] the test reached its assertion AND the assertion was on the user-facing behavior described in the story spec (not on auth state, login redirect, or pre-condition setup)
    [ ] no auth-blocked / migration-pending / pre-existing-failure rationalization is being used to justify a partial e2e
@@ -508,7 +508,7 @@ start it; the loop never manages the dev server.
 
 8. If you genuinely cannot complete the issue (real blocker, e.g. external
    dependency missing, ambiguous spec), commit any partial work with
-   prefix `RALPH(it={{ITERATION}} issue={{ISSUE_NUMBER}}) HALT: ` and
+   prefix `SANDCASTLE(it={{ITERATION}} issue={{ISSUE_NUMBER}}) HALT: ` and
    output `<promise>HALT</promise>` with a one-paragraph reason. Do NOT
    edit labels — the issue stays on `in-progress` and the driver will
    quarantine via `needs-human` when recovery escalates.
@@ -580,7 +580,7 @@ Field rules:
    string), or JSON `null` if `e2eActuallyRan=false`. Verbatim — no
    paraphrasing, no empty string. Use `null`, not `""`.
 
-5. `e2eAssertionLine`: a line from `/tmp/ralph-e2e-it{{ITERATION}}.log` that
+5. `e2eAssertionLine`: a line from `/tmp/sandcastle-e2e-it{{ITERATION}}.log` that
    PROVES the test reached its assertion (must start with ✓ / ✔ / PASS,
    contain `expect(`, or be the test description text). JSON `null` if no
    e2e ran. Use `null`, not `""`.

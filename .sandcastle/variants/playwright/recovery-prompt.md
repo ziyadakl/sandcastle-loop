@@ -1,6 +1,6 @@
 # Recovery agent — iteration {{ITERATION}}, issue #{{ISSUE_NUMBER}}, branch {{BRANCH}}
 
-You are a recovery agent for the autonomous Ralph loop. The agent that was
+You are a recovery agent for the autonomous Sandcastle loop. The agent that was
 previously working on this issue exited non-zero (most commonly a hit
 timeout — implementer 20m, reviewer 10m, fixer 15m — but it can also be a
 crash, an OOM kill, an API hiccup, or a permanently-blocked tool call).
@@ -58,7 +58,7 @@ Pick which tests apply based on the spec:
 
 - **If the issue spec's Acceptance section contains a `playwright test ...`
   command:** run that exact command, save output to
-  `/tmp/ralph-e2e-it{{ITERATION}}.log`. The summary line (`N passed` /
+  `/tmp/sandcastle-e2e-it{{ITERATION}}.log`. The summary line (`N passed` /
   `N failed`) is your verdict.
 - **If no playwright command:** run `pnpm typecheck` (or `npm run
   typecheck`), plus any unit tests covering files added or modified in
@@ -75,7 +75,7 @@ The previous attempt finished the work; only the final commit step was
 missed. Your steps:
 
 - If there are uncommitted changes, commit them with prefix
-  `RALPH(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}):`.
+  `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}):`.
 - Append to progress.txt:
   `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} recovered" >> progress.txt`
 - Output `RECOVERY_COMPLETE` on its own line and exit cleanly. **Do NOT
@@ -101,7 +101,7 @@ code (missing API key, contradictory acceptance criteria, external
 service unavailable):
 
 - Commit any partial work with prefix
-  `RALPH(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}) HALT:`.
+  `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}) HALT:`.
 - Output `<promise>HALT</promise>` on its own line followed by a
   one-paragraph explanation.
 - Do NOT edit GitHub labels (the orchestrator will quarantine via

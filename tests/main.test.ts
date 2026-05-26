@@ -32,7 +32,7 @@ import { existsSync } from "node:fs";
 import {
   runMain,
   parsePlan,
-  parseRalphArgs,
+  parseSandcastleArgs,
   preflight,
   loadDotenv,
   isTransientServerError,
@@ -45,7 +45,7 @@ import {
   WRITE_PROJECT_DOTENV_COMMAND,
   __resetTransientStateForTests,
   type Deps,
-  type RalphArgs,
+  type SandcastleArgs,
   type SandboxRunSpec,
   type TopLevelRunSpec,
   type CreateSandboxSpec,
@@ -261,7 +261,7 @@ function buildDeps(opts: {
 // between calls and we don't need per-test directories.
 const TEST_REPO_ROOT = mkdtempSync(path.join(tmpdir(), "sandcastle-main-test-"));
 
-function baseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
+function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
   return {
     iterations: 1,
     repoRoot: TEST_REPO_ROOT,
@@ -849,22 +849,22 @@ describe("sandcastle-loop main.mts — parsePlan", () => {
   });
 });
 
-describe("sandcastle-loop main.mts — parseRalphArgs", () => {
+describe("sandcastle-loop main.mts — parseSandcastleArgs", () => {
   it("--help sets showHelp", () => {
-    const r = parseRalphArgs(["--help"]);
+    const r = parseSandcastleArgs(["--help"]);
     expect(r.showHelp).toBe(true);
   });
 
   it("requires --iterations", () => {
-    expect(() => parseRalphArgs([])).toThrow(/--iterations/);
+    expect(() => parseSandcastleArgs([])).toThrow(/--iterations/);
   });
 
   it("rejects non-integer --iterations", () => {
-    expect(() => parseRalphArgs(["--iterations", "0"])).toThrow();
+    expect(() => parseSandcastleArgs(["--iterations", "0"])).toThrow();
   });
 
   it("parses defaults for unspecified flags", () => {
-    const r = parseRalphArgs(["--iterations", "3"]);
+    const r = parseSandcastleArgs(["--iterations", "3"]);
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);

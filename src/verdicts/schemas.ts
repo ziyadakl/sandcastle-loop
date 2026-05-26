@@ -1,5 +1,5 @@
 /**
- * Runtime Zod schemas for every load-bearing agent verdict in the Ralph loop.
+ * Runtime Zod schemas for every load-bearing agent verdict in the Sandcastle loop.
  *
  * Each schema's inferred type MUST match the corresponding interface in
  * src/types.ts exactly — types.ts is the contract shared with all five

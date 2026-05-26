@@ -1,6 +1,6 @@
 # Recovery agent — iteration {{ITERATION}}, issue #{{ISSUE_NUMBER}}, branch {{BRANCH}}
 
-You are a recovery agent for the autonomous Ralph loop. The agent that was
+You are a recovery agent for the autonomous Sandcastle loop. The agent that was
 previously working on this issue exited non-zero (most commonly a hit
 timeout — implementer 20m, reviewer 10m, fixer 15m — but it can also be a
 crash, an OOM kill, an API hiccup, or a permanently-blocked tool call).
@@ -61,7 +61,7 @@ which tests apply based on the spec:
   command** (e.g. `pytest tests/test_foo.py::test_bar`, `npm test --
   --grep foo`, `cargo test bar`, `go test ./pkg/... -run TestBar`,
   `mvn test -Dtest=FooTest`): run that exact command and save output to
-  `/tmp/ralph-test-it{{ITERATION}}.log`. The summary line (`N passed`,
+  `/tmp/sandcastle-test-it{{ITERATION}}.log`. The summary line (`N passed`,
   `test result: ok`, etc.) is your verdict.
 - **If no specific command:** detect the project's runner from its files
   (`pyproject.toml` → `pytest`, `package.json` → `npm test` / `pnpm test`,
@@ -83,7 +83,7 @@ The previous attempt finished the work; only the final commit step was
 missed. Your steps:
 
 - If there are uncommitted changes, commit them with prefix
-  `RALPH(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}):`.
+  `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}):`.
 - Append to progress.txt:
   `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} recovered" >> progress.txt`
 - Output `RECOVERY_COMPLETE` on its own line and exit cleanly. **Do NOT
@@ -109,7 +109,7 @@ code (missing API key, contradictory acceptance criteria, external
 service unavailable):
 
 - Commit any partial work with prefix
-  `RALPH(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}) HALT:`.
+  `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}) HALT:`.
 - Output `<promise>HALT</promise>` on its own line followed by a
   one-paragraph explanation.
 - Do NOT edit GitHub labels (the orchestrator will quarantine via

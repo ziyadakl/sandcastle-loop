@@ -655,7 +655,7 @@ export async function applyMigrationsBetween(
           databaseUrl,
         ],
         {
-          env: { ...process.env, PGAPPNAME: "ralph-migration-applier" },
+          env: { ...process.env, PGAPPNAME: "sandcastle-migration-applier" },
           timeout,
         },
       );

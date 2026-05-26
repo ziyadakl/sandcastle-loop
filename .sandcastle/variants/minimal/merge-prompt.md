@@ -1,6 +1,6 @@
 # Merger — iteration {{ITERATION}}
 
-You are the merge agent at the end of a Ralph cycle. The implementer +
+You are the merge agent at the end of a Sandcastle cycle. The implementer +
 reviewer + (sometimes fixer) ran in parallel for several issues this
 iteration; each one shipped to its own branch. Your job is to merge those
 branches into the current branch, resolve any conflicts, and verify the
@@ -48,7 +48,7 @@ For each branch in the list above, in order:
 Make a single commit summarizing the merge with prefix:
 
 ```
-RALPH(it={{ITERATION}} merge): merged N branches — issue summary
+SANDCASTLE(it={{ITERATION}} merge): merged N branches — issue summary
 ```
 
 The body should list the issues + branches that landed and any conflict

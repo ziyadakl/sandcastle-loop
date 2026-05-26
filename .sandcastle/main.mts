@@ -1,6 +1,6 @@
 #!/usr/bin/env -S npx tsx
 /**
- * Sandcastle "ralph" orchestrator (Wave 6.1, Agent B).
+ * Sandcastle "sandcastle" orchestrator (Wave 6.1, Agent B).
  *
  * Adapts Matt Pocock's `parallel-planner-with-review` template (verified at
  * node_modules/@ai-hero/sandcastle/dist/templates/parallel-planner-with-review
@@ -82,7 +82,7 @@ export interface PlanIssue {
  * Args parsed from argv (or supplied programmatically in tests). Every
  * default lives here so consumers don't have to remember them.
  */
-export interface RalphArgs {
+export interface SandcastleArgs {
   iterations: number;
   issue?: number;
   repoRoot: string;
@@ -422,14 +422,14 @@ Exit codes:
 `;
 
 /**
- * Parse argv into a fully-defaulted {@link RalphArgs}. Throws on validation
+ * Parse argv into a fully-defaulted {@link SandcastleArgs}. Throws on validation
  * errors with a precise message — the CLI entry catches and exits 2.
  *
  * Exported so tests can drive the orchestrator without re-implementing the
  * full default set.
  */
-export function parseRalphArgs(argv: readonly string[]): {
-  args: RalphArgs;
+export function parseSandcastleArgs(argv: readonly string[]): {
+  args: SandcastleArgs;
   showHelp: boolean;
 } {
   const { values } = parseArgs({
@@ -500,7 +500,7 @@ export function parseRalphArgs(argv: readonly string[]): {
       ? defaultCodingModelFor(provider)
       : models.implementer.default);
 
-  const args: RalphArgs = {
+  const args: SandcastleArgs = {
     iterations,
     issue,
     repoRoot: values["repo-root"] ?? process.cwd(),
@@ -576,7 +576,7 @@ function detectBranchOr(fallback: string): string {
   }
 }
 
-function defaultArgs(): RalphArgs {
+function defaultArgs(): SandcastleArgs {
   return {
     iterations: 1,
     repoRoot: process.cwd(),
@@ -736,7 +736,7 @@ export interface PreflightResult {
  * presence, docker daemon. Pure — never mutates state. Tests call it
  * directly with their own runners.
  */
-export function preflight(args: RalphArgs, opts: {
+export function preflight(args: SandcastleArgs, opts: {
   exec?: (bin: string, args: readonly string[]) => { ok: boolean; stderr?: string };
   fileExists?: (p: string) => boolean;
   listMigrations?: (repoRoot: string) => string[];
@@ -1461,7 +1461,7 @@ export function withHardCeiling<T>(
  * `dryRun` short-circuits claim / quarantine / markDone / comment to log-only
  * operations so a misconfigured first run can't move labels.
  */
-export function buildDefaultDeps(args: RalphArgs): Deps {
+export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // pnpm install (not npm) — affinity-tracker and similar monorepos use
   // pnpm's workspace:* protocol which npm refuses to parse. The Dockerfile
   // ships `corepack enable` so `pnpm` works without an extra global install.
@@ -2062,7 +2062,7 @@ export function cleanupIssueBranch(
 }
 
 interface PipelineCtx {
-  readonly args: RalphArgs;
+  readonly args: SandcastleArgs;
   readonly deps: Deps;
   readonly iteration: number;
   readonly issueNumber: number;
@@ -3104,7 +3104,7 @@ async function runIssuePipeline(
  * Production CLI entry calls this then exits with the result's `exitCode`.
  */
 export async function runMain(
-  args: RalphArgs,
+  args: SandcastleArgs,
   deps: Deps,
 ): Promise<RunMainResult> {
   let consecutiveFailures = 0;
@@ -3763,7 +3763,7 @@ export async function runMain(
           );
           if (ffSucceeded) {
             const summary =
-              `[ralph it=${it}] integration ${args.branch} fast-forwarded; ` +
+              `[sandcastle it=${it}] integration ${args.branch} fast-forwarded; ` +
               `staging certified by post-merge reviewer`;
             try {
               const promoteRes = await deps.promoteStagingToDone(
@@ -3791,7 +3791,7 @@ export async function runMain(
           // staging at its current tip (next iteration's reset will tag
           // it as `bad-merge-iter-<N>`).
           const reason =
-            `[ralph it=${it}] staging post-merge reviewer marked ` +
+            `[sandcastle it=${it}] staging post-merge reviewer marked ` +
             `${postMergeMarker || "(no marker)"} after fixer pass — ` +
             `quarantining all issues that landed on ${STAGING_BRANCH} ` +
             `this iteration. Integration ${args.branch} NOT advanced.`;
@@ -3917,9 +3917,9 @@ function isMain(): boolean {
 
 if (isMain()) {
   void (async (): Promise<void> => {
-    let parsed: { args: RalphArgs; showHelp: boolean };
+    let parsed: { args: SandcastleArgs; showHelp: boolean };
     try {
-      parsed = parseRalphArgs(process.argv.slice(2));
+      parsed = parseSandcastleArgs(process.argv.slice(2));
     } catch (err) {
       process.stderr.write(`error: ${(err as Error).message}\n\n${HELP_TEXT}`);
       process.exit(2);

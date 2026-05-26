@@ -30,7 +30,7 @@ import {
 import {
   runMain,
   type Deps,
-  type RalphArgs,
+  type SandcastleArgs,
   type SandboxRunSpec,
   type TopLevelRunSpec,
   type CreateSandboxSpec,
@@ -479,7 +479,7 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
   };
 }
 
-function gateBaseArgs(over: Partial<RalphArgs> = {}): RalphArgs {
+function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
   return {
     iterations: 1,
     repoRoot: "/repo",

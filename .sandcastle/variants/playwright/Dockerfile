@@ -1,4 +1,4 @@
-# Sandcastle ralph-loop sandbox image — playwright variant.
+# Sandcastle sandcastle-loop sandbox image — playwright variant.
 #
 # This variant pins Playwright to 1.56.x to avoid the Chrome-for-Testing
 # memory regression introduced in Playwright 1.57+. From 1.57 onwards

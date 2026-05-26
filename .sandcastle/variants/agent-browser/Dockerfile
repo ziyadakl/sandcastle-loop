@@ -1,4 +1,4 @@
-# Sandcastle ralph-loop sandbox image — agent-browser variant.
+# Sandcastle sandcastle-loop sandbox image — agent-browser variant.
 #
 # This variant replaces Playwright with Vercel Labs' agent-browser
 # (https://github.com/vercel-labs/agent-browser): a native Rust CLI

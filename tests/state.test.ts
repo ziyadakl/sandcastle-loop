@@ -131,7 +131,7 @@ async function writePrd(state: PrdState): Promise<void> {
 beforeEach(async () => {
   ghCalls.length = 0;
   mockState.resolver = null;
-  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-state-test-"));
+  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandcastle-state-test-"));
   await writePrd(SEED_PRD);
 });
 
@@ -569,14 +569,14 @@ describe("transitionLabel", () => {
 
 describe("closeIssue", () => {
   it("invokes gh issue close with --comment when provided", async () => {
-    await closeIssue(99, "RALPH(it=3) closed by abc1234");
+    await closeIssue(99, "SANDCASTLE(it=3) closed by abc1234");
     expect(ghCalls).toHaveLength(1);
     expect(ghCalls[0]?.args).toEqual([
       "issue",
       "close",
       "99",
       "--comment",
-      "RALPH(it=3) closed by abc1234",
+      "SANDCASTLE(it=3) closed by abc1234",
     ]);
   });
 

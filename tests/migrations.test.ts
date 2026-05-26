@@ -84,7 +84,7 @@ function recordingExec(handler: {
 async function makeRepoWithMigrations(
   files: Record<string, string>,
 ): Promise<string> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ralph-mig-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "sandcastle-mig-"));
   for (const [rel, content] of Object.entries(files)) {
     const abs = path.join(root, rel);
     await fs.mkdir(path.dirname(abs), { recursive: true });

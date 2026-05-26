@@ -1,6 +1,6 @@
 # PLANNER — iteration {{ITERATION}}
 
-You are the planner agent for an autonomous ralph loop. Your job is to choose
+You are the planner agent for an autonomous sandcastle loop. Your job is to choose
 up to **{{MAX_CONCURRENT}}** GitHub issues to dispatch in parallel this cycle.
 
 # OPEN ISSUES
