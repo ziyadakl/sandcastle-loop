@@ -91,6 +91,7 @@ row or by recovery) → HAS_BLOCKERS for the rollup.
    silently dropped. Pay special attention to test files: a "kept both"
    resolution that accidentally lost an assertion is a real bug.
 
+<!-- variant:test-runner-invocation -->
 2. **Combined typecheck** — run the project's typecheck. If you can scope
    it (e.g. `pnpm typecheck:nextjs`), do that to save memory; otherwise
    run `pnpm typecheck`. If it fails, name the file:line and the cause.
@@ -98,6 +99,7 @@ row or by recovery) → HAS_BLOCKERS for the rollup.
 3. **Combined tests** — run `pnpm vitest run` (or equivalent). If anything
    fails, identify whether the failure is from this iteration's merge
    into staging or pre-existing on `{{INTEGRATION_BRANCH}}`.
+<!-- /variant:test-runner-invocation -->
 
 4. **Issue spec coverage** — for each merged issue listed above, confirm
    the deliverable that the per-issue implementer claimed actually made it

@@ -1,7 +1,9 @@
+<!-- variant:variant-intro -->
 # Variant note
 
 This variant uses Playwright pinned to 1.56.x to avoid the Chrome-for-Testing
 memory regression in 1.57+.
+<!-- /variant:variant-intro -->
 
 # Sandcastle Implementer Prompt — iteration {{ITERATION}}, GitHub issue #{{ISSUE_NUMBER}}
 
@@ -367,6 +369,7 @@ failure was inherited from the prior iteration, you must not ship until you
 have verified the feature you wrote actually works end-to-end. If you
 cannot fix the pre-existing condition, HALT.
 
+<!-- variant:e2e-command -->
 **Required artifacts.** Save the full playwright output to
 `/tmp/sandcastle-e2e-it{{ITERATION}}.log`. Detect the project's playwright
 config location (search for `playwright.config.{ts,js,mjs}` from repo
@@ -387,6 +390,11 @@ output suppression before the tee. The reviewer reads the resulting log to
 detect bail signals (auth redirects, 401s, skipped tests). Filtering those
 signals out is a prompt-following failure — the reviewer's check 8 will
 catch and reject the commit.
+<!-- /variant:e2e-command -->
+
+<!-- variant:cli-cheatsheet -->
+
+<!-- /variant:cli-cheatsheet -->
 
 Then extract the summary line(s) (e.g. `2 passed (15.4s)` or `1 failed`) and
 (a) include them in the commit body, (b) append to progress.txt:

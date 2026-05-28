@@ -1,7 +1,9 @@
+<!-- variant:variant-intro -->
 # Variant note
 
 This variant uses Playwright pinned to 1.56.x to avoid the Chrome-for-Testing
 memory regression in 1.57+.
+<!-- /variant:variant-intro -->
 
 # Reviewer — iteration {{ITERATION}}, issue #{{ISSUE_NUMBER}}, commit {{COMMIT_SHA}}, branch {{BRANCH}}
 
@@ -55,6 +57,7 @@ sentences) why the rebuttal didn't change your mind.
 
 </branch-patch>
 
+<!-- variant:e2e-log-section -->
 # E2E LOG — only present if the implementer ran playwright
 # Bounded to the last 50KB. Huge logs (e.g. failing tests with deep stack
 # traces and screenshot blobs) used to blow the reviewer's context window
@@ -66,6 +69,7 @@ sentences) why the rebuttal didn't change your mind.
 !`if [ -f /tmp/sandcastle-e2e-it{{ITERATION}}.log ]; then node -e "const fs=require('fs');const p='/tmp/sandcastle-e2e-it{{ITERATION}}.log';const s=fs.readFileSync(p,'utf8');const LIMIT=50000;if(s.length>LIMIT){const nl=s.indexOf('\n',s.length-LIMIT);const cut=nl>=0?nl+1:s.length-LIMIT;process.stdout.write('[e2e log truncated — original size '+Buffer.byteLength(s,'utf8')+' bytes, '+s.length+' chars, showing last '+(s.length-cut)+' chars from newline boundary]\n'+s.slice(cut));}else{process.stdout.write(s);}"; else echo "(no /tmp/sandcastle-e2e-it{{ITERATION}}.log present — implementer did not run playwright)"; fi`
 
 </e2e-log>
+<!-- /variant:e2e-log-section -->
 
 # DRIVER GROUND TRUTH (authoritative — can't be overridden by self-attestation)
 
@@ -135,6 +139,7 @@ the implementer was required to run it and save output to
 5. Does the certification block in the commit body have all checkboxes
    `[x]` when SPEC_REQUIRES_PLAYWRIGHT=yes or COMMIT_TOUCHED_UI=yes?
 
+<!-- variant:assertion-patterns -->
 # EVIDENCE QUOTE — STRICT verification of the certification's `e2eAssertionLine` field
 
 The quoted line MUST satisfy ALL of:
@@ -162,6 +167,7 @@ If ANY of the above fails, emit:
 > HARD: certification evidence is fabricated, generic, or doesn't prove
 > the test reached its assertion. `<paste the offending line and the rule
 > it violated>`.
+<!-- /variant:assertion-patterns -->
 
 # CROSS-CHECK CERTIFICATION VS BAIL SIGNALS
 

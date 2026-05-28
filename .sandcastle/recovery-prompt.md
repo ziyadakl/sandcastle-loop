@@ -109,6 +109,7 @@ Confirm the state matches what the orchestrator's `REASON` says above.
 
 Pick which tests apply based on the spec:
 
+<!-- variant:test-runner-invocation -->
 - **If the issue spec's Acceptance section contains a `playwright test ...`
   command:** run that exact command, save output to
   `/tmp/sandcastle-e2e-it{{ITERATION}}.log`. The summary line (`N passed` /
@@ -117,6 +118,7 @@ Pick which tests apply based on the spec:
   typecheck`), plus any unit tests covering files added or modified in
   this iteration's diff (`pnpm vitest run <test-file>` for each new
   `*.test.ts`).
+<!-- /variant:test-runner-invocation -->
 - **At minimum:** `pnpm typecheck` always runs. If it fails, the work is
   broken regardless.
 

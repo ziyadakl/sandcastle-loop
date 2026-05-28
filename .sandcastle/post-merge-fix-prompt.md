@@ -75,6 +75,7 @@ issue's work from scratch.
 ## 2. Make the fix
 
 - Edit code on `integration-candidate` directly. Do NOT switch branches.
+<!-- variant:test-runner-invocation -->
 - Run the project's typecheck + tests as you go (whichever the project
   uses — `pnpm typecheck` / `pnpm vitest run`, `pytest`, `cargo test`,
   `go test ./...`, etc.). For multi-package workspaces, prefer narrow
@@ -83,6 +84,7 @@ issue's work from scratch.
   silently while the agent keeps emitting tokens. The reviewer will
   re-run the full set after you exit; if they're red when you finish,
   the fix didn't land.
+<!-- /variant:test-runner-invocation -->
 - If the reviewer's concern is "test X fails because branch A and branch
   B both changed module M in incompatible ways", the right fix is
   usually a small reconciliation commit that touches M — NOT reverting
