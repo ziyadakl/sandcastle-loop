@@ -23,12 +23,12 @@ For each branch in the list above, in order:
    sides of each conflict marker and choosing the correct resolution.
    Don't blindly take "ours" or "theirs" — understand what each side
    intended.
-<!-- variant:test-runner-invocation -->
+<!-- variant:test-runner-merge -->
 3. After resolving conflicts (or if there were none), run
    `npm run typecheck` and `npm run test` (or the project's equivalents,
    e.g. `pnpm typecheck` / `pnpm vitest run`) to verify everything still
    works.
-<!-- /variant:test-runner-invocation -->
+<!-- /variant:test-runner-merge -->
 4. If tests fail, **fix the issues before proceeding to the next branch**.
    A merge that breaks tests is worse than no merge — do not move on
    until the suite is green again.
