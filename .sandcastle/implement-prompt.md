@@ -489,9 +489,14 @@ start it; the loop never manages the dev server.
    `packages/db/migrations/` (or wherever the project keeps migrations)
    MUST be fully qualified as `public.<name>` or `"public"."<name>"`.
    This applies to table names, function names, type names, sequence
-   names. Covers `ALTER TABLE`, `CREATE INDEX … ON`, `DROP TABLE`,
-   `UPDATE`, `INSERT INTO`, `DELETE FROM`, subqueries (`FROM
-   public.<table>` inside CASE/WHERE/SELECT), and `USING` clauses.
+   names. Covers `ALTER TABLE`, `DROP TABLE`, `UPDATE`, `INSERT INTO`,
+   `DELETE FROM`, `JOIN`, subqueries (`FROM public.<table>` inside
+   CASE/WHERE/SELECT), and `USING` clauses. `CREATE INDEX ... ON
+   <table>` is NOT caught by the grep self-check below (the regex
+   doesn't include `ON` because of false positives on `ON CONFLICT` /
+   `ON UPDATE` / `ON DELETE` in foreign keys) — when you write a
+   `CREATE INDEX`, manually qualify the table name and visually
+   verify before commit.
 
    Why: CI typically runs migrations against a vanilla `postgres:16`
    image where `search_path` is not guaranteed to include `public`.
