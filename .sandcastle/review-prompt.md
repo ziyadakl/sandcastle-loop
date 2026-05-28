@@ -248,6 +248,24 @@ Category-specific guidance:
   Over-invocation (extra tools beyond required) is never a finding;
   only under-invocation is.
 
+- **Migration schema qualification** — only if the diff includes any
+  new or modified `.sql` file under `packages/db/migrations/` (or
+  wherever the project keeps migrations).
+
+  1. For each `.sql` file in the diff, grep:
+     ```
+     grep -nE '(ALTER TABLE|FROM|UPDATE|INSERT INTO|DELETE FROM|JOIN|DROP TABLE)[[:space:]]+"?[a-z_][a-z0-9_]*"?[[:space:]]' <file> | grep -v 'public\.' | grep -v -- '--'
+     ```
+  2. Non-empty output = HARD finding. Emit `HAS_BLOCKERS` with the
+     file:line of each unqualified reference. CI breaks on these.
+  3. ALSO check whether the diff modifies `0000_*.sql` (the baseline
+     migration). If yes, this is a HARD finding unless the issue
+     brief explicitly authorized a baseline rebuild — verify in the
+     brief text loaded above. Default is HAS_BLOCKERS for any
+     baseline modification.
+
+  Empty grep + no baseline mutation = `ok`.
+
 ```
 CATEGORY SWEEP:
 - Execution evidence: <ok | n/a (...) | <finding>>
@@ -258,6 +276,7 @@ CATEGORY SWEEP:
 - Error handling: <ok | n/a (...) | <finding>>
 - Edge cases: <ok | n/a (...) | <finding>>
 - Skill discipline: <ok | n/a (...) | <finding>>
+- Migration schema qualification: <ok | n/a (...) | <finding>>
 SWEEP COMPLETE.
 ```
 
