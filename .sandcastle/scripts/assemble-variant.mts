@@ -48,6 +48,25 @@ function listBasePrompts(sandcastleDir: string): string[] {
   return out;
 }
 
+const OPENER_RE = /<!-- variant:([a-z0-9-]+) -->/g;
+const CLOSER_RE = /<!-- \/variant:([a-z0-9-]+) -->/g;
+
+function findOrphanOpeners(text: string): string[] {
+  const opens = new Map<string, number>();
+  const closes = new Map<string, number>();
+  for (const m of text.matchAll(OPENER_RE)) {
+    opens.set(m[1], (opens.get(m[1]) ?? 0) + 1);
+  }
+  for (const m of text.matchAll(CLOSER_RE)) {
+    closes.set(m[1], (closes.get(m[1]) ?? 0) + 1);
+  }
+  const orphans: string[] = [];
+  for (const [name, count] of opens) {
+    if ((closes.get(name) ?? 0) < count) orphans.push(name);
+  }
+  return orphans;
+}
+
 function atomicWrite(target: string, content: string): void {
   const tmp = join(dirname(target), `.${basename(target)}.tmp-${process.pid}`);
   try {
@@ -84,9 +103,19 @@ function main(): void {
   const basePrompts = listBasePrompts(sandcastleDir);
   const seenMarkers = new Set<string>();
   let appliedCount = 0;
+  let warnings = 0;
 
   for (const abs of basePrompts) {
     const original = readFileSync(abs, "utf8");
+
+    const orphans = findOrphanOpeners(original);
+    for (const name of orphans) {
+      console.error(
+        `assemble-variant: base prompt ${abs} has unmatched <!-- variant:${name} --> opener (no corresponding <!-- /variant:${name} --> closer) — assembled output may swallow downstream content`,
+      );
+      warnings++;
+    }
+
     const markers = findMarkerNames(original);
     for (const m of markers) seenMarkers.add(m);
 
@@ -105,7 +134,6 @@ function main(): void {
     atomicWrite(abs, assembled);
   }
 
-  let warnings = 0;
   for (const key of overrides.keys()) {
     if (!seenMarkers.has(key)) {
       console.error(
@@ -120,4 +148,9 @@ function main(): void {
   );
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  fail(msg);
+}
