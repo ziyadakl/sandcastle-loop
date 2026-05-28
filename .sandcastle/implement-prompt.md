@@ -207,6 +207,32 @@ NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
 These rules cut across every step. Breaking either of them is a HARD
 finding for the reviewer.
 
+## Brief vs body — precedence inside an issue
+
+The issue you're picking up has two textual layers: the **issue body**
+(raw triage input written when the ticket was filed) and the **agent
+brief** (a curated comment added during triage, usually labeled "Agent
+Brief" or posted by the operator).
+
+**The agent brief wins when the two conflict.** The brief is the
+operator's authoritative decision about what's in and out of scope;
+the body is the unfiltered original. Examples of conflicts to expect:
+
+- Body recommends a sweeping refactor; brief restricts scope to one
+  file. Follow the brief.
+- Body suggests re-dumping a baseline; brief lists baseline-rebuild
+  as out of scope. Follow the brief.
+- Body lists three acceptance criteria; brief narrows to one. Follow
+  the brief.
+
+If you cannot reconcile a conflict — e.g., the brief says X and the
+body says NOT-X with no way to do both — do NOT pick one silently.
+Emit `<promise>HALT</promise>` and surface the conflict in your
+output so the operator can resolve it.
+
+If there is no agent brief comment on the issue, the body is
+authoritative. The brief is only present when triage added one.
+
 ## Destructive operations — audit first, never default
 
 Do NOT run destructive operations as a way to "unstick" something. Stop
@@ -457,6 +483,37 @@ start it; the loop never manages the dev server.
    detects prefix collisions and fails the iteration with a clear error
    before any psql runs. If you see that error, renumber your migration
    rather than fighting it.
+
+   **Schema qualification — non-negotiable.** Every reference to a
+   `public`-schema object inside any `.sql` file under
+   `packages/db/migrations/` (or wherever the project keeps migrations)
+   MUST be fully qualified as `public.<name>` or `"public"."<name>"`.
+   This applies to table names, function names, type names, sequence
+   names. Covers `ALTER TABLE`, `CREATE INDEX … ON`, `DROP TABLE`,
+   `UPDATE`, `INSERT INTO`, `DELETE FROM`, subqueries (`FROM
+   public.<table>` inside CASE/WHERE/SELECT), and `USING` clauses.
+
+   Why: CI typically runs migrations against a vanilla `postgres:16`
+   image where `search_path` is not guaranteed to include `public`.
+   Unqualified refs that work on dev (Supabase, etc.) fail with
+   `relation does not exist` on a fresh CI DB. The rule is universal —
+   do not wait for the issue brief to mention it.
+
+   Self-check BEFORE STEP 9 commit. Run this and quote the result in
+   your WIP progress line; non-empty output means a missed qualifier:
+
+   ```
+   ! grep -nE '(ALTER TABLE|FROM|UPDATE|INSERT INTO|DELETE FROM|JOIN|DROP TABLE)[[:space:]]+"?[a-z_][a-z0-9_]*"?[[:space:]]' packages/db/migrations/<NNNN>_*.sql | grep -v 'public\.' | grep -v -- '--'
+   ```
+
+   **Do NOT modify the baseline migration** (`0000_*.sql` in
+   `packages/db/migrations/`, or whatever the project's first numbered
+   migration is named). The baseline is treated as immutable by the
+   loop. If the issue body suggests re-dumping the baseline, that
+   suggestion does NOT authorize you — see the brief-vs-body
+   precedence rule in "Iteration safety" above. If the issue genuinely
+   requires excising rows or tables from the baseline, emit
+   `<promise>HALT</promise>` and let the operator decide.
 
 5. APPEND a line to progress.txt:
    `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} <one-line>" >> progress.txt`.
