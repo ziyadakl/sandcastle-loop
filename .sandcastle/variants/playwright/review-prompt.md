@@ -187,6 +187,45 @@ Beyond the execution-evidence check above, evaluate the diff for:
 Skip cosmetic / SOFT findings entirely — DO NOT block on naming, comment
 phrasing, or "prefer this pattern" suggestions.
 
+7. **Skill discipline** — only if SANDCASTLE.md exists at the repo root.
+
+   1. Read SANDCASTLE.md.
+   2. Find the section matching this ticket's `type:` label (visible
+      in the issue spec's labels).
+   3. List the Required tools for that section. Add any tools required
+      by `tool:Y` labels on this ticket.
+   4. Compare to SKILLS_INVOKED above. If any Required tool is missing
+      from SKILLS_INVOKED, emit a finding:
+      `Required: [list]. Invoked: [list]. Missing: [list].`
+   5. If `tool:audit` was present, scan the implementer's transcript
+      for audit's P0/P1 findings and verify the diff resolves them.
+      Same for `tool:critique`. If unfixed P0/P1 remain, emit a
+      finding.
+   6. If SANDCASTLE.md does not exist or has no section matching the
+      ticket's type, mark this category `n/a`.
+
+   A missing Required tool is a HARD finding — emit HAS_BLOCKERS.
+   Over-invocation (extra tools beyond required) is never a finding;
+   only under-invocation is.
+
+8. **Migration schema qualification** — only if the diff includes any
+   new or modified `.sql` file under `packages/db/migrations/` (or
+   wherever the project keeps migrations).
+
+   1. For each `.sql` file in the diff, grep:
+      ```
+      grep -nE '(ALTER TABLE|FROM|UPDATE|INSERT INTO|DELETE FROM|JOIN|DROP TABLE)[[:space:]]+"?[a-z_][a-z0-9_]*"?[[:space:]]' <file> | grep -v 'public\.' | grep -v -- '--'
+      ```
+   2. Non-empty output = HARD finding. Emit `HAS_BLOCKERS` with the
+      file:line of each unqualified reference. CI breaks on these.
+   3. ALSO check whether the diff modifies `0000_*.sql` (the baseline
+      migration). If yes, this is a HARD finding unless the issue
+      brief explicitly authorized a baseline rebuild — verify in the
+      brief text loaded above. Default is HAS_BLOCKERS for any
+      baseline modification.
+
+   Empty grep + no baseline mutation = `ok`.
+
 # CATEGORY SWEEP — required output before the final marker
 
 Reviewers that find one issue and stop produce ping-pong retry cycles —
@@ -215,6 +254,8 @@ CATEGORY SWEEP:
 - Security: <ok | n/a (...) | <finding>>
 - Error handling: <ok | n/a (...) | <finding>>
 - Edge cases: <ok | n/a (...) | <finding>>
+- Skill discipline: <ok | n/a (...) | <finding>>
+- Migration schema qualification: <ok | n/a (...) | <finding>>
 SWEEP COMPLETE.
 ```
 

@@ -87,6 +87,52 @@ The orchestrator has pre-fetched the issue spec. Read it carefully:
 
 </recent-commits>
 
+# STEP 0 — Read project rules (BEFORE any code work)
+
+If `SANDCASTLE.md` exists at the repo root, this project has opted
+into skill discipline. You MUST follow these steps before writing
+any code:
+
+1. Read `SANDCASTLE.md` at the repo root.
+
+2. This ticket has exactly one `type:X` label (the orchestrator
+   already verified this — if you got dispatched, the label is
+   present). Find that label in your ticket's metadata.
+
+3. In `SANDCASTLE.md`, locate the section matching your `type:X`
+   label. List its "Required" tools. Also list any tools required
+   by `tool:Y` labels on this ticket (search the ticket's labels
+   for any starting with `tool:`).
+
+4. Output a `<skill-plan>` block listing the exact skills you will
+   invoke for this ticket, in the order you'll invoke them. Example:
+
+   ```
+   <skill-plan>
+   - impeccable
+   - layout
+   - clarify
+   - glass-morphism
+   - polish
+   </skill-plan>
+   ```
+
+5. For EACH skill in your plan, invoke it via the Skill tool BEFORE
+   writing any code. Format: `Skill(skill="<name>")`. After
+   invocation, apply the tool's guidance to your work. The
+   orchestrator captures every `Skill()` call you make and forwards
+   the list to the reviewer as authoritative ground truth — you
+   cannot omit a required tool and claim you used it.
+
+6. If `tool:audit` or `tool:critique` is present on this ticket:
+   after invoking the tool, READ its report/findings carefully. Any
+   P0 or P1 severity findings MUST be addressed in your diff before
+   you declare done. The reviewer will verify.
+
+7. If `SANDCASTLE.md` does not exist or has no section matching this
+   ticket's `type:` label, skip this step entirely. Proceed to STEP
+   1 — there is no skill discipline to enforce.
+
 # Story-type rubric — READ FIRST, before [STEP 1/9]
 
 Classify the story by scanning the issue body for a `playwright test` command:
@@ -160,6 +206,32 @@ NOT skip emission. Emit the marker BEFORE doing the step's work, not after.
 
 These rules cut across every step. Breaking either of them is a HARD
 finding for the reviewer.
+
+## Brief vs body — precedence inside an issue
+
+The issue you're picking up has two textual layers: the **issue body**
+(raw triage input written when the ticket was filed) and the **agent
+brief** (a curated comment added during triage, usually labeled "Agent
+Brief" or posted by the operator).
+
+**The agent brief wins when the two conflict.** The brief is the
+operator's authoritative decision about what's in and out of scope;
+the body is the unfiltered original. Examples of conflicts to expect:
+
+- Body recommends a sweeping refactor; brief restricts scope to one
+  file. Follow the brief.
+- Body suggests re-dumping a baseline; brief lists baseline-rebuild
+  as out of scope. Follow the brief.
+- Body lists three acceptance criteria; brief narrows to one. Follow
+  the brief.
+
+If you cannot reconcile a conflict — e.g., the brief says X and the
+body says NOT-X with no way to do both — do NOT pick one silently.
+Emit `<promise>HALT</promise>` and surface the conflict in your
+output so the operator can resolve it.
+
+If there is no agent brief comment on the issue, the body is
+authoritative. The brief is only present when triage added one.
 
 ## Destructive operations — audit first, never default
 
@@ -396,6 +468,42 @@ start it; the loop never manages the dev server.
    detects prefix collisions and fails the iteration with a clear error
    before any psql runs. If you see that error, renumber your migration
    rather than fighting it.
+
+   **Schema qualification — non-negotiable.** Every reference to a
+   `public`-schema object inside any `.sql` file under
+   `packages/db/migrations/` (or wherever the project keeps migrations)
+   MUST be fully qualified as `public.<name>` or `"public"."<name>"`.
+   This applies to table names, function names, type names, sequence
+   names. Covers `ALTER TABLE`, `DROP TABLE`, `UPDATE`, `INSERT INTO`,
+   `DELETE FROM`, `JOIN`, subqueries (`FROM public.<table>` inside
+   CASE/WHERE/SELECT), and `USING` clauses. `CREATE INDEX ... ON
+   <table>` is NOT caught by the grep self-check below (the regex
+   doesn't include `ON` because of false positives on `ON CONFLICT` /
+   `ON UPDATE` / `ON DELETE` in foreign keys) — when you write a
+   `CREATE INDEX`, manually qualify the table name and visually
+   verify before commit.
+
+   Why: CI typically runs migrations against a vanilla `postgres:16`
+   image where `search_path` is not guaranteed to include `public`.
+   Unqualified refs that work on dev (Supabase, etc.) fail with
+   `relation does not exist` on a fresh CI DB. The rule is universal —
+   do not wait for the issue brief to mention it.
+
+   Self-check BEFORE STEP 9 commit. Run this and quote the result in
+   your WIP progress line; non-empty output means a missed qualifier:
+
+   ```
+   ! grep -nE '(ALTER TABLE|FROM|UPDATE|INSERT INTO|DELETE FROM|JOIN|DROP TABLE)[[:space:]]+"?[a-z_][a-z0-9_]*"?[[:space:]]' packages/db/migrations/<NNNN>_*.sql | grep -v 'public\.' | grep -v -- '--'
+   ```
+
+   **Do NOT modify the baseline migration** (`0000_*.sql` in
+   `packages/db/migrations/`, or whatever the project's first numbered
+   migration is named). The baseline is treated as immutable by the
+   loop. If the issue body suggests re-dumping the baseline, that
+   suggestion does NOT authorize you — see the brief-vs-body
+   precedence rule in "Iteration safety" above. If the issue genuinely
+   requires excising rows or tables from the baseline, emit
+   `<promise>HALT</promise>` and let the operator decide.
 
 5. APPEND a line to progress.txt:
    `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} <one-line>" >> progress.txt`.
