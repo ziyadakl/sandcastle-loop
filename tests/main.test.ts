@@ -1963,6 +1963,116 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
     }
   });
 
+  // Issue 7 (audit 2026-05-30): when an operator commits to integrationBranch
+  // mid-iteration, the staging tip is no longer an ancestor of integration —
+  // FF refuses and a human merges manually. Three such recoveries hit
+  // affinity-tracker in two days. The orchestrator should attempt a non-FF
+  // merge on the live worktree before quarantining. Conflicts still
+  // quarantine — they're real author work; FF refusal alone is plumbing.
+  it("auto-merges with --no-ff when integration has diverged from staging (no conflicts)", () => {
+    const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repoRoot, env: gitEnv, encoding: "utf8" }).trim();
+
+      // staging gets one commit (loop's iteration work)
+      git("branch", "integration-candidate");
+      git("checkout", "-q", "integration-candidate");
+      writeFileSync(path.join(repoRoot, "staging-file.ts"), "export const STAGING = 1;\n");
+      git("add", "staging-file.ts");
+      git("commit", "-q", "-m", "staging work");
+      const stagingTip = git("rev-parse", "HEAD");
+
+      // operator commits to integration (feat-x) on a DIFFERENT path → divergence, no conflict
+      git("checkout", "-q", "-b", "feat-x", "main");
+      writeFileSync(path.join(repoRoot, "operator-file.ts"), "export const OP = 1;\n");
+      git("add", "operator-file.ts");
+      git("commit", "-q", "-m", "operator hotfix");
+      const integrationTipBefore = git("rev-parse", "HEAD");
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const ok = fastForwardIntegration(
+        repoRoot,
+        "feat-x",
+        (s) => logs.push(s),
+        (s) => errors.push(s),
+      );
+
+      expect(errors).toEqual([]);
+      expect(ok).toBe(true);
+
+      // HEAD on feat-x must now be a merge commit with both staging-tip and
+      // the operator's commit as parents.
+      const parents = git("rev-parse", "HEAD^@").split("\n");
+      expect(parents.length).toBe(2);
+      expect(parents).toContain(stagingTip);
+      expect(parents).toContain(integrationTipBefore);
+
+      // Both files present in working tree (no data lost in either direction)
+      expect(existsSync(path.join(repoRoot, "staging-file.ts"))).toBe(true);
+      expect(existsSync(path.join(repoRoot, "operator-file.ts"))).toBe(true);
+
+      // Deterministic, audit-traceable commit message
+      const subject = git("log", "-1", "--format=%s");
+      expect(subject).toBe(
+        "Sandcastle: merge integration-candidate into feat-x [auto-no-ff]",
+      );
+      expect(logs.some((l) => l.includes("auto --no-ff"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("aborts and refuses when --no-ff auto-merge would conflict", () => {
+    const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repoRoot, env: gitEnv, encoding: "utf8" }).trim();
+
+      // staging modifies shared.ts one way
+      git("branch", "integration-candidate");
+      git("checkout", "-q", "integration-candidate");
+      writeFileSync(path.join(repoRoot, "shared.ts"), "export const X = 'staging';\n");
+      git("add", "shared.ts");
+      git("commit", "-q", "-m", "staging touches shared");
+
+      // operator modifies the SAME file differently on feat-x → real conflict
+      git("checkout", "-q", "-b", "feat-x", "main");
+      writeFileSync(path.join(repoRoot, "shared.ts"), "export const X = 'operator';\n");
+      git("add", "shared.ts");
+      git("commit", "-q", "-m", "operator touches shared");
+      const integrationTipBefore = git("rev-parse", "HEAD");
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const ok = fastForwardIntegration(
+        repoRoot,
+        "feat-x",
+        (s) => logs.push(s),
+        (s) => errors.push(s),
+      );
+
+      expect(ok).toBe(false);
+      expect(errors.length).toBeGreaterThan(0);
+      // Monitoring continuity: keep "fast-forward refused" as the prefix that
+      // downstream grep/alerting may already match.
+      expect(errors.some((e) => e.startsWith("fast-forward refused"))).toBe(true);
+      // Proves we ACTUALLY attempted the auto-merge before giving up — without
+      // this, the conflict path would silently regress to the old "refuse
+      // without trying" behaviour and still pass the assertions above.
+      expect(errors.some((e) => e.includes("auto --no-ff also failed"))).toBe(true);
+
+      // HEAD must be unchanged — no half-applied merge state
+      expect(git("rev-parse", "HEAD")).toBe(integrationTipBefore);
+      // Working tree must be clean — `git merge --abort` ran on the failed merge
+      expect(git("status", "--porcelain")).toBe("");
+      expect(existsSync(path.join(repoRoot, ".git", "MERGE_HEAD"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   describe("parseWorktreeList", () => {
     it("parses attached and detached worktrees", () => {
       const stdout = [

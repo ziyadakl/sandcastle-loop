@@ -1351,6 +1351,16 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
  *
  * If the branch is not checked out anywhere, fall back to `update-ref`.
  *
+ * Divergence fallback (audit 2026-05-30, Issue 7): when an operator
+ * commits to `integrationBranch` mid-iteration, staging is no longer an
+ * ancestor of integration and `--ff-only` refuses. Rather than dump the
+ * recovery on a human, attempt `git merge --no-ff` on the live worktree
+ * with a deterministic commit message. Real conflicts still refuse
+ * (they're author work). No-worktree divergence still refuses (the
+ * orchestrator's launch worktree always has integrationBranch checked
+ * out in practice; auto-merging into a bare ref adds complexity for a
+ * case that doesn't occur).
+ *
  * Returns true on success.
  */
 export function fastForwardIntegration(
@@ -1369,16 +1379,6 @@ export function fastForwardIntegration(
     logError(`fast-forward: cannot resolve integration branch '${integrationBranch}'`);
     return false;
   }
-  // Verify it's actually a fast-forward — refuse to clobber unrelated history.
-  const merge = runGit(repoRoot, "merge-base", "--is-ancestor", integrationTip, stagingTip);
-  if (!merge.ok) {
-    logError(
-      `fast-forward refused: ${integrationBranch} (${integrationTip.slice(0, 8)}) ` +
-        `is not an ancestor of ${STAGING_BRANCH} (${stagingTip.slice(0, 8)}); ` +
-        `human triage required`,
-    );
-    return false;
-  }
   const listed = runGit(repoRoot, "worktree", "list", "--porcelain");
   if (!listed.ok) {
     logError(`fast-forward: worktree list failed: ${listed.stderr}`);
@@ -1387,6 +1387,46 @@ export function fastForwardIntegration(
   const liveWorktree = parseWorktreeList(listed.stdout).find(
     (w) => w.branch === `refs/heads/${integrationBranch}`,
   );
+  const ancestor = runGit(repoRoot, "merge-base", "--is-ancestor", integrationTip, stagingTip);
+  if (!ancestor.ok) {
+    // Divergence — try auto --no-ff merge on the live worktree.
+    if (!liveWorktree) {
+      logError(
+        `fast-forward refused: ${integrationBranch} (${integrationTip.slice(0, 8)}) ` +
+          `is not an ancestor of ${STAGING_BRANCH} (${stagingTip.slice(0, 8)}); ` +
+          `no live worktree on ${integrationBranch} — auto --no-ff not possible; ` +
+          `human triage required`,
+      );
+      return false;
+    }
+    const mergeMsg =
+      `Sandcastle: merge ${STAGING_BRANCH} into ${integrationBranch} [auto-no-ff]`;
+    const noFf = runGit(
+      liveWorktree.path,
+      "merge",
+      "--no-ff",
+      "-m",
+      mergeMsg,
+      stagingTip,
+    );
+    if (!noFf.ok) {
+      // Leave no half-applied merge state — next iteration's repair logic
+      // assumes the launch worktree is on a clean integrationBranch.
+      runGit(liveWorktree.path, "merge", "--abort");
+      logError(
+        `fast-forward refused: ${integrationBranch} (${integrationTip.slice(0, 8)}) ` +
+          `is not an ancestor of ${STAGING_BRANCH} (${stagingTip.slice(0, 8)}); ` +
+          `auto --no-ff also failed: ${noFf.stderr.trim()}; human triage required`,
+      );
+      return false;
+    }
+    log(
+      `auto --no-ff merge (via worktree in ${liveWorktree.path}): ` +
+        `${STAGING_BRANCH} ${stagingTip.slice(0, 8)} → ${integrationBranch} ` +
+        `(divergence resolved)`,
+    );
+    return true;
+  }
   if (liveWorktree) {
     const ff = runGit(liveWorktree.path, "merge", "--ff-only", stagingTip);
     if (!ff.ok) {
