@@ -2147,15 +2147,48 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
         const from = git("rev-parse", "HEAD");
         writeFileSync(path.join(repoRoot, "package.json"), `{"name":"x"}\n`);
         writeFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "lockfile: 9\n");
+        writeFileSync(path.join(repoRoot, "pnpm-workspace.yaml"), "packages:\n");
         writeFileSync(path.join(repoRoot, "yarn.lock"), "# yarn\n");
         writeFileSync(path.join(repoRoot, "package-lock.json"), `{"name":"x"}\n`);
+        writeFileSync(path.join(repoRoot, "bun.lock"), "# bun\n");
+        writeFileSync(path.join(repoRoot, "bun.lockb"), "binary\n");
         git("add", "-A");
         git("commit", "-q", "-m", "all manifests");
         const to = git("rev-parse", "HEAD");
         const result = detectChangedLockfiles(repoRoot, from, to);
-        expect(result.slice().sort()).toEqual(
-          ["package-lock.json", "package.json", "pnpm-lock.yaml", "yarn.lock"],
+        expect(result.slice().sort()).toEqual([
+          "bun.lock",
+          "bun.lockb",
+          "package-lock.json",
+          "package.json",
+          "pnpm-lock.yaml",
+          "pnpm-workspace.yaml",
+          "yarn.lock",
+        ]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    // Regression guard for the review finding: pnpm-workspace.yaml
+    // controls `allowBuilds` / `ignoredBuiltDependencies`, so a change
+    // there genuinely stales node_modules install-script state. The
+    // file IS present in this very repo. Without this case the warning
+    // would silently miss the exact shape the audit's Issue 8 is about.
+    it("flags a standalone pnpm-workspace.yaml change", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        writeFileSync(
+          path.join(repoRoot, "pnpm-workspace.yaml"),
+          "allowBuilds:\n  esbuild: false\n",
         );
+        git("add", "pnpm-workspace.yaml");
+        git("commit", "-q", "-m", "add workspace config");
+        const to = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, from, to)).toEqual([
+          "pnpm-workspace.yaml",
+        ]);
       } finally {
         cleanup();
       }

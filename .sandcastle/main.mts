@@ -1418,8 +1418,19 @@ export function fastForwardIntegration(
     );
     if (!noFf.ok) {
       // Leave no half-applied merge state — next iteration's repair logic
-      // assumes the launch worktree is on a clean integrationBranch.
-      runGit(liveWorktree.path, "merge", "--abort");
+      // assumes the launch worktree is on a clean integrationBranch. If
+      // the abort itself fails (lock contention, NFS, simultaneous git),
+      // surface it loudly — the next iteration's --ff-only will refuse
+      // with "you have unmerged paths" and a quiet abort failure here
+      // hides the real cause.
+      const abort = runGit(liveWorktree.path, "merge", "--abort");
+      if (!abort.ok) {
+        logError(
+          `fast-forward: merge --abort in ${liveWorktree.path} failed: ` +
+            `${abort.stderr.trim()}; worktree may be in a partial-merge state ` +
+            `— next iteration's FF will refuse with "unmerged paths"`,
+        );
+      }
       logError(
         `fast-forward refused: ${integrationBranch} (${integrationTip.slice(0, 8)}) ` +
           `is not an ancestor of ${STAGING_BRANCH} (${stagingTip.slice(0, 8)}); ` +
@@ -1467,13 +1478,19 @@ export function fastForwardIntegration(
  * Dep-manifest files whose change leaves the host's `node_modules` stale
  * until someone runs the project's install command. Detection is on
  * basename so nested workspace lockfiles (`apps/web/package.json`) trigger
- * too. Order doesn't matter — the warning lists every match.
+ * too. `pnpm-workspace.yaml` is included because it drives `allowBuilds`
+ * / `ignoredBuiltDependencies` — changing it changes which install-scripts
+ * pnpm runs, and a stale state there silently mis-builds native deps.
+ * Order doesn't matter — the warning lists every match.
  */
 const HOST_NODE_MODULES_LOCKFILES = [
   "package.json",
   "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
   "yarn.lock",
   "package-lock.json",
+  "bun.lock",
+  "bun.lockb",
 ] as const;
 
 /**
