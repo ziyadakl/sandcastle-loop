@@ -1456,6 +1456,51 @@ export function fastForwardIntegration(
   return true;
 }
 
+/**
+ * Dep-manifest files whose change leaves the host's `node_modules` stale
+ * until someone runs the project's install command. Detection is on
+ * basename so nested workspace lockfiles (`apps/web/package.json`) trigger
+ * too. Order doesn't matter — the warning lists every match.
+ */
+const HOST_NODE_MODULES_LOCKFILES = [
+  "package.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "package-lock.json",
+] as const;
+
+/**
+ * Return the relative paths of dep-manifest files that changed between
+ * `fromSha` and `toSha`. The host's `node_modules` doesn't auto-refresh
+ * when a merge advances integration past such a commit, so the next
+ * host-side `tsc` / `npm run x` will fail with "missing dependency"
+ * errors. Audit Issue 8 (2026-05-30): lucide-react landed via the
+ * sandbox's auto pnpm install, host typecheck blew up. Auto --no-ff
+ * merges (Issue 7) make this strictly more frequent — operator pushes
+ * that bring lockfile changes now land without a human in the loop to
+ * remember the refresh.
+ *
+ * Fail-quiet: identical SHAs, empty SHAs, or a `git diff` error all
+ * return `[]`. A missing warning beats a crashing loop.
+ */
+export function detectChangedLockfiles(
+  repoRoot: string,
+  fromSha: string,
+  toSha: string,
+): readonly string[] {
+  if (fromSha === "" || toSha === "" || fromSha === toSha) return [];
+  const res = runGit(repoRoot, "diff", "--name-only", fromSha, toSha);
+  if (!res.ok) return [];
+  const changed = res.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return changed.filter((p) => {
+    const basename = p.includes("/") ? p.slice(p.lastIndexOf("/") + 1) : p;
+    return (HOST_NODE_MODULES_LOCKFILES as readonly string[]).includes(basename);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency limiter (small inline semaphore — no extra dep)
 // ---------------------------------------------------------------------------
@@ -3872,6 +3917,7 @@ export async function runMain(
         if (postMergeMarker === "POST_MERGE_ALL_CLEAR" && mergerOk) {
           // Fast-forward integration, then promote all merged-to-staging
           // issues to done.
+          const integrationTipBefore = resolveRefSha(args.repoRoot, args.branch);
           ffSucceeded = fastForwardIntegration(
             args.repoRoot,
             args.branch,
@@ -3879,6 +3925,24 @@ export async function runMain(
             (s) => deps.logError(s),
           );
           if (ffSucceeded) {
+            // Audit Issue 8 (2026-05-30): warn when this iteration's
+            // integration moved a dep manifest — host `node_modules` is
+            // now out of step with the lockfile until the operator runs
+            // their install. See detectChangedLockfiles.
+            const integrationTipAfter = resolveRefSha(args.repoRoot, args.branch);
+            const changedLockfiles = detectChangedLockfiles(
+              args.repoRoot,
+              integrationTipBefore,
+              integrationTipAfter,
+            );
+            if (changedLockfiles.length > 0) {
+              deps.logError(
+                `WARN: host node_modules may be stale — these dep manifests ` +
+                  `changed in this iteration's integration: ${changedLockfiles.join(", ")}. ` +
+                  `Run your package manager's install (e.g. \`pnpm install\`) on the host ` +
+                  `to refresh before using it interactively.`,
+              );
+            }
             const summary =
               `[sandcastle it=${it}] integration ${args.branch} fast-forwarded; ` +
               `staging certified by post-merge reviewer`;

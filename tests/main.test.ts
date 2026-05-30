@@ -38,6 +38,7 @@ import {
   isTransientServerError,
   ensureStagingWorktree,
   fastForwardIntegration,
+  detectChangedLockfiles,
   parseWorktreeList,
   serializeDotenv,
   extractCategorySweep,
@@ -2071,6 +2072,141 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
     } finally {
       cleanup();
     }
+  });
+
+  // Issue 8 (audit 2026-05-30): detect dep-manifest changes between two
+  // commits so the loop can warn the operator that host node_modules is
+  // stale after a successful merge. Auto --no-ff (Issue 7) makes this
+  // strictly more frequent.
+  describe("detectChangedLockfiles", () => {
+    function initRepoForDiff(): {
+      repoRoot: string;
+      git: (...args: string[]) => string;
+      cleanup: () => void;
+    } {
+      const tmp = mkdtempSync(path.join(tmpdir(), "sc-lock-"));
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "Test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "Test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+      };
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: tmp, env: gitEnv, encoding: "utf8" }).trim();
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: tmp, env: gitEnv, stdio: "ignore" });
+      git("config", "user.email", "test@example.com");
+      git("config", "user.name", "Test");
+      writeFileSync(path.join(tmp, "README.md"), "hello\n");
+      git("add", "README.md");
+      git("commit", "-q", "-m", "init");
+      return { repoRoot: tmp, git, cleanup: () => rmSync(tmp, { recursive: true, force: true }) };
+    }
+
+    it("returns [] when the two SHAs are identical", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const sha = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, sha, sha)).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("returns [] when the diff contains no dep-manifest files", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        writeFileSync(path.join(repoRoot, "src.ts"), "export const X = 1;\n");
+        git("add", "src.ts");
+        git("commit", "-q", "-m", "code only");
+        const to = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, from, to)).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("flags a root package.json change", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        writeFileSync(path.join(repoRoot, "package.json"), `{"name":"x"}\n`);
+        git("add", "package.json");
+        git("commit", "-q", "-m", "add pkg");
+        const to = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, from, to)).toEqual(["package.json"]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("flags every supported lockfile basename in one diff", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        writeFileSync(path.join(repoRoot, "package.json"), `{"name":"x"}\n`);
+        writeFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "lockfile: 9\n");
+        writeFileSync(path.join(repoRoot, "yarn.lock"), "# yarn\n");
+        writeFileSync(path.join(repoRoot, "package-lock.json"), `{"name":"x"}\n`);
+        git("add", "-A");
+        git("commit", "-q", "-m", "all manifests");
+        const to = git("rev-parse", "HEAD");
+        const result = detectChangedLockfiles(repoRoot, from, to);
+        expect(result.slice().sort()).toEqual(
+          ["package-lock.json", "package.json", "pnpm-lock.yaml", "yarn.lock"],
+        );
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("flags lockfiles inside workspace subdirectories", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        mkdirSync(path.join(repoRoot, "apps", "web"), { recursive: true });
+        writeFileSync(path.join(repoRoot, "apps", "web", "package.json"), `{"name":"web"}\n`);
+        writeFileSync(path.join(repoRoot, "apps", "web", "pnpm-lock.yaml"), "lockfile: 9\n");
+        git("add", "-A");
+        git("commit", "-q", "-m", "nested workspace lockfile");
+        const to = git("rev-parse", "HEAD");
+        const result = detectChangedLockfiles(repoRoot, from, to);
+        expect(result.slice().sort()).toEqual([
+          "apps/web/package.json",
+          "apps/web/pnpm-lock.yaml",
+        ]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("ignores files that merely contain a lockfile-shaped basename (no full match)", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const from = git("rev-parse", "HEAD");
+        // Files with substrings of lockfile names must NOT be flagged.
+        writeFileSync(path.join(repoRoot, "my-package.json.bak"), "{}\n");
+        writeFileSync(path.join(repoRoot, "package.json.template"), "{}\n");
+        git("add", "-A");
+        git("commit", "-q", "-m", "lookalikes");
+        const to = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, from, to)).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("fails quiet on empty SHA (returns [])", () => {
+      const { repoRoot, git, cleanup } = initRepoForDiff();
+      try {
+        const sha = git("rev-parse", "HEAD");
+        expect(detectChangedLockfiles(repoRoot, "", sha)).toEqual([]);
+        expect(detectChangedLockfiles(repoRoot, sha, "")).toEqual([]);
+      } finally {
+        cleanup();
+      }
+    });
   });
 
   describe("parseWorktreeList", () => {
