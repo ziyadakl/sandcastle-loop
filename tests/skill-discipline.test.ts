@@ -26,6 +26,7 @@ import { join } from "node:path";
 import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
+  resolveSessionFilePath,
 } from "../.sandcastle/lib/skill-discipline.js";
 import {
   runMain,
@@ -260,6 +261,104 @@ describe("extractSkillInvocationsFromSession", () => {
       }),
     ]);
     expect(extractSkillInvocationsFromSession(p)).toEqual(["valid-one"]);
+  });
+});
+
+// Audit Issue 1 (2026-05-30): IterationResult.sessionFilePath is only
+// populated when bindMountHandle is wired. On normal host-backed
+// orchestration it's undefined and every iteration was being credited
+// with zero skill invocations. resolveSessionFilePath falls back to
+// `~/.claude/projects/<encoded(repoRoot)>/<sessionId>.jsonl`.
+describe("resolveSessionFilePath", () => {
+  it("returns sessionFilePath verbatim when the SDK provided one", () => {
+    const explicit = "/some/sdk/chosen/path.jsonl";
+    expect(
+      resolveSessionFilePath(
+        { sessionFilePath: explicit, sessionId: "abc-123" },
+        "/Users/ziyadakl/Dev/Sandcastle",
+        "/Users/ziyadakl",
+      ),
+    ).toBe(explicit);
+  });
+
+  it("falls back to the conventional Mac-style path when only sessionId is set", () => {
+    expect(
+      resolveSessionFilePath(
+        { sessionId: "abc-123" },
+        "/Users/ziyadakl/Dev/Sandcastle",
+        "/Users/ziyadakl",
+      ),
+    ).toBe(
+      "/Users/ziyadakl/.claude/projects/-Users-ziyadakl-Dev-Sandcastle/abc-123.jsonl",
+    );
+  });
+
+  it("falls back to the conventional VPS path documented in the audit", () => {
+    // Affinity-tracker's deploy host — the exact path the audit references.
+    expect(
+      resolveSessionFilePath(
+        { sessionId: "xyz-789" },
+        "/home/agent/workspace",
+        "/home/deploy",
+      ),
+    ).toBe(
+      "/home/deploy/.claude/projects/-home-agent-workspace/xyz-789.jsonl",
+    );
+  });
+
+  it("normalises a repoRoot with a trailing separator before encoding", () => {
+    expect(
+      resolveSessionFilePath(
+        { sessionId: "s1" },
+        "/home/agent/workspace/",
+        "/home/deploy",
+      ),
+    ).toBe(
+      "/home/deploy/.claude/projects/-home-agent-workspace/s1.jsonl",
+    );
+  });
+
+  it("treats empty sessionFilePath as absent and uses the fallback", () => {
+    expect(
+      resolveSessionFilePath(
+        { sessionFilePath: "", sessionId: "s2" },
+        "/r",
+        "/h",
+      ),
+    ).toBe("/h/.claude/projects/-r/s2.jsonl");
+  });
+
+  it("returns undefined when neither sessionFilePath nor sessionId is available", () => {
+    expect(resolveSessionFilePath({}, "/r", "/h")).toBeUndefined();
+    expect(resolveSessionFilePath({ sessionId: "" }, "/r", "/h")).toBeUndefined();
+  });
+
+  it("returns undefined when HOME cannot be determined and no homeDir override is given", () => {
+    const prevHome = process.env.HOME;
+    try {
+      delete process.env.HOME;
+      expect(
+        resolveSessionFilePath({ sessionId: "s3" }, "/r"),
+      ).toBeUndefined();
+    } finally {
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+    }
+  });
+
+  it("reads HOME from process.env when no override is given", () => {
+    const prevHome = process.env.HOME;
+    try {
+      process.env.HOME = "/tmp/fake-home";
+      expect(
+        resolveSessionFilePath(
+          { sessionId: "s4" },
+          "/work/proj",
+        ),
+      ).toBe("/tmp/fake-home/.claude/projects/-work-proj/s4.jsonl");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
   });
 });
 

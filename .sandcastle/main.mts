@@ -58,6 +58,7 @@ import { models } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   extractSkillInvocationsFromSession,
+  resolveSessionFilePath,
   filterPlanByTypeLabels,
 } from "./lib/skill-discipline.js";
 import {
@@ -205,15 +206,21 @@ export interface RunHandle {
   /**
    * Per-iteration session-capture metadata, threaded straight through from the
    * SDK's `SandboxRunResult.iterations` (see
-   * `node_modules/@ai-hero/sandcastle/dist/createSandbox.d.ts:71`). Only the
-   * `sessionFilePath` is consumed today — by
-   * {@link extractSkillInvocationsFromSession} in {@link runImplementer} —
-   * so we narrow the seam to that field. Optional because legacy test mocks
-   * return `{ stdout, commits }` without iteration data, and because the SDK
-   * leaves `sessionFilePath` undefined when capture is disabled or the
-   * provider is non-Claude.
+   * `node_modules/@ai-hero/sandcastle/dist/Orchestrator.d.ts:32`). We expose
+   * both `sessionFilePath` (the SDK's chosen path, set only when capture is
+   * wired with `bindMountHandle`) and `sessionId` (always present for Claude
+   * agents) so {@link resolveSessionFilePath} in skill-discipline can fall
+   * back to the conventional `~/.claude/projects/<encoded>/<id>.jsonl`
+   * layout when `sessionFilePath` is undefined. Audit Issue 1 (2026-05-30)
+   * — without the `sessionId` fallback, every iteration on host-backed
+   * orchestration was credited with zero skill invocations.
+   * Optional because legacy test mocks return `{ stdout, commits }` without
+   * iteration data.
    */
-  readonly iterations?: readonly { readonly sessionFilePath?: string }[];
+  readonly iterations?: readonly {
+    readonly sessionFilePath?: string;
+    readonly sessionId?: string;
+  }[];
 }
 
 export interface SandboxHandle {
@@ -1784,15 +1791,17 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
                 signal,
               }),
           );
-          // Forward the SDK's per-iteration session-capture metadata. Only
-          // `sessionFilePath` is consumed downstream (by
-          // extractSkillInvocationsFromSession in runImplementer) — see the
-          // seam definition on `RunHandle.iterations` for why we narrow.
+          // Forward the SDK's per-iteration session-capture metadata —
+          // both `sessionFilePath` (when capture is wired) and `sessionId`
+          // (always present for Claude agents) so the downstream consumer
+          // can fall back to the conventional path layout. See
+          // resolveSessionFilePath / the seam definition on RunHandle.
           return {
             stdout: r.stdout,
             commits: r.commits,
             iterations: r.iterations.map((it) => ({
               sessionFilePath: it.sessionFilePath,
+              sessionId: it.sessionId,
             })),
           };
         },
@@ -2242,7 +2251,8 @@ async function runImplementer(
   // invoked them. Missing iterations array (legacy test mocks) yields [].
   const skillsInvoked: string[] = [];
   for (const it of r.iterations ?? []) {
-    for (const name of extractSkillInvocationsFromSession(it.sessionFilePath)) {
+    const sessionPath = resolveSessionFilePath(it, ctx.args.repoRoot);
+    for (const name of extractSkillInvocationsFromSession(sessionPath)) {
       skillsInvoked.push(name);
     }
   }
@@ -3890,9 +3900,8 @@ export async function runMain(
           // affected issues (see post-merge-review-prompt.md).
           const fixerSkillsInvoked: string[] = [];
           for (const fxIt of fixerResult?.iterations ?? []) {
-            for (const name of extractSkillInvocationsFromSession(
-              fxIt.sessionFilePath,
-            )) {
+            const sessionPath = resolveSessionFilePath(fxIt, args.repoRoot);
+            for (const name of extractSkillInvocationsFromSession(sessionPath)) {
               fixerSkillsInvoked.push(name);
             }
           }
