@@ -1,3 +1,5 @@
 .env
 logs/
 worktrees/
+.restart-remaining
+.loop.lock
