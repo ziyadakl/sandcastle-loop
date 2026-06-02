@@ -5,17 +5,24 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   statSync,
   copyFileSync,
+  openSync,
+  rmSync,
 } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(HERE, "..");
-const TEMPLATE_ROOT = resolve(PACKAGE_ROOT, ".sandcastle");
 const TARGET_ROOT = process.cwd();
+
+const REPO = "ziyadakl/sandcastle-loop";
+const REF = "main";
 
 const EXCLUDE = new Set(["logs"]);
 const WANTED_DEPS = [
@@ -46,6 +53,45 @@ function copyDir(src, dest) {
     const d = join(dest, entry);
     if (statSync(s).isDirectory()) copyDir(s, d);
     else copyFileSync(s, d);
+  }
+}
+
+function withFetchedTemplate(fn) {
+  const tmp = mkdtempSync(join(tmpdir(), "sandcastle-init-"));
+  try {
+    const tarball = join(tmp, "src.tar.gz");
+
+    try {
+      const fd = openSync(tarball, "w");
+      execFileSync("gh", ["api", `repos/${REPO}/tarball/${REF}`], {
+        stdio: ["ignore", fd, "inherit"],
+      });
+    } catch {
+      execFileSync(
+        "curl",
+        ["-fsSL", `https://github.com/${REPO}/archive/${REF}.tar.gz`, "-o", tarball],
+        { stdio: ["ignore", "inherit", "inherit"] },
+      );
+    }
+
+    execFileSync("tar", ["-xzf", tarball, "-C", tmp], { stdio: "inherit" });
+
+    const extracted = readdirSync(tmp).find((n) =>
+      n.startsWith("ziyadakl-sandcastle-loop-"),
+    );
+    if (!extracted) fail("fetched tarball did not contain expected top-level dir");
+
+    const sandcastleSrc = join(tmp, extracted, ".sandcastle");
+    if (!existsSync(join(sandcastleSrc, ".gitignore"))) {
+      fail(
+        "fetched tarball is missing .sandcastle/.gitignore — refusing to copy " +
+          "(would silently land a broken init). Report this.",
+      );
+    }
+
+    return fn(sandcastleSrc);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
   }
 }
 
@@ -102,7 +148,9 @@ function main() {
     fail(".sandcastle/ already exists. Remove it to re-init.");
   }
 
-  copyDir(TEMPLATE_ROOT, resolve(TARGET_ROOT, ".sandcastle"));
+  withFetchedTemplate((src) =>
+    copyDir(src, resolve(TARGET_ROOT, ".sandcastle")),
+  );
   const addedDeps = injectIntoProjectPackageJson();
 
   console.log("- Copied template files to .sandcastle/");
