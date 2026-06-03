@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { macHostSandbox, applyPromptArgs } from "../.sandcastle/lib/mac-host-sandbox.js";
+import { worktreePathFor } from "../.sandcastle/lib/worktree-path.js";
 
 function initTempRepo(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "mac-host-test-"));
@@ -268,6 +269,18 @@ describe("macHostSandbox top-level run()", () => {
       if (prevBin === undefined) delete process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
       else process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = prevBin;
     }
+  });
+});
+
+describe("worktreePathFor (extracted helper)", () => {
+  it("transforms branch names by replacing / with -", () => {
+    expect(worktreePathFor("agent/issue-42")).toBe(".sandcastle/worktrees/agent-issue-42");
+  });
+  it("handles branch names without /", () => {
+    expect(worktreePathFor("main")).toBe(".sandcastle/worktrees/main");
+  });
+  it("replaces every / in a deeply-nested branch", () => {
+    expect(worktreePathFor("feat/a/b/c")).toBe(".sandcastle/worktrees/feat-a-b-c");
   });
 });
 

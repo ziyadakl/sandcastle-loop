@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync, rmSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { worktreePathFor as canonicalWorktreePathFor } from "../main.mjs";
+import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
 
 const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
