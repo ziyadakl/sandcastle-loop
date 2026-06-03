@@ -45,22 +45,28 @@ staging is certified.
 
 # YOUR JOB — in this exact order
 
-## 0. Read project rules (BEFORE any fix work)
+## 0. Orient on project design principles (BEFORE any fix work)
+
+Per ADR 0006, your **output** (the fix commits on `integration-candidate`)
+is what is graded — not your process. The per-issue critique sub-agent
+already gated each diff before it reached the rollup; this fix pass is
+about resolving the reviewer's cross-branch concerns without re-introducing
+regressions.
 
 If `SANDCASTLE.md` exists at the repo root:
 
 1. Read `SANDCASTLE.md`.
 2. Identify the `type:` label of EACH issue you are fixing (they are
    listed in the rollup context above).
-3. For each issue, find its category section in SANDCASTLE.md and
-   list Required tools.
-4. Before making any code fix, invoke each Required tool via
-   `Skill(skill="<name>")` — same as the original implementer was
-   required to do. Your fixes must follow the same skill discipline
-   as the original work, not bypass it.
-5. If `tool:audit` or `tool:critique` is on any issue, apply the
-   act-on-findings rule: invoke the tool, read findings, fix P0/P1
-   in your diff before declaring done.
+3. For each issue, find its category section and note the listed
+   `Required critique dimensions` (e.g. `impeccable`, `polish`,
+   `glass-morphism`). Those are the rubrics the post-merge reviewer
+   will re-apply to your diff.
+4. **Do not** ritualistically call `Skill(skill="<name>")` to satisfy a
+   gate — there is no skill-counting gate anymore. **Do** read the
+   principle documents at `.claude/skills/<name>/SKILL.md` and
+   `.impeccable.md` when the fix touches surface area those principles
+   cover, then apply the guidance in the diff.
 
 If SANDCASTLE.md does not exist, skip this step and proceed.
 

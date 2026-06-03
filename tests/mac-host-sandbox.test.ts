@@ -357,6 +357,11 @@ describe("applyPromptArgs", () => {
       STORY_TITLE: "A title",
       ATTEMPT_NUMBER: "1",
       REVIEWER_FEEDBACK: "",
+      // critique-as-gate placeholders (STEP 0 + retry pass); runImplementer
+      // supplies both on every dispatch, so the mac-host substitution path
+      // must too — keep this key set in sync with main.mts promptArgs.
+      REQUIRED_SKILLS: "",
+      CRITIQUE_FEEDBACK: "",
     };
     const out = applyPromptArgs(raw, args);
     const PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
