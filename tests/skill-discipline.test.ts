@@ -1202,21 +1202,30 @@ describe("findLoadableRubrics (dual-path: project-local then ~/.claude/skills)",
 
 describe("critiqueErrorReasonCode", () => {
   it("maps noRubricLoaded with highest precedence", () => {
-    const err = new CritiqueCriticalError("f", "type:backend", true, true, true);
+    const err = new CritiqueCriticalError("f", "type:backend", {
+      retryExhausted: true,
+      criticalAfterRetry: true,
+      noRubricLoaded: true,
+    });
     expect(critiqueErrorReasonCode(err).reasonCode).toBe(
       "critique-no-rubric-loaded",
     );
   });
 
   it("maps criticalAfterRetry above retryExhausted", () => {
-    const err = new CritiqueCriticalError("f", "type:backend", true, true, false);
+    const err = new CritiqueCriticalError("f", "type:backend", {
+      retryExhausted: true,
+      criticalAfterRetry: true,
+    });
     expect(critiqueErrorReasonCode(err).reasonCode).toBe(
       "critique-retry-critical",
     );
   });
 
   it("maps retryExhausted when only that flag is set", () => {
-    const err = new CritiqueCriticalError("f", "type:backend", true, false, false);
+    const err = new CritiqueCriticalError("f", "type:backend", {
+      retryExhausted: true,
+    });
     expect(critiqueErrorReasonCode(err).reasonCode).toBe(
       "critique-retry-exhausted",
     );
