@@ -121,4 +121,26 @@ describe("macHostSandbox run()", () => {
     ).rejects.toThrow(/prompt file not found/);
     await handle.close();
   });
+
+  it("run() returns commits made in the worktree as { sha } objects", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/commits" });
+    const wt = handle.worktreePath;
+    // Make a real commit in the worktree before calling run().
+    writeFileSync(path.join(wt, "f.txt"), "x");
+    execFileSync("git", ["add", "f.txt"], { cwd: wt });
+    execFileSync("git", ["commit", "-m", "test commit"], { cwd: wt });
+    // Place a prompt and call run() (the spawn does nothing important; we are
+    // testing that readCommitsSince picks up the pre-spawn commit).
+    writeFileSync(path.join(wt, "p.md"), "hi");
+    const result = await handle.run({
+      name: "smoke",
+      model: "claude-test",
+      promptFile: "p.md",
+      idleTimeoutSeconds: 30,
+    });
+    expect(result.commits.length).toBe(1);
+    expect(result.commits[0].sha).toMatch(/^[0-9a-f]{40}$/);
+    await handle.close();
+  });
 });

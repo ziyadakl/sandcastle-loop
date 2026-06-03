@@ -33,7 +33,8 @@ export interface MacHostRunSpec {
 
 export interface MacHostRunHandle {
   readonly stdout: string;
-  readonly commits: readonly string[];
+  readonly commits: readonly { sha: string }[];
+  // Reserved for future sessionFilePath integration:
   readonly iterations?: readonly {
     readonly sessionFilePath?: string;
     readonly sessionId?: string;
@@ -80,14 +81,14 @@ function preCleanWorktree(repoRoot: string, wtPath: string): void {
   }
 }
 
-function readCommitsSince(wtPath: string, _runName: string): string[] {
+function readCommitsSince(wtPath: string, forkSha: string): { sha: string }[] {
   try {
     const out = execFileSync(
       "git",
-      ["log", "--format=%H", "@{u}..HEAD"],
+      ["log", "--format=%H", `${forkSha}..HEAD`],
       { cwd: wtPath, stdio: ["ignore", "pipe", "ignore"] },
     ).toString("utf8");
-    return out.split("\n").filter(Boolean);
+    return out.split("\n").filter(Boolean).map((sha) => ({ sha }));
   } catch {
     return [];
   }
@@ -107,6 +108,11 @@ export function macHostSandbox(
         ["worktree", "add", "-B", spec.branch, wtPath],
         { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
       );
+      const forkSha = execFileSync(
+        "git",
+        ["rev-parse", "HEAD"],
+        { cwd: wtPath, stdio: ["ignore", "pipe", "ignore"] },
+      ).toString("utf8").trim();
 
       const capturedEnv = opts.env;
       return {
@@ -136,6 +142,14 @@ export function macHostSandbox(
           const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
 
           return await new Promise<MacHostRunHandle>((resolve, reject) => {
+            let settled = false;
+            const safeReject = (err: Error) => {
+              if (!settled) { settled = true; reject(err); }
+            };
+            const safeResolve = (val: MacHostRunHandle) => {
+              if (!settled) { settled = true; resolve(val); }
+            };
+
             const child = spawn(claudeBin, claudeArgs, {
               cwd: wtPath,
               env: childEnv,
@@ -148,34 +162,36 @@ export function macHostSandbox(
               if (Date.now() - lastChunkAt > idleMs) {
                 clearInterval(idleTimer);
                 child.kill("SIGTERM");
-                reject(new Error(`run "${runSpec.name}": idle timeout after ${idleMs}ms`));
+                safeReject(new Error(`run "${runSpec.name}": idle timeout after ${idleMs}ms`));
               }
             }, 5_000);
-            child.stdout.on("data", (chunk: Buffer) => {
+            child.stdout.setEncoding("utf8");
+            child.stdout.on("data", (chunk: string) => {
               lastChunkAt = Date.now();
-              stdoutBuf += chunk.toString("utf8");
+              stdoutBuf += chunk;
               process.stdout.write(chunk);
             });
-            child.stderr.on("data", (chunk: Buffer) => {
+            child.stderr.setEncoding("utf8");
+            child.stderr.on("data", (chunk: string) => {
               lastChunkAt = Date.now();
-              stderrBuf += chunk.toString("utf8");
+              stderrBuf += chunk;
               process.stderr.write(chunk);
             });
             child.on("error", (err: Error) => {
               clearInterval(idleTimer);
-              reject(err);
+              safeReject(err);
             });
             child.on("close", (code: number | null) => {
               clearInterval(idleTimer);
               if (code !== 0 && claudeBin !== "/bin/cat") {
-                reject(new Error(
+                safeReject(new Error(
                   `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
                 ));
                 return;
               }
               // commits: read git log on the worktree branch since createSandbox.
-              const commits = readCommitsSince(wtPath, runSpec.name);
-              resolve({ stdout: stdoutBuf, commits });
+              const commits = readCommitsSince(wtPath, forkSha);
+              safeResolve({ stdout: stdoutBuf, commits });
             });
           });
         },
