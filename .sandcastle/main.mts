@@ -3021,9 +3021,7 @@ async function shipAfterMigrations(
           `for this slice and any other slice with the same required-` +
           `principles set.`,
         ctx.typeLabel,
-        false,
-        false,
-        true,
+        { noRubricLoaded: true },
       );
     }
     const critique = await sandbox.run({
@@ -3059,7 +3057,7 @@ async function shipAfterMigrations(
     );
     if (verdict === "CRITIQUE_CRITICAL") {
       // P0 / ban-list violations are structural; retry won't fix them.
-      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, false);
+      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel);
     }
     if (verdict === "CRITIQUE_NEEDS_FIXES") {
       // v2 retry path (ADR 0006): one implementer pass with critique
@@ -3069,7 +3067,9 @@ async function shipAfterMigrations(
         ctx.deps.log(
           `[critique] issue=${ctx.issueNumber} NEEDS_FIXES — retry disabled (--no-retry), quarantining`,
         );
-        throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, true);
+        throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, {
+          retryExhausted: true,
+        });
       }
       ctx.deps.log(
         `[critique] issue=${ctx.issueNumber} attempt 1 NEEDS_FIXES — ` +
@@ -3114,18 +3114,18 @@ async function shipAfterMigrations(
           "CRITIQUE_CRITICAL",
         ] as const);
       } catch {
-        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, true);
+        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, {
+          retryExhausted: true,
+        });
       }
       ctx.deps.log(
         `[critique] issue=${ctx.issueNumber} attempt 2 verdict=${verdict2}`,
       );
       if (verdict2 !== "CRITIQUE_CLEAN") {
-        throw new CritiqueCriticalError(
-          critique2.stdout,
-          ctx.typeLabel,
-          true,
-          verdict2 === "CRITIQUE_CRITICAL",
-        );
+        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, {
+          retryExhausted: true,
+          criticalAfterRetry: verdict2 === "CRITIQUE_CRITICAL",
+        });
       }
       // Falls through to journal-validation + applyMigrations block below.
     }

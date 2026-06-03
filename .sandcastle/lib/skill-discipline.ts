@@ -435,17 +435,19 @@ export class CritiqueCriticalError extends Error {
   constructor(
     findings: string,
     typeLabel: string,
-    retryExhausted = false,
-    criticalAfterRetry = false,
-    noRubricLoaded = false,
+    opts: {
+      retryExhausted?: boolean;
+      criticalAfterRetry?: boolean;
+      noRubricLoaded?: boolean;
+    } = {},
   ) {
     super(`critique CRITICAL_BLOCKERS for ${typeLabel} — see findings`);
     this.name = "CritiqueCriticalError";
     this.findings = findings;
     this.typeLabel = typeLabel;
-    this.retryExhausted = retryExhausted;
-    this.criticalAfterRetry = criticalAfterRetry;
-    this.noRubricLoaded = noRubricLoaded;
+    this.retryExhausted = opts.retryExhausted ?? false;
+    this.criticalAfterRetry = opts.criticalAfterRetry ?? false;
+    this.noRubricLoaded = opts.noRubricLoaded ?? false;
   }
 }
 
