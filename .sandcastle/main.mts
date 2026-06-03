@@ -589,11 +589,11 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     retryEnabled: values["no-retry"] !== true,
     stagingEnabled: values["no-staging"] !== true,
     provider,
+    sandbox,
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
     allowDirtySandcastle: values["allow-dirty-sandcastle"] === true,
-    sandbox,
   };
   return { args, showHelp: false };
 }
