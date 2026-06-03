@@ -1,11 +1,11 @@
 import * as sandcastle from "@ai-hero/sandcastle";
+import type { SandboxHooks } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { envForModel } from "../providers.js";
 import { macHostSandbox } from "./mac-host-sandbox.js";
 
 import type {
   TopLevelRunSpec,
-  CreateSandboxSpec,
   SandboxRunSpec,
   RunHandle,
 } from "../main.mjs";
@@ -69,7 +69,7 @@ export interface SandboxProvider {
 export interface DockerProviderConfig {
   readonly imageName: string;
   readonly repoRoot: string;
-  readonly hooks: unknown;
+  readonly hooks: SandboxHooks;
   readonly copyToWorktree: readonly string[];
   readonly copyToWorktreeMs: number;
   readonly completionSignal: readonly string[];
@@ -92,6 +92,8 @@ export function makeDockerProvider(
     });
   return {
     async topLevelRun(spec) {
+      // [...config.completionSignal] sheds the `readonly` so the SDK's
+      // mutable `string[]` signature is satisfied without a whole-object cast.
       const result = await sandcastle.run({
         sandbox: buildSandbox(containerEnv, spec.mounts),
         cwd: spec.cwd ?? config.repoRoot,
@@ -103,9 +105,9 @@ export function makeDockerProvider(
         promptFile: spec.promptFile,
         promptArgs: spec.promptArgs,
         idleTimeoutSeconds: spec.idleTimeoutSeconds,
-        completionSignal: config.completionSignal,
+        completionSignal: [...config.completionSignal],
         signal: spec.signal,
-      } as Parameters<typeof sandcastle.run>[0]);
+      });
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
@@ -114,9 +116,9 @@ export function makeDockerProvider(
         sandbox: buildSandbox(spec.sandboxEnv, spec.mounts),
         cwd: config.repoRoot,
         hooks: config.hooks,
-        copyToWorktree: config.copyToWorktree,
+        copyToWorktree: [...config.copyToWorktree],
         timeouts: { copyToWorktreeMs: config.copyToWorktreeMs },
-      } as Parameters<typeof sandcastle.createSandbox>[0]);
+      });
       return {
         branch: handle.branch,
         worktreePath: handle.worktreePath,
@@ -130,9 +132,9 @@ export function makeDockerProvider(
             promptFile: opts.promptFile,
             promptArgs: opts.promptArgs,
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
-            completionSignal: config.completionSignal,
+            completionSignal: [...config.completionSignal],
             signal: opts.signal,
-          } as Parameters<typeof handle.run>[0]);
+          });
           return {
             stdout: r.stdout,
             commits: r.commits,
@@ -202,7 +204,11 @@ export function makeMacHostProvider(
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
             signal: opts.signal,
           });
-          return { stdout: r.stdout, commits: r.commits };
+          // Always return an iterations array (empty on mac-host until the
+          // mac-host helper populates per-iteration session metadata —
+          // tracked separately) so the consumer's RunHandle.iterations
+          // field is consistently typed across providers.
+          return { stdout: r.stdout, commits: r.commits, iterations: [] };
         },
         close: () => handle.close(),
       };

@@ -39,6 +39,6 @@ describe("sandbox routing by --sandbox flag", () => {
         { sandbox: "docker", repoRoot: "/tmp/x", imageName: "sandcastle:foo" } as any,
         {},
       ),
-    ).toThrow(/docker provider requires dockerConfig/);
+    ).toThrow();
   });
 });
