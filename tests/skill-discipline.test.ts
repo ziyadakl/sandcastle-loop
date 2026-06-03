@@ -20,13 +20,18 @@
  * file (unchanged by the JSONL refactor — kept here for cohesion).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
   resolveSessionFilePath,
+  parseRequiredSkillsByType,
+  validateRequiredSkillsInvoked,
+  findLoadableRubrics,
+  CritiqueCriticalError,
+  critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import {
   runMain,
@@ -1036,5 +1041,201 @@ describe("sandbox-health stall-streak detector", () => {
         /sandbox-health:\s+iteration 1 all-stalled \(streak 1\/3\)/.test(l),
       ),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Critique-as-gate library additions (ported from affinity-tracker @31631acb)
+// ---------------------------------------------------------------------------
+
+describe("parseRequiredSkillsByType", () => {
+  it("extracts skills from a Required: bullet list, dropping descriptive prose after the first token", () => {
+    const md = [
+      "### type:new-component",
+      "",
+      "Required:",
+      "",
+      "- impeccable (load design context — prerequisite for all design skills)",
+      "- layout (composition and spacing)",
+      "- clarify (microcopy)",
+      "",
+      "Opt in via `tool:` labels on the ticket:",
+      "",
+      "- tool:bento → magic-bento",
+    ].join("\n");
+    const parsed = parseRequiredSkillsByType(md);
+    expect(parsed.get("type:new-component")).toEqual([
+      "impeccable",
+      "layout",
+      "clarify",
+    ]);
+  });
+
+  it("returns [] for Required: (none) (e.g. type:cleanup)", () => {
+    const md = [
+      "### type:cleanup",
+      "",
+      "Removing dead code or dev-only data.",
+      "Required: (none)",
+      "",
+      "### type:other",
+      "",
+      "Required:",
+      "",
+      "- simplify",
+    ].join("\n");
+    const parsed = parseRequiredSkillsByType(md);
+    expect(parsed.get("type:cleanup")).toEqual([]);
+    expect(parsed.get("type:other")).toEqual(["simplify"]);
+  });
+
+  it("ignores tool: opt-in bullets so they never leak into the required set", () => {
+    const md = [
+      "### type:visual-enhance",
+      "",
+      "Required:",
+      "",
+      "- impeccable",
+      "- polish",
+      "",
+      "Opt in (pick whichever applies):",
+      "",
+      "- bolder, quieter, colorize",
+      "- tool:audit, tool:critique",
+    ].join("\n");
+    const parsed = parseRequiredSkillsByType(md);
+    // Only the bullets BEFORE the "Opt in" line count as required.
+    expect(parsed.get("type:visual-enhance")).toEqual(["impeccable", "polish"]);
+  });
+
+  it("matches both 'Required:' and 'Required critique dimensions:' block headers", () => {
+    const md = [
+      "### type:backend",
+      "",
+      "Required critique dimensions:",
+      "",
+      "- simplify",
+      "- context7-docs (backend writes the highest density of library calls)",
+    ].join("\n");
+    const parsed = parseRequiredSkillsByType(md);
+    expect(parsed.get("type:backend")).toEqual(["simplify", "context7-docs"]);
+  });
+});
+
+describe("validateRequiredSkillsInvoked", () => {
+  it("returns missing skills preserving required-list order", () => {
+    const { missing } = validateRequiredSkillsInvoked(
+      ["a", "b", "c", "d"],
+      ["b", "d"],
+    );
+    expect(missing).toEqual(["a", "c"]);
+  });
+
+  it("returns empty missing when invoked is a superset and when required is empty", () => {
+    expect(
+      validateRequiredSkillsInvoked(["a", "b"], ["a", "b", "c"]).missing,
+    ).toEqual([]);
+    expect(validateRequiredSkillsInvoked([], ["a"]).missing).toEqual([]);
+    expect(validateRequiredSkillsInvoked([], []).missing).toEqual([]);
+  });
+});
+
+describe("findLoadableRubrics (dual-path: project-local then ~/.claude/skills)", () => {
+  let repoRoot: string;
+  let fakeHome: string;
+
+  const writeSkill = (root: string, name: string) => {
+    const dir = join(root, ".claude", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), `# ${name}\n`);
+  };
+
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "flr-repo-"));
+    // Isolated tmpdir as homeDir so the dev user's real ~/.claude/skills
+    // can never leak positive results into these assertions.
+    fakeHome = mkdtempSync(join(tmpdir(), "flr-home-"));
+  });
+
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
+
+  it("resolves a rubric present project-local", () => {
+    writeSkill(repoRoot, "layout");
+    expect(findLoadableRubrics(["layout"], repoRoot, fakeHome)).toEqual([
+      "layout",
+    ]);
+  });
+
+  it("resolves a rubric present only in the home fallback", () => {
+    writeSkill(fakeHome, "simplify");
+    expect(findLoadableRubrics(["simplify"], repoRoot, fakeHome)).toEqual([
+      "simplify",
+    ]);
+  });
+
+  it("returns only the subset that resolves on either path", () => {
+    writeSkill(repoRoot, "layout");
+    writeSkill(fakeHome, "simplify");
+    expect(
+      findLoadableRubrics(
+        ["layout", "simplify", "does-not-exist"],
+        repoRoot,
+        fakeHome,
+      ),
+    ).toEqual(["layout", "simplify"]);
+  });
+
+  it("returns [] when no required rubric resolves anywhere", () => {
+    expect(
+      findLoadableRubrics(["nope", "also-nope"], repoRoot, fakeHome),
+    ).toEqual([]);
+  });
+});
+
+describe("critiqueErrorReasonCode", () => {
+  it("maps noRubricLoaded with highest precedence", () => {
+    const err = new CritiqueCriticalError("f", "type:backend", true, true, true);
+    expect(critiqueErrorReasonCode(err).reasonCode).toBe(
+      "critique-no-rubric-loaded",
+    );
+  });
+
+  it("maps criticalAfterRetry above retryExhausted", () => {
+    const err = new CritiqueCriticalError("f", "type:backend", true, true, false);
+    expect(critiqueErrorReasonCode(err).reasonCode).toBe(
+      "critique-retry-critical",
+    );
+  });
+
+  it("maps retryExhausted when only that flag is set", () => {
+    const err = new CritiqueCriticalError("f", "type:backend", true, false, false);
+    expect(critiqueErrorReasonCode(err).reasonCode).toBe(
+      "critique-retry-exhausted",
+    );
+  });
+
+  it("maps a first-pass critical to the default reason code", () => {
+    const err = new CritiqueCriticalError("f", "type:backend");
+    expect(critiqueErrorReasonCode(err).reasonCode).toBe(
+      "critique-critical-fail",
+    );
+  });
+});
+
+describe("CritiqueCriticalError", () => {
+  it("carries findings + typeLabel and produces a formatted message", () => {
+    const err = new CritiqueCriticalError(
+      "## Findings\n\n1. P0 — impeccable — banned pattern",
+      "type:new-component",
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("CritiqueCriticalError");
+    expect(err.typeLabel).toBe("type:new-component");
+    expect(err.findings).toContain("banned pattern");
+    expect(err.message).toContain("type:new-component");
+    expect(err.message).toContain("CRITICAL_BLOCKERS");
   });
 });
