@@ -37,6 +37,15 @@ you can't resolve round 2's findings now, the orchestrator will quarantine
 the ticket — there is no attempt 4. If round 2's complaint is genuinely
 mistaken, a `<rebuttal>` is still allowed; pick it deliberately.
 
+**Skill discipline still applies on retries.** STEP 0 below is per-attempt,
+not per-issue: the host counts THIS attempt's `Skill()` invocations
+against the required list, and the previous attempt's invocations do NOT
+carry over. Even though the retry framing is "fix the reviewer's
+feedback," you MUST invoke `Skill('<name>')` for every principle in
+`{{REQUIRED_SKILLS}}` BEFORE touching code on this retry pass —
+otherwise the gate throws `skill-discipline-fail` and quarantines the
+slice without running critique or merge.
+
 You have two choices on a retry:
 
 1. **Fix the feedback.** Append a new commit on top of the existing branch
@@ -89,51 +98,69 @@ The orchestrator has pre-fetched the issue spec. Read it carefully:
 
 </recent-commits>
 
-# STEP 0 — Read project rules (BEFORE any code work)
+# STEP 0 — Required Skill() invocations (BEFORE any code work)
 
-If `SANDCASTLE.md` exists at the repo root, this project has opted
-into skill discipline. You MUST follow these steps before writing
+This project has opted into **skill discipline**. The host counts
+your `Skill()` tool invocations against a per-issue required list
+computed from the issue's `type:X` label in `SANDCASTLE.md`. If you
+finish without invoking every required `Skill()`, the host throws
+`MissingRequiredSkillsError` and quarantines the slice with reason
+`skill-discipline-fail` — no critique, no merge, no recovery. This
+gate runs BEFORE the critique gate and BEFORE any commit lands on
+the integration branch.
+
+**REQUIRED SKILLS for this issue: `{{REQUIRED_SKILLS}}`**
+
+**This gate is per-attempt, not per-issue.** On ANY pass —
+`ATTEMPT_NUMBER=1`, retry (`=2`), critique-retry, or final-shot
+(`=3`) — you must invoke `Skill('<name>')` for every principle in the
+list above BEFORE writing code on this attempt. The host extracts
+invocations from THIS attempt's session only; prior attempts' Skill()
+calls do not satisfy the gate. If a retry skips this, the slice is
+quarantined with `skill-discipline-fail` before review or merge.
+
+If that list is non-empty, you MUST follow these steps before writing
 any code:
 
-1. Read `SANDCASTLE.md` at the repo root.
+1. **Invoke `Skill('<name>')` for every principle in the list above.**
+   Do this as your very first tool calls, before reading the
+   codebase, before writing tests, before writing code. Each
+   invocation loads the principle's `SKILL.md` rubric into your
+   context so you can actually apply it. A "ritual" invocation that
+   doesn't shape the work is gameable (the host can't tell the
+   difference), but it's also pointless — the critique sub-agent
+   grades the resulting diff against the same rubrics, so a
+   non-applied skill will surface as P1/P0 findings on review
+   anyway. Invoke and apply, not invoke and ignore.
 
-2. This ticket has exactly one `type:X` label (the orchestrator
-   already verified this — if you got dispatched, the label is
-   present). Find that label in your ticket's metadata.
+2. **Then read the rubric content** from `.claude/skills/<name>/SKILL.md`
+   in the repo (project-specific principles like `impeccable`, `layout`,
+   `polish`) or `~/.claude/skills/<name>/SKILL.md` (cross-project
+   principles like `simplify`, `context7-docs`). Project-local wins
+   precedence when both exist. Also read `.impeccable.md` at the repo
+   root — that's the project's design vocabulary, warm voice, ethical
+   guardrails, and aesthetic direction.
 
-3. In `SANDCASTLE.md`, locate the section matching your `type:X`
-   label. List its "Required" tools. Also list any tools required
-   by `tool:Y` labels on this ticket (search the ticket's labels
-   for any starting with `tool:`).
+3. **Apply the principles as you write.** A critique sub-agent will
+   review your diff against these principles after you finish. If
+   it finds P1+ issues, you'll get one retry pass with explicit
+   feedback at `{{CRITIQUE_FEEDBACK}}` below.
 
-4. Output a `<skill-plan>` block listing the exact skills you will
-   invoke for this ticket, in the order you'll invoke them. Example:
+4. If `{{CRITIQUE_FEEDBACK}}` is non-empty, this is the retry pass.
+   The previous critique's findings are in that block. Address every
+   P0 and P1 finding directly. The next critique will block merge if
+   the same issues persist.
 
-   ```
-   <skill-plan>
-   - impeccable
-   - layout
-   - clarify
-   - glass-morphism
-   - polish
-   </skill-plan>
-   ```
+5. `SANDCASTLE.md` lists the full principle catalog per `type:X`
+   label if you want to see what other ticket types require. The
+   list above is THIS ticket's subset — that's what the gate checks.
 
-5. For EACH skill in your plan, invoke it via the Skill tool BEFORE
-   writing any code. Format: `Skill(skill="<name>")`. After
-   invocation, apply the tool's guidance to your work. The
-   orchestrator captures every `Skill()` call you make and forwards
-   the list to the reviewer as authoritative ground truth — you
-   cannot omit a required tool and claim you used it.
+If `{{REQUIRED_SKILLS}}` is empty (no `SANDCASTLE.md`, or `type:X`
+not listed there, or a type like `type:cleanup` that explicitly
+requires none), skip this step entirely — the host gate is a no-op
+for this slice.
 
-6. If `tool:audit` or `tool:critique` is present on this ticket:
-   after invoking the tool, READ its report/findings carefully. Any
-   P0 or P1 severity findings MUST be addressed in your diff before
-   you declare done. The reviewer will verify.
-
-7. If `SANDCASTLE.md` does not exist or has no section matching this
-   ticket's `type:` label, skip this step entirely. Proceed to STEP
-   1 — there is no skill discipline to enforce.
+{{CRITIQUE_FEEDBACK}}
 
 # Story-type rubric — READ FIRST, before [STEP 1/9]
 
