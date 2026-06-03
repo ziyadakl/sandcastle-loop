@@ -23,47 +23,54 @@ export function applyPromptArgs(
   });
 }
 
+// Fields shared by every spec passed to spawnAgent. The buildArgs callback
+// reads from this base so callers can declare it once without picking which
+// concrete spec type they want — TS function-parameter contravariance makes
+// `(spec: MacHostRunSpec) =>` unassignable to a wider union slot, but the
+// base type sidesteps that trap.
+export interface MacHostRunSpecBase {
+  readonly name: string;
+  readonly maxIterations?: number;
+  readonly model: string;
+  readonly promptFile: string;
+  readonly promptArgs?: Record<string, string>;
+  readonly idleTimeoutSeconds?: number;
+  readonly signal?: AbortSignal;
+}
+
 export interface MacHostSandboxOptions {
   readonly repoRoot: string;
   readonly env?: Record<string, string>;
-  // Override the binary spawned to run the agent. Default `claude` from PATH.
-  // Test code injects a fake binary here for deterministic behavior. The
-  // SANDCASTLE_MAC_HOST_CLAUDE_BIN env var is consulted as a fallback when
-  // this option is omitted.
+  /**
+   * Override the binary spawned to run the agent. Default `claude` from PATH.
+   * Test code injects a fake binary here for deterministic behavior.
+   * `SANDCASTLE_MAC_HOST_CLAUDE_BIN` is consulted as a fallback when this
+   * option is omitted.
+   *
+   * If you set `claudeBin` WITHOUT `buildArgs`, the legacy single-positional
+   * form is used: the binary is invoked as `claudeBin <promptFullPath>` and
+   * stdin is closed. This matches the historical `/bin/cat <promptFile>` test
+   * seam shape. For full control over argv and stdin, also set `buildArgs`.
+   */
   readonly claudeBin?: string;
-  // Build the argv passed to the binary. When omitted, args default to
-  // production-style flags (`--print --model … --dangerously-skip-permissions`)
-  // unless a non-default binary is in use, in which case the legacy
-  // single-positional-arg form is used. Provide this for explicit control.
-  readonly buildArgs?: (
-    spec: MacHostRunSpec | MacHostTopLevelRunSpec,
-  ) => readonly string[];
+  /**
+   * Build the argv passed to the binary. When set, stdin receives the
+   * substituted prompt text (production-equivalent behavior). When omitted,
+   * args default to production flags if no binary override is in effect, or
+   * to `[promptFullPath]` (legacy positional seam) if a binary override is.
+   */
+  readonly buildArgs?: (spec: MacHostRunSpecBase) => readonly string[];
 }
 
 export interface MacHostCreateSpec {
   readonly branch: string;
 }
 
-export interface MacHostTopLevelRunSpec {
-  readonly name: string;
-  readonly maxIterations?: number;
-  readonly model: string;
-  readonly promptFile: string;
-  readonly promptArgs?: Record<string, string>;
-  readonly idleTimeoutSeconds?: number;
+export interface MacHostTopLevelRunSpec extends MacHostRunSpecBase {
   readonly cwd?: string;
-  readonly signal?: AbortSignal;
 }
 
-export interface MacHostRunSpec {
-  readonly name: string;
-  readonly maxIterations?: number;
-  readonly model: string;
-  readonly promptFile: string;
-  readonly promptArgs?: Record<string, string>;
-  readonly idleTimeoutSeconds?: number;
-  readonly signal?: AbortSignal;
-}
+export interface MacHostRunSpec extends MacHostRunSpecBase {}
 
 export interface MacHostRunHandle {
   readonly stdout: string;
@@ -142,36 +149,37 @@ async function spawnAgent(
   const rawPrompt = readFileSync(promptFullPath, "utf8");
   const promptText = applyPromptArgs(rawPrompt, runSpec.promptArgs ?? {});
 
-  // Resolve the binary to spawn. Explicit options.claudeBin wins; the
-  // SANDCASTLE_MAC_HOST_CLAUDE_BIN env var is a fallback so existing test
-  // harnesses keep working; default is `claude` from PATH for production.
+  // Spawn mode drives three policies (argv shape, stdin piping, exit-code
+  // handling) off the same upstream choice — encode it once.
+  //   - production: default `claude` binary, production flags, prompt via
+  //     stdin, non-zero exit fails.
+  //   - explicit-args: caller supplied buildArgs; same stdin/exit policy as
+  //     production but argv comes from the callback.
+  //   - legacy-positional: caller supplied only claudeBin (option or env
+  //     var); argv is `[promptFullPath]`, stdin is closed, non-zero exit is
+  //     tolerated. Used by /bin/cat-style test seams.
   // The previous NODE_ENV === "test" implicit branch is intentionally gone
   // — that seam was global-state that could leak into production.
-  const claudeBin =
-    opts.claudeBin ?? process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ?? "claude";
-  const usingOverrideBin =
-    opts.claudeBin !== undefined ||
-    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN !== undefined;
-  // Args: explicit buildArgs wins. Otherwise a non-default binary gets the
-  // legacy single-positional-arg form (used by /bin/cat-style test seams).
-  // Default binary (`claude`) gets the production flags.
-  const claudeArgs = opts.buildArgs
-    ? [...opts.buildArgs(runSpec)]
-    : usingOverrideBin
-      ? [promptFullPath]
-      : [
-          "--print",
-          "--model", runSpec.model,
-          "--dangerously-skip-permissions",
-        ];
-  // Stdin policy: explicit buildArgs means the caller opted into the
-  // production contract (prompt via stdin); legacy positional-arg seam
-  // closes stdin so /bin/cat doesn't block.
-  const pipePromptToStdin = !usingOverrideBin || opts.buildArgs !== undefined;
-  // Exit-code policy: legacy positional-arg seam tolerates non-zero (some
-  // fake bins for abort/idle tests are killed mid-run). Production and
-  // explicit buildArgs paths fail on non-zero exit.
-  const failOnNonZero = !usingOverrideBin || opts.buildArgs !== undefined;
+  const envBin = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+  const mode: "production" | "explicit-args" | "legacy-positional" =
+    opts.buildArgs !== undefined
+      ? "explicit-args"
+      : opts.claudeBin !== undefined || envBin !== undefined
+        ? "legacy-positional"
+        : "production";
+  const claudeBin = opts.claudeBin ?? envBin ?? "claude";
+  const claudeArgs =
+    mode === "explicit-args"
+      ? [...opts.buildArgs!(runSpec)]
+      : mode === "legacy-positional"
+        ? [promptFullPath]
+        : [
+            "--print",
+            "--model", runSpec.model,
+            "--dangerously-skip-permissions",
+          ];
+  const pipePromptToStdin = mode !== "legacy-positional";
+  const failOnNonZero = mode !== "legacy-positional";
 
   const childEnv = { ...process.env, ...env };
   const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
