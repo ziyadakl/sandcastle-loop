@@ -56,9 +56,15 @@ import {
 import { models } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
+  CritiqueCriticalError,
+  critiqueErrorReasonCode,
   extractSkillInvocationsFromSession,
   resolveSessionFilePath,
   filterPlanByTypeLabels,
+  findLoadableRubrics,
+  MissingRequiredSkillsError,
+  parseRequiredSkillsByType,
+  validateRequiredSkillsInvoked,
 } from "./lib/skill-discipline.js";
 import {
   envForModel,
@@ -101,6 +107,7 @@ export interface SandcastleArgs {
   plannerModel: string;
   implementerModel: string;
   reviewerModel: string;
+  critiqueModel: string;
   mergerModel: string;
   postMergeReviewerModel: string;
   recoveryModel: string;
@@ -397,6 +404,7 @@ Optional:
   --planner-model M             Default: from .sandcastle/models.ts (planner.default).
   --implementer-model M         Default: from .sandcastle/models.ts (implementer.default).
   --reviewer-model M            Default: from .sandcastle/models.ts (reviewer.default).
+  --critique-model M            Default: from .sandcastle/models.ts (critique.default).
   --merger-model M              Default: from .sandcastle/models.ts (merger.default).
   --post-merge-reviewer-model M Default: from .sandcastle/models.ts (postMergeReviewer.default).
   --recovery-model M            Default: from .sandcastle/models.ts (recovery.default). Used by the recovery pass.
@@ -477,6 +485,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "planner-model": { type: "string" },
       "implementer-model": { type: "string" },
       "reviewer-model": { type: "string" },
+      "critique-model": { type: "string" },
       "merger-model": { type: "string" },
       "post-merge-reviewer-model": { type: "string" },
       "recovery-model": { type: "string" },
@@ -565,6 +574,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     plannerModel: values["planner-model"] ?? models.planner.default,
     implementerModel,
     reviewerModel: values["reviewer-model"] ?? models.reviewer.default,
+    critiqueModel: values["critique-model"] ?? models.critique.default,
     mergerModel: values["merger-model"] ?? models.merger.default,
     postMergeReviewerModel:
       values["post-merge-reviewer-model"] ?? models.postMergeReviewer.default,
@@ -641,6 +651,7 @@ function defaultArgs(): SandcastleArgs {
     plannerModel: models.planner.default,
     implementerModel: models.implementer.default,
     reviewerModel: models.reviewer.default,
+    critiqueModel: models.critique.default,
     mergerModel: models.merger.default,
     postMergeReviewerModel: models.postMergeReviewer.default,
     recoveryModel: models.recovery.default,
@@ -777,6 +788,7 @@ const REQUIRED_PROMPT_FILES = [
   "plan-prompt.md",
   "implement-prompt.md",
   "review-prompt.md",
+  "critique-prompt.md",
   "merge-prompt.md",
   "post-merge-review-prompt.md",
   "post-merge-fix-prompt.md",
@@ -2207,15 +2219,58 @@ interface PipelineCtx {
   readonly iteration: number;
   readonly issueNumber: number;
   readonly issue: PlanIssue;
+  /**
+   * Pre-computed required `Skill()` invocations for this issue's `type:X`
+   * label, looked up by the orchestrator from the parsed `SANDCASTLE.md`
+   * map. `undefined` when SANDCASTLE.md doesn't exist OR the issue's
+   * `type:X` label has no matching section (graceful degradation rule).
+   * `[]` when the type explicitly requires nothing (e.g. `type:cleanup`).
+   * Threaded into {@link runImplementer} (and the post-merge fixer
+   * union-set) so the skill-discipline gate can fail-fast on omissions.
+   */
+  readonly requiredSkills?: readonly string[];
+  /**
+   * The issue's `type:X` label (e.g. `type:new-component`). Threaded into the
+   * critique sub-agent at ship time so it can look up the right rubric in
+   * SANDCASTLE.md. `undefined` when the issue has no type label or when
+   * SANDCASTLE.md doesn't list the type — critique is skipped in that case.
+   */
+  readonly typeLabel?: string;
 }
 
-async function runImplementer(
+export async function runImplementer(
   sb: SandboxHandle,
   ctx: PipelineCtx,
   opts: {
     attemptNumber?: 1 | 2 | 3;
     model?: string;
     reviewerFeedback?: string;
+    critiqueFeedback?: string;
+    /**
+     * Required principle names for the issue's `type:X` label, looked up by
+     * the orchestrator from the parsed `SANDCASTLE.md` map and threaded in
+     * per-issue. Two consumers:
+     *
+     *   1. Surfaced to the implementer prompt as `{{REQUIRED_SKILLS}}` (see
+     *      `promptArgs` below) so STEP 0 of `.sandcastle/implement-prompt.md`
+     *      can instruct the model to invoke `Skill(<name>)` for each
+     *      principle BEFORE writing code.
+     *
+     *   2. Validated post-run against the host-extracted `skillsInvoked`
+     *      list — if any required principle wasn't invoked, throws
+     *      {@link MissingRequiredSkillsError} which the orchestrator's
+     *      catch handler maps to `skill-discipline-fail` quarantine.
+     *
+     * Re-promoted from telemetry-only WARN (v1 demotion) back to hard throw
+     * per ADR 0006 v3. The prompt-side linkage was added in v3.2 after the
+     * v3 hard throw quarantined legitimate slices because the prompt never
+     * told the model the rules changed.
+     *
+     * `undefined` (no SANDCASTLE.md or unknown `type:` label) → gate is a
+     * no-op AND `REQUIRED_SKILLS` placeholder gets ""; `[]` (e.g.
+     * `type:cleanup` requires none) → same no-op result.
+     */
+    requiredSkills?: readonly string[];
   } = {},
 ): Promise<{
   commits: readonly { sha: string }[];
@@ -2238,9 +2293,11 @@ async function runImplementer(
         name:
           attemptNumber === 1
             ? "implementer"
-            : attemptNumber === 3
-              ? "implementer-retry-2"
-              : "implementer-retry",
+            : opts.critiqueFeedback !== undefined
+              ? "implementer-critique-retry"
+              : attemptNumber === 3
+                ? "implementer-retry-2"
+                : "implementer-retry",
         maxIterations: 100,
         model,
         promptFile: "./.sandcastle/implement-prompt.md",
@@ -2252,6 +2309,15 @@ async function runImplementer(
           BRANCH: ctx.issue.branch,
           ATTEMPT_NUMBER: String(attemptNumber),
           REVIEWER_FEEDBACK: opts.reviewerFeedback ?? "",
+          CRITIQUE_FEEDBACK: opts.critiqueFeedback ?? "",
+          // Per ADR 0006 v3.2: the skill-discipline gate is a hard throw
+          // (v3 re-promotion). The implementer prompt's STEP 0 reads this
+          // placeholder and instructs the model to invoke Skill(<name>) for
+          // each principle BEFORE writing code. Empty string when undefined
+          // (no SANDCASTLE.md or unknown type:label) so the prompt's
+          // conditional block can detect "gate disabled for this slice"
+          // without templating errors.
+          REQUIRED_SKILLS: opts.requiredSkills?.join(", ") ?? "",
         },
       }),
     primaryModel,
@@ -2272,6 +2338,37 @@ async function runImplementer(
     const sessionPath = resolveSessionFilePath(it, ctx.args.repoRoot);
     for (const name of extractSkillInvocationsFromSession(sessionPath)) {
       skillsInvoked.push(name);
+    }
+  }
+  // Per-issue skill-discipline gate — RE-PROMOTED to a hard throw per
+  // ADR 0006 v3. Original v1 demotion to telemetry assumed critique-as-gate
+  // fully replaced this check, but empirical log analysis (see
+  // docs/adr/0006-v3-supporting-analysis.md) showed critique silently
+  // abstains on issues whose required principles lack SKILL.md rubric files
+  // on disk — real regressions shipped via that path. Critique covers a
+  // subset, not a superset, of what skill-discipline catches; the two layers
+  // are complementary, not redundant. The post-merge-fixer gate (separate
+  // call site) intentionally stays as WARN-only because the per-issue gate
+  // already covered each diff before rollup.
+  //
+  // Known cost: this gate is process-gating and gameable — the implementer
+  // can ritually emit Skill() calls without applying any guidance.
+  // Critique-as-gate is the outcome-gating layer that grades the actual
+  // diff. Two-gate is more robust than either alone: implementer must
+  // invoke Skill() AND the diff must pass critique AND the rubric must
+  // be loadable.
+  if (opts.requiredSkills && opts.requiredSkills.length > 0) {
+    const { missing } = validateRequiredSkillsInvoked(
+      opts.requiredSkills,
+      skillsInvoked,
+    );
+    if (missing.length > 0) {
+      throw new MissingRequiredSkillsError(
+        missing,
+        skillsInvoked,
+        opts.requiredSkills,
+        ctx.issueNumber,
+      );
     }
   }
   if (requireCommits && r.commits.length === 0) {
@@ -2756,6 +2853,154 @@ async function shipAfterMigrations(
   finalMarker: string,
   skillsInvoked: readonly string[] = [],
 ): Promise<IssueOutcome> {
+  // Critique gate (ADR 0006). Runs BEFORE migrations apply so a
+  // CRITIQUE_CRITICAL diff doesn't pollute the dev DB or get marked as
+  // in-progress in a way the outer loop has to undo. Only runs when the
+  // issue has a type label that SANDCASTLE.md lists principles for —
+  // `ctx.typeLabel` undefined means graceful-degradation skips the gate
+  // (e.g., issues with no type label, or type labels not in SANDCASTLE.md).
+  if (
+    ctx.typeLabel !== undefined &&
+    ctx.requiredSkills !== undefined &&
+    ctx.requiredSkills.length > 0
+  ) {
+    // No-rubric preflight (ADR 0006 v3). The critique prompt's step 2
+    // silently skips principles without a `.claude/skills/<name>/SKILL.md`
+    // file on disk. If ALL required principles are missing their rubric,
+    // critique loads nothing and returns CRITIQUE_CLEAN regardless of the
+    // diff — silent abstention. Real regressions shipped via this path
+    // (caught later by the post-merge fixer). Quarantine here with a
+    // distinct reason code so the operator knows to install the missing
+    // SKILL.md files rather than hunting for a "real" critique blocker.
+    const loadable = findLoadableRubrics(ctx.requiredSkills, ctx.args.repoRoot);
+    if (loadable.length === 0) {
+      const missingPaths = ctx.requiredSkills
+        .map((n) => `- .claude/skills/${n}/SKILL.md`)
+        .join("\n");
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} NO RUBRIC LOADED — ` +
+          `required principles ${ctx.requiredSkills.join(", ")} have zero ` +
+          `SKILL.md files on disk; quarantining without dispatching critique`,
+      );
+      throw new CritiqueCriticalError(
+        `Critique cannot grade this slice: zero rubric SKILL.md files ` +
+          `loaded for the issue's required principles ` +
+          `(${ctx.requiredSkills.join(", ")}).\n\n` +
+          `Expected at least one of:\n${missingPaths}\n\n` +
+          `Install the SKILL.md file(s) and re-queue the issue. Until then, ` +
+          `critique would silently abstain (return CLEAN with no grading) ` +
+          `for this slice and any other slice with the same required-` +
+          `principles set.`,
+        ctx.typeLabel,
+        false,
+        false,
+        true,
+      );
+    }
+    const critique = await sandbox.run({
+      name: `critique (issue=${ctx.issueNumber})`,
+      maxIterations: 1,
+      model: ctx.args.critiqueModel,
+      promptFile: "./.sandcastle/critique-prompt.md",
+      idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
+      promptArgs: {
+        ITERATION: String(ctx.iteration),
+        ISSUE_NUMBER: String(ctx.issueNumber),
+        TYPE_LABEL: ctx.typeLabel,
+        BRANCH: ctx.issue.branch,
+        BASE_BRANCH: ctx.args.branch,
+        REQUIRED_PRINCIPLES: ctx.requiredSkills.join(", "),
+      },
+    });
+    let verdict: "CRITIQUE_CLEAN" | "CRITIQUE_NEEDS_FIXES" | "CRITIQUE_CRITICAL";
+    try {
+      verdict = extractMarker(critique.stdout, [
+        "CRITIQUE_CLEAN",
+        "CRITIQUE_NEEDS_FIXES",
+        "CRITIQUE_CRITICAL",
+      ] as const);
+    } catch {
+      // Malformed verdict (no marker at all) — fail closed by treating as
+      // CRITICAL with the full stdout as findings so the operator can see
+      // what happened.
+      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel);
+    }
+    ctx.deps.log(
+      `[critique] issue=${ctx.issueNumber} type=${ctx.typeLabel} verdict=${verdict}`,
+    );
+    if (verdict === "CRITIQUE_CRITICAL") {
+      // P0 / ban-list violations are structural; retry won't fix them.
+      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, false);
+    }
+    if (verdict === "CRITIQUE_NEEDS_FIXES") {
+      // v2 retry path (ADR 0006): one implementer pass with critique
+      // findings as feedback, then re-critique. Ship on CLEAN, quarantine on
+      // still NEEDS_FIXES or any CRITICAL.
+      if (!ctx.args.retryEnabled) {
+        ctx.deps.log(
+          `[critique] issue=${ctx.issueNumber} NEEDS_FIXES — retry disabled (--no-retry), quarantining`,
+        );
+        throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, true);
+      }
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} attempt 1 NEEDS_FIXES — ` +
+          `re-running implementer on ${ctx.args.implementerModel} with critique feedback`,
+      );
+      const implFix = await runImplementer(sandbox, ctx, {
+        attemptNumber: 2,
+        critiqueFeedback: critique.stdout,
+        requiredSkills: ctx.requiredSkills,
+      });
+      // Refresh postSha — mirrors the HAS_BLOCKERS retry pattern. Without
+      // this, the migration-journal validation block below runs on stale SHA
+      // range and silently skips any new migrations the retry-implementer
+      // added.
+      const postShaRetry = sandbox.worktreePath
+        ? await ctx.deps.captureSha(sandbox.worktreePath)
+        : (implFix.commits[implFix.commits.length - 1]?.sha ?? postSha);
+      postSha = postShaRetry;
+      const critique2 = await sandbox.run({
+        name: `critique-retry (issue=${ctx.issueNumber})`,
+        maxIterations: 1,
+        model: ctx.args.critiqueModel,
+        promptFile: "./.sandcastle/critique-prompt.md",
+        idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
+        promptArgs: {
+          ITERATION: String(ctx.iteration),
+          ISSUE_NUMBER: String(ctx.issueNumber),
+          TYPE_LABEL: ctx.typeLabel,
+          BRANCH: ctx.issue.branch,
+          BASE_BRANCH: ctx.args.branch,
+          REQUIRED_PRINCIPLES: ctx.requiredSkills.join(", "),
+        },
+      });
+      let verdict2:
+        | "CRITIQUE_CLEAN"
+        | "CRITIQUE_NEEDS_FIXES"
+        | "CRITIQUE_CRITICAL";
+      try {
+        verdict2 = extractMarker(critique2.stdout, [
+          "CRITIQUE_CLEAN",
+          "CRITIQUE_NEEDS_FIXES",
+          "CRITIQUE_CRITICAL",
+        ] as const);
+      } catch {
+        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, true);
+      }
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} attempt 2 verdict=${verdict2}`,
+      );
+      if (verdict2 !== "CRITIQUE_CLEAN") {
+        throw new CritiqueCriticalError(
+          critique2.stdout,
+          ctx.typeLabel,
+          true,
+          verdict2 === "CRITIQUE_CRITICAL",
+        );
+      }
+      // Falls through to journal-validation + applyMigrations block below.
+    }
+  }
   if (preSha !== "" && postSha !== "" && preSha !== postSha) {
     // Drizzle journal-registration gate. If the implementer added a new
     // <NNNN>_*.sql migration on disk but forgot to register it in
@@ -2845,7 +3090,10 @@ async function runIssuePipeline(
       : "";
 
     // Phase 2a: implementer attempt 1 (default model, no feedback)
-    const impl1 = await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+    const impl1 = await runImplementer(sandbox, ctx, {
+      attemptNumber: 1,
+      requiredSkills: ctx.requiredSkills,
+    });
     let postSha = sandbox.worktreePath
       ? await ctx.deps.captureSha(sandbox.worktreePath)
       : impl1.commits[impl1.commits.length - 1]?.sha ?? "";
@@ -2899,6 +3147,7 @@ async function runIssuePipeline(
       attemptNumber: 2,
       model: implEscalations[0],
       reviewerFeedback: review1.stdout,
+      requiredSkills: ctx.requiredSkills,
     });
     const rebuttal = extractRebuttal(impl2.stdout);
     const postSha2 = sandbox.worktreePath
@@ -2972,6 +3221,7 @@ async function runIssuePipeline(
         attemptNumber: 3,
         model: implEscalations[0],
         reviewerFeedback: review2.stdout,
+        requiredSkills: ctx.requiredSkills,
       });
       const rebuttal3 = extractRebuttal(impl3.stdout);
       const postSha3 = sandbox.worktreePath
@@ -3020,6 +3270,88 @@ async function runIssuePipeline(
     return { status: "quarantined", finalMarker: review2.marker, postSha };
   } catch (err) {
     const errMsg = (err as Error).message;
+    // Critique gate failures (CRITIQUE_CRITICAL or CRITIQUE_NEEDS_FIXES that
+    // didn't pass on retry, or malformed verdict) take a dedicated quarantine
+    // path with the critique findings posted as a GitHub issue comment.
+    // Critique runs inside shipAfterMigrations — by the time we catch this,
+    // the implementer has committed but migrations have NOT applied (gate
+    // runs before applyMigrations), so quarantining is safe state-wise.
+    // `critiqueErrorReasonCode(err)` resolves to one of: `critique-no-rubric-loaded`,
+    // `critique-retry-critical`, `critique-retry-exhausted`, `critique-critical-fail`
+    // (the flag→code mapping lives in lib/skill-discipline.ts).
+    if (err instanceof CritiqueCriticalError) {
+      deferralCounts.delete(ctx.issueNumber);
+      const { reasonCode, verdictHeader } = critiqueErrorReasonCode(err);
+      const reason = err.noRubricLoaded
+        ? `[issue=${ctx.issueNumber}] ${reasonCode}: ` +
+          `zero SKILL.md files loaded for required principles on ` +
+          `${err.typeLabel}. Install missing rubrics and re-queue.`
+        : `[issue=${ctx.issueNumber}] ${reasonCode}: ` +
+          `critique sub-agent blocked merge for ${err.typeLabel}. ` +
+          `Findings posted to the issue as a comment.`;
+      ctx.deps.logError(reason);
+      const commentBody = err.noRubricLoaded
+        ? `**Critique-gate verdict: ${verdictHeader}** (issue type \`${err.typeLabel}\`)\n\n` +
+          `Critique did not run because no rubric \`SKILL.md\` files were loadable for this issue's required principles. The critique sub-agent would have silently abstained (loaded zero rubrics → returned \`CRITIQUE_CLEAN\` with no grading), so the orchestrator quarantines instead. Install the missing rubric(s) listed below, then remove \`needs-human\` and add \`ready-for-agent\` to re-queue.\n\n` +
+          `<details><summary>Missing rubric paths</summary>\n\n\`\`\`\n${err.findings.slice(0, 16000)}\n\`\`\`\n\n</details>`
+        : `**Critique-gate verdict: ${verdictHeader}** (issue type \`${err.typeLabel}\`)\n\n` +
+          `The autonomous critique sub-agent blocked merge of this issue's diff against the project's design principles. Full critique output:\n\n` +
+          `<details><summary>Critique findings</summary>\n\n\`\`\`\n${err.findings.slice(0, 16000)}\n\`\`\`\n\n</details>`;
+      try {
+        await ctx.deps.comment(ctx.issueNumber, commentBody);
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} comment failed: ${(e as Error).message}`,
+        );
+      }
+      try {
+        await ctx.deps.quarantine(ctx.issueNumber, reason);
+        return { status: "quarantined", finalMarker: "HALT" };
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} quarantine failed: ${(e as Error).message}`,
+        );
+        return { status: "error", finalMarker: "HALT" };
+      }
+    }
+    // Skill-discipline gate failure (per ADR 0006 v3). The per-issue
+    // implementer gate throws when the agent skipped required Skill()
+    // invocations for its ticket's type:X label. Acts as a hard backstop
+    // for critique-as-gate's silent-abstention failure mode (zero-rubric
+    // case). Implementer's commits live on the agent branch but are not
+    // merged; operator can re-queue after addressing.
+    if (err instanceof MissingRequiredSkillsError) {
+      deferralCounts.delete(ctx.issueNumber);
+      const reasonCode = "skill-discipline-fail";
+      const reason =
+        `[issue=${ctx.issueNumber}] ${reasonCode}: ` +
+        `implementer skipped required Skill() invocations: ` +
+        `${err.missing.join(", ")}. Quarantining for triage.`;
+      ctx.deps.logError(reason);
+      try {
+        await ctx.deps.comment(
+          ctx.issueNumber,
+          `**Skill-discipline gate: implementer missed required Skill() invocations**\n\n` +
+            `- Required principles for this issue type: \`${err.required.join("`, `")}\`\n` +
+            `- Invoked: ${err.invoked.length === 0 ? "_(none)_" : "`" + err.invoked.join("`, `") + "`"}\n` +
+            `- Missing: \`${err.missing.join("`, `")}\`\n\n` +
+            `The skill-discipline gate is the hard backstop for critique-as-gate's silent-abstention failure mode (see ADR 0006 v3). The implementer's commits are on the agent's branch but have not merged. Re-queue (\`ready-for-agent\`) after the implementer either invokes the missing skills explicitly or the required-principles set in \`SANDCASTLE.md\` is corrected for this \`type:\` label.`,
+        );
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} comment failed: ${(e as Error).message}`,
+        );
+      }
+      try {
+        await ctx.deps.quarantine(ctx.issueNumber, reason);
+        return { status: "quarantined", finalMarker: "HALT" };
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} quarantine failed: ${(e as Error).message}`,
+        );
+        return { status: "error", finalMarker: "HALT" };
+      }
+    }
     const transientVerdict = isTransientError(errMsg);
     // Stall detection: surface "the sandbox stopped responding" failures
     // distinctly from "the spec was bad" failures so runMain can pause
@@ -3277,10 +3609,29 @@ export async function runMain(
   // per-iteration so newly-added `type:` labels are picked up.
   const sandcastleMdPath = path.join(args.repoRoot, "SANDCASTLE.md");
   const sandcastleMdExists = existsSync(sandcastleMdPath);
+  // Parse SANDCASTLE.md ONCE at startup into a `type:X → required-skills[]`
+  // map. The orchestrator looks up each dispatched issue's `type:X` label
+  // in this map to compute the per-issue `requiredSkills` threaded into
+  // runImplementer's opts. Empty map when SANDCASTLE.md doesn't exist —
+  // the per-issue lookup then yields `undefined` and the gate is a no-op
+  // (backward compat for projects without the file).
+  let requiredSkillsByType: ReadonlyMap<string, readonly string[]> = new Map();
   if (sandcastleMdExists) {
     deps.log(
       `SANDCASTLE.md found at ${sandcastleMdPath} — skill discipline enabled (planner picks re-validated against host-side label fetch)`,
     );
+    try {
+      const mdContent = readFileSync(sandcastleMdPath, "utf8");
+      requiredSkillsByType = parseRequiredSkillsByType(mdContent);
+      deps.log(
+        `skill-discipline: parsed ${requiredSkillsByType.size} type:X section(s) from SANDCASTLE.md`,
+      );
+    } catch (err) {
+      deps.logError(
+        `skill-discipline: failed to read/parse SANDCASTLE.md — gate disabled this run: ${(err as Error).message}`,
+      );
+      requiredSkillsByType = new Map();
+    }
   } else {
     deps.log(
       `No SANDCASTLE.md at repo root — skill discipline disabled (no type:-label enforcement)`,
@@ -3408,6 +3759,15 @@ export async function runMain(
 
       // Phase 1: planner (or one-shot bypass)
       let plan: PlanIssue[];
+      // Per-issue required-skills lookup, populated below if SANDCASTLE.md
+      // exists AND the planner returned issues to dispatch. Empty map means
+      // "skill discipline disabled for this iteration" — runImplementer
+      // receives `undefined` for opts.requiredSkills and its gate is a no-op.
+      // Lives in the iteration scope (not the planner-else scope) so the
+      // parallel dispatch below can read it without var-hoisting tricks.
+      let perIssueTypeLabel: ReadonlyMap<string, string> = new Map();
+      let perIssueRequiredSkills: ReadonlyMap<string, readonly string[]> =
+        new Map();
       if (args.issue !== undefined) {
         plan = [
           {
@@ -3416,6 +3776,46 @@ export async function runMain(
             branch: `agent/issue-${args.issue}`,
           },
         ];
+        // One-shot mode bypasses the planner but still needs the type:X
+        // label + required-skills lookup for the critique gate. Fetch the
+        // issue's labels directly via gh and populate the per-issue maps.
+        if (sandcastleMdExists) {
+          try {
+            const ghOut = execFileSync(
+              "gh",
+              [
+                "issue",
+                "view",
+                String(args.issue),
+                "--json",
+                "labels",
+                "--jq",
+                "[.labels[].name]",
+              ],
+              { encoding: "utf8", cwd: args.repoRoot },
+            ).trim();
+            const oneShotLabels = JSON.parse(ghOut) as string[];
+            const typeLabel = oneShotLabels.find((l) => l.startsWith("type:"));
+            if (typeLabel !== undefined) {
+              const req = requiredSkillsByType.get(typeLabel);
+              const builtTypeLabels = new Map<string, string>();
+              const builtReq = new Map<string, readonly string[]>();
+              builtTypeLabels.set(String(args.issue), typeLabel);
+              if (req !== undefined) builtReq.set(String(args.issue), req);
+              perIssueTypeLabel = builtTypeLabels;
+              perIssueRequiredSkills = builtReq;
+              deps.log(
+                `one-shot: issue #${args.issue} type=${typeLabel}` +
+                  ` requiredSkills=[${req?.join(", ") ?? "(unknown type)"}]`,
+              );
+            }
+          } catch (err) {
+            deps.log(
+              `one-shot: failed to fetch labels for issue #${args.issue}: ` +
+                `${(err as Error).message} — critique gate will skip`,
+            );
+          }
+        }
       } else {
         let plannerStdout: string;
         try {
@@ -3513,6 +3913,27 @@ export async function runMain(
             deps.log(`skipping issue #${e.id} — ${e.reason}`);
           }
           plan = [...kept];
+          // For every kept issue, pick its single `type:X` label and look
+          // up the required skills in the startup-parsed map. Empty list
+          // (type:cleanup) and "no matching section" both result in the
+          // gate being a no-op for that issue — but they're distinct:
+          // empty list → explicit "none required"; missing entry → the
+          // type is unknown to SANDCASTLE.md (graceful-degradation rule).
+          // We only emit a map entry for known types so unknown-type
+          // issues stay on the `undefined` no-op path.
+          const built = new Map<string, readonly string[]>();
+          const builtTypeLabels = new Map<string, string>();
+          for (const p of kept) {
+            const labels = labelLookup.get(p.id) ?? [];
+            const typeLabel = labels.find((l) => l.startsWith("type:"));
+            if (typeLabel === undefined) continue;
+            const req = requiredSkillsByType.get(typeLabel);
+            if (req === undefined) continue;
+            built.set(p.id, req);
+            builtTypeLabels.set(p.id, typeLabel);
+          }
+          perIssueRequiredSkills = built;
+          perIssueTypeLabel = builtTypeLabels;
         }
       }
 
@@ -3551,6 +3972,8 @@ export async function runMain(
               iteration: it,
               issueNumber,
               issue: p,
+              requiredSkills: perIssueRequiredSkills.get(p.id),
+              typeLabel: perIssueTypeLabel.get(p.id),
             };
             const outcome = await runIssuePipeline(ctx);
             return { issue: p, issueNumber, outcome };
@@ -3924,6 +4347,46 @@ export async function runMain(
             }
           }
           skillsInvokedByIssue.set("fixer", fixerSkillsInvoked);
+
+          // Post-merge fixer skill-discipline telemetry (DEMOTED — was a hard
+          // gate before, but the gate had the exact gaming pattern that
+          // motivated ADR 0006's pivot for the per-issue implementer: the
+          // fixer commit can apply real principle-aligned work AND narrate
+          // "Skills invoked: impeccable, polish" in its commit message, yet
+          // still register zero `Skill()` tool calls. Counting tool calls
+          // graded the process, not the output. The per-issue critique
+          // sub-agent already gates each diff before it reaches the rollup;
+          // the rollup-level gate was catching ritual non-compliance, not
+          // actual quality regressions, and forced manual `git merge --no-ff
+          // integration-candidate` recovery on every iteration. Now: compute
+          // the UNION across all rollup issues and log the missing-vs-invoked
+          // list for triage, but always proceed to the re-review dispatch.
+          const unionRequiredSet = new Set<string>();
+          const unionRequired: string[] = [];
+          for (const b of mergedBranches) {
+            const req = perIssueRequiredSkills.get(b.id);
+            if (req === undefined) continue;
+            for (const s of req) {
+              if (unionRequiredSet.has(s)) continue;
+              unionRequiredSet.add(s);
+              unionRequired.push(s);
+            }
+          }
+          if (unionRequired.length > 0) {
+            const { missing } = validateRequiredSkillsInvoked(
+              unionRequired,
+              fixerSkillsInvoked,
+            );
+            if (missing.length > 0) {
+              deps.log(
+                `[skill-discipline] WARN post-merge-fixer missed: ` +
+                  `${missing.join(", ")}; invoked: ` +
+                  `${fixerSkillsInvoked.length === 0 ? "(none)" : fixerSkillsInvoked.join(", ")} ` +
+                  `(telemetry only — per-issue critique already gated each diff; ` +
+                  `re-review will catch rollup-level regressions)`,
+              );
+            }
+          }
 
           const reviewerEscModel =
             models.postMergeReviewer.escalations[0] ??
