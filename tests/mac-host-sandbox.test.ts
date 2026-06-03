@@ -29,7 +29,7 @@ describe("macHostSandbox", () => {
     const factory = macHostSandbox({ repoRoot, env: {} });
     const handle = await factory.createSandbox({ branch: "feat/x" });
     expect(handle.branch).toBe("feat/x");
-    expect(handle.worktreePath).toContain(".sandcastle/worktrees/feat/x");
+    expect(handle.worktreePath).toContain(".sandcastle/worktrees/feat-x");
     expect(existsSync(handle.worktreePath!)).toBe(true);
     await handle.close();
   });
@@ -53,6 +53,33 @@ describe("macHostSandbox", () => {
     const h2 = await factory.createSandbox({ branch: "feat/reuse" });
     expect(h2.worktreePath).toBe(stalePath);
     expect(existsSync(stalePath)).toBe(true);
+    await h2.close();
+  });
+
+  it("createSandbox handles an orphan dir that git does not know about (tier 2)", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const h1 = await factory.createSandbox({ branch: "feat/orphan" });
+    const wtPath = h1.worktreePath;
+    // Remove the worktree registration but leave the directory orphan
+    execFileSync("git", ["worktree", "remove", "--force", wtPath], { cwd: repoRoot });
+    // Recreate the directory but NOT the registration
+    execFileSync("mkdir", ["-p", wtPath]);
+    // Re-create — should reap the orphan and succeed
+    const h2 = await factory.createSandbox({ branch: "feat/orphan" });
+    expect(h2.worktreePath).toBe(wtPath);
+    expect(existsSync(wtPath)).toBe(true);
+    await h2.close();
+  });
+
+  it("createSandbox handles a dangling registration with no dir (tier 3)", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const h1 = await factory.createSandbox({ branch: "feat/dangle" });
+    const wtPath = h1.worktreePath;
+    // rmSync the dir but leave git's registration intact
+    rmSync(wtPath, { recursive: true, force: true });
+    // Re-create — should prune the dangling registration and succeed
+    const h2 = await factory.createSandbox({ branch: "feat/dangle" });
+    expect(existsSync(h2.worktreePath)).toBe(true);
     await h2.close();
   });
 });

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { existsSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { worktreePathFor as canonicalWorktreePathFor } from "../main.mjs";
 
 export interface MacHostSandboxOptions {
   readonly repoRoot: string;
@@ -33,6 +34,10 @@ export interface MacHostRunSpec {
 export interface MacHostRunHandle {
   readonly stdout: string;
   readonly commits: readonly string[];
+  readonly iterations?: readonly {
+    readonly sessionFilePath?: string;
+    readonly sessionId?: string;
+  }[];
 }
 
 export interface MacHostSandboxHandle {
@@ -47,8 +52,8 @@ export interface MacHostSandboxFactory {
   run(spec: MacHostTopLevelRunSpec): Promise<MacHostRunHandle>;
 }
 
-function worktreePathFor(repoRoot: string, branch: string): string {
-  return path.join(repoRoot, ".sandcastle", "worktrees", branch);
+function absoluteWorktreePath(repoRoot: string, branch: string): string {
+  return path.join(repoRoot, canonicalWorktreePathFor(branch));
 }
 
 function preCleanWorktree(repoRoot: string, wtPath: string): void {
@@ -82,7 +87,7 @@ export function macHostSandbox(
 
   return {
     async createSandbox(spec) {
-      const wtPath = worktreePathFor(repoRoot, spec.branch);
+      const wtPath = absoluteWorktreePath(repoRoot, spec.branch);
       preCleanWorktree(repoRoot, wtPath);
       execFileSync(
         "git",
