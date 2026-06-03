@@ -1876,10 +1876,19 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         // `worktree add`.
       }
 
+      // Work around the SDK bug where createSandbox hardcodes
+      // agentProviderEnv: {}, dropping per-call env injection. We bake the
+      // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
+      // into sandbox.env so it actually reaches the container. Anthropic
+      // models return {} from envForModel (subscription path), so this is
+      // a no-op for the default Anthropic case.
+      const implEnv = envForModel(spec.implementerModel);
+      const sandboxEnv = { ...containerEnv, ...implEnv };
+
       // mac-host: bypass the SDK's createSandbox and delegate entirely to
       // the mac-host factory, which manages worktrees natively.
       if (args.sandbox === "mac-host") {
-        const factory = factories.buildForCreate(containerEnv) as ReturnType<typeof macHostSandbox>;
+        const factory = factories.buildForCreate(sandboxEnv) as ReturnType<typeof macHostSandbox>;
         const handle = await factory.createSandbox({ branch: spec.branch });
         return {
           branch: handle.branch,
@@ -1902,15 +1911,6 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
           close: () => handle.close(),
         };
       }
-
-      // Work around the SDK bug where createSandbox hardcodes
-      // agentProviderEnv: {}, dropping per-call env injection. We bake the
-      // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
-      // into sandbox.env so it actually reaches the container. Anthropic
-      // models return {} from envForModel (subscription path), so this is
-      // a no-op for the default Anthropic case.
-      const implEnv = envForModel(spec.implementerModel);
-      const sandboxEnv = { ...containerEnv, ...implEnv };
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
         sandbox: factories.buildForCreate(sandboxEnv, spec.mounts) as ReturnType<typeof docker>,
