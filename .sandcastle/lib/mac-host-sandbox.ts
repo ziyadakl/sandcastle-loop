@@ -3,6 +3,26 @@ import { existsSync, rmSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { worktreePathFor as canonicalWorktreePathFor } from "../main.mjs";
 
+const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+
+// Mirrors the SDK's substitutePromptArgs contract for the keys this repo
+// uses: same placeholder regex, fail-loud on unmatched key. Does NOT inject
+// SOURCE_BRANCH/TARGET_BRANCH built-ins or preprocess !`...` shell blocks —
+// see FOLLOW_UPS.md.
+export function applyPromptArgs(
+  prompt: string,
+  args: Record<string, string>,
+): string {
+  return prompt.replace(PLACEHOLDER_PATTERN, (_match, key: string) => {
+    if (!(key in args)) {
+      throw new Error(
+        `Prompt argument "{{${key}}}" has no matching value in promptArgs`,
+      );
+    }
+    return args[key];
+  });
+}
+
 export interface MacHostSandboxOptions {
   readonly repoRoot: string;
   readonly env?: Record<string, string>;
@@ -106,7 +126,8 @@ async function spawnAgent(
   if (!existsSync(promptFullPath)) {
     throw new Error(`prompt file not found: ${promptFullPath}`);
   }
-  const promptText = readFileSync(promptFullPath, "utf8");
+  const rawPrompt = readFileSync(promptFullPath, "utf8");
+  const promptText = applyPromptArgs(rawPrompt, runSpec.promptArgs ?? {});
 
   // The Claude Code CLI binary used by the host. Override via env for
   // tests. Default `claude` is whatever's on PATH (the user's normal CLI).

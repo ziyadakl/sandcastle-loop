@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { macHostSandbox } from "../.sandcastle/lib/mac-host-sandbox.js";
+import { macHostSandbox, applyPromptArgs } from "../.sandcastle/lib/mac-host-sandbox.js";
 
 function initTempRepo(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "mac-host-test-"));
@@ -231,5 +231,57 @@ describe("macHostSandbox top-level run()", () => {
       idleTimeoutSeconds: 30,
     });
     expect(result.stdout).toContain("staged prompt");
+  });
+});
+
+describe("applyPromptArgs", () => {
+  it("substitutes a single key", () => {
+    expect(applyPromptArgs("hello {{NAME}}", { NAME: "world" })).toBe("hello world");
+  });
+
+  it("substitutes multiple keys, including repeats", () => {
+    expect(
+      applyPromptArgs("it={{ITER}} num={{NUM}} it-again={{ITER}}", {
+        ITER: "3",
+        NUM: "42",
+      }),
+    ).toBe("it=3 num=42 it-again=3");
+  });
+
+  it("tolerates inner whitespace inside {{ KEY }}", () => {
+    expect(applyPromptArgs("{{ KEY }}", { KEY: "v" })).toBe("v");
+  });
+
+  it("leaves non-identifier curly patterns untouched", () => {
+    const input = "{not_a_key} {{ lower-case-key }} {{}} {{1NUM}}";
+    expect(applyPromptArgs(input, { NUM: "v" })).toBe(input);
+  });
+
+  it("throws on missing key, with the key name in the message", () => {
+    expect(() => applyPromptArgs("{{MISSING}}", {})).toThrowError(/\{\{MISSING\}\}/);
+  });
+
+  it("passes through plain text with no placeholders and empty args", () => {
+    expect(applyPromptArgs("plain text", {})).toBe("plain text");
+  });
+
+  it("throws on a placeholder when args is empty", () => {
+    expect(() => applyPromptArgs("{{K}}", {})).toThrow();
+  });
+
+  it("substitutes every placeholder in implement-prompt.md with the caller's keys", () => {
+    const promptPath = path.resolve(__dirname, "../.sandcastle/implement-prompt.md");
+    const raw = readFileSync(promptPath, "utf8");
+    const args = {
+      ITERATION: "3",
+      ISSUE_NUMBER: "42",
+      BRANCH: "feat/x",
+      STORY_TITLE: "A title",
+      ATTEMPT_NUMBER: "1",
+      REVIEWER_FEEDBACK: "",
+    };
+    const out = applyPromptArgs(raw, args);
+    const PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+    expect(out.match(PATTERN)).toBeNull();
   });
 });
