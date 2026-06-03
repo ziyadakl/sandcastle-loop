@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -141,6 +141,60 @@ describe("macHostSandbox run()", () => {
     });
     expect(result.commits.length).toBe(1);
     expect(result.commits[0].sha).toMatch(/^[0-9a-f]{40}$/);
+    await handle.close();
+  });
+});
+
+describe("macHostSandbox abort signal", () => {
+  let repoRoot: string;
+  beforeEach(() => { repoRoot = initTempRepo(); });
+  afterEach(() => { rmSync(repoRoot, { recursive: true, force: true }); });
+
+  it("run() aborts when signal fires mid-spawn", async () => {
+    // Write a tiny shell script that sleeps for 5 s, giving us a long-running
+    // child that the abort signal can reliably kill before it exits.
+    const sleepScript = path.join(repoRoot, "fake-claude.sh");
+    writeFileSync(sleepScript, "#!/bin/sh\nsleep 5\n");
+    chmodSync(sleepScript, 0o755);
+    const oldBin = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = sleepScript;
+    try {
+      const factory = macHostSandbox({ repoRoot, env: {} });
+      const handle = await factory.createSandbox({ branch: "feat/abort" });
+      writeFileSync(path.join(handle.worktreePath, "p.md"), "x");
+      const controller = new AbortController();
+      const runPromise = handle.run({
+        name: "abort-me",
+        model: "claude-test",
+        promptFile: "p.md",
+        idleTimeoutSeconds: 60,
+        signal: controller.signal,
+      });
+      // Fire abort after a short delay to let the process start
+      setTimeout(() => controller.abort(), 100);
+      await expect(runPromise).rejects.toThrow(/aborted/);
+      await handle.close();
+    } finally {
+      if (oldBin === undefined) delete process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+      else process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = oldBin;
+    }
+  });
+
+  it("run() rejects immediately if signal is already aborted before spawn", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/abort-pre" });
+    writeFileSync(path.join(handle.worktreePath, "p.md"), "x");
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      handle.run({
+        name: "pre-aborted",
+        model: "claude-test",
+        promptFile: "p.md",
+        idleTimeoutSeconds: 60,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/already aborted/);
     await handle.close();
   });
 });

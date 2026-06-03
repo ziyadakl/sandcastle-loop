@@ -1660,11 +1660,10 @@ export function buildSandboxFactory(
   containerEnv: Record<string, string>,
 ): SandboxFactoryHandles {
   if (args.sandbox === "mac-host") {
-    const f = macHostSandbox({ repoRoot: args.repoRoot, env: containerEnv });
     return {
       kind: "mac-host",
-      buildForTopLevel: () => f,
-      buildForCreate: () => f,
+      buildForTopLevel: () => macHostSandbox({ repoRoot: args.repoRoot, env: containerEnv }),
+      buildForCreate: (sandboxEnv) => macHostSandbox({ repoRoot: args.repoRoot, env: sandboxEnv }),
     };
   }
   return {
@@ -1803,7 +1802,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         const factory = factories.buildForTopLevel() as ReturnType<typeof macHostSandbox>;
         const result = await withCeiling(
           `top-level run "${spec.name}"`,
-          () => factory.run({
+          (signal) => factory.run({
             name: spec.name,
             maxIterations: spec.maxIterations ?? 1,
             model: spec.model,
@@ -1811,6 +1810,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
             promptArgs: spec.promptArgs,
             idleTimeoutSeconds: spec.idleTimeoutSeconds,
             cwd: spec.cwd,
+            signal,
           }),
         );
         return { stdout: result.stdout, commits: result.commits };
@@ -1887,13 +1887,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
           run: async (opts) => {
             const r = await withCeiling(
               `sandbox run "${opts.name}"`,
-              () => handle.run({
+              (signal) => handle.run({
                 name: opts.name,
                 maxIterations: opts.maxIterations ?? 1,
                 model: opts.model,
                 promptFile: opts.promptFile,
                 promptArgs: opts.promptArgs,
                 idleTimeoutSeconds: opts.idleTimeoutSeconds,
+                signal,
               }),
             );
             return r;

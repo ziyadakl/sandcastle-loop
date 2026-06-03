@@ -20,6 +20,7 @@ export interface MacHostTopLevelRunSpec {
   readonly promptArgs?: Record<string, string>;
   readonly idleTimeoutSeconds?: number;
   readonly cwd?: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface MacHostRunSpec {
@@ -29,6 +30,7 @@ export interface MacHostRunSpec {
   readonly promptFile: string;
   readonly promptArgs?: Record<string, string>;
   readonly idleTimeoutSeconds?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface MacHostRunHandle {
@@ -110,14 +112,19 @@ async function spawnAgent(
   const claudeBin =
     process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ??
     (process.env.NODE_ENV === "test" ? "/bin/cat" : "claude");
-  const claudeArgs =
-    claudeBin === "/bin/cat"
-      ? [promptFullPath]
-      : [
-          "--model", runSpec.model,
-          "--print",
-          "--prompt-file", promptFullPath,
-        ];
+  // When SANDCASTLE_MAC_HOST_CLAUDE_BIN is set (test seam) or we're in the
+  // default test path (/bin/cat), pass only the prompt path as the argument
+  // so the substitute binary receives it cleanly (cat reads it, sleep uses it
+  // as duration, etc.). In production the full Claude CLI flags are used.
+  const isTestSeam = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN !== undefined
+    || process.env.NODE_ENV === "test";
+  const claudeArgs = isTestSeam
+    ? [promptFullPath]
+    : [
+        "--model", runSpec.model,
+        "--print",
+        "--prompt-file", promptFullPath,
+      ];
 
   const childEnv = { ...process.env, ...env };
   const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
@@ -136,6 +143,21 @@ async function spawnAgent(
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    // Wire abort signal — kill the child and reject before it can settle normally.
+    const onAbort = () => {
+      child.kill("SIGTERM");
+      safeReject(new Error(`run "${runSpec.name}": aborted`));
+    };
+    if (runSpec.signal) {
+      if (runSpec.signal.aborted) {
+        child.kill("SIGTERM");
+        safeReject(new Error(`run "${runSpec.name}": already aborted before spawn`));
+      } else {
+        runSpec.signal.addEventListener("abort", onAbort);
+      }
+    }
+
     let stdoutBuf = "";
     let stderrBuf = "";
     let lastChunkAt = Date.now();
@@ -160,11 +182,13 @@ async function spawnAgent(
     });
     child.on("error", (err: Error) => {
       clearInterval(idleTimer);
+      runSpec.signal?.removeEventListener("abort", onAbort);
       safeReject(err);
     });
     child.on("close", (code: number | null) => {
       clearInterval(idleTimer);
-      if (code !== 0 && claudeBin !== "/bin/cat") {
+      runSpec.signal?.removeEventListener("abort", onAbort);
+      if (code !== 0 && !isTestSeam) {
         safeReject(new Error(
           `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
         ));

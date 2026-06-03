@@ -21,4 +21,14 @@ describe("sandbox routing by --sandbox flag", () => {
     );
     expect(factory.kind).toBe("docker");
   });
+
+  it("buildForCreate mac-host returns a fresh factory per call (per-call sandboxEnv)", () => {
+    const factory = buildSandboxFactory(
+      { sandbox: "mac-host", repoRoot: "/tmp/x", imageName: "unused" } as any,
+      {},
+    );
+    const a = factory.buildForCreate({ FOO: "1" });
+    const b = factory.buildForCreate({ FOO: "2" });
+    expect(a).not.toBe(b);
+  });
 });
