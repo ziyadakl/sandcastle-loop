@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -165,7 +165,7 @@ describe("macHostSandbox top-level run()", () => {
 
   it("top-level run honours cwd override", async () => {
     const subDir = path.join(repoRoot, "staging");
-    execFileSync("mkdir", ["-p", subDir]);
+    mkdirSync(subDir, { recursive: true });
     const promptPath = path.join(subDir, "p.md");
     writeFileSync(promptPath, "staged prompt");
     const factory = macHostSandbox({ repoRoot, env: {} });
