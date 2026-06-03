@@ -1,34 +1,44 @@
 import { describe, it, expect } from "vitest";
-import { buildSandboxFactory } from "../.sandcastle/main.mjs";
+import { buildSandboxProvider } from "../.sandcastle/lib/sandbox-provider.js";
 
-// `buildSandboxFactory(args, containerEnv)` is a pure helper exported from
-// main.mts that returns a SandboxFactoryHandles bag. It picks docker(...)
-// or macHostSandbox(...) based on args.sandbox.
+// `buildSandboxProvider(args, containerEnv, dockerConfig?)` is a pure helper
+// that returns a uniform SandboxProvider shape regardless of which provider
+// is selected. Both docker and mac-host expose the same topLevelRun /
+// createSandbox methods.
+
+const DUMMY_DOCKER_CONFIG = {
+  hooks: {},
+  copyToWorktree: ["node_modules"],
+  copyToWorktreeMs: 600_000,
+  completionSignal: ["<promise>COMPLETE</promise>"],
+};
 
 describe("sandbox routing by --sandbox flag", () => {
-  it("returns the mac-host factory when args.sandbox === 'mac-host'", () => {
-    const factory = buildSandboxFactory(
+  it("returns a SandboxProvider with topLevelRun and createSandbox when args.sandbox === 'mac-host'", () => {
+    const provider = buildSandboxProvider(
       { sandbox: "mac-host", repoRoot: "/tmp/x", imageName: "unused" } as any,
       {},
     );
-    expect(factory.kind).toBe("mac-host");
+    expect(typeof provider.topLevelRun).toBe("function");
+    expect(typeof provider.createSandbox).toBe("function");
   });
 
-  it("returns the docker factory when args.sandbox === 'docker'", () => {
-    const factory = buildSandboxFactory(
+  it("returns a SandboxProvider with topLevelRun and createSandbox when args.sandbox === 'docker'", () => {
+    const provider = buildSandboxProvider(
       { sandbox: "docker", repoRoot: "/tmp/x", imageName: "sandcastle:foo" } as any,
       {},
+      DUMMY_DOCKER_CONFIG,
     );
-    expect(factory.kind).toBe("docker");
+    expect(typeof provider.topLevelRun).toBe("function");
+    expect(typeof provider.createSandbox).toBe("function");
   });
 
-  it("buildForCreate mac-host returns a fresh factory per call (per-call sandboxEnv)", () => {
-    const factory = buildSandboxFactory(
-      { sandbox: "mac-host", repoRoot: "/tmp/x", imageName: "unused" } as any,
-      {},
-    );
-    const a = factory.buildForCreate({ FOO: "1" });
-    const b = factory.buildForCreate({ FOO: "2" });
-    expect(a).not.toBe(b);
+  it("throws when docker is selected without a dockerConfig", () => {
+    expect(() =>
+      buildSandboxProvider(
+        { sandbox: "docker", repoRoot: "/tmp/x", imageName: "sandcastle:foo" } as any,
+        {},
+      ),
+    ).toThrow(/docker provider requires dockerConfig/);
   });
 });
