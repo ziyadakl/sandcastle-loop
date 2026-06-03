@@ -189,6 +189,14 @@ export interface SandcastleArgs {
    * "tweak-then-test-then-commit" workflows in the template repo itself.
    */
   allowDirtySandcastle: boolean;
+  /**
+   * Sandbox provider. `"docker"` (default) runs each agent inside an
+   * ephemeral Docker container. `"mac-host"` skips the container and
+   * runs the agent natively on the macOS host — useful for development
+   * on Apple Silicon where Docker-in-Docker or nested virtualisation is
+   * unavailable. Wired via `--sandbox docker|mac-host`.
+   */
+  sandbox: "docker" | "mac-host";
 }
 
 /**
@@ -423,6 +431,8 @@ Optional:
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
                             matching 'sandcastle docker build-image'.
+  --sandbox PROVIDER        Sandbox provider: docker (default) or mac-host
+                            (no container — runs agent natively on macOS host).
   --allow-dirty-sandcastle  Skip the preflight check that refuses launch
                             when .sandcastle/main.mts has uncommitted
                             modifications vs HEAD. The check exists to
@@ -476,6 +486,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
+      "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
       "help": { type: "boolean" },
@@ -528,6 +539,17 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       ? defaultCodingModelFor(provider)
       : models.implementer.default);
 
+  const sandbox: "docker" | "mac-host" = (() => {
+    const v = values.sandbox;
+    if (v === undefined) return "docker";
+    if (v !== "docker" && v !== "mac-host") {
+      throw new Error(
+        `--sandbox: expected one of docker|mac-host, got ${JSON.stringify(v)}`,
+      );
+    }
+    return v;
+  })();
+
   const args: SandcastleArgs = {
     iterations: effectiveIterations,
     issue,
@@ -571,6 +593,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
     allowDirtySandcastle: values["allow-dirty-sandcastle"] === true,
+    sandbox,
   };
   return { args, showHelp: false };
 }
@@ -627,6 +650,7 @@ function defaultArgs(): SandcastleArgs {
     stagingEnabled: true,
     imageName: defaultImageName(process.cwd()),
     allowDirtySandcastle: false,
+    sandbox: "docker",
   };
 }
 
