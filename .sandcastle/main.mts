@@ -67,6 +67,7 @@ import {
   isProviderName,
   type ProviderName,
 } from "./providers.js";
+import { macHostSandbox } from "./lib/mac-host-sandbox.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -832,23 +833,27 @@ export function preflight(args: SandcastleArgs, opts: {
     if (!fileExists(full)) errors.push(`missing prompt file: ${full}`);
   }
 
-  // 5. docker daemon
-  const dk = exec("docker", ["info"]);
-  if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
+  // 5. docker daemon — only required when using the docker sandbox provider.
+  // The mac-host path runs no Docker commands, so skip this to avoid blocking
+  // startup if Docker isn't running on the host.
+  if (args.sandbox === "docker") {
+    const dk = exec("docker", ["info"]);
+    if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
 
-  // 6. project's sandbox image exists locally. Without this check, iteration
-  // 1 immediately fails with "Image '<name>' not found locally" after the
-  // planner has already booted — wasted setup + confusing first-run UX on
-  // any fresh worktree or post-`docker prune` machine. Catch at boot
-  // instead and point the user at the build command.
-  if (dk.ok) {
-    const img = exec("docker", ["image", "inspect", args.imageName]);
-    if (!img.ok) {
-      errors.push(
-        `sandbox image '${args.imageName}' not found locally. Build it with: ` +
-          `node_modules/.bin/sandcastle docker build-image --image-name ` +
-          `${args.imageName} --dockerfile .sandcastle/Dockerfile`,
-      );
+    // 6. project's sandbox image exists locally. Without this check, iteration
+    // 1 immediately fails with "Image '<name>' not found locally" after the
+    // planner has already booted — wasted setup + confusing first-run UX on
+    // any fresh worktree or post-`docker prune` machine. Catch at boot
+    // instead and point the user at the build command.
+    if (dk.ok) {
+      const img = exec("docker", ["image", "inspect", args.imageName]);
+      if (!img.ok) {
+        errors.push(
+          `sandbox image '${args.imageName}' not found locally. Build it with: ` +
+            `node_modules/.bin/sandcastle docker build-image --image-name ` +
+            `${args.imageName} --dockerfile .sandcastle/Dockerfile`,
+        );
+      }
     }
   }
 
@@ -1615,6 +1620,76 @@ export function withHardCeiling<T>(
   return invoke(controller.signal).finally(() => clearTimeout(timer));
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox factory helpers (module scope so buildSandboxFactory can use them)
+// ---------------------------------------------------------------------------
+
+// Auth mounts — sandcastle's docker provider does NOT auto-mount these.
+// Without them, `claude` and `gh` inside the container can't see the host's
+// session and fail with "Not logged in" / "no auth" errors.
+//
+// Note: we deliberately do NOT mount ~/.gitconfig. Single-file bind mounts
+// in Docker fail with "Device or resource busy" when anyone (sandcastle's
+// own setup, or the agent) tries to update the file via the standard
+// write-temp-then-rename pattern that git config uses. Instead we read
+// user.name / user.email from the host's gitconfig at CLI startup and
+// pass them as GIT_* env vars (see buildGitEnv below).
+const AUTH_MOUNTS = [
+  { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
+  { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
+] as const;
+
+function buildMounts(extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) {
+  return extra && extra.length > 0
+    ? { mounts: [...AUTH_MOUNTS, ...extra] }
+    : { mounts: [...AUTH_MOUNTS] };
+}
+
+// ---------------------------------------------------------------------------
+// Exported sandbox factory
+// ---------------------------------------------------------------------------
+
+export interface SandboxFactoryHandles {
+  kind: "docker" | "mac-host";
+  buildForTopLevel: (extraMounts?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => unknown;
+  buildForCreate: (sandboxEnv: Record<string, string>, extraMounts?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => unknown;
+}
+
+export function buildSandboxFactory(
+  args: { sandbox: "docker" | "mac-host"; imageName: string; repoRoot: string },
+  containerEnv: Record<string, string>,
+): SandboxFactoryHandles {
+  if (args.sandbox === "mac-host") {
+    const f = macHostSandbox({ repoRoot: args.repoRoot, env: containerEnv });
+    return {
+      kind: "mac-host",
+      buildForTopLevel: () => f,
+      buildForCreate: () => f,
+    };
+  }
+  return {
+    kind: "docker",
+    buildForTopLevel: (extraMounts) =>
+      docker({
+        imageName: args.imageName,
+        env: containerEnv,
+        containerUid: 1001,
+        containerGid: 1001,
+        ...buildMounts(extraMounts),
+      }),
+    buildForCreate: (sandboxEnv, extraMounts) =>
+      docker({
+        imageName: args.imageName,
+        env: sandboxEnv,
+        containerUid: 1001,
+        containerGid: 1001,
+        ...buildMounts(extraMounts),
+      }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+
 /**
  * Build the production {@link Deps} bag — wires sandcastle.run /
  * sandcastle.createSandbox / src/state/gh.ts wrappers / src/migrations/.
@@ -1654,32 +1729,18 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   const writeProjectDotenv = {
     command: WRITE_PROJECT_DOTENV_COMMAND,
   };
-  const hooks = {
-    sandbox: {
-      onSandboxReady: [writeProjectDotenv, { command: "CI=true pnpm install" }],
-    },
-  } as const;
+  // For mac-host, omit the pnpm install hook — there's no container to run
+  // it in. The mac-host path bypasses sandcastle.createSandbox entirely so
+  // `hooks` is only consumed by the Docker path, but we keep the ternary for
+  // clarity and future-proofing.
+  const hooks = args.sandbox === "mac-host"
+    ? {}
+    : {
+        sandbox: {
+          onSandboxReady: [writeProjectDotenv, { command: "CI=true pnpm install" }],
+        },
+      } as const;
   const copyToWorktree = ["node_modules"];
-
-  // Auth mounts — sandcastle's docker provider does NOT auto-mount these.
-  // Without them, `claude` and `gh` inside the container can't see the host's
-  // session and fail with "Not logged in" / "no auth" errors.
-  //
-  // Note: we deliberately do NOT mount ~/.gitconfig. Single-file bind mounts
-  // in Docker fail with "Device or resource busy" when anyone (sandcastle's
-  // own setup, or the agent) tries to update the file via the standard
-  // write-temp-then-rename pattern that git config uses. Instead we read
-  // user.name / user.email from the host's gitconfig at CLI startup and
-  // pass them as GIT_* env vars (see buildGitEnv below).
-  const authMounts = [
-    { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
-    { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
-  ] as const;
-  const buildMounts = (extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => {
-    return extra && extra.length > 0
-      ? { mounts: [...authMounts, ...extra] }
-      : { mounts: [...authMounts] };
-  };
 
   // Read git user identity from the host at CLI startup. The container's
   // safe.directory will be set up by sandcastle itself; user.name/user.email
@@ -1701,6 +1762,10 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
   };
+
+  // Pick sandbox factory once; methods below use factories.buildForTopLevel()
+  // / factories.buildForCreate(sandboxEnv) to get the right provider object.
+  const factories = buildSandboxFactory(args, containerEnv);
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -1734,11 +1799,27 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // time on a fresh sandbox because it doesn't get copyToWorktree's
       // node_modules so the install starts from scratch on a 1.7 GB
       // monorepo and trips workspace catalog errors.
+      if (args.sandbox === "mac-host") {
+        const factory = factories.buildForTopLevel() as ReturnType<typeof macHostSandbox>;
+        const result = await withCeiling(
+          `top-level run "${spec.name}"`,
+          () => factory.run({
+            name: spec.name,
+            maxIterations: spec.maxIterations ?? 1,
+            model: spec.model,
+            promptFile: spec.promptFile,
+            promptArgs: spec.promptArgs,
+            idleTimeoutSeconds: spec.idleTimeoutSeconds,
+            cwd: spec.cwd,
+          }),
+        );
+        return { stdout: result.stdout, commits: result.commits };
+      }
       const result = await withCeiling(
         `top-level run "${spec.name}"`,
         (signal) =>
           sandcastle.run({
-            sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
+            sandbox: factories.buildForTopLevel(spec.mounts) as ReturnType<typeof docker>,
             cwd: spec.cwd ?? args.repoRoot,
             name: spec.name,
             maxIterations: spec.maxIterations ?? 1,
@@ -1795,6 +1876,32 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         // `worktree add`.
       }
 
+      // mac-host: bypass the SDK's createSandbox and delegate entirely to
+      // the mac-host factory, which manages worktrees natively.
+      if (args.sandbox === "mac-host") {
+        const factory = factories.buildForCreate(containerEnv) as ReturnType<typeof macHostSandbox>;
+        const handle = await factory.createSandbox({ branch: spec.branch });
+        return {
+          branch: handle.branch,
+          worktreePath: handle.worktreePath,
+          run: async (opts) => {
+            const r = await withCeiling(
+              `sandbox run "${opts.name}"`,
+              () => handle.run({
+                name: opts.name,
+                maxIterations: opts.maxIterations ?? 1,
+                model: opts.model,
+                promptFile: opts.promptFile,
+                promptArgs: opts.promptArgs,
+                idleTimeoutSeconds: opts.idleTimeoutSeconds,
+              }),
+            );
+            return r;
+          },
+          close: () => handle.close(),
+        };
+      }
+
       // Work around the SDK bug where createSandbox hardcodes
       // agentProviderEnv: {}, dropping per-call env injection. We bake the
       // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
@@ -1805,7 +1912,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       const sandboxEnv = { ...containerEnv, ...implEnv };
       const handle = await sandcastle.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, env: sandboxEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
+        sandbox: factories.buildForCreate(sandboxEnv, spec.mounts) as ReturnType<typeof docker>,
         cwd: args.repoRoot,
         hooks,
         copyToWorktree,
