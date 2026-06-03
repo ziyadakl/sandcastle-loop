@@ -272,6 +272,34 @@ describe("macHostSandbox top-level run()", () => {
   });
 });
 
+describe("macHostSandbox explicit claudeBin/buildArgs", () => {
+  let repoRoot: string;
+  beforeEach(() => { repoRoot = initTempRepo(); });
+  afterEach(() => { rmSync(repoRoot, { recursive: true, force: true }); });
+
+  it("uses opts.claudeBin and opts.buildArgs and pipes the prompt to stdin", async () => {
+    const fakeBin = path.join(repoRoot, "fake-claude.sh");
+    writeFileSync(fakeBin, `#!/bin/sh\nread input\necho "ARGS:$@ STDIN:$input"\nexit 0\n`);
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(path.join(repoRoot, "p.md"), "prompt body\n");
+
+    const factory = macHostSandbox({
+      repoRoot,
+      env: {},
+      claudeBin: fakeBin,
+      buildArgs: (spec) => ["--marker", spec.name],
+    });
+    const result = await factory.run({
+      name: "test-run",
+      model: "claude-sonnet-4-5",
+      promptFile: "p.md",
+      idleTimeoutSeconds: 30,
+    });
+    expect(result.stdout).toContain("ARGS:--marker test-run");
+    expect(result.stdout).toContain("STDIN:prompt body");
+  });
+});
+
 describe("worktreePathFor (extracted helper)", () => {
   it("transforms branch names by replacing / with -", () => {
     expect(worktreePathFor("agent/issue-42")).toBe(".sandcastle/worktrees/agent-issue-42");

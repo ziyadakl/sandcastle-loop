@@ -26,6 +26,18 @@ export function applyPromptArgs(
 export interface MacHostSandboxOptions {
   readonly repoRoot: string;
   readonly env?: Record<string, string>;
+  // Override the binary spawned to run the agent. Default `claude` from PATH.
+  // Test code injects a fake binary here for deterministic behavior. The
+  // SANDCASTLE_MAC_HOST_CLAUDE_BIN env var is consulted as a fallback when
+  // this option is omitted.
+  readonly claudeBin?: string;
+  // Build the argv passed to the binary. When omitted, args default to
+  // production-style flags (`--print --model … --dangerously-skip-permissions`)
+  // unless a non-default binary is in use, in which case the legacy
+  // single-positional-arg form is used. Provide this for explicit control.
+  readonly buildArgs?: (
+    spec: MacHostRunSpec | MacHostTopLevelRunSpec,
+  ) => readonly string[];
 }
 
 export interface MacHostCreateSpec {
@@ -121,6 +133,7 @@ async function spawnAgent(
   runSpec: MacHostRunSpec | MacHostTopLevelRunSpec,
   env: Record<string, string>,
   forkSha: string | null,
+  opts: MacHostSandboxOptions,
 ): Promise<MacHostRunHandle> {
   const promptFullPath = path.join(cwd, runSpec.promptFile);
   if (!existsSync(promptFullPath)) {
@@ -129,26 +142,36 @@ async function spawnAgent(
   const rawPrompt = readFileSync(promptFullPath, "utf8");
   const promptText = applyPromptArgs(rawPrompt, runSpec.promptArgs ?? {});
 
-  // The Claude Code CLI binary used by the host. Override via env for
-  // tests. Default `claude` is whatever's on PATH (the user's normal CLI).
+  // Resolve the binary to spawn. Explicit options.claudeBin wins; the
+  // SANDCASTLE_MAC_HOST_CLAUDE_BIN env var is a fallback so existing test
+  // harnesses keep working; default is `claude` from PATH for production.
+  // The previous NODE_ENV === "test" implicit branch is intentionally gone
+  // — that seam was global-state that could leak into production.
   const claudeBin =
-    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ??
-    (process.env.NODE_ENV === "test" ? "/bin/cat" : "claude");
-  // When SANDCASTLE_MAC_HOST_CLAUDE_BIN is set (test seam) or we're in the
-  // default test path (/bin/cat), pass only the prompt path as the argument
-  // so the substitute binary receives it cleanly (cat reads it, sleep uses it
-  // as duration, etc.). In production the full Claude CLI args are used and
-  // the prompt is passed via stdin.
-  const isTestSeam =
-    !!process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ||
-    process.env.NODE_ENV === "test";
-  const claudeArgs = isTestSeam
-    ? [promptFullPath]
-    : [
-        "--print",
-        "--model", runSpec.model,
-        "--dangerously-skip-permissions",
-      ];
+    opts.claudeBin ?? process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ?? "claude";
+  const usingOverrideBin =
+    opts.claudeBin !== undefined ||
+    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN !== undefined;
+  // Args: explicit buildArgs wins. Otherwise a non-default binary gets the
+  // legacy single-positional-arg form (used by /bin/cat-style test seams).
+  // Default binary (`claude`) gets the production flags.
+  const claudeArgs = opts.buildArgs
+    ? [...opts.buildArgs(runSpec)]
+    : usingOverrideBin
+      ? [promptFullPath]
+      : [
+          "--print",
+          "--model", runSpec.model,
+          "--dangerously-skip-permissions",
+        ];
+  // Stdin policy: explicit buildArgs means the caller opted into the
+  // production contract (prompt via stdin); legacy positional-arg seam
+  // closes stdin so /bin/cat doesn't block.
+  const pipePromptToStdin = !usingOverrideBin || opts.buildArgs !== undefined;
+  // Exit-code policy: legacy positional-arg seam tolerates non-zero (some
+  // fake bins for abort/idle tests are killed mid-run). Production and
+  // explicit buildArgs paths fail on non-zero exit.
+  const failOnNonZero = !usingOverrideBin || opts.buildArgs !== undefined;
 
   const childEnv = { ...process.env, ...env };
   const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
@@ -168,9 +191,10 @@ async function spawnAgent(
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // Pass the prompt: production path writes to stdin; test seam already has
-    // the prompt file as a positional arg so just close stdin to unblock /bin/cat.
-    if (!isTestSeam) {
+    // Pass the prompt according to the resolved stdin policy: production and
+    // explicit buildArgs callers receive prompt text on stdin; legacy
+    // positional-arg seams close stdin so /bin/cat doesn't block.
+    if (pipePromptToStdin) {
       child.stdin.end(promptText);
     } else {
       child.stdin.end();
@@ -220,7 +244,7 @@ async function spawnAgent(
     child.on("close", (code: number | null) => {
       clearInterval(idleTimer);
       runSpec.signal?.removeEventListener("abort", onAbort);
-      if (code !== 0 && !isTestSeam) {
+      if (code !== 0 && failOnNonZero) {
         safeReject(new Error(
           `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
         ));
@@ -258,7 +282,7 @@ export function macHostSandbox(
         branch: spec.branch,
         worktreePath: wtPath,
         async run(runSpec): Promise<MacHostRunHandle> {
-          return await spawnAgent(wtPath, runSpec, opts.env ?? {}, forkSha);
+          return await spawnAgent(wtPath, runSpec, opts.env ?? {}, forkSha, opts);
         },
         async close() {
           preCleanWorktree(repoRoot, wtPath);
@@ -273,7 +297,7 @@ export function macHostSandbox(
         ["rev-parse", "HEAD"],
         { cwd: effectiveCwd, stdio: ["ignore", "pipe", "ignore"] },
       ).toString("utf8").trim();
-      return await spawnAgent(effectiveCwd, spec, opts.env ?? {}, forkSha);
+      return await spawnAgent(effectiveCwd, spec, opts.env ?? {}, forkSha, opts);
     },
   };
 }
