@@ -2973,6 +2973,176 @@ async function runRecovery(
  */
 type PromptLegPath = "first-pass-only" | "critique-retry" | "implementer-retry";
 
+const CRITIQUE_MARKERS = [
+  "CRITIQUE_CLEAN",
+  "CRITIQUE_NEEDS_FIXES",
+  "CRITIQUE_CRITICAL",
+] as const;
+type CritiqueVerdict = (typeof CRITIQUE_MARKERS)[number];
+
+/**
+ * Run the critique gate (ADR 0006) for one issue and return the
+ * (possibly retry-refreshed) postSha. Steps: no-rubric preflight →
+ * dispatch critique → parse verdict → on CRITIQUE_NEEDS_FIXES, one
+ * implementer-retry pass + re-critique.
+ *
+ * Throws {@link CritiqueCriticalError} on every blocking outcome (no rubric
+ * loaded, first-pass CRITICAL, malformed marker, retry disabled, or the
+ * retry pass still not CLEAN) so the runIssuePipeline catch handler can
+ * quarantine. Runs BEFORE migrations apply so a CRITICAL diff never
+ * pollutes the dev DB or gets marked in-progress in a way the outer loop
+ * has to undo.
+ *
+ * Applies its own graceful-degradation guard: issues with no type label or
+ * no required principles skip the gate and return postSha unchanged. The
+ * function is exported so the verdict/retry branching is unit-testable
+ * against a sandbox stub without driving the full runIssuePipeline loop.
+ */
+export async function runCritique(
+  sandbox: SandboxHandle,
+  ctx: PipelineCtx,
+  postSha: string,
+): Promise<{ postSha: string }> {
+  const typeLabel = ctx.typeLabel;
+  const requiredSkills = ctx.requiredSkills;
+  // Only gate issues whose type label maps to SANDCASTLE.md principles —
+  // `ctx.typeLabel`/`requiredSkills` undefined or empty means
+  // graceful-degradation skips the gate (e.g. issues with no type label,
+  // or type labels not in SANDCASTLE.md).
+  if (
+    typeLabel === undefined ||
+    requiredSkills === undefined ||
+    requiredSkills.length === 0
+  ) {
+    return { postSha };
+  }
+
+  // No-rubric preflight (ADR 0006 v3). The critique prompt's step 2
+  // silently skips principles without a `.claude/skills/<name>/SKILL.md`
+  // file on disk. If ALL required principles are missing their rubric,
+  // critique loads nothing and returns CRITIQUE_CLEAN regardless of the
+  // diff — silent abstention. Real regressions shipped via this path
+  // (caught later by the post-merge fixer). Quarantine here with a
+  // distinct reason code so the operator knows to install the missing
+  // SKILL.md files rather than hunting for a "real" critique blocker.
+  const loadable = findLoadableRubrics(requiredSkills, ctx.args.repoRoot);
+  if (loadable.length === 0) {
+    const missingPaths = requiredSkills
+      .map((n) => `- .claude/skills/${n}/SKILL.md`)
+      .join("\n");
+    ctx.deps.log(
+      `[critique] issue=${ctx.issueNumber} NO RUBRIC LOADED — ` +
+        `required principles ${requiredSkills.join(", ")} have zero ` +
+        `SKILL.md files on disk; quarantining without dispatching critique`,
+    );
+    throw new CritiqueCriticalError(
+      `Critique cannot grade this slice: zero rubric SKILL.md files ` +
+        `loaded for the issue's required principles ` +
+        `(${requiredSkills.join(", ")}).\n\n` +
+        `Expected at least one of:\n${missingPaths}\n\n` +
+        `Install the SKILL.md file(s) and re-queue the issue. Until then, ` +
+        `critique would silently abstain (return CLEAN with no grading) ` +
+        `for this slice and any other slice with the same required-` +
+        `principles set.`,
+      typeLabel,
+      { noRubricLoaded: true },
+    );
+  }
+
+  // One critique dispatch + verdict parse. marker=null means the sub-agent
+  // emitted no recognizable marker (malformed) — the caller fails closed
+  // per attempt. Collapses the two formerly-duplicated sandbox.run blocks.
+  const dispatchCritique = async (
+    name: string,
+  ): Promise<{ marker: CritiqueVerdict | null; stdout: string }> => {
+    const result = await sandbox.run({
+      name,
+      maxIterations: 1,
+      model: ctx.args.critiqueModel,
+      promptFile: "./.sandcastle/critique-prompt.md",
+      idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
+      promptArgs: {
+        ITERATION: String(ctx.iteration),
+        ISSUE_NUMBER: String(ctx.issueNumber),
+        TYPE_LABEL: typeLabel,
+        BRANCH: ctx.issue.branch,
+        BASE_BRANCH: ctx.args.branch,
+        REQUIRED_PRINCIPLES: requiredSkills.join(", "),
+      },
+    });
+    try {
+      return {
+        marker: extractMarker(result.stdout, CRITIQUE_MARKERS),
+        stdout: result.stdout,
+      };
+    } catch {
+      return { marker: null, stdout: result.stdout };
+    }
+  };
+
+  const a1 = await dispatchCritique(`critique (issue=${ctx.issueNumber})`);
+  if (a1.marker === null) {
+    // Malformed verdict (no marker at all) — fail closed by treating as
+    // CRITICAL with the full stdout as findings so the operator can see
+    // what happened.
+    throw new CritiqueCriticalError(a1.stdout, typeLabel);
+  }
+  ctx.deps.log(
+    `[critique] issue=${ctx.issueNumber} type=${typeLabel} verdict=${a1.marker}`,
+  );
+  if (a1.marker === "CRITIQUE_CRITICAL") {
+    // P0 / ban-list violations are structural; retry won't fix them.
+    throw new CritiqueCriticalError(a1.stdout, typeLabel);
+  }
+  if (a1.marker === "CRITIQUE_NEEDS_FIXES") {
+    // v2 retry path (ADR 0006): one implementer pass with critique findings
+    // as feedback, then re-critique. Ship on CLEAN, quarantine on still
+    // NEEDS_FIXES or any CRITICAL.
+    if (!ctx.args.retryEnabled) {
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} NEEDS_FIXES — retry disabled (--no-retry), quarantining`,
+      );
+      throw new CritiqueCriticalError(a1.stdout, typeLabel, {
+        retryExhausted: true,
+      });
+    }
+    ctx.deps.log(
+      `[critique] issue=${ctx.issueNumber} attempt 1 NEEDS_FIXES — ` +
+        `re-running implementer on ${ctx.args.implementerModel} with critique feedback`,
+    );
+    const implFix = await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      critiqueFeedback: a1.stdout,
+      requiredSkills,
+    });
+    // Refresh postSha — mirrors the HAS_BLOCKERS retry pattern. Without
+    // this, the caller's migration-journal validation block runs on a stale
+    // SHA range and silently skips any new migrations the retry-implementer
+    // added.
+    postSha = sandbox.worktreePath
+      ? await ctx.deps.captureSha(sandbox.worktreePath)
+      : (implFix.commits[implFix.commits.length - 1]?.sha ?? postSha);
+    const a2 = await dispatchCritique(
+      `critique-retry (issue=${ctx.issueNumber})`,
+    );
+    if (a2.marker === null) {
+      throw new CritiqueCriticalError(a2.stdout, typeLabel, {
+        retryExhausted: true,
+      });
+    }
+    ctx.deps.log(
+      `[critique] issue=${ctx.issueNumber} attempt 2 verdict=${a2.marker}`,
+    );
+    if (a2.marker !== "CRITIQUE_CLEAN") {
+      throw new CritiqueCriticalError(a2.stdout, typeLabel, {
+        retryExhausted: true,
+        criticalAfterRetry: a2.marker === "CRITIQUE_CRITICAL",
+      });
+    }
+  }
+  return { postSha };
+}
+
 async function shipAfterMigrations(
   ctx: PipelineCtx,
   sandbox: SandboxHandle,
@@ -2983,153 +3153,11 @@ async function shipAfterMigrations(
   legPath: PromptLegPath = "first-pass-only",
 ): Promise<IssueOutcome> {
   // Critique gate (ADR 0006). Runs BEFORE migrations apply so a
-  // CRITIQUE_CRITICAL diff doesn't pollute the dev DB or get marked as
-  // in-progress in a way the outer loop has to undo. Only runs when the
-  // issue has a type label that SANDCASTLE.md lists principles for —
-  // `ctx.typeLabel` undefined means graceful-degradation skips the gate
-  // (e.g., issues with no type label, or type labels not in SANDCASTLE.md).
-  if (
-    ctx.typeLabel !== undefined &&
-    ctx.requiredSkills !== undefined &&
-    ctx.requiredSkills.length > 0
-  ) {
-    // No-rubric preflight (ADR 0006 v3). The critique prompt's step 2
-    // silently skips principles without a `.claude/skills/<name>/SKILL.md`
-    // file on disk. If ALL required principles are missing their rubric,
-    // critique loads nothing and returns CRITIQUE_CLEAN regardless of the
-    // diff — silent abstention. Real regressions shipped via this path
-    // (caught later by the post-merge fixer). Quarantine here with a
-    // distinct reason code so the operator knows to install the missing
-    // SKILL.md files rather than hunting for a "real" critique blocker.
-    const loadable = findLoadableRubrics(ctx.requiredSkills, ctx.args.repoRoot);
-    if (loadable.length === 0) {
-      const missingPaths = ctx.requiredSkills
-        .map((n) => `- .claude/skills/${n}/SKILL.md`)
-        .join("\n");
-      ctx.deps.log(
-        `[critique] issue=${ctx.issueNumber} NO RUBRIC LOADED — ` +
-          `required principles ${ctx.requiredSkills.join(", ")} have zero ` +
-          `SKILL.md files on disk; quarantining without dispatching critique`,
-      );
-      throw new CritiqueCriticalError(
-        `Critique cannot grade this slice: zero rubric SKILL.md files ` +
-          `loaded for the issue's required principles ` +
-          `(${ctx.requiredSkills.join(", ")}).\n\n` +
-          `Expected at least one of:\n${missingPaths}\n\n` +
-          `Install the SKILL.md file(s) and re-queue the issue. Until then, ` +
-          `critique would silently abstain (return CLEAN with no grading) ` +
-          `for this slice and any other slice with the same required-` +
-          `principles set.`,
-        ctx.typeLabel,
-        { noRubricLoaded: true },
-      );
-    }
-    const critique = await sandbox.run({
-      name: `critique (issue=${ctx.issueNumber})`,
-      maxIterations: 1,
-      model: ctx.args.critiqueModel,
-      promptFile: "./.sandcastle/critique-prompt.md",
-      idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
-      promptArgs: {
-        ITERATION: String(ctx.iteration),
-        ISSUE_NUMBER: String(ctx.issueNumber),
-        TYPE_LABEL: ctx.typeLabel,
-        BRANCH: ctx.issue.branch,
-        BASE_BRANCH: ctx.args.branch,
-        REQUIRED_PRINCIPLES: ctx.requiredSkills.join(", "),
-      },
-    });
-    let verdict: "CRITIQUE_CLEAN" | "CRITIQUE_NEEDS_FIXES" | "CRITIQUE_CRITICAL";
-    try {
-      verdict = extractMarker(critique.stdout, [
-        "CRITIQUE_CLEAN",
-        "CRITIQUE_NEEDS_FIXES",
-        "CRITIQUE_CRITICAL",
-      ] as const);
-    } catch {
-      // Malformed verdict (no marker at all) — fail closed by treating as
-      // CRITICAL with the full stdout as findings so the operator can see
-      // what happened.
-      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel);
-    }
-    ctx.deps.log(
-      `[critique] issue=${ctx.issueNumber} type=${ctx.typeLabel} verdict=${verdict}`,
-    );
-    if (verdict === "CRITIQUE_CRITICAL") {
-      // P0 / ban-list violations are structural; retry won't fix them.
-      throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel);
-    }
-    if (verdict === "CRITIQUE_NEEDS_FIXES") {
-      // v2 retry path (ADR 0006): one implementer pass with critique
-      // findings as feedback, then re-critique. Ship on CLEAN, quarantine on
-      // still NEEDS_FIXES or any CRITICAL.
-      if (!ctx.args.retryEnabled) {
-        ctx.deps.log(
-          `[critique] issue=${ctx.issueNumber} NEEDS_FIXES — retry disabled (--no-retry), quarantining`,
-        );
-        throw new CritiqueCriticalError(critique.stdout, ctx.typeLabel, {
-          retryExhausted: true,
-        });
-      }
-      ctx.deps.log(
-        `[critique] issue=${ctx.issueNumber} attempt 1 NEEDS_FIXES — ` +
-          `re-running implementer on ${ctx.args.implementerModel} with critique feedback`,
-      );
-      const implFix = await runImplementer(sandbox, ctx, {
-        attemptNumber: 2,
-        critiqueFeedback: critique.stdout,
-        requiredSkills: ctx.requiredSkills,
-      });
-      // Refresh postSha — mirrors the HAS_BLOCKERS retry pattern. Without
-      // this, the migration-journal validation block below runs on stale SHA
-      // range and silently skips any new migrations the retry-implementer
-      // added.
-      const postShaRetry = sandbox.worktreePath
-        ? await ctx.deps.captureSha(sandbox.worktreePath)
-        : (implFix.commits[implFix.commits.length - 1]?.sha ?? postSha);
-      postSha = postShaRetry;
-      const critique2 = await sandbox.run({
-        name: `critique-retry (issue=${ctx.issueNumber})`,
-        maxIterations: 1,
-        model: ctx.args.critiqueModel,
-        promptFile: "./.sandcastle/critique-prompt.md",
-        idleTimeoutSeconds: ctx.args.reviewerTimeoutSec,
-        promptArgs: {
-          ITERATION: String(ctx.iteration),
-          ISSUE_NUMBER: String(ctx.issueNumber),
-          TYPE_LABEL: ctx.typeLabel,
-          BRANCH: ctx.issue.branch,
-          BASE_BRANCH: ctx.args.branch,
-          REQUIRED_PRINCIPLES: ctx.requiredSkills.join(", "),
-        },
-      });
-      let verdict2:
-        | "CRITIQUE_CLEAN"
-        | "CRITIQUE_NEEDS_FIXES"
-        | "CRITIQUE_CRITICAL";
-      try {
-        verdict2 = extractMarker(critique2.stdout, [
-          "CRITIQUE_CLEAN",
-          "CRITIQUE_NEEDS_FIXES",
-          "CRITIQUE_CRITICAL",
-        ] as const);
-      } catch {
-        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, {
-          retryExhausted: true,
-        });
-      }
-      ctx.deps.log(
-        `[critique] issue=${ctx.issueNumber} attempt 2 verdict=${verdict2}`,
-      );
-      if (verdict2 !== "CRITIQUE_CLEAN") {
-        throw new CritiqueCriticalError(critique2.stdout, ctx.typeLabel, {
-          retryExhausted: true,
-          criticalAfterRetry: verdict2 === "CRITIQUE_CRITICAL",
-        });
-      }
-      // Falls through to journal-validation + applyMigrations block below.
-    }
-  }
+  // CRITIQUE_CRITICAL diff never pollutes the dev DB or gets marked
+  // in-progress in a way the outer loop has to undo. runCritique applies
+  // its own type/required-skills graceful-degradation guard and returns the
+  // (retry-refreshed) postSha; it throws CritiqueCriticalError to quarantine.
+  postSha = (await runCritique(sandbox, ctx, postSha)).postSha;
   if (preSha !== "" && postSha !== "" && preSha !== postSha) {
     // Drizzle journal-registration gate. If the implementer added a new
     // <NNNN>_*.sql migration on disk but forgot to register it in

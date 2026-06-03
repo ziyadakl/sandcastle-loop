@@ -32,6 +32,7 @@ import { existsSync } from "node:fs";
 import {
   runMain,
   runImplementer,
+  runCritique,
   parsePlan,
   parseBlockedBy,
   buildBlockedByNote,
@@ -60,6 +61,8 @@ import {
 import {
   MissingRequiredSkillsError,
   validateRequiredSkillsInvoked,
+  CritiqueCriticalError,
+  critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
 import { parse as parseDotenv } from "dotenv";
@@ -3694,5 +3697,242 @@ describe("post-merge fixer skill-discipline union (telemetry helper)", () => {
     expect(union).toEqual(["impeccable", "polish"]);
     const { missing } = validateRequiredSkillsInvoked(union, fixerInvoked);
     expect(missing).toEqual(["polish"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runCritique — the critique gate's dispatch + verdict + retry ladder.
+//
+// Closes the disclosed integration-test gap: prior to the runCritique
+// extraction the gate was inline in the non-exported shipAfterMigrations and
+// only the pure helpers (findLoadableRubrics, critiqueErrorReasonCode) had
+// coverage — the dispatch/verdict/retry orchestration itself had none. These
+// drive runCritique directly against a per-name sandbox stub, asserting every
+// verdict outcome and the exact CritiqueCriticalError flags the
+// runIssuePipeline catch handler maps to quarantine reason codes.
+// ---------------------------------------------------------------------------
+describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
+  const ISSUE = 7;
+  const A1 = `critique (issue=${ISSUE})`;
+  const A2 = `critique-retry (issue=${ISSUE})`;
+  // runImplementer names the attempt-2 critique-retry leg with this bare
+  // marker (see the name ternary in runImplementer's sb.run spec).
+  const IMPL = "implementer-critique-retry";
+
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-critique-"));
+    // A loadable rubric so the no-rubric preflight passes for the dispatch
+    // tests (findLoadableRubrics resolves <repoRoot>/.claude/skills/<n>/SKILL.md).
+    mkdirSync(path.join(tmp, ".claude", "skills", "impeccable"), {
+      recursive: true,
+    });
+    writeFileSync(
+      path.join(tmp, ".claude", "skills", "impeccable", "SKILL.md"),
+      "# impeccable\n",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function critiqueArgs(): SandcastleArgs {
+    return { ...skillGateArgs(), repoRoot: tmp };
+  }
+
+  function critiqueCtx(over: { retryEnabled?: boolean } = {}) {
+    const issue: PlanIssue = {
+      id: String(ISSUE),
+      title: "critique test",
+      branch: `agent/issue-${ISSUE}`,
+    };
+    return {
+      args: { ...critiqueArgs(), retryEnabled: over.retryEnabled ?? true },
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: ISSUE,
+      issue,
+      requiredSkills: ["impeccable"] as readonly string[],
+      typeLabel: "type:new-component",
+    };
+  }
+
+  /** A sandbox whose run() returns a canned RunHandle keyed by run name, and
+   *  records the names it was asked to run. No worktreePath → the retry leg
+   *  derives postSha from the implementer's last commit, not captureSha. */
+  function makeCritiqueSandbox(byName: Record<string, RunHandle>): {
+    sandbox: SandboxHandle;
+    names: string[];
+  } {
+    const names: string[] = [];
+    const sandbox: SandboxHandle = {
+      branch: `agent/issue-${ISSUE}`,
+      run: async (opts) => {
+        names.push(opts.name);
+        const h = byName[opts.name];
+        if (!h) throw new Error(`unexpected run name=${opts.name}`);
+        return h;
+      },
+      close: async () => undefined,
+    };
+    return { sandbox, names };
+  }
+
+  async function catchErr(p: Promise<unknown>): Promise<unknown> {
+    try {
+      await p;
+      return undefined;
+    } catch (e) {
+      return e;
+    }
+  }
+
+  it("attempt-1 CRITIQUE_CLEAN → returns postSha unchanged, no throw", async () => {
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const r = await runCritique(sandbox, critiqueCtx(), "post-sha");
+    expect(r.postSha).toBe("post-sha");
+    expect(names).toEqual([A1]); // no retry dispatched
+  });
+
+  it("attempt-1 CRITIQUE_CRITICAL → throws first-pass critical (no retry flags)", async () => {
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "## Findings\n\n1. P0\n\nCRITIQUE_CRITICAL", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(false);
+    expect(e.criticalAfterRetry).toBe(false);
+    expect(e.noRubricLoaded).toBe(false);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-critical-fail");
+    expect(names).toEqual([A1]); // CRITICAL is structural — never retries
+  });
+
+  it("attempt-1 malformed (no marker) → fails closed as critical-fail", async () => {
+    const { sandbox } = makeCritiqueSandbox({
+      [A1]: { stdout: "I forgot to emit a marker line.", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(false);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-critical-fail");
+  });
+
+  it("NEEDS_FIXES → retry → CLEAN → ships, returns refreshed postSha", async () => {
+    const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "## Findings\n\n1. P1\n\nCRITIQUE_NEEDS_FIXES", commits: [] },
+      [IMPL]: {
+        stdout: implementerStdout({ ghIssue: ISSUE }),
+        commits: [{ sha: "retry-sha" }],
+        iterations: [{ sessionFilePath: implJsonl }],
+      },
+      [A2]: { stdout: "fixed now\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const r = await runCritique(sandbox, critiqueCtx(), "post-sha");
+    expect(r.postSha).toBe("retry-sha"); // refreshed from the retry implementer
+    expect(names).toEqual([A1, IMPL, A2]);
+  });
+
+  it("NEEDS_FIXES → retry → CRITICAL → throws critical-introduced-by-retry", async () => {
+    const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
+    const { sandbox } = makeCritiqueSandbox({
+      [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
+      [IMPL]: {
+        stdout: implementerStdout({ ghIssue: ISSUE }),
+        commits: [],
+        iterations: [{ sessionFilePath: implJsonl }],
+      },
+      [A2]: { stdout: "## Findings\n\n1. P0\n\nCRITIQUE_CRITICAL", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(true);
+    expect(e.criticalAfterRetry).toBe(true);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-retry-critical");
+  });
+
+  it("NEEDS_FIXES → retry → still NEEDS_FIXES → quarantines retry-exhausted", async () => {
+    const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
+    const { sandbox } = makeCritiqueSandbox({
+      [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
+      [IMPL]: {
+        stdout: implementerStdout({ ghIssue: ISSUE }),
+        commits: [],
+        iterations: [{ sessionFilePath: implJsonl }],
+      },
+      [A2]: { stdout: "## Findings\n\n1. P1\n\nCRITIQUE_NEEDS_FIXES", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(true);
+    expect(e.criticalAfterRetry).toBe(false); // unresolved, not newly-critical
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe(
+      "critique-retry-exhausted",
+    );
+  });
+
+  it("retry attempt-2 malformed marker → quarantines retry-exhausted (not retry-critical)", async () => {
+    const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
+    const { sandbox } = makeCritiqueSandbox({
+      [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
+      [IMPL]: {
+        stdout: implementerStdout({ ghIssue: ISSUE }),
+        commits: [],
+        iterations: [{ sessionFilePath: implJsonl }],
+      },
+      [A2]: { stdout: "the retry critic forgot to emit a marker", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(true);
+    expect(e.criticalAfterRetry).toBe(false); // malformed ≠ critical-after-retry
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe(
+      "critique-retry-exhausted",
+    );
+  });
+
+  it("NEEDS_FIXES with retry disabled → quarantines without dispatching the implementer", async () => {
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
+    });
+    const err = await catchErr(
+      runCritique(sandbox, critiqueCtx({ retryEnabled: false }), "post-sha"),
+    );
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(true);
+    expect(e.criticalAfterRetry).toBe(false);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe(
+      "critique-retry-exhausted",
+    );
+    expect(names).toEqual([A1]); // implementer never ran
+  });
+
+  it("no rubric loaded → throws noRubricLoaded WITHOUT dispatching critique", async () => {
+    const { sandbox, names } = makeCritiqueSandbox({});
+    const ctx = {
+      ...critiqueCtx(),
+      // A principle name guaranteed absent from BOTH the tmp repoRoot and the
+      // real ~/.claude/skills/ — runCritique calls findLoadableRubrics with
+      // the default homeDir, so the name must be one host state can't supply.
+      requiredSkills: ["__nonexistent_principle__"] as readonly string[],
+    };
+    const err = await catchErr(runCritique(sandbox, ctx, "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.noRubricLoaded).toBe(true);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe(
+      "critique-no-rubric-loaded",
+    );
+    expect(names).toEqual([]); // preflight quarantines before any dispatch
   });
 });
