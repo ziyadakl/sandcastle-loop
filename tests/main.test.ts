@@ -31,6 +31,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   runMain,
+  runImplementer,
   parsePlan,
   parseSandcastleArgs,
   preflight,
@@ -52,7 +53,12 @@ import {
   type CreateSandboxSpec,
   type RunHandle,
   type SandboxHandle,
+  type PlanIssue,
 } from "../.sandcastle/main.mjs";
+import {
+  MissingRequiredSkillsError,
+  validateRequiredSkillsInvoked,
+} from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
@@ -277,6 +283,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     plannerModel: "claude-opus-4-7",
     implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
+    critiqueModel: "claude-haiku-4-5",
     mergerModel: "claude-opus-4-7",
     postMergeReviewerModel: "claude-opus-4-7",
     recoveryModel: "claude-opus-4-7",
@@ -3038,5 +3045,392 @@ describe("runMain — restart on .sandcastle/** change", () => {
       if (prev === undefined) delete process.env.SANDCASTLE_REMAINING_ITERATIONS;
       else process.env.SANDCASTLE_REMAINING_ITERATIONS = prev;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Critique-as-gate / skill-discipline weave (ADR 0006 v3 / v3.2)
+//
+// These exercise the orchestrator-side weave added to main.mts:
+//   1. runImplementer's per-issue skill-discipline HARD gate (throw →
+//      MissingRequiredSkillsError → skill-discipline-fail quarantine).
+//   2. runImplementer's REQUIRED_SKILLS prompt-arg linkage.
+//   3. The post-merge-fixer WARN-only union telemetry shape.
+// Pure-library coverage (findLoadableRubrics, critiqueErrorReasonCode,
+// parseRequiredSkillsByType, validateRequiredSkillsInvoked, etc.) lives in
+// tests/skill-discipline.test.ts — the template splits orchestrator-behavior
+// tests (here) from library-unit tests (there), so those blocks are NOT
+// duplicated into this file.
+// ---------------------------------------------------------------------------
+
+/** Write a session JSONL fixture whose assistant turns each carry one
+ *  `Skill(<name>)` tool_use block — the shape
+ *  extractSkillInvocationsFromSession parses. */
+function writeSessionJsonl(
+  dir: string,
+  name: string,
+  skills: readonly string[],
+): string {
+  const p = path.join(dir, name);
+  const lines: string[] = [];
+  for (const s of skills) {
+    lines.push(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", name: "Skill", input: { skill: s } }],
+        },
+      }),
+    );
+  }
+  writeFileSync(p, lines.join("\n") + "\n");
+  return p;
+}
+
+/** Build a minimal SandboxHandle whose `run()` returns a RunHandle pointing
+ *  at the given JSONL fixture. runImplementer doesn't care about commits
+ *  (attempt 2 path) or stdout shape (rebuttal/halt branches skip parsing),
+ *  so both are minimal. attemptNumber=2 bypasses `requireCommits` — the gate
+ *  runs BEFORE it anyway, but skipping it keeps the fixture simpler. */
+function makeMockSandbox(sessionFilePath: string): SandboxHandle {
+  const handle: RunHandle = {
+    stdout: "<rebuttal>noop</rebuttal>",
+    commits: [],
+    iterations: [{ sessionFilePath }],
+  };
+  return {
+    branch: "agent/issue-1",
+    run: async () => handle,
+    close: async () => undefined,
+  };
+}
+
+/** Minimal Deps for runImplementer. The implementer only touches `log` and
+ *  `logError` (no rate-limit thrown), so the remaining stubs are unused but
+ *  must satisfy the type. */
+function makeNoopDeps(): Deps {
+  const unused = (): Promise<never> => {
+    throw new Error("noop dep called");
+  };
+  return {
+    run: unused,
+    createSandbox: unused,
+    claim: unused,
+    markDone: unused,
+    markMergedToStaging: unused,
+    promoteStagingToDone: unused,
+    quarantine: unused,
+    release: unused,
+    comment: unused,
+    listIssuesByLabel: unused,
+    applyMigrations: unused,
+    validateMigrationJournal: unused,
+    captureSha: unused,
+    log: () => undefined,
+    logError: () => undefined,
+  };
+}
+
+function skillGateArgs(): SandcastleArgs {
+  return {
+    iterations: 1,
+    repoRoot: "/repo",
+    branch: "main",
+    label: "ready-for-agent",
+    maxConcurrent: 1,
+    plannerModel: "stub-planner",
+    implementerModel: "stub-implementer",
+    reviewerModel: "stub-reviewer",
+    critiqueModel: "stub-critique",
+    mergerModel: "stub-merger",
+    postMergeReviewerModel: "stub-pmr",
+    recoveryModel: "stub-recovery",
+    implementerTimeoutSec: 60,
+    reviewerTimeoutSec: 60,
+    hardCeilingSec: 60,
+    consecutiveFailureLimit: 5,
+    dryRun: true,
+    recoveryEnabled: false,
+    retryEnabled: true,
+    stagingEnabled: false,
+  } as SandcastleArgs;
+}
+
+describe("runImplementer skill-discipline gate", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-skill-gate-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("throws MissingRequiredSkillsError when the session JSONL lacks a required Skill() invocation (re-promoted per ADR 0006 v3)", async () => {
+    // Per ADR 0006 v3, the per-issue skill-discipline gate is RE-PROMOTED
+    // from telemetry-only (v1) back to throw → quarantine. Critique-as-
+    // gate silently abstains on issues whose required principles lack
+    // SKILL.md rubric files, so the skill-discipline gate is the hard
+    // backstop. This test verifies the gate throws and carries the
+    // structured missing/invoked/required/issueNumber fields the
+    // orchestrator's quarantine path consumes.
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", ["impeccable"]);
+    const sandbox = makeMockSandbox(jsonl);
+    const issue: PlanIssue = {
+      id: "1",
+      title: "test issue",
+      branch: "agent/issue-1",
+    };
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 42,
+      issue,
+      requiredSkills: ["impeccable", "polish"] as readonly string[],
+    };
+    await expect(
+      runImplementer(sandbox, ctx, {
+        attemptNumber: 2, // bypass requireCommits
+        requiredSkills: ctx.requiredSkills,
+      }),
+    ).rejects.toThrowError(MissingRequiredSkillsError);
+
+    // Re-run to inspect the thrown error's structured fields.
+    let caught: unknown;
+    try {
+      await runImplementer(sandbox, ctx, {
+        attemptNumber: 2,
+        requiredSkills: ctx.requiredSkills,
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(MissingRequiredSkillsError);
+    const err = caught as MissingRequiredSkillsError;
+    expect(err.missing).toEqual(["polish"]);
+    expect(err.invoked).toEqual(["impeccable"]);
+    expect(err.required).toEqual(["impeccable", "polish"]);
+    expect(err.issueNumber).toBe(42);
+  });
+
+  it("does not throw when all required Skill() invocations are present", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", [
+      "impeccable",
+      "polish",
+    ]);
+    const sandbox = makeMockSandbox(jsonl);
+    const issue: PlanIssue = {
+      id: "1",
+      title: "test issue",
+      branch: "agent/issue-1",
+    };
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 1,
+      issue,
+    };
+    const r = await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      requiredSkills: ["impeccable", "polish"],
+    });
+    expect(r.skillsInvoked).toEqual(["impeccable", "polish"]);
+  });
+
+  it("does not throw when opts.requiredSkills is undefined (backward compat for projects without SANDCASTLE.md)", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", ["impeccable"]);
+    const sandbox = makeMockSandbox(jsonl);
+    const issue: PlanIssue = {
+      id: "1",
+      title: "test issue",
+      branch: "agent/issue-1",
+    };
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 1,
+      issue,
+    };
+    const r = await runImplementer(sandbox, ctx, { attemptNumber: 2 });
+    expect(r.skillsInvoked).toEqual(["impeccable"]);
+  });
+
+  it("does not throw when opts.requiredSkills is empty (type:cleanup case)", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeMockSandbox(jsonl);
+    const issue: PlanIssue = {
+      id: "1",
+      title: "test issue",
+      branch: "agent/issue-1",
+    };
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 1,
+      issue,
+    };
+    const r = await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      requiredSkills: [],
+    });
+    expect(r.skillsInvoked).toEqual([]);
+  });
+});
+
+describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", () => {
+  // The v3 re-promotion turned skill-discipline into a hard throw, but the
+  // implementer prompt didn't tell the model the rule changed. v3.2 closes
+  // the loop: the prompt now reads {{REQUIRED_SKILLS}} and instructs the
+  // model to invoke Skill(<name>) for each principle. These tests verify the
+  // orchestrator-side wiring — that opts.requiredSkills reaches the
+  // implementer's promptArgs as a comma-joined string — so future refactors
+  // can't silently break the linkage.
+
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-prompt-args-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** Sandbox whose `run()` captures the opts it was called with so tests can
+   *  assert on promptArgs. Returns a successful no-op iteration so the rest
+   *  of runImplementer (skill extraction, gate validation) sees a
+   *  fully-invoked principle set and doesn't throw before we check args. */
+  function makeCapturingSandbox(
+    sessionFilePath: string,
+  ): SandboxHandle & { captured: Record<string, unknown>[] } {
+    const captured: Record<string, unknown>[] = [];
+    const handle: RunHandle = {
+      stdout: "<rebuttal>noop</rebuttal>",
+      commits: [],
+      iterations: [{ sessionFilePath }],
+    };
+    const sb: SandboxHandle = {
+      branch: "agent/issue-1",
+      run: async (opts) => {
+        captured.push(opts as unknown as Record<string, unknown>);
+        return handle;
+      },
+      close: async () => undefined,
+    };
+    return Object.assign(sb, { captured });
+  }
+
+  it("threads opts.requiredSkills into promptArgs as comma-joined REQUIRED_SKILLS", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", [
+      "impeccable",
+      "layout",
+      "clarify",
+      "polish",
+      "glass-morphism",
+      "context7-docs",
+    ]);
+    const sandbox = makeCapturingSandbox(jsonl);
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 310,
+      issue: {
+        id: "310",
+        title: "10-Item soft cap",
+        branch: "agent/issue-310",
+      },
+    };
+    await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      requiredSkills: [
+        "impeccable",
+        "layout",
+        "clarify",
+        "polish",
+        "glass-morphism",
+        "context7-docs",
+      ],
+    });
+    expect(sandbox.captured).toHaveLength(1);
+    const promptArgs = sandbox.captured[0]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(promptArgs.REQUIRED_SKILLS).toBe(
+      "impeccable, layout, clarify, polish, glass-morphism, context7-docs",
+    );
+  });
+
+  it("passes REQUIRED_SKILLS='' when opts.requiredSkills is undefined (no SANDCASTLE.md)", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeCapturingSandbox(jsonl);
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 1,
+      issue: { id: "1", title: "test", branch: "agent/issue-1" },
+    };
+    await runImplementer(sandbox, ctx, { attemptNumber: 2 });
+    expect(sandbox.captured).toHaveLength(1);
+    const promptArgs = sandbox.captured[0]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(promptArgs.REQUIRED_SKILLS).toBe("");
+  });
+
+  it("passes REQUIRED_SKILLS='' when opts.requiredSkills is an empty list (type:cleanup case)", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeCapturingSandbox(jsonl);
+    const ctx = {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 1,
+      issue: { id: "1", title: "test", branch: "agent/issue-1" },
+    };
+    await runImplementer(sandbox, ctx, {
+      attemptNumber: 2,
+      requiredSkills: [],
+    });
+    expect(sandbox.captured).toHaveLength(1);
+    const promptArgs = sandbox.captured[0]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(promptArgs.REQUIRED_SKILLS).toBe("");
+  });
+});
+
+describe("post-merge fixer skill-discipline union (telemetry helper)", () => {
+  // The post-merge fixer gate is WARN-only telemetry (ADR 0006 extended).
+  // The union-compute logic is exercised — host code uses it to format the
+  // WARN log — so we keep this thin shape assertion on
+  // validateRequiredSkillsInvoked over a UNION-style input. Nothing throws.
+  it("computes missing skills from the UNION across rollup issues", () => {
+    const issueRequirements: Array<readonly string[]> = [
+      ["impeccable"],
+      ["polish"],
+    ];
+    const fixerInvoked: readonly string[] = ["impeccable"];
+    const unionSet = new Set<string>();
+    const union: string[] = [];
+    for (const req of issueRequirements) {
+      for (const s of req) {
+        if (unionSet.has(s)) continue;
+        unionSet.add(s);
+        union.push(s);
+      }
+    }
+    expect(union).toEqual(["impeccable", "polish"]);
+    const { missing } = validateRequiredSkillsInvoked(union, fixerInvoked);
+    expect(missing).toEqual(["polish"]);
   });
 });

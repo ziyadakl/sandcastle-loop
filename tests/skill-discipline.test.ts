@@ -596,6 +596,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     plannerModel: "claude-opus-4-7",
     implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
+    critiqueModel: "claude-haiku-4-5",
     mergerModel: "claude-opus-4-7",
     postMergeReviewerModel: "claude-opus-4-7",
     recoveryModel: "claude-opus-4-7",
