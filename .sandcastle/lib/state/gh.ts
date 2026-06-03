@@ -658,6 +658,68 @@ export interface LabelledIssueSummary {
   labels: string[];
 }
 
+export interface OpenIssueWithBody {
+  number: number;
+  body: string;
+  labels: string[];
+}
+
+const OpenIssueRow = z.object({
+  number: z.number().int(),
+  body: z.string().nullable().optional(),
+  labels: z.array(z.object({ name: z.string() })),
+});
+const OpenIssueRows = z.array(OpenIssueRow);
+
+/**
+ * List ALL open issues with their body markdown + labels (no label filter).
+ *
+ * Used by the loop driver's "no claimable issues" exit (Issue E) to surface
+ * `Blocked by: #N` chains: it needs the set of every open issue number to
+ * decide whether a blocker referenced by a `ready-for-agent` issue is still
+ * open, and the bodies to find the directives. A blocker is typically
+ * `in-progress` (not `ready-for-agent`), so a label-filtered query wouldn't
+ * see it — hence "all open".
+ *
+ * Caps at 100 results (same pagination caveat as the other list helpers).
+ */
+export async function listOpenIssuesWithBodies(): Promise<OpenIssueWithBody[]> {
+  const { stdout } = await runGh([
+    "issue",
+    "list",
+    "--state",
+    "open",
+    "--json",
+    "number,body,labels",
+    "--limit",
+    "100",
+  ]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout || "[]");
+  } catch (err) {
+    throw new Error(
+      `listOpenIssuesWithBodies: failed to parse gh output as JSON: ${
+        (err as Error).message
+      }`,
+    );
+  }
+  const result = OpenIssueRows.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `listOpenIssuesWithBodies: unexpected gh output shape: ${result.error.message}`,
+    );
+  }
+  const summaries: OpenIssueWithBody[] = result.data.map((row) => ({
+    number: row.number,
+    body: row.body ?? "",
+    labels: row.labels.map((l) => l.name),
+  }));
+  summaries.sort((a, b) => a.number - b.number);
+  warnIfHitLimit(summaries.length, "listOpenIssuesWithBodies");
+  return summaries;
+}
+
 const LabelledIssueRow = z.object({
   number: z.number().int(),
   title: z.string(),
