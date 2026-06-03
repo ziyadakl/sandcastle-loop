@@ -43,3 +43,11 @@ Affinity-tracker's `package.json` likely has a `packageManager: "pnpm@10.19.0"` 
 - Pass the env var through `buildDefaultDeps` instead of baking into the image (more flexible per-project).
 
 **Where to look:** `.sandcastle/Dockerfile` — corepack is enabled there but not pre-warmed.
+
+## 3. mac-host provider: missing SDK parity for built-in args and shell-block preprocessing
+
+**Severity:** Low (latent). No existing prompt file in `.sandcastle/` references the built-in keys, so the gap is invisible today. Becomes a correctness bug the first time a prompt references `{{SOURCE_BRANCH}}` / `{{TARGET_BRANCH}}` or relies on `!`...`` block expansion on the mac-host path.
+
+**Where:** `.sandcastle/lib/mac-host-sandbox.ts` — `applyPromptArgs` mirrors the SDK's `substitutePromptArgs` regex and fail-loud-on-missing-key contract, but does not (a) auto-inject `SOURCE_BRANCH` / `TARGET_BRANCH` from the worktree/host branch, nor (b) run the preprocessor that executes `!`shell`` blocks and inlines their output.
+
+**Fix outline:** Add the two built-ins to `applyPromptArgs` (or a wrapper) at the `spawnAgent` call site, populating `SOURCE_BRANCH` from the worktree branch and `TARGET_BRANCH` from `git rev-parse --abbrev-ref HEAD` in `repoRoot`. Shell-block preprocessing is a larger lift — port or call the SDK's `PromptPreprocessor`, which would also need a shell-block sanitization pass on arg values.

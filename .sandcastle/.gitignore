@@ -3,3 +3,4 @@ logs/
 worktrees/
 .restart-remaining
 .loop.lock
+.sandbox-flag

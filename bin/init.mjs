@@ -13,7 +13,7 @@ import {
   rmSync,
 } from "node:fs";
 import { resolve, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 
@@ -135,6 +135,21 @@ function injectIntoProjectPackageJson() {
   return added;
 }
 
+export function detectActiveProfile(targetDir) {
+  const entries = readdirSync(targetDir);
+  if (
+    entries.some(
+      (e) => e.endsWith(".xcodeproj") || e.endsWith(".xcworkspace"),
+    )
+  ) {
+    return "mac-host";
+  }
+  if (existsSync(join(targetDir, "Package.swift"))) {
+    return "mac-host";
+  }
+  return "minimal";
+}
+
 function main() {
   const sub = process.argv[2];
   if (sub && sub !== "init") {
@@ -153,15 +168,25 @@ function main() {
   );
   const addedDeps = injectIntoProjectPackageJson();
 
+  const profile = detectActiveProfile(TARGET_ROOT);
+  const sandboxFlag = profile === "mac-host" ? "mac-host" : "docker";
+  writeFileSync(
+    resolve(TARGET_ROOT, ".sandcastle/.sandbox-flag"),
+    sandboxFlag + "\n",
+  );
+
   console.log("- Copied template files to .sandcastle/");
   console.log("- Added 'sandcastle' script to package.json");
   if (addedDeps > 0) {
     console.log(`- Added ${addedDeps} devDependencies to package.json`);
   }
+  console.log(`- Detected profile: ${profile} (sandbox: ${sandboxFlag})`);
   console.log("");
   console.log("Next steps:");
   console.log("  1. pnpm install");
   console.log("  2. pnpm sandcastle --iterations 50 --max-concurrent 2 --branch <feature>");
 }
 
-main();
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

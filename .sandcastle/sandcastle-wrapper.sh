@@ -24,8 +24,19 @@ else
   RUNNER=(tsx .sandcastle/main.mts)
 fi
 
+# Forward .sandcastle/.sandbox-flag as --sandbox to main.mts. The file is
+# produced by the /sandcastle-profile skill when a profile is activated.
+# Evaluated once at launch; restart to pick up profile switches.
+SANDBOX_FLAG=""
+if [ -f .sandcastle/.sandbox-flag ]; then
+  SANDBOX_VALUE=$(tr -d '[:space:]' < .sandcastle/.sandbox-flag)
+  if [ -n "$SANDBOX_VALUE" ]; then
+    SANDBOX_FLAG="--sandbox $SANDBOX_VALUE"
+  fi
+fi
+
 while true; do
-  "${RUNNER[@]}" "$@"
+  "${RUNNER[@]}" "$@" $SANDBOX_FLAG
   code=$?
   if [ "$code" -ne "$RESTART_EXIT_CODE" ]; then
     exit "$code"

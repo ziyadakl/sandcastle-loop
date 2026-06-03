@@ -28,8 +28,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import * as sandcastle from "@ai-hero/sandcastle";
-import { docker, defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
+import { defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
   claimViaLabel,
@@ -67,6 +66,11 @@ import {
   isProviderName,
   type ProviderName,
 } from "./providers.js";
+import { worktreePathFor } from "./lib/worktree-path.js";
+import {
+  buildSandboxProvider,
+  type SandboxProvider,
+} from "./lib/sandbox-provider.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -189,6 +193,14 @@ export interface SandcastleArgs {
    * "tweak-then-test-then-commit" workflows in the template repo itself.
    */
   allowDirtySandcastle: boolean;
+  /**
+   * Sandbox provider. `"docker"` (default) runs each agent inside an
+   * ephemeral Docker container. `"mac-host"` skips the container and
+   * runs the agent natively on the macOS host — useful for development
+   * on Apple Silicon where Docker-in-Docker or nested virtualisation is
+   * unavailable. Wired via `--sandbox docker|mac-host`.
+   */
+  sandbox: "docker" | "mac-host";
 }
 
 /**
@@ -423,6 +435,8 @@ Optional:
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
                             matching 'sandcastle docker build-image'.
+  --sandbox PROVIDER        Sandbox provider: docker (default) or mac-host
+                            (no container — runs agent natively on macOS host).
   --allow-dirty-sandcastle  Skip the preflight check that refuses launch
                             when .sandcastle/main.mts has uncommitted
                             modifications vs HEAD. The check exists to
@@ -476,6 +490,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
+      "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
       "help": { type: "boolean" },
@@ -528,6 +543,17 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       ? defaultCodingModelFor(provider)
       : models.implementer.default);
 
+  const sandbox: "docker" | "mac-host" = (() => {
+    const v = values.sandbox;
+    if (v === undefined) return "docker";
+    if (v !== "docker" && v !== "mac-host") {
+      throw new Error(
+        `--sandbox: expected one of docker|mac-host, got ${JSON.stringify(v)}`,
+      );
+    }
+    return v;
+  })();
+
   const args: SandcastleArgs = {
     iterations: effectiveIterations,
     issue,
@@ -567,6 +593,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     retryEnabled: values["no-retry"] !== true,
     stagingEnabled: values["no-staging"] !== true,
     provider,
+    sandbox,
     imageName:
       values["image-name"] ??
       defaultImageName(path.resolve(values["repo-root"] ?? process.cwd())),
@@ -627,6 +654,7 @@ function defaultArgs(): SandcastleArgs {
     stagingEnabled: true,
     imageName: defaultImageName(process.cwd()),
     allowDirtySandcastle: false,
+    sandbox: "docker",
   };
 }
 
@@ -808,23 +836,27 @@ export function preflight(args: SandcastleArgs, opts: {
     if (!fileExists(full)) errors.push(`missing prompt file: ${full}`);
   }
 
-  // 5. docker daemon
-  const dk = exec("docker", ["info"]);
-  if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
+  // 5. docker daemon — only required when using the docker sandbox provider.
+  // The mac-host path runs no Docker commands, so skip this to avoid blocking
+  // startup if Docker isn't running on the host.
+  if (args.sandbox === "docker") {
+    const dk = exec("docker", ["info"]);
+    if (!dk.ok) errors.push(`docker info failed: ${dk.stderr ?? "unknown"}`);
 
-  // 6. project's sandbox image exists locally. Without this check, iteration
-  // 1 immediately fails with "Image '<name>' not found locally" after the
-  // planner has already booted — wasted setup + confusing first-run UX on
-  // any fresh worktree or post-`docker prune` machine. Catch at boot
-  // instead and point the user at the build command.
-  if (dk.ok) {
-    const img = exec("docker", ["image", "inspect", args.imageName]);
-    if (!img.ok) {
-      errors.push(
-        `sandbox image '${args.imageName}' not found locally. Build it with: ` +
-          `node_modules/.bin/sandcastle docker build-image --image-name ` +
-          `${args.imageName} --dockerfile .sandcastle/Dockerfile`,
-      );
+    // 6. project's sandbox image exists locally. Without this check, iteration
+    // 1 immediately fails with "Image '<name>' not found locally" after the
+    // planner has already booted — wasted setup + confusing first-run UX on
+    // any fresh worktree or post-`docker prune` machine. Catch at boot
+    // instead and point the user at the build command.
+    if (dk.ok) {
+      const img = exec("docker", ["image", "inspect", args.imageName]);
+      if (!img.ok) {
+        errors.push(
+          `sandbox image '${args.imageName}' not found locally. Build it with: ` +
+            `node_modules/.bin/sandcastle docker build-image --image-name ` +
+            `${args.imageName} --dockerfile .sandcastle/Dockerfile`,
+        );
+      }
     }
   }
 
@@ -1591,6 +1623,13 @@ export function withHardCeiling<T>(
   return invoke(controller.signal).finally(() => clearTimeout(timer));
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox provider construction lives in `./lib/sandbox-provider.ts` — both
+// docker and mac-host implement the same uniform `SandboxProvider` shape,
+// so `buildDefaultDeps` below picks one and calls `provider.topLevelRun` /
+// `provider.createSandbox` without branching on the provider kind.
+// ---------------------------------------------------------------------------
+
 /**
  * Build the production {@link Deps} bag — wires sandcastle.run /
  * sandcastle.createSandbox / src/state/gh.ts wrappers / src/migrations/.
@@ -1630,32 +1669,15 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   const writeProjectDotenv = {
     command: WRITE_PROJECT_DOTENV_COMMAND,
   };
-  const hooks = {
+  // Docker `onSandboxReady` hooks. mac-host never reaches sandcastle.createSandbox
+  // so it carries no analogous concept; if mac-host ever grows hook support
+  // it'll live in MacHostProviderConfig, not as a shared variable.
+  const dockerHooks = {
     sandbox: {
       onSandboxReady: [writeProjectDotenv, { command: "CI=true pnpm install" }],
     },
   } as const;
   const copyToWorktree = ["node_modules"];
-
-  // Auth mounts — sandcastle's docker provider does NOT auto-mount these.
-  // Without them, `claude` and `gh` inside the container can't see the host's
-  // session and fail with "Not logged in" / "no auth" errors.
-  //
-  // Note: we deliberately do NOT mount ~/.gitconfig. Single-file bind mounts
-  // in Docker fail with "Device or resource busy" when anyone (sandcastle's
-  // own setup, or the agent) tries to update the file via the standard
-  // write-temp-then-rename pattern that git config uses. Instead we read
-  // user.name / user.email from the host's gitconfig at CLI startup and
-  // pass them as GIT_* env vars (see buildGitEnv below).
-  const authMounts = [
-    { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
-    { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
-  ] as const;
-  const buildMounts = (extra?: readonly { hostPath: string; sandboxPath: string; readonly?: boolean }[]) => {
-    return extra && extra.length > 0
-      ? { mounts: [...authMounts, ...extra] }
-      : { mounts: [...authMounts] };
-  };
 
   // Read git user identity from the host at CLI startup. The container's
   // safe.directory will be set up by sandcastle itself; user.name/user.email
@@ -1678,6 +1700,21 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
   };
 
+  // Pick sandbox provider once. Both docker and mac-host implement the same
+  // `SandboxProvider` shape so the methods below call provider.topLevelRun /
+  // provider.createSandbox uniformly. Docker-only construction config (hooks,
+  // copyToWorktree, completionSignal, copyToWorktreeMs) is baked into the
+  // adapter and ignored on the mac-host path.
+  const provider: SandboxProvider = buildSandboxProvider(args, containerEnv, {
+    hooks: dockerHooks,
+    copyToWorktree,
+    copyToWorktreeMs: 600_000,
+    completionSignal: [
+      "<promise>COMPLETE</promise>",
+      "<promise>HALT</promise>",
+    ],
+  });
+
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
       `[dry-run] ${action} ${rest.map((r) => JSON.stringify(r)).join(" ")}\n`,
@@ -1685,16 +1722,10 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   };
 
   // Sandcastle's default completion signal is `<promise>COMPLETE</promise>`.
-  // The implementer prompt also has `<promise>HALT</promise>` for blocked
-  // stories, but sandcastle didn't recognise HALT as terminal — so on the
-  // 2026-05-08 issue #83 smoke test, the implementer HALTed cleanly on
-  // iteration 1 and sandcastle then re-ran it 5+ more times burning Sonnet
-  // tokens. Treat HALT as a completion signal too. Other agents that don't
-  // emit HALT are unaffected.
-  const completionSignal = [
-    "<promise>COMPLETE</promise>",
-    "<promise>HALT</promise>",
-  ];
+  // We also accept `<promise>HALT</promise>` so the implementer's blocked-
+  // story signal terminates cleanly — see provider config above. (Without
+  // this, a HALT on iteration 1 would loop until the model token budget
+  // exhausted; bit issue #83 on the 2026-05-08 smoke.)
 
   const ceilingMs = args.hardCeilingSec * 1000;
   const withCeiling = <T,>(
@@ -1706,25 +1737,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     async run(spec) {
       // Top-level runs (planner, merger) don't need `pnpm install` — the
       // planner just calls `gh` + reads files, the merger just runs `git
-      // merge`. Running the hook here previously failed the merger every
-      // time on a fresh sandbox because it doesn't get copyToWorktree's
-      // node_modules so the install starts from scratch on a 1.7 GB
-      // monorepo and trips workspace catalog errors.
+      // merge`. Provider-specific knobs (hooks, completionSignal, mounts)
+      // live inside the SandboxProvider adapter — see lib/sandbox-provider.ts.
       const result = await withCeiling(
         `top-level run "${spec.name}"`,
-        (signal) =>
-          sandcastle.run({
-            sandbox: docker({ imageName: args.imageName, env: containerEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
-            cwd: spec.cwd ?? args.repoRoot,
-            name: spec.name,
-            maxIterations: spec.maxIterations ?? 1,
-            agent: sandcastle.claudeCode(spec.model, { env: envForModel(spec.model) }),
-            promptFile: spec.promptFile,
-            promptArgs: spec.promptArgs,
-            idleTimeoutSeconds: spec.idleTimeoutSeconds,
-            completionSignal,
-            signal,
-          }),
+        (signal) => provider.topLevelRun({ ...spec, signal }),
       );
       return { stdout: result.stdout, commits: result.commits };
     },
@@ -1742,6 +1759,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       //   2. Orphan dir git doesn't know about → `rmSync` removes it.
       //   3. Dangling registration with no dir → `git worktree prune`
       //      clears the registration so a fresh `add` succeeds.
+      // Note: the mac-host provider runs its own pre-clean inside
+      // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
+      // The outer pre-clean here is redundant on the mac-host path but
+      // idempotent — letting it run keeps the orchestrator-side cleanup
+      // contract identical across providers.
       const wtPath = path.join(
         args.repoRoot,
         worktreePathFor(spec.branch),
@@ -1779,16 +1801,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // a no-op for the default Anthropic case.
       const implEnv = envForModel(spec.implementerModel);
       const sandboxEnv = { ...containerEnv, ...implEnv };
-      const handle = await sandcastle.createSandbox({
+
+      const handle = await provider.createSandbox({
         branch: spec.branch,
-        sandbox: docker({ imageName: args.imageName, env: sandboxEnv, containerUid: 1001, containerGid: 1001, ...buildMounts(spec.mounts) }),
-        cwd: args.repoRoot,
-        hooks,
-        copyToWorktree,
-        // Some target repos have multi-GB node_modules (1.7 GB observed on
-        // affinity-tracker). Sandcastle's default copyToWorktree timeout is
-        // 60s — enough to silently quarantine real issues. Bump to 10 min.
-        timeouts: { copyToWorktreeMs: 600_000 },
+        mounts: spec.mounts,
+        sandboxEnv,
       });
       return {
         branch: handle.branch,
@@ -1796,17 +1813,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         run: async (opts) => {
           const r = await withCeiling(
             `sandbox run "${opts.name}"`,
-            (signal) =>
-              handle.run({
-                name: opts.name,
-                maxIterations: opts.maxIterations ?? 1,
-                agent: sandcastle.claudeCode(opts.model, { env: envForModel(opts.model) }),
-                promptFile: opts.promptFile,
-                promptArgs: opts.promptArgs,
-                idleTimeoutSeconds: opts.idleTimeoutSeconds,
-                completionSignal,
-                signal,
-              }),
+            (signal) => handle.run({ ...opts, signal }),
           );
           // Forward the SDK's per-iteration session-capture metadata —
           // both `sessionFilePath` (when capture is wired) and `sessionId`
@@ -1816,7 +1823,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
           return {
             stdout: r.stdout,
             commits: r.commits,
-            iterations: r.iterations.map((it) => ({
+            iterations: r.iterations?.map((it) => ({
               sessionFilePath: it.sessionFilePath,
               sessionId: it.sessionId,
             })),
@@ -2018,17 +2025,11 @@ export function verifyLandedBranches(
   return candidateBranches.filter((b) => mergedSet.has(b));
 }
 
-/**
- * Repo-relative path where the SDK provisions a per-branch git worktree.
- *
- * MUST stay in sync with `@ai-hero/sandcastle/dist/WorktreeManager.js`
- * (forward slashes become dashes). Both our pre-clean guard in
- * `createSandbox` and `cleanupIssueBranch` derive paths from this helper
- * so the two consumers can't drift from each other or from the SDK.
- */
-export function worktreePathFor(branch: string): string {
-  return `.sandcastle/worktrees/${branch.replace(/\//g, "-")}`;
-}
+// worktreePathFor lives in `./lib/worktree-path.ts` (imported at top of file
+// so mac-host-sandbox.ts can import it without depending on this 4k-line
+// orchestrator). Re-exported here so external consumers of main.mjs keep
+// working.
+export { worktreePathFor };
 
 /**
  * Per-branch cleanup for the sandcastle loop.
