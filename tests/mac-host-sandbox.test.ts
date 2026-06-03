@@ -144,3 +144,38 @@ describe("macHostSandbox run()", () => {
     await handle.close();
   });
 });
+
+describe("macHostSandbox top-level run()", () => {
+  let repoRoot: string;
+  beforeEach(() => { repoRoot = initTempRepo(); });
+  afterEach(() => { rmSync(repoRoot, { recursive: true, force: true }); });
+
+  it("top-level run executes in repoRoot when no cwd override", async () => {
+    const promptPath = path.join(repoRoot, "merger-prompt.md");
+    writeFileSync(promptPath, "merge please");
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const result = await factory.run({
+      name: "merger",
+      model: "claude-test",
+      promptFile: "merger-prompt.md",
+      idleTimeoutSeconds: 30,
+    });
+    expect(result.stdout).toContain("merge please");
+  });
+
+  it("top-level run honours cwd override", async () => {
+    const subDir = path.join(repoRoot, "staging");
+    execFileSync("mkdir", ["-p", subDir]);
+    const promptPath = path.join(subDir, "p.md");
+    writeFileSync(promptPath, "staged prompt");
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const result = await factory.run({
+      name: "merger",
+      model: "claude-test",
+      promptFile: "p.md",
+      cwd: subDir,
+      idleTimeoutSeconds: 30,
+    });
+    expect(result.stdout).toContain("staged prompt");
+  });
+});

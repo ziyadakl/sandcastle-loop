@@ -94,6 +94,90 @@ function readCommitsSince(wtPath: string, forkSha: string): { sha: string }[] {
   }
 }
 
+async function spawnAgent(
+  cwd: string,
+  runSpec: MacHostRunSpec | MacHostTopLevelRunSpec,
+  env: Record<string, string>,
+  forkSha: string | null,
+): Promise<MacHostRunHandle> {
+  const promptFullPath = path.join(cwd, runSpec.promptFile);
+  if (!existsSync(promptFullPath)) {
+    throw new Error(`prompt file not found: ${promptFullPath}`);
+  }
+
+  // The Claude Code CLI binary used by the host. Override via env for
+  // tests. Default `claude` is whatever's on PATH (the user's normal CLI).
+  const claudeBin =
+    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ??
+    (process.env.NODE_ENV === "test" ? "/bin/cat" : "claude");
+  const claudeArgs =
+    claudeBin === "/bin/cat"
+      ? [promptFullPath]
+      : [
+          "--model", runSpec.model,
+          "--print",
+          "--prompt-file", promptFullPath,
+        ];
+
+  const childEnv = { ...process.env, ...env };
+  const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
+
+  return await new Promise<MacHostRunHandle>((resolve, reject) => {
+    let settled = false;
+    const safeReject = (err: Error) => {
+      if (!settled) { settled = true; reject(err); }
+    };
+    const safeResolve = (val: MacHostRunHandle) => {
+      if (!settled) { settled = true; resolve(val); }
+    };
+
+    const child = spawn(claudeBin, claudeArgs, {
+      cwd,
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let lastChunkAt = Date.now();
+    const idleTimer = setInterval(() => {
+      if (Date.now() - lastChunkAt > idleMs) {
+        clearInterval(idleTimer);
+        child.kill("SIGTERM");
+        safeReject(new Error(`run "${runSpec.name}": idle timeout after ${idleMs}ms`));
+      }
+    }, 5_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      lastChunkAt = Date.now();
+      stdoutBuf += chunk;
+      process.stdout.write(chunk);
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      lastChunkAt = Date.now();
+      stderrBuf += chunk;
+      process.stderr.write(chunk);
+    });
+    child.on("error", (err: Error) => {
+      clearInterval(idleTimer);
+      safeReject(err);
+    });
+    child.on("close", (code: number | null) => {
+      clearInterval(idleTimer);
+      if (code !== 0 && claudeBin !== "/bin/cat") {
+        safeReject(new Error(
+          `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
+        ));
+        return;
+      }
+      // commits: read git log on the worktree branch since createSandbox,
+      // or return [] when running outside any worktree (forkSha === null).
+      const commits = forkSha !== null ? readCommitsSince(cwd, forkSha) : [];
+      safeResolve({ stdout: stdoutBuf, commits });
+    });
+  });
+}
+
 export function macHostSandbox(
   opts: MacHostSandboxOptions,
 ): MacHostSandboxFactory {
@@ -114,86 +198,11 @@ export function macHostSandbox(
         { cwd: wtPath, stdio: ["ignore", "pipe", "ignore"] },
       ).toString("utf8").trim();
 
-      const capturedEnv = opts.env;
       return {
         branch: spec.branch,
         worktreePath: wtPath,
         async run(runSpec): Promise<MacHostRunHandle> {
-          const promptFullPath = path.join(wtPath, runSpec.promptFile);
-          if (!existsSync(promptFullPath)) {
-            throw new Error(`prompt file not found: ${promptFullPath}`);
-          }
-
-          // The Claude Code CLI binary used by the host. Override via env for
-          // tests. Default `claude` is whatever's on PATH (the user's normal CLI).
-          const claudeBin =
-            process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ??
-            (process.env.NODE_ENV === "test" ? "/bin/cat" : "claude");
-          const claudeArgs =
-            claudeBin === "/bin/cat"
-              ? [promptFullPath]
-              : [
-                  "--model", runSpec.model,
-                  "--print",
-                  "--prompt-file", promptFullPath,
-                ];
-
-          const childEnv = { ...process.env, ...(capturedEnv ?? {}) };
-          const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
-
-          return await new Promise<MacHostRunHandle>((resolve, reject) => {
-            let settled = false;
-            const safeReject = (err: Error) => {
-              if (!settled) { settled = true; reject(err); }
-            };
-            const safeResolve = (val: MacHostRunHandle) => {
-              if (!settled) { settled = true; resolve(val); }
-            };
-
-            const child = spawn(claudeBin, claudeArgs, {
-              cwd: wtPath,
-              env: childEnv,
-              stdio: ["ignore", "pipe", "pipe"],
-            });
-            let stdoutBuf = "";
-            let stderrBuf = "";
-            let lastChunkAt = Date.now();
-            const idleTimer = setInterval(() => {
-              if (Date.now() - lastChunkAt > idleMs) {
-                clearInterval(idleTimer);
-                child.kill("SIGTERM");
-                safeReject(new Error(`run "${runSpec.name}": idle timeout after ${idleMs}ms`));
-              }
-            }, 5_000);
-            child.stdout.setEncoding("utf8");
-            child.stdout.on("data", (chunk: string) => {
-              lastChunkAt = Date.now();
-              stdoutBuf += chunk;
-              process.stdout.write(chunk);
-            });
-            child.stderr.setEncoding("utf8");
-            child.stderr.on("data", (chunk: string) => {
-              lastChunkAt = Date.now();
-              stderrBuf += chunk;
-              process.stderr.write(chunk);
-            });
-            child.on("error", (err: Error) => {
-              clearInterval(idleTimer);
-              safeReject(err);
-            });
-            child.on("close", (code: number | null) => {
-              clearInterval(idleTimer);
-              if (code !== 0 && claudeBin !== "/bin/cat") {
-                safeReject(new Error(
-                  `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
-                ));
-                return;
-              }
-              // commits: read git log on the worktree branch since createSandbox.
-              const commits = readCommitsSince(wtPath, forkSha);
-              safeResolve({ stdout: stdoutBuf, commits });
-            });
-          });
+          return await spawnAgent(wtPath, runSpec, opts.env ?? {}, forkSha);
         },
         async close() {
           preCleanWorktree(repoRoot, wtPath);
@@ -201,8 +210,9 @@ export function macHostSandbox(
       };
     },
 
-    async run(_spec): Promise<MacHostRunHandle> {
-      throw new Error("top-level run() not yet implemented");
+    async run(spec): Promise<MacHostRunHandle> {
+      const effectiveCwd = spec.cwd ?? repoRoot;
+      return await spawnAgent(effectiveCwd, spec, opts.env ?? {}, null);
     },
   };
 }
