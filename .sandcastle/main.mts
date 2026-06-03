@@ -1624,14 +1624,10 @@ export function withHardCeiling<T>(
 }
 
 // ---------------------------------------------------------------------------
-// Sandbox factory helpers (module scope so buildSandboxFactory can use them)
-// ---------------------------------------------------------------------------
-
 // Sandbox provider construction lives in `./lib/sandbox-provider.ts` — both
 // docker and mac-host implement the same uniform `SandboxProvider` shape,
 // so `buildDefaultDeps` below picks one and calls `provider.topLevelRun` /
 // `provider.createSandbox` without branching on the provider kind.
-
 // ---------------------------------------------------------------------------
 
 /**
@@ -1763,6 +1759,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       //   2. Orphan dir git doesn't know about → `rmSync` removes it.
       //   3. Dangling registration with no dir → `git worktree prune`
       //      clears the registration so a fresh `add` succeeds.
+      // Note: the mac-host provider runs its own pre-clean inside
+      // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
+      // The outer pre-clean here is redundant on the mac-host path but
+      // idempotent — letting it run keeps the orchestrator-side cleanup
+      // contract identical across providers.
       const wtPath = path.join(
         args.repoRoot,
         worktreePathFor(spec.branch),

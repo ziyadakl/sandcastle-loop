@@ -183,9 +183,12 @@ export function makeMacHostProvider(
       return { stdout: r.stdout, commits: r.commits };
     },
     async createSandbox(spec) {
-      // Per-call sandboxEnv lands in the mac-host construction here — closes
-      // the prior FOLLOW_UPS.md §3 documented gap where the mac-host path
-      // only honored construction-time env.
+      // Per-call sandboxEnv lands in the mac-host construction here. The
+      // previous SandboxFactoryHandles shape constructed the mac-host
+      // sandbox once at orchestrator startup with `containerEnv` and could
+      // not honor the per-call implementer-provider env that the docker
+      // path threads via `sandcastle.claudeCode(model, { env })`. The new
+      // shape closes that gap.
       const factory = macHostSandbox({
         repoRoot: config.repoRoot,
         env: spec.sandboxEnv,
