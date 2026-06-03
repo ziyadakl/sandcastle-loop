@@ -232,6 +232,43 @@ describe("macHostSandbox top-level run()", () => {
     });
     expect(result.stdout).toContain("staged prompt");
   });
+
+  it("top-level run() returns commits made inside cwd since the run started", async () => {
+    const subDir = path.join(repoRoot, "sub");
+    mkdirSync(subDir);
+    writeFileSync(path.join(subDir, "seed.txt"), "seed\n");
+    execFileSync("git", ["init", "-b", "main"], { cwd: subDir });
+    execFileSync("git", ["config", "user.email", "t@t.test"], { cwd: subDir });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: subDir });
+    execFileSync("git", ["add", "."], { cwd: subDir });
+    execFileSync("git", ["commit", "-m", "seed"], { cwd: subDir });
+
+    const fakeBin = path.join(repoRoot, "fake-claude.sh");
+    writeFileSync(
+      fakeBin,
+      `#!/bin/sh\ncd "$(dirname "$0")/sub"\necho touched > new.txt\ngit add new.txt\ngit commit -m "agent commit" >/dev/null 2>&1\nexit 0\n`,
+    );
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(path.join(subDir, "p.md"), "prompt body\n");
+
+    const prevBin = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+    process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = fakeBin;
+    try {
+      const factory = macHostSandbox({ repoRoot, env: {} });
+      const result = await factory.run({
+        name: "merger",
+        model: "claude-test",
+        promptFile: "p.md",
+        cwd: subDir,
+        idleTimeoutSeconds: 30,
+      });
+      expect(result.commits.length).toBe(1);
+      expect(result.commits[0].sha).toMatch(/^[a-f0-9]{40}$/);
+    } finally {
+      if (prevBin === undefined) delete process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+      else process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = prevBin;
+    }
+  });
 });
 
 describe("applyPromptArgs", () => {

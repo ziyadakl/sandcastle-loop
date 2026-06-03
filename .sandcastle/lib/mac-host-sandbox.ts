@@ -268,7 +268,12 @@ export function macHostSandbox(
 
     async run(spec): Promise<MacHostRunHandle> {
       const effectiveCwd = spec.cwd ?? repoRoot;
-      return await spawnAgent(effectiveCwd, spec, opts.env ?? {}, null);
+      const forkSha = execFileSync(
+        "git",
+        ["rev-parse", "HEAD"],
+        { cwd: effectiveCwd, stdio: ["ignore", "pipe", "ignore"] },
+      ).toString("utf8").trim();
+      return await spawnAgent(effectiveCwd, spec, opts.env ?? {}, forkSha);
     },
   };
 }
