@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -81,5 +81,44 @@ describe("macHostSandbox", () => {
     const h2 = await factory.createSandbox({ branch: "feat/dangle" });
     expect(existsSync(h2.worktreePath)).toBe(true);
     await h2.close();
+  });
+});
+
+describe("macHostSandbox run()", () => {
+  let repoRoot: string;
+  beforeEach(() => { repoRoot = initTempRepo(); });
+  afterEach(() => { rmSync(repoRoot, { recursive: true, force: true }); });
+
+  it("run() spawns a process in the worktree and captures stdout", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/spawn" });
+    // Place a tiny prompt file the fake claude wrapper can consume.
+    const promptPath = path.join(handle.worktreePath, "prompt.md");
+    writeFileSync(promptPath, "hello world");
+    // Use the test seam: override claude binary path via env.
+    const result = await handle.run({
+      name: "smoke",
+      model: "claude-test",
+      promptFile: "prompt.md",
+      idleTimeoutSeconds: 30,
+    });
+    // Default seam runs `cat <promptFile>` if SANDCASTLE_MAC_HOST_CLAUDE_BIN
+    // is unset for tests — see implementation note in Step 3.3.
+    expect(result.stdout).toContain("hello world");
+    await handle.close();
+  });
+
+  it("run() rejects when promptFile does not exist in the worktree", async () => {
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/missing" });
+    await expect(
+      handle.run({
+        name: "smoke",
+        model: "claude-test",
+        promptFile: "nope.md",
+        idleTimeoutSeconds: 30,
+      }),
+    ).rejects.toThrow(/prompt file not found/);
+    await handle.close();
   });
 });

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { existsSync, rmSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { worktreePathFor as canonicalWorktreePathFor } from "../main.mjs";
 
 export interface MacHostSandboxOptions {
@@ -80,6 +80,19 @@ function preCleanWorktree(repoRoot: string, wtPath: string): void {
   }
 }
 
+function readCommitsSince(wtPath: string, _runName: string): string[] {
+  try {
+    const out = execFileSync(
+      "git",
+      ["log", "--format=%H", "@{u}..HEAD"],
+      { cwd: wtPath, stdio: ["ignore", "pipe", "ignore"] },
+    ).toString("utf8");
+    return out.split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 export function macHostSandbox(
   opts: MacHostSandboxOptions,
 ): MacHostSandboxFactory {
@@ -95,11 +108,76 @@ export function macHostSandbox(
         { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
       );
 
+      const capturedEnv = opts.env;
       return {
         branch: spec.branch,
         worktreePath: wtPath,
-        async run(_runSpec): Promise<MacHostRunHandle> {
-          throw new Error("run() not yet implemented");
+        async run(runSpec): Promise<MacHostRunHandle> {
+          const promptFullPath = path.join(wtPath, runSpec.promptFile);
+          if (!existsSync(promptFullPath)) {
+            throw new Error(`prompt file not found: ${promptFullPath}`);
+          }
+
+          // The Claude Code CLI binary used by the host. Override via env for
+          // tests. Default `claude` is whatever's on PATH (the user's normal CLI).
+          const claudeBin =
+            process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ??
+            (process.env.NODE_ENV === "test" ? "/bin/cat" : "claude");
+          const claudeArgs =
+            claudeBin === "/bin/cat"
+              ? [promptFullPath]
+              : [
+                  "--model", runSpec.model,
+                  "--print",
+                  "--prompt-file", promptFullPath,
+                ];
+
+          const childEnv = { ...process.env, ...(capturedEnv ?? {}) };
+          const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
+
+          return await new Promise<MacHostRunHandle>((resolve, reject) => {
+            const child = spawn(claudeBin, claudeArgs, {
+              cwd: wtPath,
+              env: childEnv,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let stdoutBuf = "";
+            let stderrBuf = "";
+            let lastChunkAt = Date.now();
+            const idleTimer = setInterval(() => {
+              if (Date.now() - lastChunkAt > idleMs) {
+                clearInterval(idleTimer);
+                child.kill("SIGTERM");
+                reject(new Error(`run "${runSpec.name}": idle timeout after ${idleMs}ms`));
+              }
+            }, 5_000);
+            child.stdout.on("data", (chunk: Buffer) => {
+              lastChunkAt = Date.now();
+              stdoutBuf += chunk.toString("utf8");
+              process.stdout.write(chunk);
+            });
+            child.stderr.on("data", (chunk: Buffer) => {
+              lastChunkAt = Date.now();
+              stderrBuf += chunk.toString("utf8");
+              process.stderr.write(chunk);
+            });
+            child.on("error", (err: Error) => {
+              clearInterval(idleTimer);
+              reject(err);
+            });
+            child.on("close", (code: number | null) => {
+              clearInterval(idleTimer);
+              if (code !== 0 && claudeBin !== "/bin/cat") {
+                reject(new Error(
+                  `run "${runSpec.name}" exited ${code}: ${stderrBuf.slice(-500)}`,
+                ));
+                return;
+              }
+              // commits: read git log on the worktree branch since createSandbox.
+              const commits = readCommitsSince(wtPath, runSpec.name);
+              resolve({ stdout: stdoutBuf, commits });
+            });
+          });
         },
         async close() {
           preCleanWorktree(repoRoot, wtPath);
