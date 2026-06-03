@@ -19,6 +19,7 @@ export {
   // V1 label-state-machine surface.
   listReadyIssues,
   listIssuesByLabel,
+  listOpenIssuesWithBodies,
   claimViaLabel,
   markDoneViaLabel,
   quarantineViaLabel,
@@ -38,6 +39,10 @@ export {
   LABEL_QUARANTINE_ALIAS,
   STATUS_LABELS,
 } from "./gh.js";
-export type { ReadyIssueSummary, LabelledIssueSummary } from "./gh.js";
+export type {
+  ReadyIssueSummary,
+  LabelledIssueSummary,
+  OpenIssueWithBody,
+} from "./gh.js";
 
 export { withPrdLock, withSingleInstance } from "./locks.js";
