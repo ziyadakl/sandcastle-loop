@@ -62,7 +62,7 @@ CRITIQUE_CLEAN
 
 ## Findings
 
-1. **`apps/nextjs/src/app/(quick-links)/quick-links/page.tsx:13` — P1 — clarify.** The h1 reads "QUICK LINKS" (all-caps + tracking-wider). Impeccable warm-voice principle prohibits long uppercase passages on chrome. **Fix:** sentence-case the heading to "Quick links" and drop the tracking-wider; weight + size already carry hierarchy.
+1. **`src/components/PageHeader.tsx:13` — P1 — clarify.** The h1 is all-caps + tracking-wider. Impeccable warm-voice principle prohibits long uppercase passages on chrome. **Fix:** sentence-case the heading and drop the tracking-wider; weight + size already carry hierarchy.
 
 2. ...
 
@@ -76,7 +76,7 @@ CRITIQUE_NEEDS_FIXES
 
 ## Findings
 
-1. **`packages/ui/src/error-banner.tsx:42` — P0 — impeccable.** The error banner uses a side-stripe border — explicitly banned in the design vocabulary. **Fix:** swap to a full-width subtle background tint with no stripe.
+1. **`src/components/ErrorBanner.tsx:42` — P0 — impeccable.** The error banner uses a side-stripe border — explicitly banned in the design vocabulary. **Fix:** swap to a full-width subtle background tint with no stripe.
 
 2. ...
 
