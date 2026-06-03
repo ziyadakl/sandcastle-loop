@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { worktreePathFor as canonicalWorktreePathFor } from "../main.mjs";
 
@@ -106,6 +106,7 @@ async function spawnAgent(
   if (!existsSync(promptFullPath)) {
     throw new Error(`prompt file not found: ${promptFullPath}`);
   }
+  const promptText = readFileSync(promptFullPath, "utf8");
 
   // The Claude Code CLI binary used by the host. Override via env for
   // tests. Default `claude` is whatever's on PATH (the user's normal CLI).
@@ -115,15 +116,17 @@ async function spawnAgent(
   // When SANDCASTLE_MAC_HOST_CLAUDE_BIN is set (test seam) or we're in the
   // default test path (/bin/cat), pass only the prompt path as the argument
   // so the substitute binary receives it cleanly (cat reads it, sleep uses it
-  // as duration, etc.). In production the full Claude CLI flags are used.
-  const isTestSeam = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN !== undefined
-    || process.env.NODE_ENV === "test";
+  // as duration, etc.). In production the full Claude CLI args are used and
+  // the prompt is passed via stdin.
+  const isTestSeam =
+    !!process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN ||
+    process.env.NODE_ENV === "test";
   const claudeArgs = isTestSeam
     ? [promptFullPath]
     : [
-        "--model", runSpec.model,
         "--print",
-        "--prompt-file", promptFullPath,
+        "--model", runSpec.model,
+        "--dangerously-skip-permissions",
       ];
 
   const childEnv = { ...process.env, ...env };
@@ -141,8 +144,16 @@ async function spawnAgent(
     const child = spawn(claudeBin, claudeArgs, {
       cwd,
       env: childEnv,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // Pass the prompt: production path writes to stdin; test seam already has
+    // the prompt file as a positional arg so just close stdin to unblock /bin/cat.
+    if (!isTestSeam) {
+      child.stdin.end(promptText);
+    } else {
+      child.stdin.end();
+    }
 
     // Wire abort signal — kill the child and reject before it can settle normally.
     const onAbort = () => {
