@@ -68,6 +68,7 @@ import {
   type ProviderName,
 } from "./providers.js";
 import { macHostSandbox } from "./lib/mac-host-sandbox.js";
+import { worktreePathFor } from "./lib/worktree-path.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2150,11 +2151,10 @@ export function verifyLandedBranches(
   return candidateBranches.filter((b) => mergedSet.has(b));
 }
 
-// worktreePathFor lives in `lib/worktree-path.ts` so the mac-host sandbox
-// helper can import it without depending on this 4k-line orchestrator.
-// Re-exported here so external consumers of main.mjs continue working,
-// and imported so in-file consumers below still resolve the name.
-import { worktreePathFor } from "./lib/worktree-path.js";
+// worktreePathFor lives in `./lib/worktree-path.ts` (imported at top of file
+// so mac-host-sandbox.ts can import it without depending on this 4k-line
+// orchestrator). Re-exported here so external consumers of main.mjs keep
+// working.
 export { worktreePathFor };
 
 /**
