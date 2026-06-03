@@ -557,6 +557,10 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
       const all = await opts.listIssuesByLabel(label);
       return all.filter((issue) => issue.labels.includes(label));
     },
+    async listOpenIssuesWithBodies() {
+      // Issue E: gate tests never reach the blocked-by exit path; default [].
+      return [];
+    },
     async applyMigrations(_repoRoot, _preSha, _postSha) {
       return { applied: 0, realErrors: [] };
     },

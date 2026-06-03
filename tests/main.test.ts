@@ -33,6 +33,8 @@ import {
   runMain,
   runImplementer,
   parsePlan,
+  parseBlockedBy,
+  buildBlockedByNote,
   parseSandcastleArgs,
   preflight,
   loadDotenv,
@@ -222,6 +224,11 @@ function buildDeps(opts: {
       // Existing tests use `repoRoot: "/repo"` which never has the file, so
       // the orchestrator never calls this path. Tests that exercise the
       // skill-discipline filter explicitly override this stub.
+      return [];
+    },
+    async listOpenIssuesWithBodies() {
+      // Issue E: default empty so the "no claimable issues" exit falls back
+      // to the plain message. Blocked-by tests override this stub.
       return [];
     },
     async applyMigrations(repoRoot, preSha, postSha) {
@@ -414,6 +421,76 @@ describe("sandcastle-loop main.mts — happy path", () => {
     expect(b.state.marksDone).toEqual([]);
     // No sandbox should ever be created when there's nothing to plan.
     expect(b.state.sandboxesCreated).toEqual([]);
+  });
+
+  // Issue E: surface `Blocked by: #N` chains at the "no claimable issues"
+  // exit so the operator can tell "nothing ready" from "everything ready is
+  // blocked". The blocker (#313) is deliberately NOT itself ready-for-agent
+  // (it's in-progress) — proving the openness check consults the full open
+  // set, not just the ready-for-agent slice.
+  it("enriches the clean-exit message with open blocked-by chains", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    b.deps.listOpenIssuesWithBodies = async () => [
+      {
+        number: 316,
+        body: "Implement the thing.\n\nBlocked by: #313\n",
+        labels: ["ready-for-agent", "type:feature"],
+      },
+      {
+        // The blocker — open but in-progress, not ready-for-agent.
+        number: 313,
+        body: "Foundation work.",
+        labels: ["in-progress"],
+      },
+    ];
+
+    const result = await runMain(baseArgs(), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    const exitLine = b.state.logs.find((l) =>
+      l.startsWith("no claimable issues — exiting cleanly"),
+    );
+    expect(exitLine).toBeDefined();
+    expect(exitLine).toContain(
+      "#316 is ready-for-agent but blocked by #313 (open)",
+    );
+  });
+
+  it("keeps the plain clean-exit message when the blocker is closed", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    // #316 ready-for-agent, blocked by #313 — but #313 is NOT in the open
+    // set (it's closed), so the chain must NOT be surfaced.
+    b.deps.listOpenIssuesWithBodies = async () => [
+      {
+        number: 316,
+        body: "Blocked by: #313\n",
+        labels: ["ready-for-agent"],
+      },
+    ];
+
+    const result = await runMain(baseArgs(), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.logs).toContain("no claimable issues — exiting cleanly");
+    expect(
+      b.state.logs.some((l) => l.includes("blocked by")),
+    ).toBe(false);
+  });
+
+  it("degrades to the plain clean-exit message when the gh query throws", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    b.deps.listOpenIssuesWithBodies = async () => {
+      throw new Error("gh boom");
+    };
+
+    const result = await runMain(baseArgs(), b.deps);
+
+    // A gh failure must NOT crash the clean exit.
+    expect(result.exitCode).toBe(0);
+    expect(b.state.logs).toContain("no claimable issues — exiting cleanly");
   });
 });
 
@@ -2881,6 +2958,8 @@ describe("sandcastle-loop main.mts — third-attempt grant", () => {
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(159);
     expect(b.state.quarantines[0]!.reason).toMatch(/third attempt/);
+    // Issue F: round-3 quarantine carries the implementer-retry path token.
+    expect(b.state.quarantines[0]!.reason).toContain("path=implementer-retry");
     // Round 3 actually ran (regression guard).
     const names = b.state.runCalls.map((c) => c.spec.name);
     expect(names).toContain("implementer-retry-2");
@@ -2929,6 +3008,8 @@ describe("sandcastle-loop main.mts — third-attempt grant", () => {
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(152);
     expect(b.state.quarantines[0]!.reason).toMatch(/escalated retry/);
+    // Issue F: escalated-retry quarantine carries the critique-retry path token.
+    expect(b.state.quarantines[0]!.reason).toContain("path=critique-retry");
     // Crucially: no third attempt was made.
     const names = b.state.runCalls.map((c) => c.spec.name);
     expect(names).not.toContain("implementer-retry-2");
@@ -2968,6 +3049,186 @@ describe("sandcastle-loop main.mts — third-attempt grant", () => {
     expect(b.state.quarantines).toHaveLength(1);
     const names = b.state.runCalls.map((c) => c.spec.name);
     expect(names).not.toContain("implementer-retry-2");
+  });
+});
+
+// Issue F: each terminal outcome is annotated with the prompt-leg path it
+// traversed (path=first-pass-only | critique-retry | implementer-retry),
+// partitioned by the reviewer pass that decided the outcome.
+describe("sandcastle-loop main.mts — prompt-leg path annotation (Issue F)", () => {
+  it("ships on reviewer attempt 1 ALL_CLEAR → path=first-pass-only", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "401", title: "first pass", branch: "agent/issue-401" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 401 }),
+      commits: [{ sha: "fp" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([401]);
+    expect(
+      b.state.logs.some(
+        (l) => l.includes("[issue=401]") && l.includes("path=first-pass-only"),
+      ),
+    ).toBe(true);
+  });
+
+  it("ships on reviewer attempt 2 ALL_CLEAR → path=critique-retry", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "402", title: "critique retry", branch: "agent/issue-402" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 402 }),
+      commits: [{ sha: "r1" }],
+    });
+    // Reviewer attempt 1 blocks → escalate to implementer + reviewer attempt 2.
+    b.enqueue("reviewer", { stdout: "needs work\n\nHAS_BLOCKERS" });
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 402 }),
+      commits: [{ sha: "r2" }],
+    });
+    b.enqueue("reviewer-retry", { stdout: "fixed\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([402]);
+    expect(
+      b.state.logs.some(
+        (l) => l.includes("[issue=402]") && l.includes("path=critique-retry"),
+      ),
+    ).toBe(true);
+  });
+
+  it("ships on reviewer attempt 3 ALL_CLEAR → path=implementer-retry", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "403", title: "round 3", branch: "agent/issue-403" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 403 }),
+      commits: [{ sha: "r1" }],
+    });
+    b.enqueue("reviewer", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "type safety": "missing return type" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 2 resolves type safety but surfaces a NEW category → grants round 3.
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 403 }),
+      commits: [{ sha: "r2" }],
+    });
+    b.enqueue("reviewer-retry", {
+      stdout: reviewerStdoutWithSweep({
+        findings: { "spec fit": "missing acceptance criterion" },
+        marker: "HAS_BLOCKERS",
+      }),
+    });
+    // Round 3 ships.
+    b.enqueue("implementer-retry-2", {
+      stdout: implementerStdout({ ghIssue: 403 }),
+      commits: [{ sha: "r3" }],
+    });
+    b.enqueue("reviewer-retry-2", {
+      stdout: reviewerStdoutWithSweep({ findings: {}, marker: "ALL_CLEAR" }),
+    });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([403]);
+    expect(
+      b.state.logs.some(
+        (l) =>
+          l.includes("[issue=403]") && l.includes("path=implementer-retry"),
+      ),
+    ).toBe(true);
+  });
+});
+
+// Issue E unit tests for the pure blocked-by helpers.
+describe("parseBlockedBy", () => {
+  it("extracts a single `Blocked by: #N` directive", () => {
+    expect(parseBlockedBy("Do the thing.\n\nBlocked by: #313\n")).toEqual([313]);
+  });
+
+  it("accepts the hyphenated `Blocked-by:` spelling, case-insensitively", () => {
+    expect(parseBlockedBy("BLOCKED-BY: #42")).toEqual([42]);
+    expect(parseBlockedBy("blocked by: #7")).toEqual([7]);
+  });
+
+  it("captures multiple blockers on one directive line, deduped + sorted", () => {
+    expect(parseBlockedBy("Blocked by: #314, #313 and #313")).toEqual([
+      313, 314,
+    ]);
+  });
+
+  it("returns [] when there is no directive (a bare `#5` reference is ignored)", () => {
+    expect(parseBlockedBy("See #5 for context.")).toEqual([]);
+    expect(parseBlockedBy("")).toEqual([]);
+  });
+});
+
+describe("buildBlockedByNote", () => {
+  it("surfaces a ready-for-agent issue blocked by a still-open (non-ready) blocker", () => {
+    const note = buildBlockedByNote([
+      {
+        number: 316,
+        body: "Blocked by: #313",
+        labels: ["ready-for-agent"],
+      },
+      { number: 313, body: "foundation", labels: ["in-progress"] },
+    ]);
+    expect(note).toBe(
+      " (note: #316 is ready-for-agent but blocked by #313 (open))",
+    );
+  });
+
+  it("returns '' when the blocker is not in the open set (closed)", () => {
+    const note = buildBlockedByNote([
+      { number: 316, body: "Blocked by: #313", labels: ["ready-for-agent"] },
+    ]);
+    expect(note).toBe("");
+  });
+
+  it("ignores blocked-by directives on issues that aren't ready-for-agent", () => {
+    const note = buildBlockedByNote([
+      { number: 200, body: "Blocked by: #199", labels: ["in-progress"] },
+      { number: 199, body: "x", labels: ["in-progress"] },
+    ]);
+    expect(note).toBe("");
   });
 });
 
@@ -3123,6 +3384,7 @@ function makeNoopDeps(): Deps {
     release: unused,
     comment: unused,
     listIssuesByLabel: unused,
+    listOpenIssuesWithBodies: unused,
     applyMigrations: unused,
     validateMigrationJournal: unused,
     captureSha: unused,

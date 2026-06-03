@@ -39,6 +39,7 @@ import {
   promoteAllStagingToDone,
   postIssueComment,
   listIssuesByLabel,
+  listOpenIssuesWithBodies,
   LABEL_READY,
   acquireSingleInstanceLock,
 } from "./lib/state/index.js";
@@ -333,6 +334,19 @@ export interface Deps {
   listIssuesByLabel(
     label: string,
   ): Promise<readonly { number: number; title: string; labels: readonly string[] }[]>;
+  /**
+   * List ALL open issues with body + labels. Used only by the "no claimable
+   * issues" exit (Issue E) to surface `Blocked by: #N` chains — the operator
+   * otherwise can't distinguish "nothing ready" from "everything ready is
+   * blocked". A blocker is usually `in-progress` (not `ready-for-agent`), so
+   * the openness check needs the full open set, not a label-filtered view.
+   * Tests inject a stub; production wraps {@link listOpenIssuesWithBodies}.
+   * The clean-exit caller wraps this in try/catch so a gh failure degrades to
+   * the plain message rather than crashing the exit.
+   */
+  listOpenIssuesWithBodies(): Promise<
+    readonly { number: number; body: string; labels: readonly string[] }[]
+  >;
   /** Migrations between two SHAs in `repoRoot`. Returns # applied + errors. */
   applyMigrations(
     repoRoot: string,
@@ -1881,6 +1895,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // skill-discipline gate). Returns []` if there are no matches.
       return await listIssuesByLabel(label);
     },
+    async listOpenIssuesWithBodies() {
+      // Read-only; safe under --dry-run. Used by the "no claimable issues"
+      // exit to surface `Blocked by: #N` chains.
+      return await listOpenIssuesWithBodies();
+    },
     async applyMigrations(repoRoot, preSha, postSha) {
       const r = await applyMigrationsBetween(repoRoot, preSha, postSha);
       return {
@@ -1968,6 +1987,67 @@ export function parsePlan(stdout: string): PlanIssue[] {
     out.push({ id: r.id, title: r.title, branch: r.branch });
   }
   return out;
+}
+
+/**
+ * Extract the issue numbers a body declares it is blocked by. Recognises the
+ * directive `Blocked by: #N` and the hyphenated `Blocked-by: #N`, both
+ * case-insensitively, with flexible whitespace. A single line may name several
+ * blockers (`Blocked by: #313, #314`); each `#N` after the directive (up to
+ * the end of that line) is captured. Returns a de-duplicated, ascending list.
+ *
+ * Exported for unit testing.
+ */
+export function parseBlockedBy(body: string): number[] {
+  if (typeof body !== "string" || body.length === 0) return [];
+  const found = new Set<number>();
+  // Match the directive, then sweep the rest of that line for `#N` tokens.
+  const directive = /blocked[\s-]*by\s*:\s*([^\n\r]*)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = directive.exec(body)) !== null) {
+    const rest = m[1] ?? "";
+    const refs = rest.matchAll(/#(\d+)/g);
+    for (const ref of refs) {
+      const n = Number(ref[1]);
+      if (Number.isInteger(n) && n > 0) found.add(n);
+    }
+  }
+  return [...found].sort((a, b) => a - b);
+}
+
+/**
+ * Build the "(note: …)" suffix for the "no claimable issues" exit (Issue E).
+ *
+ * Given the full set of open issues, find those labelled `ready-for-agent`
+ * whose body declares `Blocked by: #N` for an `N` that is still open. Those
+ * issues are why the planner returned nothing: the planner silently drops
+ * blocked issues, so without this the operator can't tell "nothing ready"
+ * from "everything ready is blocked".
+ *
+ * Openness of a blocker = membership in `openIssues` (blockers are usually
+ * `in-progress`, not `ready-for-agent`, so we must consult the whole open
+ * set, not a label-filtered slice). Returns `""` when nothing ready is
+ * blocked — the caller then keeps the plain exit message.
+ *
+ * Exported for unit testing.
+ */
+export function buildBlockedByNote(
+  openIssues: readonly { number: number; body: string; labels: readonly string[] }[],
+): string {
+  const openNumbers = new Set(openIssues.map((i) => i.number));
+  const notes: string[] = [];
+  const ready = openIssues
+    .filter((i) => i.labels.includes(LABEL_READY))
+    .sort((a, b) => a.number - b.number);
+  for (const issue of ready) {
+    const blockers = parseBlockedBy(issue.body).filter((n) =>
+      openNumbers.has(n),
+    );
+    if (blockers.length === 0) continue;
+    const blockerStr = blockers.map((n) => `#${n} (open)`).join(", ");
+    notes.push(`#${issue.number} is ready-for-agent but blocked by ${blockerStr}`);
+  }
+  return notes.length === 0 ? "" : ` (note: ${notes.join("; ")})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2134,15 +2214,44 @@ export function cleanupIssueBranch(
       } catch {
         // ignore — prune is best-effort
       }
+      // Issue D: after prune, decide whether the worktree is genuinely still
+      // registered. If `prune` already cleared a dangling registration, the
+      // worktree is effectively gone and the retry-remove below would fail
+      // with "not a working tree" — a misleading warn. Only retry (and warn
+      // on failure) when the registration actually survived the prune.
+      //
+      // We match by branch ref (not by path): `git worktree list --porcelain`
+      // reports realpath'd absolute paths, so a path comparison would
+      // mis-classify under macOS symlinks (/var → /private/var in tmpdirs)
+      // and silently suppress every warn. Branch-ref is an exact string and
+      // there's a 1:1 branch↔worktree mapping here. If the list itself fails,
+      // default to "still registered" so we fail toward surfacing the warn,
+      // not hiding it.
+      let stillRegistered = true;
       try {
-        execFileSync("git", ["worktree", "remove", wtPath], {
-          cwd: repoRoot,
-          stdio: ["ignore", "pipe", "ignore"],
-        });
+        const listed = execFileSync(
+          "git",
+          ["worktree", "list", "--porcelain"],
+          { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        );
+        stillRegistered = parseWorktreeList(listed).some(
+          (e) => e.branch === `refs/heads/${branch}`,
+        );
       } catch {
-        warn(`worktree remove ${wtPath} failed: ${(err1 as Error).message}`);
-        // Continue to branch delete anyway — registration may be gone already.
+        stillRegistered = true;
       }
+      if (stillRegistered) {
+        try {
+          execFileSync("git", ["worktree", "remove", wtPath], {
+            cwd: repoRoot,
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+        } catch {
+          warn(`worktree remove ${wtPath} failed: ${(err1 as Error).message}`);
+          // Continue to branch delete anyway — registration may be gone already.
+        }
+      }
+      // else: prune already cleaned it — fall through to branch delete with no warn.
     }
   }
 
@@ -2845,6 +2954,25 @@ async function runRecovery(
  * accepted SQL hits the dev DB — intermediate state from a failed first
  * attempt never leaks. Returns the IssueOutcome the caller should bubble up.
  */
+/**
+ * Issue F: which prompt-leg path an issue traversed to its terminal outcome.
+ * Partitioned by the reviewer-pass that decided the outcome (the three exit
+ * boundaries the loop has):
+ *   - `first-pass-only`  — shipped on reviewer attempt 1's ALL_CLEAR, no retry
+ *   - `critique-retry`   — decided by reviewer attempt 2 (ship OR escalated-
+ *                          retry quarantine), i.e. the HAS_BLOCKERS → implementer
+ *                          attempt 2 → reviewer attempt 2 leg
+ *   - `implementer-retry` — decided by the round-3 grant (implementer attempt 3
+ *                          → reviewer attempt 3, ship OR quarantine)
+ *
+ * Note (intentional): every reviewer-attempt-2 exit also ran implementer
+ * attempt 2, so "critique-retry" and "implementer-retry" overlap on the fact
+ * that an implementer retry happened. We partition by the deciding reviewer
+ * pass (the exit boundary) rather than by "did an implementer retry run", so
+ * each terminal outcome carries exactly one path token.
+ */
+type PromptLegPath = "first-pass-only" | "critique-retry" | "implementer-retry";
+
 async function shipAfterMigrations(
   ctx: PipelineCtx,
   sandbox: SandboxHandle,
@@ -2852,6 +2980,7 @@ async function shipAfterMigrations(
   postSha: string,
   finalMarker: string,
   skillsInvoked: readonly string[] = [],
+  legPath: PromptLegPath = "first-pass-only",
 ): Promise<IssueOutcome> {
   // Critique gate (ADR 0006). Runs BEFORE migrations apply so a
   // CRITIQUE_CRITICAL diff doesn't pollute the dev DB or get marked as
@@ -3048,6 +3177,12 @@ async function shipAfterMigrations(
     }
   }
   void sandbox; // sandbox lifecycle handled by the caller's finally block
+  // Issue F: annotate the terminal outcome with the prompt-leg path it took.
+  // Emitted unconditionally (BEFORE the staging branch below) so it's visible
+  // under both --staging and --no-staging.
+  ctx.deps.log(
+    `[issue=${ctx.issueNumber}] shipped (marker=${finalMarker}) path=${legPath}`,
+  );
   const summary = `[issue=${ctx.issueNumber}] shipped via sandcastle-loop (commit ${postSha}, branch ${ctx.issue.branch})`;
   // Under --no-staging (legacy), flip label → done immediately. Under staging
   // (default), keep the issue in `in-progress` until the merger lands it on
@@ -3113,6 +3248,7 @@ async function runIssuePipeline(
         postSha,
         "ALL_CLEAR",
         impl1.skillsInvoked,
+        "first-pass-only",
       );
     }
 
@@ -3175,6 +3311,7 @@ async function runIssuePipeline(
         postSha,
         "ALL_CLEAR",
         impl2.skillsInvoked,
+        "critique-retry",
       );
     }
 
@@ -3252,11 +3389,12 @@ async function runIssuePipeline(
           postSha,
           "ALL_CLEAR",
           impl3.skillsInvoked,
+          "implementer-retry",
         );
       }
       const reason3 =
         `[issue=${ctx.issueNumber}] reviewer marked ${review3.marker} after ` +
-        `third attempt — quarantining for human triage.`;
+        `third attempt — quarantining for human triage. path=implementer-retry`;
       deferralCounts.delete(ctx.issueNumber);
       await ctx.deps.quarantine(ctx.issueNumber, reason3);
       return { status: "quarantined", finalMarker: review3.marker, postSha };
@@ -3264,7 +3402,7 @@ async function runIssuePipeline(
 
     const reason =
       `[issue=${ctx.issueNumber}] reviewer marked ${review2.marker} after ` +
-      `escalated retry — quarantining for human triage.`;
+      `escalated retry — quarantining for human triage. path=critique-retry`;
     deferralCounts.delete(ctx.issueNumber);
     await ctx.deps.quarantine(ctx.issueNumber, reason);
     return { status: "quarantined", finalMarker: review2.marker, postSha };
@@ -3938,7 +4076,22 @@ export async function runMain(
       }
 
       if (plan.length === 0) {
-        deps.log("no claimable issues — exiting cleanly");
+        // Issue E: the planner silently drops issues whose body declares
+        // `Blocked by: #N`. Surface those at the clean exit so the operator
+        // can tell "nothing ready" from "everything ready is blocked". A gh
+        // failure here must NOT crash the clean exit — fall back to plain.
+        let note = "";
+        try {
+          const open = await deps.listOpenIssuesWithBodies();
+          note = buildBlockedByNote(open);
+        } catch (err) {
+          deps.log(
+            `blocked-by scan skipped: listOpenIssuesWithBodies failed: ${
+              (err as Error).message
+            }`,
+          );
+        }
+        deps.log(`no claimable issues — exiting cleanly${note}`);
         return {
           exitCode: 0,
           iterationsRun,
