@@ -46,6 +46,9 @@ map and both gates graceful-degrade to a no-op (nothing is graded). See
 fail-loud preflight that quarantines a typed issue whose principles have no
 loadable rubric.
 
+**Lint gate**:
+Host-side backstop that quarantines a slice whose commit lacks the `SANDCASTLE-LINT: pass` cert when the target project defines a `lint` script. Dormant by default — a project with no `lint` script (like this template) graceful-degrades to a no-op, same as the critique/skill-discipline gates. See `classifyLintCert` / `checkLintCert` in `.sandcastle/main.mts`.
+
 **Issue / story**:
 A unit of backlog work in GitHub Issues. Carries one of these status labels at a time: `ready-for-agent`, `in-progress`, `done`, `needs-human`.
 
