@@ -4,3 +4,5 @@ worktrees/
 .restart-remaining
 .loop.lock
 .sandbox-flag
+status.json
+.status.json.tmp-*
