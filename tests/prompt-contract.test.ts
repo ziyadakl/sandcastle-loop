@@ -73,3 +73,38 @@ describe("SANDCASTLE.md.example parses to its documented map (can't rot)", () =>
     expect([...(map.get("type:cleanup") ?? [])]).toEqual([]);
   });
 });
+
+describe("lint-gate ↔ prompt contract", () => {
+  const reviewPrompt = readFileSync(
+    join(sandcastleDir, "review-prompt.md"),
+    "utf8",
+  );
+  const recoveryPrompt = readFileSync(
+    join(sandcastleDir, "recovery-prompt.md"),
+    "utf8",
+  );
+
+  it("the lint cert token the host greps for is the one implement-prompt.md tells the implementer to write", () => {
+    // The shipAfterMigrations backstop greps the shipped commit body for
+    // `SANDCASTLE-LINT: pass` (LINT_CERT_TOKEN). If the host token and the
+    // implementer prompt ever drift, every lint-enabled run quarantines on a
+    // cert the model was never told to emit — the same warn/throw drift class
+    // the skill-discipline contract above guards.
+    expect(mainSource).toContain("SANDCASTLE-LINT: pass");
+    expect(implementPrompt).toContain("SANDCASTLE-LINT: pass");
+  });
+
+  it("recovery-prompt.md also emits the lint cert (its commits hit the recovery-reviewer's cert check)", () => {
+    // review-prompt.md treats a missing SANDCASTLE-LINT cert as a HARD finding,
+    // and it reviews BOTH implementer commits AND recovery commits (the
+    // recovery-reviewer pass). If recovery-prompt.md drops the cert
+    // instruction, every lint-enabled recovered issue false-quarantines.
+    expect(recoveryPrompt).toContain("SANDCASTLE-LINT: pass");
+  });
+
+  it("the reviewer enforces lint via a CATEGORY SWEEP line", () => {
+    // The host backstop only checks cert PRESENCE; the reviewer verifies the
+    // cert is TRUE. If the sweep line is dropped, lint stops being enforced.
+    expect(reviewPrompt).toMatch(/Lint \/ code style/);
+  });
+});

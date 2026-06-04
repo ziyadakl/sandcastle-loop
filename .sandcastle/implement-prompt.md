@@ -355,6 +355,39 @@ Do NOT use `/simplify` as an excuse to refactor unrelated code. The skill
 operates on the diff for THIS iteration only. If it tries to wander into
 files you didn't touch, stop it.
 
+# LINT — code-style gate (run during STEP 5/9, certify in STEP 9/9)
+
+The loop enforces code style. After unit tests are green (STEP 5/9) and before
+you commit, run the project's lint script and fix **every** error it reports:
+
+```
+pnpm lint    # or `pnpm run lint`
+```
+
+Lint failures are not cosmetic here — they are a HARD finding. The reviewer
+re-checks lint and will emit `HAS_BLOCKERS` (bouncing the work back to you) if
+it fails, and the host quarantines any shipped commit that changed code but
+lacks the lint certification below. So fix lint before you commit; do not defer
+it.
+
+**Certify in your STEP 9/9 commit body.** Add exactly ONE of these lines to the
+commit message body, followed by a one-line evidence quote:
+
+- `SANDCASTLE-LINT: pass` — you ran the project's lint script and it reported
+  zero errors. (This exact token is what the host greps for.)
+- `SANDCASTLE-LINT: n/a` — ONLY if the project genuinely has no `lint` script
+  in its `package.json`. (When there's no lint script the host gate is dormant
+  anyway, but state it so the reviewer doesn't have to guess.)
+
+Evidence line: paste the linter's summary proving the run was clean — e.g. a
+`✖ 0 problems` / `0 errors` summary, or the clean tail of the lint output.
+
+Do NOT write `SANDCASTLE-LINT: pass` without actually running lint to a clean
+result. The reviewer re-runs/inspects lint and a falsified cert is a HARD
+finding, exactly like a falsified e2e certification. If the project has a lint
+script and you cannot get it to pass, that is a real blocker — HALT per step 8
+rather than committing an uncertified diff.
+
 # STEP 6/9 (E2e) — non-negotiable rules
 
 If the issue spec's Acceptance section contains a playwright command (any
@@ -462,7 +495,9 @@ start it; the loop never manages the dev server.
 2. Plan your approach. If the change is more than a couple of files, sketch
    it out before writing code.
 
-3. Run the project's verification commands. ALL must pass before you commit.
+3. Run the project's verification commands. ALL must pass before you commit —
+   that includes the project's lint script (see the LINT gate section above);
+   `pnpm lint` is part of "ALL", not an optional extra.
    **Prefer narrow scope by default** to keep memory pressure low. A
    whole-repo typecheck in a constrained container can OOM-kill tsc
    silently — the kernel kills the child while the SDK still sees the
