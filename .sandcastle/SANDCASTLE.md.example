@@ -17,6 +17,12 @@ diff must pass the critique sub-agent graded against `<name>`'s rubric
 quarantined rather than silently shipped (ADR 0006 v3 fail-loud preflight).
 Delete this `# SANDCASTLE.md (EXAMPLE…)` title line after copying.
 
+**Install a rubric for every principle you list**, or that type's issues will be
+quarantined. The `type:new-component` example below lists `impeccable` and
+`layout`, so a verbatim copy quarantines your first `type:new-component` issue
+until you add those `SKILL.md` files (repo-local or `~/.claude/skills/`) or swap
+in principles you already have.
+
 ### type:new-component
 
 Required:
