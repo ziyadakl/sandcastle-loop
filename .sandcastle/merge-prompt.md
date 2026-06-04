@@ -29,9 +29,12 @@ For each branch in the list above, in order:
    e.g. `pnpm typecheck` / `pnpm vitest run`) to verify everything still
    works.
 <!-- /variant:test-runner-merge -->
-4. If tests fail, **fix the issues before proceeding to the next branch**.
-   A merge that breaks tests is worse than no merge — do not move on
-   until the suite is green again.
+4. Also run the project's lint script (`pnpm lint`; skip if the project has
+   no `lint` script) on the merged result — a per-branch clean lint doesn't
+   guarantee the *combined* tree lints cleanly.
+5. If tests or lint fail, **fix the issues before proceeding to the next
+   branch**. A merge that breaks tests or lint is worse than no merge — do
+   not move on until both are green again.
 
 # AFTER ALL BRANCHES ARE MERGED
 

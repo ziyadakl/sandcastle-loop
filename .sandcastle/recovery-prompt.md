@@ -119,8 +119,10 @@ Pick which tests apply based on the spec:
   this iteration's diff (`pnpm vitest run <test-file>` for each new
   `*.test.ts`).
 <!-- /variant:test-runner-recovery -->
-- **At minimum:** `pnpm typecheck` always runs. If it fails, the work is
-  broken regardless.
+- **At minimum:** `pnpm typecheck` always runs, plus `pnpm lint` if the
+  project has a `lint` script. If either fails, the work is broken regardless
+  — fix it before committing. A lint failure is a HARD finding the
+  recovery-reviewer will reject, exactly as on the implementer's pass.
 
 ## 3. Decide based on test results
 
@@ -131,6 +133,13 @@ missed. Your steps:
 
 - If there are uncommitted changes, commit them with prefix
   `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}):`.
+- **Lint certification.** If the project has a `lint` script, you must have
+  run `pnpm lint` to a clean result (see step 2) — add a `SANDCASTLE-LINT: pass`
+  line to the commit body, with the linter's zero-error summary as evidence.
+  The recovery-reviewer checks for this token exactly as it does on the
+  implementer's commits; a recovery commit that changed code on a lint-enabled
+  project without it is rejected. Use `SANDCASTLE-LINT: n/a` only when the
+  project genuinely has no `lint` script.
 - Append to progress.txt:
   `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} recovered" >> progress.txt`
 - Output `RECOVERY_COMPLETE` on its own line and exit cleanly. **Do NOT

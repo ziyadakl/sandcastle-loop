@@ -101,7 +101,13 @@ row or by recovery) → HAS_BLOCKERS for the rollup.
    into staging or pre-existing on `{{INTEGRATION_BRANCH}}`.
 <!-- /variant:test-runner-post-merge-review -->
 
-4. **Issue spec coverage** — for each merged issue listed above, confirm
+4. **Combined lint** — run the project's lint script (`pnpm lint`; skip if the
+   project has no `lint` script). A clean per-issue lint doesn't guarantee the
+   merged tree lints cleanly. If it fails, name the file:line and whether it's
+   from this iteration's merge into staging or pre-existing on
+   `{{INTEGRATION_BRANCH}}`.
+
+5. **Issue spec coverage** — for each merged issue listed above, confirm
    the deliverable that the per-issue implementer claimed actually made it
    through the merge (file exists, the relevant test/function/behavior is
    present at HEAD).

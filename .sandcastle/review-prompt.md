@@ -272,6 +272,24 @@ Category-specific guidance:
 
   Empty grep + no baseline mutation = `ok`.
 
+- **Lint / code style** — only if the project has a `lint` script in its
+  `package.json`. If it doesn't, mark this category `n/a (no lint script)`.
+
+  1. The implementer was required to run `pnpm lint` to a clean result and
+     certify it with a `SANDCASTLE-LINT: pass` line in the commit body
+     (visible above). Confirm that token is present.
+  2. If the project has a lint script but the commit body lacks
+     `SANDCASTLE-LINT: pass` (or claims `n/a` when a lint script clearly
+     exists), that's a HARD finding — emit `HAS_BLOCKERS`.
+  3. Cross-check the claim against the diff: if the changed code obviously
+     violates the project's lint rules (unused imports, banned `any`,
+     formatting the linter would reject), treat a `SANDCASTLE-LINT: pass`
+     cert as falsified — a HARD finding, exactly like a fabricated e2e
+     certification. When in doubt, re-run `pnpm lint` yourself.
+  4. A genuine lint failure is HARD — the work cannot ship with style errors.
+
+  Cert present + diff consistent with a clean lint = `ok`.
+
 ```
 CATEGORY SWEEP:
 - Execution evidence: <ok | n/a (...) | <finding>>
@@ -283,6 +301,7 @@ CATEGORY SWEEP:
 - Edge cases: <ok | n/a (...) | <finding>>
 - Skill discipline: <ok | n/a (...) | <finding>>
 - Migration schema qualification: <ok | n/a (...) | <finding>>
+- Lint / code style: <ok | n/a (...) | <finding>>
 SWEEP COMPLETE.
 ```
 
