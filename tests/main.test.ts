@@ -33,6 +33,7 @@ import {
   runMain,
   runImplementer,
   runCritique,
+  shipAfterMigrations,
   parsePlan,
   parseBlockedBy,
   buildBlockedByNote,
@@ -3934,5 +3935,152 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
       "critique-no-rubric-loaded",
     );
     expect(names).toEqual([]); // preflight quarantines before any dispatch
+  });
+});
+
+describe("shipAfterMigrations integration leg (critique gate + migration journal)", () => {
+  const ISSUE = 7;
+  const CRITIQUE = `critique (issue=${ISSUE})`;
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-ship-"));
+    mkdirSync(path.join(tmp, ".claude", "skills", "impeccable"), {
+      recursive: true,
+    });
+    writeFileSync(
+      path.join(tmp, ".claude", "skills", "impeccable", "SKILL.md"),
+      "# impeccable\n",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // No worktreePath: shipAfterMigrations does not call captureSha (unlike
+  // runCritique's retry leg), so the canned-by-name sandbox is sufficient.
+  function makeShipSandbox(byName: Record<string, RunHandle>): {
+    sandbox: SandboxHandle;
+    names: string[];
+  } {
+    const names: string[] = [];
+    const sandbox: SandboxHandle = {
+      branch: `agent/issue-${ISSUE}`,
+      run: async (opts) => {
+        names.push(opts.name);
+        const h = byName[opts.name];
+        if (!h) throw new Error(`unexpected run name=${opts.name}`);
+        return h;
+      },
+      close: async () => undefined,
+    };
+    return { sandbox, names };
+  }
+
+  // deps is injectable (unlike critiqueCtx's fixed makeNoopDeps): the ship
+  // tests need the recording buildDeps() harness to assert migrations/markDone.
+  function shipCtx(deps: Deps) {
+    return {
+      args: {
+        ...skillGateArgs(),
+        repoRoot: tmp,
+        stagingEnabled: false, // staging path (markMergedToStaging) is out of scope; covered separately
+        retryEnabled: true,
+      },
+      deps,
+      iteration: 1,
+      issueNumber: ISSUE,
+      issue: {
+        id: String(ISSUE),
+        title: "integration",
+        branch: `agent/issue-${ISSUE}`,
+      },
+      requiredSkills: ["impeccable"] as readonly string[],
+      typeLabel: "type:new-component",
+    };
+  }
+
+  async function catchErr(p: Promise<unknown>): Promise<unknown> {
+    try {
+      await p;
+      return undefined;
+    } catch (e) {
+      return e;
+    }
+  }
+
+  it("CRITIQUE_CLEAN → dispatches critique, validates journal, applies migrations, marks done", async () => {
+    const b = buildDeps();
+    const { sandbox, names } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const out = await shipAfterMigrations(
+      shipCtx(b.deps),
+      sandbox,
+      "pre-sha",
+      "post-sha",
+      "STORY_COMPLETE",
+      ["impeccable"],
+      "first-pass-only",
+    );
+    expect(names).toEqual([CRITIQUE]);
+    expect(b.state.migrationsCalls).toHaveLength(1);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(b.state.marksDone[0]?.issueNum).toBe(ISSUE);
+    expect(b.state.quarantines).toEqual([]);
+    expect(out.status).toBe("ok");
+  });
+
+  it("CRITIQUE_CRITICAL → throws before migrations; no apply, no markDone", async () => {
+    const b = buildDeps();
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: {
+        stdout: "## Findings\n\n1. P0\n\nCRITIQUE_CRITICAL",
+        commits: [],
+      },
+    });
+    const err = await catchErr(
+      shipAfterMigrations(
+        shipCtx(b.deps),
+        sandbox,
+        "pre-sha",
+        "post-sha",
+        "STORY_COMPLETE",
+      ),
+    );
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    expect((err as CritiqueCriticalError).noRubricLoaded).toBe(false);
+    expect(critiqueErrorReasonCode(err as CritiqueCriticalError).reasonCode).toBe("critique-critical-fail");
+    expect(b.state.migrationsCalls).toEqual([]);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("CRITIQUE_CLEAN but unregistered migration → journal gate throws before applyMigrations", async () => {
+    const b = buildDeps({
+      unregisteredMigrations: [
+        {
+          file: "0007_thing.sql",
+          expectedTag: "0007_thing",
+          journalPath: "packages/db/migrations/meta/_journal.json",
+          journalMissing: false,
+        },
+      ],
+    });
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "looks fine\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const err = await catchErr(
+      shipAfterMigrations(
+        shipCtx(b.deps),
+        sandbox,
+        "pre-sha",
+        "post-sha",
+        "STORY_COMPLETE",
+      ),
+    );
+    expect((err as Error).message).toMatch(/not\s+registered/i);
+    expect(b.state.migrationsCalls).toEqual([]);
+    expect(b.state.marksDone).toEqual([]);
   });
 });

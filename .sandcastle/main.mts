@@ -3143,7 +3143,7 @@ export async function runCritique(
   return { postSha };
 }
 
-async function shipAfterMigrations(
+export async function shipAfterMigrations(
   ctx: PipelineCtx,
   sandbox: SandboxHandle,
   preSha: string,
