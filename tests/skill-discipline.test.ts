@@ -567,6 +567,10 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async validateMigrationJournal(_repoRoot, _preSha, _postSha) {
       return [];
     },
+    async checkLintCert(_repoRoot, _preSha, _postSha) {
+      // Skill-discipline gate tests don't exercise the lint gate; stay dormant.
+      return { status: "dormant" };
+    },
     async captureSha(_w) {
       return "sha-x";
     },
