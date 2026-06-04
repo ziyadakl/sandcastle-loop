@@ -23,6 +23,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeHostSessionPath } from "@ai-hero/sandcastle";
 import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
@@ -365,6 +366,37 @@ describe("resolveSessionFilePath", () => {
       else process.env.HOME = prevHome;
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// SDK drift guard — resolver must point at the SAME session file the SDK does
+// ---------------------------------------------------------------------------
+//
+// resolveSessionFilePath's sessionId fallback hand-mirrors @ai-hero/sandcastle's
+// project-path encoding (skill-discipline.ts `encodeProjectPath`, copied
+// byte-for-byte from the SDK). If a future SDK bump ever changes that encoding,
+// THIS fails loudly instead of the skill-discipline gate silently abstaining —
+// resolving a non-existent path and behaving as if no skills were invoked (the
+// documented silent-abstention failure class; see docs/adr/0006). The oracle is
+// the SDK's now-public `claudeHostSessionPath`, so the guard tracks upstream
+// automatically rather than re-encoding our own assumption.
+describe("SDK drift guard — resolveSessionFilePath matches the SDK's session path", () => {
+  const projectsOf = (home: string) => join(home, ".claude", "projects");
+  const cases: ReadonlyArray<{ repoRoot: string; sessionId: string; home: string }> = [
+    { repoRoot: "/Users/ziyadakl/Dev/Sandcastle", sessionId: "abc-123", home: "/Users/ziyadakl" },
+    { repoRoot: "/home/agent/workspace", sessionId: "xyz-789", home: "/home/deploy" },
+    { repoRoot: "/work/proj", sessionId: "s4", home: "/tmp/fake-home" },
+    { repoRoot: "/", sessionId: "s1", home: "/h" },
+    { repoRoot: "/trailing/slash/", sessionId: "s3", home: "/h" },
+    { repoRoot: "C:\\Users\\dev\\proj", sessionId: "s2", home: "/h" },
+  ];
+  for (const { repoRoot, sessionId, home } of cases) {
+    it(`matches the SDK for repoRoot=${repoRoot}`, () => {
+      const ours = resolveSessionFilePath({ sessionId }, repoRoot, home);
+      const sdk = claudeHostSessionPath(repoRoot, sessionId, projectsOf(home));
+      expect(ours).toBe(sdk);
+    });
+  }
 });
 
 describe("filterPlanByTypeLabels", () => {
