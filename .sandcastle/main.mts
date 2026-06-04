@@ -373,6 +373,26 @@ export interface Deps {
   >;
   /** Capture the current HEAD SHA inside the sandbox worktree. */
   captureSha(worktreePath: string): Promise<string>;
+  /**
+   * Lint-gate backstop — deterministic, host-side, needs no `node_modules`.
+   * Reads the post-commit message and the project's package.json to classify:
+   *   - `"dormant"`: project has no `lint` script, or there's no code diff
+   *     (`preSha === postSha`) — the gate is a graceful no-op.
+   *   - `"pass"`: the commit body carries the `SANDCASTLE-LINT: pass` cert.
+   *   - `"missing"`: a lint-enabled project changed code but the commit body
+   *     lacks the cert — `shipAfterMigrations` quarantines for human triage.
+   * The lint RUN and the truth of the cert are handled in-sandbox (implementer
+   * runs+fixes lint; reviewer's CATEGORY SWEEP verifies). This host check only
+   * confirms the cert is present, mirroring how the e2e gate pairs driver
+   * ground-truth with reviewer verification. Required like its sibling gate
+   * `validateMigrationJournal` — every code-bearing slice is classified; the
+   * dormant cases are decided inside, not by an absent method.
+   */
+  checkLintCert(
+    repoRoot: string,
+    preSha: string,
+    postSha: string,
+  ): Promise<{ status: "pass" | "missing" | "dormant" }>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -1211,6 +1231,75 @@ function runGit(repoRoot: string, ...gitArgs: string[]): GitRunResult {
 }
 
 /**
+ * Stable certification token the implementer writes in the commit body when
+ * the project's lint passes, and the lint-gate backstop greps for. Kept in
+ * sync with implement-prompt.md by a prompt-contract rot-guard test.
+ */
+export const LINT_CERT_TOKEN = "SANDCASTLE-LINT: pass";
+const LINT_CERT_RE = /SANDCASTLE-LINT:\s*pass\b/i;
+
+/**
+ * Does a commit-message body carry the lint pass-certification the implementer
+ * is required to write (`SANDCASTLE-LINT: pass`)? Case- and spacing-insensitive;
+ * `pass` must be a whole word so `SANDCASTLE-LINT: n/a` (a false "no lint
+ * script" claim) does NOT satisfy it.
+ */
+export function commitMessageHasLintCert(message: string): boolean {
+  return LINT_CERT_RE.test(message);
+}
+
+/**
+ * Does the project at `repoRoot` define a non-empty `lint` script in its
+ * package.json? Drives the lint-gate's dormancy — a project with no lint
+ * script gets a graceful no-op, same philosophy as the critique gate. The
+ * loop hardcodes pnpm, so the script (whatever it shells out to) is invoked
+ * as `pnpm lint` in-sandbox by the implementer/reviewer. Fail-quiet: a
+ * missing or malformed package.json reads as "no lint script" so a parse
+ * error can never quarantine a slice.
+ */
+export function hasLintScript(repoRoot: string): boolean {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> };
+    const lint = pkg.scripts?.lint;
+    return typeof lint === "string" && lint.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pure classifier for the lint-gate backstop. Given the project's lint-script
+ * presence, the pre/post SHAs, and the shipped commit message (`null` when the
+ * message could not be read), decide the gate status. Holding every branch in
+ * one pure function — instead of the `Deps.checkLintCert` closure that does the
+ * I/O — makes each dormancy case directly unit-testable, including the
+ * safety-critical fail-quiet branch that must never quarantine on a git hiccup.
+ *   - no `lint` script                → "dormant" (project doesn't lint)
+ *   - no code diff (empty/equal SHAs) → "dormant"
+ *   - message unreadable (`null`)     → "dormant" (fail-quiet: an infra/git
+ *       hiccup must not quarantine a slice, cf. detectChangedLockfiles)
+ *   - cert present                    → "pass"
+ *   - cert absent                     → "missing" (quarantine for human triage)
+ */
+export function classifyLintCert(
+  hasLint: boolean,
+  preSha: string,
+  postSha: string,
+  message: string | null,
+): { status: "pass" | "missing" | "dormant" } {
+  if (!hasLint) return { status: "dormant" };
+  if (preSha === "" || postSha === "" || preSha === postSha) {
+    return { status: "dormant" };
+  }
+  if (message === null) return { status: "dormant" };
+  return commitMessageHasLintCert(message)
+    ? { status: "pass" }
+    : { status: "missing" };
+}
+
+/**
  * Resolve a ref to its commit SHA. Returns "" if the ref does not exist
  * (caller decides whether that's an error or just first-iteration setup).
  */
@@ -1909,6 +1998,20 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     },
     async validateMigrationJournal(repoRoot, preSha, postSha) {
       return await validateJournalRegistration(repoRoot, preSha, postSha);
+    },
+    async checkLintCert(repoRoot, preSha, postSha) {
+      // Pure I/O: gather the two inputs, then delegate every status decision
+      // to the pure `classifyLintCert` (directly unit-tested, including the
+      // fail-quiet git-hiccup branch). An empty postSha can't be `git show`n,
+      // so the message reads as null there — classifyLintCert maps it to
+      // dormant either way.
+      const hasLint = hasLintScript(repoRoot);
+      let message: string | null = null;
+      if (postSha !== "") {
+        const msg = runGit(repoRoot, "show", "-s", "--format=%B", postSha);
+        message = msg.ok ? msg.stdout : null;
+      }
+      return classifyLintCert(hasLint, preSha, postSha, message);
     },
     async captureSha(worktreePath) {
       try {
@@ -3158,6 +3261,26 @@ export async function shipAfterMigrations(
   // its own type/required-skills graceful-degradation guard and returns the
   // (retry-refreshed) postSha; it throws CritiqueCriticalError to quarantine.
   postSha = (await runCritique(sandbox, ctx, postSha)).postSha;
+  // Lint gate (deterministic host backstop). Runs after critique and before
+  // the journal/migration gates, so a lint-uncertified diff never reaches the
+  // dev DB or markDone. Dormant when the project has no `lint` script or there
+  // is no code diff. The lint RUN happens in-sandbox (implementer runs+fixes,
+  // reviewer's CATEGORY SWEEP verifies); this only confirms the implementer's
+  // `SANDCASTLE-LINT: pass` cert is present on the shipped commit.
+  const lint = await ctx.deps.checkLintCert(
+    ctx.args.repoRoot,
+    preSha,
+    postSha,
+  );
+  if (lint.status === "missing") {
+    throw new Error(
+      `lint-cert-missing: issue #${ctx.issueNumber} commit ${postSha} changed ` +
+        `code but its body lacks the \`${LINT_CERT_TOKEN}\` certification, and ` +
+        `the project defines a \`lint\` script. The implementer must run lint ` +
+        `and certify it passed (see implement-prompt.md), and the reviewer must ` +
+        `reject an uncertified or failing lint. Quarantining for human triage.`,
+    );
+  }
   if (preSha !== "" && postSha !== "" && preSha !== postSha) {
     // Drizzle journal-registration gate. If the implementer added a new
     // <NNNN>_*.sql migration on disk but forgot to register it in

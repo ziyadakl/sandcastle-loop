@@ -44,6 +44,9 @@ import {
   ensureStagingWorktree,
   fastForwardIntegration,
   detectChangedLockfiles,
+  hasLintScript,
+  commitMessageHasLintCert,
+  classifyLintCert,
   parseWorktreeList,
   serializeDotenv,
   extractCategorySweep,
@@ -94,6 +97,7 @@ interface MockState {
   releases: { issueNum: number; reason: string }[];
   comments: { issueNum: number; body: string }[];
   migrationsCalls: { repoRoot: string; preSha: string; postSha: string }[];
+  lintCertChecks: { repoRoot: string; preSha: string; postSha: string }[];
   logs: string[];
   errors: string[];
 }
@@ -109,6 +113,7 @@ function newState(): MockState {
     releases: [],
     comments: [],
     migrationsCalls: [],
+    lintCertChecks: [],
     logs: [],
     errors: [],
   };
@@ -153,6 +158,10 @@ function buildDeps(opts: {
   /** Optional iteration-start hook. Tests use this to inject mid-run
    *  filesystem mutations so the restart-detector path can be exercised. */
   iterationStartHook?: (it: number) => void | Promise<void>;
+  /** Stub return for the lint-gate backstop checkLintCert. Defaults to
+   *  "dormant" so existing tests are unaffected (the gate is a no-op).
+   *  Lint-gate tests set "pass" or "missing" to exercise it. */
+  lintCertStatus?: "pass" | "missing" | "dormant";
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -246,6 +255,12 @@ function buildDeps(opts: {
       // Default: nothing unregistered. Specific journal-staleness tests
       // can override this stub via opts.unregisteredMigrations.
       return opts.unregisteredMigrations ?? [];
+    },
+    async checkLintCert(repoRoot, preSha, postSha) {
+      // Default: "dormant" (gate no-op) so existing tests are unaffected.
+      // Lint-gate tests set opts.lintCertStatus to "pass" / "missing".
+      state.lintCertChecks.push({ repoRoot, preSha, postSha });
+      return { status: opts.lintCertStatus ?? "dormant" };
     },
     async captureSha(_w) {
       const v = shas[shaIdx % shas.length] ?? "sha-x";
@@ -3391,6 +3406,7 @@ function makeNoopDeps(): Deps {
     listOpenIssuesWithBodies: unused,
     applyMigrations: unused,
     validateMigrationJournal: unused,
+    checkLintCert: unused,
     captureSha: unused,
     log: () => undefined,
     logError: () => undefined,
@@ -4082,5 +4098,158 @@ describe("shipAfterMigrations gate ordering: critique + journal gate before migr
     expect((err as Error).message).toMatch(/not\s+registered/i);
     expect(b.state.migrationsCalls).toEqual([]);
     expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("lint cert present (status=pass) → gate runs, then ships normally", async () => {
+    const b = buildDeps({ lintCertStatus: "pass" });
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const out = await shipAfterMigrations(
+      shipCtx(b.deps),
+      sandbox,
+      "pre-sha",
+      "post-sha",
+      "STORY_COMPLETE",
+      ["impeccable"],
+      "first-pass-only",
+    );
+    // Gate was consulted with the repoRoot + the shipped SHAs.
+    expect(b.state.lintCertChecks).toEqual([
+      { repoRoot: tmp, preSha: "pre-sha", postSha: "post-sha" },
+    ]);
+    // A present cert does not block: migrations apply, issue marks done.
+    expect(b.state.migrationsCalls).toHaveLength(1);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(out.status).toBe("ok");
+  });
+
+  it("lint cert missing (status=missing) on a code diff → throws before migrations/markDone", async () => {
+    const b = buildDeps({ lintCertStatus: "missing" });
+    const { sandbox, names } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const err = await catchErr(
+      shipAfterMigrations(
+        shipCtx(b.deps),
+        sandbox,
+        "pre-sha",
+        "post-sha",
+        "STORY_COMPLETE",
+      ),
+    );
+    // Critique ran first; the lint gate then fired before the migration leg.
+    expect(names).toEqual([CRITIQUE]);
+    expect((err as Error).message).toMatch(/lint-cert-missing/i);
+    expect(b.state.migrationsCalls).toEqual([]);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("lint dormant (no lint script / status=dormant) → gate is a no-op, ships", async () => {
+    const b = buildDeps({ lintCertStatus: "dormant" });
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const out = await shipAfterMigrations(
+      shipCtx(b.deps),
+      sandbox,
+      "pre-sha",
+      "post-sha",
+      "STORY_COMPLETE",
+      ["impeccable"],
+      "first-pass-only",
+    );
+    expect(b.state.lintCertChecks).toHaveLength(1);
+    expect(b.state.migrationsCalls).toHaveLength(1);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(out.status).toBe("ok");
+  });
+});
+
+describe("lint-gate helpers (hasLintScript, commitMessageHasLintCert)", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-lint-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const writePkg = (scripts: Record<string, string>) =>
+    writeFileSync(path.join(tmp, "package.json"), JSON.stringify({ scripts }));
+
+  it("hasLintScript: true when package.json has a non-empty lint script", () => {
+    writePkg({ lint: "eslint ." });
+    expect(hasLintScript(tmp)).toBe(true);
+  });
+
+  it("hasLintScript: false when there is no lint script", () => {
+    writePkg({ test: "vitest run" });
+    expect(hasLintScript(tmp)).toBe(false);
+  });
+
+  it("hasLintScript: fail-quiet false on missing/malformed package.json or empty script", () => {
+    expect(hasLintScript(tmp)).toBe(false); // no package.json
+    writeFileSync(path.join(tmp, "package.json"), "{ not json");
+    expect(hasLintScript(tmp)).toBe(false); // malformed
+    writePkg({ lint: "   " });
+    expect(hasLintScript(tmp)).toBe(false); // whitespace-only script
+  });
+
+  it("commitMessageHasLintCert: matches the pass token, case/spacing-insensitive", () => {
+    expect(commitMessageHasLintCert("body\n\nSANDCASTLE-LINT: pass\n")).toBe(true);
+    expect(commitMessageHasLintCert("sandcastle-lint:   PASS (0 problems)")).toBe(
+      true,
+    );
+  });
+
+  it("commitMessageHasLintCert: does NOT match n/a, a missing cert, or 'passed'", () => {
+    expect(commitMessageHasLintCert("body\n\nSANDCASTLE-LINT: n/a")).toBe(false);
+    expect(commitMessageHasLintCert("no cert in this body")).toBe(false);
+    expect(commitMessageHasLintCert("SANDCASTLE-LINT: passed maybe")).toBe(false);
+  });
+});
+
+describe("classifyLintCert (lint-gate dormancy matrix)", () => {
+  const CERT = "feat: thing\n\nSANDCASTLE-LINT: pass\n";
+
+  it("dormant when the project has no lint script", () => {
+    // Even with a real diff and a missing cert, no lint script ⇒ no-op.
+    expect(classifyLintCert(false, "pre", "post", "no cert here")).toEqual({
+      status: "dormant",
+    });
+  });
+
+  it("dormant when there is no code diff (empty or equal SHAs)", () => {
+    expect(classifyLintCert(true, "", "post", CERT)).toEqual({
+      status: "dormant",
+    });
+    expect(classifyLintCert(true, "pre", "", CERT)).toEqual({
+      status: "dormant",
+    });
+    expect(classifyLintCert(true, "sha", "sha", CERT)).toEqual({
+      status: "dormant",
+    });
+  });
+
+  it("dormant (fail-quiet) when the commit message is unreadable (null)", () => {
+    // The safety-critical branch: a git/infra hiccup must NOT quarantine.
+    expect(classifyLintCert(true, "pre", "post", null)).toEqual({
+      status: "dormant",
+    });
+  });
+
+  it("pass when a lint-enabled diff carries the cert", () => {
+    expect(classifyLintCert(true, "pre", "post", CERT)).toEqual({
+      status: "pass",
+    });
+  });
+
+  it("missing when a lint-enabled diff lacks the cert", () => {
+    expect(classifyLintCert(true, "pre", "post", "feat: thing\n")).toEqual({
+      status: "missing",
+    });
   });
 });
