@@ -4,19 +4,20 @@
  * every 250ms, folds each read through the pure `reduce` reducer, and renders
  * the resulting `ViewState` with Ink.
  *
- * Phase 1 is an inline render (no alt-screen): `render(<App/>)` repaints in
- * place on every state change, which is the simplest correct Ink-7 surface for
- * a single-pane dashboard. The reducer guarantees the last-good snapshot stays
- * on screen across torn writes, so there's no flicker to manage here.
+ * The dashboard runs on the alternate screen buffer (htop/lazygit/k9s style):
+ * `render(<App/>)` repaints in place on every state change, and the reducer
+ * keeps the last-good snapshot on screen across torn writes, so there's no
+ * flicker to manage here. An input sink puts the TTY in raw mode so scroll
+ * keystrokes don't echo as escape-sequence spam.
  *
- * VISUAL LANGUAGE (see docs/adr/0007). Two ideas keep it legible on ANY theme:
- *   1. Real color is rationed — one warm-coral accent (#D77757, the value the
- *      Claude Code binary ships) for the brand label + live work, plus a small
+ * VISUAL LANGUAGE (see docs/adr/0008). Two ideas keep it legible on ANY theme:
+ *   1. Real color is rationed — one warm-coral accent (#FB8359, a brightened
+ *      take on the brand coral) for the brand label + live work, plus a small
  *      semantic set (merged-green / needs-you-amber / requeued-blue). Nothing
  *      else gets a hue.
- *   2. ALL secondary text uses the terminal's own adaptive dim (the ANSI `dim`
- *      attribute, `dimColor`) rather than a hardcoded gray, so it derives from
- *      whatever foreground the user's theme uses — readable on dark and light.
+ *   2. Secondary text (titles, numbers, separators) is one muted grey
+ *      (`MUTED_FG`), brightened from the original ANSI dim per the user's
+ *      "less muted" preference — readable on a dark theme, still subdued.
  * Exactly ONE rounded border — the bounded "running" panel, the live region —
  * because an outer card around the unbounded lists fights inline render (that's
  * the Phase-2 alt-screen). Zones are separated by thin rules, not blank lines.
@@ -25,7 +26,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { render, Box, Text } from "ink";
+import { render, Box, Text, useApp, useInput } from "ink";
 import { useEffect, useState } from "react";
 
 import { reduce, type ReadResult, type ViewState } from "./reducer.js";
@@ -50,23 +51,34 @@ const NO_COLOR = Boolean(process.env["NO_COLOR"]);
 const DIM = !NO_COLOR;
 
 /**
- * Hues only. The two dim tiers are gone on purpose: secondary text now leans on
- * the terminal-adaptive `dimColor` attribute (see file header), so the palette
- * holds just the accent + semantic status colors + the inverse-text ink for
- * filled pills. Hex so true-color terminals get the exact accent; `tint()`
- * collapses every color to the terminal default under NO_COLOR.
- *   accent — #D77757, VERIFIED in the Claude Code binary (rgb(215,119,87)).
- *   blue   — #6A9BCC, the Anthropic brand blue (also in the binary).
+ * Hues only. Secondary text uses the terminal's default foreground (full
+ * brightness — see MUTED_FG), so the palette holds just the accent + semantic
+ * status colors + the inverse-text ink for filled pills. Hex so true-color
+ * terminals get the exact accent; `tint()` collapses every color to the
+ * terminal default under NO_COLOR.
+ *   accent — #FB8359, a brightened coral (brand value #D77757 felt washed out;
+ *            brightened per the user's "less muted" preference).
+ *   blue   — #6FB0F2, a brightened take on the Anthropic brand blue (#6A9BCC).
  */
 const C = {
-  accent: "#D77757", // brand label + live/active work — the ONLY accent
-  blue: "#6A9BCC", // requeued / informational
-  success: "#7FB069", // merged
-  warning: "#E0A341", // needs-you (the call-to-action) + stale
-  error: "#E5534B", // outdated / failures
+  accent: "#FB8359", // brand label + live/active work — the ONLY accent
+  blue: "#7CBEFF", // requeued / informational
+  success: "#8FE86A", // merged
+  warning: "#FFC83D", // needs-you (the call-to-action) + stale
+  error: "#FB6258", // outdated / failures
   ink: "#1B1A18", // dark fg painted on a filled (light) pill — inverse text
   neutral: "#6E6B64", // the one neutral fill: the "waiting" banner pill bg
 } as const;
+
+/**
+ * Secondary text (issue titles, numbers, separators) renders in the terminal's
+ * DEFAULT foreground — i.e. full brightness, the same as the running-panel
+ * title. Earlier muted-grey hexes (#948E85 → #C6C0B6) looked identical on the
+ * user's terminal: a non-truecolor color level quantizes close greys to one
+ * shade, so nudging the hex did nothing. Dropping the color entirely sidesteps
+ * that — the theme's own foreground shows through, bright on any color level.
+ */
+const MUTED_FG: string | undefined = undefined;
 
 /** Fixed column widths — the running/recent rows share one grid so they align. */
 const W = { marker: 2, num: 6, title: 38, phase: 13 } as const;
@@ -171,12 +183,12 @@ function truncate(s: string, max: number): string {
 
 /** A thin full-width horizontal rule — the zone separator (adaptive dim). */
 function Rule({ width = RULE_W }: { width?: number }) {
-  return <Text dimColor={DIM}>{"─".repeat(width)}</Text>;
+  return <Text color={MUTED_FG}>{"─".repeat(width)}</Text>;
 }
 
 /** ` · ` separator, adaptive dim. */
 function Sep() {
-  return <Text dimColor={DIM}> · </Text>;
+  return <Text color={MUTED_FG}> · </Text>;
 }
 
 /**
@@ -231,9 +243,9 @@ function Header({ run }: { run: SandcastleStatus["run"] }) {
       <Sep />
       <Text>{run.repo}</Text>
       <Sep />
-      <Text dimColor={DIM}>{run.branch}</Text>
+      <Text color={MUTED_FG}>{run.branch}</Text>
       <Sep />
-      <Text dimColor={DIM}>
+      <Text color={MUTED_FG}>
         iter {run.iterations.current}/{run.iterations.total}
       </Text>
     </Box>
@@ -274,7 +286,7 @@ function IssueRow({ issue }: { issue: StatusIssue }) {
           <Text color={tint(C.warning)}>{flagged ? "⚠" : " "}</Text>
         </Box>
         <Box width={W.num}>
-          <Text dimColor={DIM}>#{issue.number}</Text>
+          <Text color={MUTED_FG}>#{issue.number}</Text>
         </Box>
         <Box width={W.title}>
           <Text>{truncate(issue.title, W.title - 1)}</Text>
@@ -288,7 +300,7 @@ function IssueRow({ issue }: { issue: StatusIssue }) {
           <Box width={W.marker + W.num}>
             <Text> </Text>
           </Box>
-          <Text dimColor={DIM}>
+          <Text color={MUTED_FG}>
             {truncate(issue.detail, W.title + W.phase - 1)}
           </Text>
         </Box>
@@ -310,7 +322,7 @@ function RunningPanel({ active }: { active: readonly StatusIssue[] }) {
         ▶ running
       </Text>
       {active.length === 0 ? (
-        <Text dimColor={DIM}>idle — no active issues</Text>
+        <Text color={MUTED_FG}>idle — no active issues</Text>
       ) : (
         active.map((issue) => <IssueRow key={issue.number} issue={issue} />)
       )}
@@ -319,8 +331,9 @@ function RunningPanel({ active }: { active: readonly StatusIssue[] }) {
 }
 
 function RecentRow({ issue }: { issue: StatusIssue }) {
-  // Recent rows are recessed: a semantic hue dimmed (merged/needs-you) or pure
-  // adaptive dim (deferred). Brightness drop vs. the live panel is the hierarchy.
+  // Recent rows: full-brightness semantic hue (merged-green / needs-you-amber)
+  // or default fg (deferred). The running panel's border + position carry the
+  // hierarchy now — the labels render bright per the user's "brighten" request.
   const statusColor =
     issue.phase === "merged"
       ? C.success
@@ -332,18 +345,18 @@ function RecentRow({ issue }: { issue: StatusIssue }) {
   return (
     <Box>
       <Box width={W.marker}>
-        <Text color={statusColor ? tint(statusColor) : undefined} dimColor={DIM}>
+        <Text color={statusColor ? tint(statusColor) : undefined}>
           {glyph}
         </Text>
       </Box>
       <Box width={W.num}>
-        <Text dimColor={DIM}>#{issue.number}</Text>
+        <Text color={MUTED_FG}>#{issue.number}</Text>
       </Box>
       <Box width={W.title}>
-        <Text dimColor={DIM}>{truncate(issue.title, W.title - 1)}</Text>
+        <Text color={MUTED_FG}>{truncate(issue.title, W.title - 1)}</Text>
       </Box>
       <Box width={W.phase}>
-        <Text color={statusColor ? tint(statusColor) : undefined} dimColor={DIM}>
+        <Text color={statusColor ? tint(statusColor) : undefined}>
           {PHASE_LABEL[issue.phase]}
         </Text>
       </Box>
@@ -398,13 +411,13 @@ export function Dashboard({ state }: { state: ViewState }) {
 
       {recent.length > 0 ? (
         <Box marginTop={1} flexDirection="column">
-          <Text dimColor={DIM}>recent</Text>
+          <Text color={MUTED_FG}>recent</Text>
           <Rule />
           {recent.map((issue) => (
             <RecentRow key={issue.number} issue={issue} />
           ))}
           {hiddenRecent > 0 ? (
-            <Text dimColor={DIM}> +{hiddenRecent} more</Text>
+            <Text color={MUTED_FG}> +{hiddenRecent} more</Text>
           ) : null}
         </Box>
       ) : null}
@@ -415,7 +428,22 @@ export function Dashboard({ state }: { state: ViewState }) {
 }
 
 function App({ statusPath }: { statusPath: string }) {
+  const { exit } = useApp();
   const [view, setView] = useState<ViewState>({ status: null, banner: null });
+
+  // Input sink → raw mode. Without an active input hook Ink leaves the TTY in
+  // cooked mode, so scrolling — which the terminal translates to cursor-key
+  // escape sequences while the alt-screen is up — gets ECHOED as `^[[A`/`^[[B`
+  // spam below the render. Consuming input flips the TTY to raw mode, so those
+  // keystrokes are swallowed instead of printed. `q` quits; Ctrl-C still exits
+  // via Ink's default. Inactive when stdin isn't a TTY, so a non-interactive
+  // stdin never trips Ink's raw-mode-unsupported throw.
+  useInput(
+    (input) => {
+      if (input === "q") exit();
+    },
+    { isActive: process.stdin.isTTY === true },
+  );
 
   useEffect(() => {
     const tick = () => {
