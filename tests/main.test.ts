@@ -3938,7 +3938,7 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
   });
 });
 
-describe("shipAfterMigrations integration leg (critique gate + migration journal)", () => {
+describe("shipAfterMigrations gate ordering: critique + journal gate before migrations/ship", () => {
   const ISSUE = 7;
   const CRITIQUE = `critique (issue=${ISSUE})`;
   let tmp: string;
