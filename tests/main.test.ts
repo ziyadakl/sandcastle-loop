@@ -307,13 +307,13 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     label: "ready-for-agent",
     maxConcurrent: 3,
     imageName: "sandcastle:affinity-tracker",
-    plannerModel: "claude-opus-4-7",
+    plannerModel: "claude-opus-4-8",
     implementerModel: "claude-sonnet-4-6",
     reviewerModel: "claude-haiku-4-5",
     critiqueModel: "claude-haiku-4-5",
-    mergerModel: "claude-opus-4-7",
-    postMergeReviewerModel: "claude-opus-4-7",
-    recoveryModel: "claude-opus-4-7",
+    mergerModel: "claude-opus-4-8",
+    postMergeReviewerModel: "claude-opus-4-8",
+    recoveryModel: "claude-opus-4-8",
     implementerTimeoutSec: 1200,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
@@ -1090,9 +1090,9 @@ describe("sandcastle-loop main.mts — parseSandcastleArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-opus-4-7");
+    expect(r.args.implementerModel).toBe("claude-opus-4-8");
     expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
-    expect(r.args.recoveryModel).toBe("claude-opus-4-7");
+    expect(r.args.recoveryModel).toBe("claude-opus-4-8");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
   });

@@ -16,7 +16,7 @@
  * once multi-provider support lands.
  *
  * Model IDs must be the exact strings the SDK accepts (e.g.
- * `claude-opus-4-7[1m]` for the 1M-context tier — lowercase, square brackets,
+ * `claude-opus-4-8[1m]` for the 1M-context tier — lowercase, square brackets,
  * no space).
  */
 
@@ -26,14 +26,14 @@ type RoleConfig = {
 };
 
 export const models = {
-  planner:           { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
-  implementer:       { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
+  planner:           { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  implementer:       { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
   reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
   critique:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  merger:            { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
-  postMergeReviewer: { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
-  postMergeFixer:    { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
-  recovery:          { default: "claude-opus-4-7",   escalations: ["claude-opus-4-7[1m]"] },
+  merger:            { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  postMergeReviewer: { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  postMergeFixer:    { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  recovery:          { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
 } as const satisfies Record<string, RoleConfig>;
 
 export type ModelRole = keyof typeof models;

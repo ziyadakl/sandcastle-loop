@@ -147,7 +147,7 @@ interface AttemptSummary {
 interface RecoveryLadderConfig   {
   promptTemplatePath: string;
   sonnetModel?: string;          // default "claude-sonnet-4-6"
-  opusModel?: string;            // default "claude-opus-4-7"
+  opusModel?: string;            // default "claude-opus-4-8"
   idleTimeoutSeconds?: number;   // default 1800
   logDir?: string;               // default `${cwd}/.sandcastle/logs`
   ...
