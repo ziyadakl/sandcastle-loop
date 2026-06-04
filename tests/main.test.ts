@@ -47,6 +47,7 @@ import {
   hasLintScript,
   commitMessageHasLintCert,
   classifyLintCert,
+  hasCodeDiff,
   parseWorktreeList,
   serializeDotenv,
   extractCategorySweep,
@@ -4209,6 +4210,19 @@ describe("lint-gate helpers (hasLintScript, commitMessageHasLintCert)", () => {
     expect(commitMessageHasLintCert("body\n\nSANDCASTLE-LINT: n/a")).toBe(false);
     expect(commitMessageHasLintCert("no cert in this body")).toBe(false);
     expect(commitMessageHasLintCert("SANDCASTLE-LINT: passed maybe")).toBe(false);
+  });
+});
+
+describe("hasCodeDiff (shared real-code-diff predicate)", () => {
+  it("true only when both SHAs resolve and differ", () => {
+    expect(hasCodeDiff("pre", "post")).toBe(true);
+  });
+
+  it("false when either SHA is empty or the two are equal", () => {
+    expect(hasCodeDiff("", "post")).toBe(false);
+    expect(hasCodeDiff("pre", "")).toBe(false);
+    expect(hasCodeDiff("", "")).toBe(false);
+    expect(hasCodeDiff("sha", "sha")).toBe(false);
   });
 });
 

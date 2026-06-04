@@ -1270,6 +1270,17 @@ export function hasLintScript(repoRoot: string): boolean {
 }
 
 /**
+ * Is there a real code diff between two SHAs? True only when both refs resolve
+ * (non-empty) and differ. The single source of truth for "this slice changed
+ * code" — shared by the lint gate (`classifyLintCert`) and the migration/journal
+ * gate in `shipAfterMigrations`, so their dormancy can never drift out of sync
+ * (the two used to carry hand-written De Morgan opposites of this predicate).
+ */
+export function hasCodeDiff(preSha: string, postSha: string): boolean {
+  return preSha !== "" && postSha !== "" && preSha !== postSha;
+}
+
+/**
  * Pure classifier for the lint-gate backstop. Given the project's lint-script
  * presence, the pre/post SHAs, and the shipped commit message (`null` when the
  * message could not be read), decide the gate status. Holding every branch in
@@ -1290,9 +1301,7 @@ export function classifyLintCert(
   message: string | null,
 ): { status: "pass" | "missing" | "dormant" } {
   if (!hasLint) return { status: "dormant" };
-  if (preSha === "" || postSha === "" || preSha === postSha) {
-    return { status: "dormant" };
-  }
+  if (!hasCodeDiff(preSha, postSha)) return { status: "dormant" };
   if (message === null) return { status: "dormant" };
   return commitMessageHasLintCert(message)
     ? { status: "pass" }
@@ -3281,7 +3290,7 @@ export async function shipAfterMigrations(
         `reject an uncertified or failing lint. Quarantining for human triage.`,
     );
   }
-  if (preSha !== "" && postSha !== "" && preSha !== postSha) {
+  if (hasCodeDiff(preSha, postSha)) {
     // Drizzle journal-registration gate. If the implementer added a new
     // <NNNN>_*.sql migration on disk but forgot to register it in
     // packages/db/migrations/meta/_journal.json, drizzle-kit migrate will
