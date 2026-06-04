@@ -70,12 +70,31 @@ import {
   critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
+import { createStatusStore } from "../.sandcastle/lib/status/store.js";
+import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Shared no-op status stub for the PipelineCtx literals these tests build by
+// hand. The functions exercised here (runImplementer / runCritique /
+// shipAfterMigrations) never read ctx.status — only runIssuePipeline/runMain do
+// — so this exists purely to satisfy the `readonly status: StatusStore` field.
+// The no-op writeFn guarantees these tests never touch disk.
+const testStatusStore = createStatusStore(
+  {
+    branch: "test",
+    repo: "test",
+    repoRoot: "/tmp",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    iterationsTotal: 1,
+    maxConcurrent: 1,
+  },
+  { writeFn: () => {} },
+);
 
 interface RunCall {
   readonly kind: "top-level";
@@ -3472,6 +3491,7 @@ describe("runImplementer skill-discipline gate", () => {
       issueNumber: 42,
       issue,
       requiredSkills: ["impeccable", "polish"] as readonly string[],
+      status: testStatusStore,
     };
     await expect(
       runImplementer(sandbox, ctx, {
@@ -3515,6 +3535,7 @@ describe("runImplementer skill-discipline gate", () => {
       iteration: 1,
       issueNumber: 1,
       issue,
+      status: testStatusStore,
     };
     const r = await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
@@ -3537,6 +3558,7 @@ describe("runImplementer skill-discipline gate", () => {
       iteration: 1,
       issueNumber: 1,
       issue,
+      status: testStatusStore,
     };
     const r = await runImplementer(sandbox, ctx, { attemptNumber: 2 });
     expect(r.skillsInvoked).toEqual(["impeccable"]);
@@ -3556,6 +3578,7 @@ describe("runImplementer skill-discipline gate", () => {
       iteration: 1,
       issueNumber: 1,
       issue,
+      status: testStatusStore,
     };
     const r = await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
@@ -3628,6 +3651,7 @@ describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", ()
         title: "10-Item soft cap",
         branch: "agent/issue-310",
       },
+      status: testStatusStore,
     };
     await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
@@ -3659,6 +3683,7 @@ describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", ()
       iteration: 1,
       issueNumber: 1,
       issue: { id: "1", title: "test", branch: "agent/issue-1" },
+      status: testStatusStore,
     };
     await runImplementer(sandbox, ctx, { attemptNumber: 2 });
     expect(sandbox.captured).toHaveLength(1);
@@ -3678,6 +3703,7 @@ describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", ()
       iteration: 1,
       issueNumber: 1,
       issue: { id: "1", title: "test", branch: "agent/issue-1" },
+      status: testStatusStore,
     };
     await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
@@ -3774,6 +3800,7 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
       issue,
       requiredSkills: ["impeccable"] as readonly string[],
       typeLabel: "type:new-component",
+      status: testStatusStore,
     };
   }
 
@@ -4015,6 +4042,7 @@ describe("shipAfterMigrations gate ordering: critique + journal gate before migr
       },
       requiredSkills: ["impeccable"] as readonly string[],
       typeLabel: "type:new-component",
+      status: testStatusStore,
     };
   }
 
@@ -4265,5 +4293,153 @@ describe("classifyLintCert (lint-gate dormancy matrix)", () => {
     expect(classifyLintCert(true, "pre", "post", "feat: thing\n")).toEqual({
       status: "missing",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Execution-level status.json feed (the `sandcastle-watch` viewer's input)
+//
+// These drive runMain end-to-end and read the status.json the orchestrator
+// actually writes to <repoRoot>/.sandcastle/status.json. The single-instance
+// lock acquisition (`ensureFileExists`) creates that dir BEFORE the store is
+// built, so the production atomicWrite path lands on disk in tests with no
+// writeFn injection. They turn the previously code-read-only claim — "each
+// outcome maps to a terminal phase + finish state for the viewer" — into
+// proof-by-execution.
+// ---------------------------------------------------------------------------
+
+/** Read + parse the status.json the loop just wrote to the shared test root. */
+function readStatusFeed(): SandcastleStatus {
+  const p = path.join(TEST_REPO_ROOT, ".sandcastle", "status.json");
+  return JSON.parse(readFileSync(p, "utf8")) as SandcastleStatus;
+}
+
+describe("sandcastle-loop main.mts — status.json feed (execution-level)", () => {
+  it("a SIGINT-interrupted run finishes the feed as 'stopped', not 'done'", async () => {
+    // Capture the SIGINT listeners present BEFORE runMain (vitest installs its
+    // own). The hook below fires only the one runMain newly registers — we
+    // invoke that handler directly rather than process.emit("SIGINT"), which
+    // would also trip vitest's handler and fight its teardown.
+    const sigintBaseline = process.listeners("SIGINT");
+    const b = buildDeps({
+      iterationStartHook: (it) => {
+        if (it !== 1) return;
+        for (const l of process.listeners("SIGINT")) {
+          if (!sigintBaseline.includes(l)) (l as (sig: string) => void)("SIGINT");
+        }
+      },
+    });
+    // Iteration 1 ships issue 71. shuttingDown is set at the top of iteration 1
+    // (via the hook), but the break only fires at the TOP of iteration 2 — so
+    // 71 still ships, then iteration 2 breaks and falls through to finish().
+    // No second planner is enqueued: iteration 2 breaks before calling it.
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    // Iteration 1 completed and shipped before the interrupt took effect.
+    expect(result.shippedIssues).toEqual([71]);
+
+    const feed = readStatusFeed();
+    // The interrupt must surface as a distinct terminal state so the viewer
+    // shows "stopped", not a false "done — loop finished".
+    expect(feed.state).toBe("stopped");
+    // The shipped issue's terminal phase is still recorded under the stop.
+    expect(feed.issues.find((i) => i.number === 71)?.phase).toBe("merged");
+    expect(feed.totals.merged).toBe(1);
+  });
+
+  it("a clean ship records ok→merged and finishes the feed 'done'", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    // Iteration 2 returns an empty plan → the loop exits at the no-claimable
+    // guard (which finishes "done" BEFORE setPlan could clear iteration 1's
+    // issues), so the shipped issue's terminal phase survives in the feed.
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+    expect(result.shippedIssues).toEqual([71]);
+
+    const feed = readStatusFeed();
+    expect(feed.state).toBe("done");
+    expect(feed.issues.find((i) => i.number === 71)?.phase).toBe("merged");
+    expect(feed.totals).toMatchObject({
+      merged: 1,
+      needsHuman: 0,
+      requeued: 0,
+      running: 0,
+    });
+  });
+
+  it("a HAS_BLOCKERS review records quarantined→needs-human with attention", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "100", title: "x", branch: "agent/issue-100" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 100 }),
+      commits: [{ sha: "c1" }],
+    });
+    b.enqueue("reviewer", { stdout: "Found a bug.\nHAS_BLOCKERS" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
+    expect(result.shippedIssues).toEqual([]);
+
+    const feed = readStatusFeed();
+    expect(feed.state).toBe("done");
+    const issue = feed.issues.find((i) => i.number === 100);
+    expect(issue?.phase).toBe("needs-human");
+    expect(issue?.attention).toBe(true);
+    expect(feed.totals.needsHuman).toBe(1);
+  });
+
+  it("a rate-limit defer records deferred→requeued (phase 'deferred')", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "400", title: "rl", branch: "agent/issue-400" }]),
+    });
+    const rl = () =>
+      new Error('API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Slow down"}}');
+    // Both implementer attempts rate-limit → the pipeline defers (release).
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      b.deps,
+    );
+    expect(result.shippedIssues).toEqual([]);
+
+    const feed = readStatusFeed();
+    expect(feed.state).toBe("done");
+    const issue = feed.issues.find((i) => i.number === 400);
+    expect(issue?.phase).toBe("deferred");
+    expect(feed.totals.requeued).toBe(1);
   });
 });
