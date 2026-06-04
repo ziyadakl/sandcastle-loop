@@ -35,6 +35,47 @@ While the merger phase runs (the step that integrates the iteration's per-issue 
 **Verdict**:
 The typed JSON envelope an agent emits at the end of a run. Parsed by `src/verdicts/`. If parsing fails the run is treated as failed.
 
+**Orchestrator stream** (a.k.a. "the sandcastle log"):
+The combined stdout of `.sandcastle/main.mts`: the SDK's per-agent startup
+lines (`[planner] Started…`, the dim `tail -f` hint, run-summary rows — emitted
+by `printFileDisplayStartup` in `@ai-hero/sandcastle/dist/run.js` using Node's
+built-in `styleText`) interleaved with the orchestrator's own ~85
+`log()`/`logError()` lines (`[env]`, `[staging]`, `=== sandcastle-loop
+iteration N/M ===`, `plan:`, `skill-discipline:`, …). In practice it is
+redirected to a file (e.g. `/tmp/sandcastle.log`) and observed live via
+`tail -f` in a tmux pane — **periodic triage glances, not a continuously-watched
+render loop**. This is the surface a human scans to answer "does anything need
+my attention / is there a reason to stop the loop." It is append-only and
+pipe/file-safe by construction. The **loop itself stays headless** — it never
+hosts a render loop, because it is launched detached/overnight and an in-loop
+TUI would only exist while attached. A polished live dashboard is provided
+instead by a **separate read-only viewer** (see below), not by restyling the
+loop into a TUI.
+
+**Agent transcript**:
+The SDK's FileDisplay per-run log — one file per agent invocation at
+`.sandcastle/logs/<branch>-<name>.log` (e.g. `agent-issue-337-implementer.log`).
+The deep-dive surface a human opens when the orchestrator stream flags a
+specific issue worth investigating. Distinct from the orchestrator stream.
+
+**Sandcastle viewer** (`sandcastle-watch`):
+A separate, **read-only** terminal UI run in the watch pane in place of
+`tail -f`. It renders the polished live dashboard (header + iteration/counts,
+a row per running issue, recent results) by reading the **status feed** — it
+never writes, never touches the loop, and can be opened/closed/attached freely.
+The worker (loop) never depends on a viewer being attached. Built with Ink
+(React-for-terminals). See plan
+`docs/superpowers/plans/2026-06-04-sandcastle-viewer-tui.md` and ADR 0008.
+
+**Status feed** (`.sandcastle/status.json`):
+The typed snapshot the loop rewrites **atomically** (write-tmp + `rename`) on
+every state transition, so the viewer renders structured data rather than
+parsing the human log's prose. zod-validated against a schema shared between
+worker and viewer. The decoupling contract between the two: the loop is the only
+writer, the viewer (and potentially the `/sandcastle-status` skill) are readers.
+Token/dollar cost is **not** a guaranteed field — SDK `usage` is Claude-Code-only
+and absent for kimi/glm runs, so cost is best-effort/optional, not load-bearing.
+
 **`SANDCASTLE.md`** (consumer gate config):
 The per-target-project file that activates the critique-as-gate and
 skill-discipline gates by mapping each issue `type:<label>` to its required
