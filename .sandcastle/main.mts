@@ -45,6 +45,7 @@ import {
 } from "./lib/state/index.js";
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
+import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import {
   applyMigrationsBetween,
   listMigrationsOnDisk,
@@ -2457,6 +2458,13 @@ interface PipelineCtx {
    * SANDCASTLE.md doesn't list the type — critique is skipped in that case.
    */
   readonly typeLabel?: string;
+  /**
+   * Status-feed store for the `sandcastle-watch` viewer. Constructed once in
+   * {@link runMain} (after the single-instance lock) and threaded per-issue so
+   * the pipeline can publish phase transitions. Every method is synchronous and
+   * non-fatal — a write failure routes to `deps.logError` and never throws.
+   */
+  readonly status: StatusStore;
 }
 
 export async function runImplementer(
@@ -3385,6 +3393,7 @@ async function runIssuePipeline(
       : "";
 
     // Phase 2a: implementer attempt 1 (default model, no feedback)
+    ctx.status.setIssuePhase(ctx.issueNumber, "implementer");
     const impl1 = await runImplementer(sandbox, ctx, {
       attemptNumber: 1,
       requiredSkills: ctx.requiredSkills,
@@ -3396,6 +3405,7 @@ async function runIssuePipeline(
     // Phase 2b: reviewer attempt 1 (default model). Note: migrations are
     // deferred until AFTER ALL_CLEAR — only the final accepted SQL hits the
     // dev DB, never the intermediate state of a failed first attempt.
+    ctx.status.setIssuePhase(ctx.issueNumber, "reviewer");
     const review1 = await runReviewer(sandbox, ctx, postSha, undefined, undefined, {
       skillsInvoked: impl1.skillsInvoked,
     });
@@ -3439,6 +3449,7 @@ async function runIssuePipeline(
       `[issue=${ctx.issueNumber}] reviewer attempt 1 HAS_BLOCKERS — ` +
         `escalating implementer to ${implEscalations[0]}`,
     );
+    ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 2");
     const impl2 = await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
       model: implEscalations[0],
@@ -3457,6 +3468,7 @@ async function runIssuePipeline(
       `[issue=${ctx.issueNumber}] running reviewer attempt 2 on ` +
         `${revEscalations[0]}${rebuttal ? " (with implementer rebuttal)" : ""}`,
     );
+    ctx.status.setIssuePhase(ctx.issueNumber, "reviewer", "attempt 2");
     const review2 = await runReviewer(sandbox, ctx, postSha, undefined, revEscalations[0], {
       implementerRebuttal: rebuttal,
       name: "reviewer-retry",
@@ -3514,6 +3526,7 @@ async function runIssuePipeline(
           `round-1 categories resolved — granting attempt 3 on ` +
           `${implEscalations[0]}`,
       );
+      ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 3");
       const impl3 = await runImplementer(sandbox, ctx, {
         attemptNumber: 3,
         model: implEscalations[0],
@@ -3529,6 +3542,7 @@ async function runIssuePipeline(
         `[issue=${ctx.issueNumber}] running reviewer attempt 3 on ` +
           `${revEscalations[0]}${rebuttal3 ? " (with implementer rebuttal)" : ""}`,
       );
+      ctx.status.setIssuePhase(ctx.issueNumber, "reviewer", "attempt 3");
       const review3 = await runReviewer(
         sandbox,
         ctx,
@@ -3721,6 +3735,7 @@ async function runIssuePipeline(
       sandbox &&
       !transientVerdict
     ) {
+      ctx.status.setIssuePhase(ctx.issueNumber, "recovery");
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] --recovery on — attempting one recovery pass`,
       );
@@ -3966,6 +3981,28 @@ export async function runMain(
     };
   }
 
+  // Status feed for the `sandcastle-watch` viewer. Constructed ONLY after the
+  // single-instance lock above succeeds, so a second loop that fails the lock
+  // and early-returns can never clobber a live status.json. Threaded into
+  // PipelineCtx so per-issue pipelines can publish phase transitions; all its
+  // methods are synchronous + non-fatal (write errors route to deps.logError).
+  const statusStore = createStatusStore(
+    {
+      branch: args.branch,
+      repo: path.basename(args.repoRoot),
+      repoRoot: args.repoRoot,
+      startedAt: new Date().toISOString(),
+      iterationsTotal: args.iterations,
+      maxConcurrent: args.maxConcurrent,
+    },
+    { onError: (err) => deps.logError(`status write failed: ${(err as Error).message}`) },
+  );
+  // Keep-alive: a phase can run for many minutes without a transition (the log
+  // shows a 1200s idle phase), so without this the viewer would mislabel a
+  // healthy loop "stale" within seconds. The timer is `unref`'d and cleared by
+  // `finish()`, so it never delays a clean exit.
+  statusStore.startHeartbeat();
+
   // Startup reconciliation: a previous loop that was killed (Ctrl-C, OOM,
   // host reboot) leaves issues stuck on `in-progress`. Without this step,
   // the new loop's planner sees those issues as unavailable (already
@@ -4022,6 +4059,7 @@ export async function runMain(
     for (let it = 1; it <= args.iterations; it++) {
       if (shuttingDown) break;
       deps.log(`\n=== sandcastle-loop iteration ${it}/${args.iterations} ===`);
+      statusStore.startIteration(it);
       iterationsRun = it;
 
       // Run the test-injected hook if present (production: undefined). This MUST
@@ -4047,6 +4085,10 @@ export async function runMain(
           String(remaining),
           "utf8",
         );
+        // Hot-reload: the wrapper will relaunch with fresh imports, so mark the
+        // feed "restarting" (not "done") — the viewer keeps the run visible
+        // rather than showing it as completed.
+        statusStore.finish("restarting");
         return {
           exitCode: 75,
           iterationsRun: iterationsRun - 1,
@@ -4252,6 +4294,9 @@ export async function runMain(
           );
         }
         deps.log(`no claimable issues — exiting cleanly${note}`);
+        // Clean terminal exit (queue drained) — the common overnight-completion
+        // path. Mark the feed done, same as out-of-iterations below.
+        statusStore.finish("done");
         return {
           exitCode: 0,
           iterationsRun,
@@ -4260,6 +4305,13 @@ export async function runMain(
         };
       }
       deps.log(`plan: ${plan.length} issue(s) to work in parallel`);
+      statusStore.setPlan(
+        plan.map((p) => ({
+          number: Number(p.id),
+          title: p.title,
+          branch: p.branch,
+        })),
+      );
       for (const p of plan) {
         deps.log(`  ${p.id}: ${p.title} → ${p.branch}`);
       }
@@ -4287,6 +4339,7 @@ export async function runMain(
               issue: p,
               requiredSkills: perIssueRequiredSkills.get(p.id),
               typeLabel: perIssueTypeLabel.get(p.id),
+              status: statusStore,
             };
             const outcome = await runIssuePipeline(ctx);
             return { issue: p, issueNumber, outcome };
@@ -4300,6 +4353,10 @@ export async function runMain(
         const planIssue = plan[i]!;
         if (s.status === "fulfilled") {
           completed.push({ issue: s.value.issue, outcome: s.value.outcome });
+          // Authoritative terminal state + totals for the viewer. One call here
+          // covers all four sub-branches (ok / quarantined / deferred / error);
+          // rejected results have no issueNumber so they are skipped below.
+          statusStore.recordOutcome(s.value.issueNumber, s.value.outcome);
           if (s.value.outcome.status === "ok") {
             shippedIssues.push(s.value.issueNumber);
             consecutiveFailures = 0;
@@ -4859,6 +4916,11 @@ export async function runMain(
     deps.log(
       `out of iterations (${args.iterations}) — exiting with code 2 (clean — just out of cycles)`,
     );
+    // Completion path. A clean out-of-iterations / drained-queue exit is "done".
+    // A SIGINT/SIGTERM `shuttingDown` break also falls through here — label that
+    // run "stopped" so the viewer shows its stopped banner instead of a false
+    // "done — loop finished" for an interrupted run.
+    statusStore.finish(shuttingDown ? "stopped" : "done");
     return {
       exitCode: 2,
       iterationsRun,
