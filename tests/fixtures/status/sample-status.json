@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "state": "running",
+  "run": {
+    "branch": "sandcastle/run-jun4",
+    "repo": "affinity-tracker",
+    "startedAt": "2026-06-04T11:30:00.000Z",
+    "iterations": { "current": 12, "total": 50 },
+    "maxConcurrent": 2
+  },
+  "totals": { "merged": 3, "needsHuman": 1, "requeued": 0, "running": 2 },
+  "issues": [
+    {
+      "number": 337,
+      "title": "backfilled txns land uncategorized",
+      "branch": "agent/issue-337",
+      "phase": "implementer",
+      "startedAt": "2026-06-04T11:52:00.000Z"
+    },
+    {
+      "number": 339,
+      "title": "scope setUserEnabled to the caller's team",
+      "branch": "agent/issue-339",
+      "phase": "reviewer",
+      "detail": "round 2 · escalate→opus-4.7",
+      "startedAt": "2026-06-04T11:47:00.000Z"
+    },
+    {
+      "number": 340,
+      "title": "duplicate webhook deliveries double-charge",
+      "branch": "agent/issue-340",
+      "phase": "needs-human",
+      "detail": "HAS_BLOCKERS · quarantined",
+      "startedAt": "2026-06-04T11:40:00.000Z",
+      "attention": true
+    },
+    {
+      "number": 331,
+      "title": "add CSV export to the transactions table",
+      "branch": "agent/issue-331",
+      "phase": "merged",
+      "startedAt": "2026-06-04T11:33:00.000Z"
+    },
+    {
+      "number": 334,
+      "title": "memoize the category breakdown chart",
+      "branch": "agent/issue-334",
+      "phase": "merged",
+      "startedAt": "2026-06-04T11:35:00.000Z"
+    },
+    {
+      "number": 336,
+      "title": "tighten the rate-limit window to 60s",
+      "branch": "agent/issue-336",
+      "phase": "merged",
+      "startedAt": "2026-06-04T11:44:00.000Z"
+    }
+  ],
+  "updatedAt": "2026-06-04T11:59:30.000Z"
+}
