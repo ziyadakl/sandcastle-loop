@@ -35,6 +35,17 @@ While the merger phase runs (the step that integrates the iteration's per-issue 
 **Verdict**:
 The typed JSON envelope an agent emits at the end of a run. Parsed by `src/verdicts/`. If parsing fails the run is treated as failed.
 
+**`SANDCASTLE.md`** (consumer gate config):
+The per-target-project file that activates the critique-as-gate and
+skill-discipline gates by mapping each issue `type:<label>` to its required
+design principles. **Absent by default** — the template ships only
+`.sandcastle/SANDCASTLE.md.example`; until a consumer copies it to
+`SANDCASTLE.md` at the repo root, `parseRequiredSkillsByType` returns an empty
+map and both gates graceful-degrade to a no-op (nothing is graded). See
+`.sandcastle/SANDCASTLE.md.example` for the format and ADR 0006 v3 for the
+fail-loud preflight that quarantines a typed issue whose principles have no
+loadable rubric.
+
 **Issue / story**:
 A unit of backlog work in GitHub Issues. Carries one of these status labels at a time: `ready-for-agent`, `in-progress`, `done`, `needs-human`.
 

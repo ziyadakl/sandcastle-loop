@@ -14,6 +14,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseRequiredSkillsByType } from "../.sandcastle/lib/skill-discipline.js";
 
 const sandcastleDir = join(process.cwd(), ".sandcastle");
 const implementPrompt = readFileSync(
@@ -21,6 +22,10 @@ const implementPrompt = readFileSync(
   "utf8",
 );
 const mainSource = readFileSync(join(sandcastleDir, "main.mts"), "utf8");
+const sandcastleExample = readFileSync(
+  join(sandcastleDir, "SANDCASTLE.md.example"),
+  "utf8",
+);
 
 describe("gate reason-code ↔ prompt contract", () => {
   it("the per-attempt skill-discipline gate's reason code is named in implement-prompt.md", () => {
@@ -56,4 +61,15 @@ describe("critique-gate placeholder symmetry", () => {
       expect(mainSource).toMatch(new RegExp(`\\b${key}:`));
     });
   }
+});
+
+describe("SANDCASTLE.md.example parses to its documented map (can't rot)", () => {
+  it("maps type:new-component -> [impeccable, layout] and type:cleanup -> []", () => {
+    const map = parseRequiredSkillsByType(sandcastleExample);
+    expect([...(map.get("type:new-component") ?? [])]).toEqual([
+      "impeccable",
+      "layout",
+    ]);
+    expect([...(map.get("type:cleanup") ?? [])]).toEqual([]);
+  });
 });

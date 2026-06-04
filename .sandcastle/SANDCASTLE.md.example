@@ -1,0 +1,34 @@
+# SANDCASTLE.md (EXAMPLE — copy to `SANDCASTLE.md` to activate the gates)
+
+**The critique-as-gate and skill-discipline gates are DORMANT by default.**
+The sandcastle template ships without a real `SANDCASTLE.md`, so
+`parseRequiredSkillsByType` finds no type sections, every issue's
+`requiredSkills` is `undefined` (or `[]` for a type that explicitly lists none), and both gates graceful-degrade to a no-op.
+Nothing is graded until you create this file.
+
+To activate: copy this file to `SANDCASTLE.md` at your repo root, then edit the
+`type:<label>` sections below so each GitHub issue type label maps to the design
+principles (Skill names) it must satisfy. A principle is enforced two ways:
+the implementer must invoke `Skill(<name>)` (skill-discipline gate), and the
+diff must pass the critique sub-agent graded against `<name>`'s rubric
+(critique-as-gate). A principle's rubric is loaded from
+`.claude/skills/<name>/SKILL.md` (repo-local) or `~/.claude/skills/<name>/SKILL.md`
+(global) — if NONE of a type's principles have a loadable rubric, the issue is
+quarantined rather than silently shipped (ADR 0006 v3 fail-loud preflight).
+Delete this `# SANDCASTLE.md (EXAMPLE…)` title line after copying.
+
+### type:new-component
+
+Required:
+
+- impeccable
+- layout
+
+Opt in via `tool:` labels for optional, non-graded tooling.
+
+### type:cleanup
+
+Required: (none)
+
+`type:cleanup` declares zero principles, so it ships without grading — use it
+for pure deletions / mechanical refactors.
