@@ -13,7 +13,8 @@
     "test": "vitest run",
     "start": "bash .sandcastle/sandcastle-wrapper.sh",
     "sandcastle:lint": "tsx .sandcastle/scripts/lint-placeholders.mts",
-    "sandcastle:check-upstream": "tsx .sandcastle/scripts/check-upstream.mts"
+    "sandcastle:check-upstream": "tsx .sandcastle/scripts/check-upstream.mts",
+    "sandcastle:watch": "tsx tools/watch/sandcastle-watch.tsx"
   },
   "engines": {
     "node": ">=22"
@@ -22,9 +23,12 @@
     "@ai-hero/sandcastle": "^0.7.0",
     "@types/node": "^25.6.1",
     "@types/proper-lockfile": "^4.1.4",
+    "@types/react": "^19.2.16",
     "dotenv": "^16.4.5",
     "dotenv-expand": "^11.0.6",
+    "ink": "^7.0.5",
     "proper-lockfile": "^4.1.2",
+    "react": "^19.2.7",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5",
