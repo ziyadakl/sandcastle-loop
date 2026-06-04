@@ -18,7 +18,7 @@
     "node": ">=22"
   },
   "devDependencies": {
-    "@ai-hero/sandcastle": "^0.5.10",
+    "@ai-hero/sandcastle": "^0.7.0",
     "@types/node": "^25.6.1",
     "@types/proper-lockfile": "^4.1.4",
     "dotenv": "^16.4.5",
