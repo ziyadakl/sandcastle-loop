@@ -10,11 +10,11 @@ import {
   reduce,
   type ReadResult,
   type ViewState,
-} from "../tools/watch/reducer.js";
+} from "../.sandcastle/watch/reducer.js";
 import {
   STALE_AFTER_MS,
   type SandcastleStatus,
-} from "../src/status/schema.js";
+} from "../.sandcastle/lib/status/schema.js";
 
 const EMPTY: ViewState = { status: null, banner: null };
 
