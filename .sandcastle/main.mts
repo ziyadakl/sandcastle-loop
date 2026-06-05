@@ -1095,6 +1095,10 @@ export const WRITE_PROJECT_DOTENV_COMMAND =
  * FAILS CLOSED: the whole command is guarded on a non-empty key and ends in
  * `|| true`, so a project without `CONTEXT7_API_KEY` gets graceful absence —
  * no context7, no error, no behavior change. It cannot break existing slices.
+ *
+ * See docs/adr/0010-context7-boot-hook.md for the full rationale (in-container
+ * registration vs host mount, the fail-closed silencing tradeoff, and the
+ * deliberate decision not to generalize into a "register any MCP" mechanism).
  */
 export const REGISTER_CONTEXT7_MCP_COMMAND =
   `if [ -n "$CONTEXT7_API_KEY" ]; then ` +
