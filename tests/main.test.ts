@@ -54,6 +54,7 @@ import {
   priorFindingsResolved,
   resolveReviewBase,
   WRITE_PROJECT_DOTENV_COMMAND,
+  REGISTER_CONTEXT7_MCP_COMMAND,
   __resetTransientStateForTests,
   type Deps,
   type SandcastleArgs,
@@ -2556,6 +2557,57 @@ describe("buildDefaultDeps writeProjectDotenv hook", () => {
     // pattern is what destroyed a `.env` on a VPS once. The node -e form
     // routes the bytes through fs.writeFileSync instead.
     expect(cmd.includes("> .env")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// registerContext7Mcp hook — structural assertions on the shell command that
+// registers the context7 docs MCP inside the sandbox at boot. The command
+// must FAIL CLOSED: inert (no error, no MCP) for any project without
+// CONTEXT7_API_KEY, so it can never break an existing slice.
+// ---------------------------------------------------------------------------
+
+describe("registerContext7Mcp hook", () => {
+  const cmd = REGISTER_CONTEXT7_MCP_COMMAND;
+
+  it("is guarded on a non-empty CONTEXT7_API_KEY (fails closed)", () => {
+    // The whole command is wrapped in `if [ -n "$CONTEXT7_API_KEY" ]; ... fi`
+    // so a project that hasn't configured the key gets graceful absence.
+    expect(cmd.includes('if [ -n "$CONTEXT7_API_KEY" ]')).toBe(true);
+    expect(cmd.includes("fi")).toBe(true);
+  });
+
+  it("registers context7 as a user-scope HTTP MCP", () => {
+    expect(
+      cmd.includes("claude mcp add --scope user --transport http context7"),
+    ).toBe(true);
+    expect(cmd.includes("https://mcp.context7.com/mcp")).toBe(true);
+  });
+
+  it("passes the key through the CONTEXT7_API_KEY header", () => {
+    expect(cmd.includes('--header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY"')).toBe(
+      true,
+    );
+  });
+
+  it("never errors the boot sequence (|| true, output silenced)", () => {
+    // `>/dev/null 2>&1 || true` keeps a failed/duplicate registration from
+    // aborting the onSandboxReady chain — the hook is best-effort.
+    expect(cmd.includes("|| true")).toBe(true);
+    expect(cmd.includes(">/dev/null 2>&1")).toBe(true);
+  });
+
+  it("is wired into the onSandboxReady hook array (not merely defined)", () => {
+    // The wiring is the entire point of the change: a well-formed command
+    // const that no hook references would do nothing. Assert the entry sits
+    // inside the onSandboxReady array literal.
+    const mainSource = readFileSync(
+      path.join(process.cwd(), ".sandcastle", "main.mts"),
+      "utf8",
+    );
+    expect(mainSource).toMatch(
+      /onSandboxReady:\s*\[[^\]]*registerContext7Mcp[^\]]*\]/,
+    );
   });
 });
 

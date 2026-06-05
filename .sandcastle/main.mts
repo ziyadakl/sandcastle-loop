@@ -1076,6 +1076,33 @@ export const WRITE_PROJECT_DOTENV_COMMAND =
   `fs.writeFileSync(p,process.env.SANDCASTLE_PROJECT_DOTENV||'',{mode:0o600});` +
   `"`;
 
+/**
+ * onSandboxReady hook command: register the context7 docs MCP inside the
+ * sandbox container at boot, so the implementer can pull live, version-correct
+ * library documentation while coding.
+ *
+ * Why this runs *inside* the container instead of mounting host MCP config:
+ *   - The loop bind-mounts the `~/.claude` *directory* but NOT the sibling
+ *     `~/.claude.json` *file*, which is where user-scope MCP config actually
+ *     lives — so a host-registered context7 never reaches the container.
+ *   - `claude mcp add --scope user` run in-container writes the container's
+ *     own `/home/agent/.claude.json`; the host config is never touched.
+ *   - The key is read from `$CONTEXT7_API_KEY`, which the loop already
+ *     forwards in as a docker env var (every root-`.env` key flows through
+ *     `readProjectEnv` → `containerEnv`). Resolving it in the boot shell
+ *     avoids any dependency on `${ENV}` expansion inside `~/.claude.json`.
+ *
+ * FAILS CLOSED: the whole command is guarded on a non-empty key and ends in
+ * `|| true`, so a project without `CONTEXT7_API_KEY` gets graceful absence —
+ * no context7, no error, no behavior change. It cannot break existing slices.
+ */
+export const REGISTER_CONTEXT7_MCP_COMMAND =
+  `if [ -n "$CONTEXT7_API_KEY" ]; then ` +
+  `claude mcp add --scope user --transport http context7 ` +
+  `https://mcp.context7.com/mcp ` +
+  `--header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY" >/dev/null 2>&1 || true; ` +
+  `fi`;
+
 function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
   try {
@@ -1813,12 +1840,23 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   const writeProjectDotenv = {
     command: WRITE_PROJECT_DOTENV_COMMAND,
   };
+  // Best-effort context7 MCP registration (fails closed without the key —
+  // see REGISTER_CONTEXT7_MCP_COMMAND). Ordered before `pnpm install` because
+  // it depends only on the baked-in `claude` CLI and the forwarded env var,
+  // not on the project's node_modules, so it can run as soon as the box is up.
+  const registerContext7Mcp = {
+    command: REGISTER_CONTEXT7_MCP_COMMAND,
+  };
   // Docker `onSandboxReady` hooks. mac-host never reaches sandcastle.createSandbox
   // so it carries no analogous concept; if mac-host ever grows hook support
   // it'll live in MacHostProviderConfig, not as a shared variable.
   const dockerHooks = {
     sandbox: {
-      onSandboxReady: [writeProjectDotenv, { command: "CI=true pnpm install" }],
+      onSandboxReady: [
+        writeProjectDotenv,
+        registerContext7Mcp,
+        { command: "CI=true pnpm install" },
+      ],
     },
   } as const;
   const copyToWorktree = ["node_modules"];
