@@ -45,6 +45,11 @@ sentences) why the rebuttal didn't change your mind.
 
 </commit-messages>
 
+The authoritative certification / lint / e2e block lives in the FINAL commit's
+body (`{{COMMIT_SHA}}` — the last entry above). Earlier commit messages are
+branch context only; wherever a check below says "the commit body", it means
+the final commit's.
+
 <branch-files>
 
 !`git diff --stat {{REVIEW_BASE}} {{COMMIT_SHA}}`

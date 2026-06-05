@@ -2994,21 +2994,26 @@ async function runReviewer(
   const skillsInvoked = opts.skillsInvoked ?? [];
   // Review the whole branch vs its fork point, not just the tip commit's
   // delta (issue #340 false-quarantined a WIP+final-commit branch). Computed
-  // on the HOST where full history is reliable, then passed as a concrete SHA
+  // on the HOST where full history is reliable (the sandbox worktree shares
+  // repoRoot's .git, so both refs resolve here), then passed as a concrete SHA
   // so the in-prompt `git diff` runs against two tip-reachable objects and can
   // never exit non-zero — a failing bang-command crashes the entire review.
-  // Fallback to the tip's parent keeps the degenerate/unresolvable case
-  // identical to the prior single-commit behavior.
   const mergeBase = runGit(
     ctx.args.repoRoot,
     "merge-base",
     ctx.args.branch,
     commitSha,
   );
-  const reviewBase =
-    mergeBase.ok && mergeBase.stdout.length > 0
-      ? mergeBase.stdout
-      : `${commitSha}~1`;
+  const tipSha = runGit(ctx.args.repoRoot, "rev-parse", commitSha);
+  const baseOk = mergeBase.ok && mergeBase.stdout.length > 0;
+  // Fall back to the tip's parent when the base can't be resolved, OR when the
+  // merge-base IS the tip — i.e. the commit is already an ancestor of the base
+  // (staging re-review, post-merge recovery, or issue.branch === args.branch).
+  // There `git diff <base>..<tip>` would be EMPTY, making the reviewer see
+  // nothing and rubber-stamp — strictly worse than the false-quarantine this
+  // fixes. The `~1` fallback keeps both cases identical to the prior behavior.
+  const baseIsTip = baseOk && tipSha.ok && tipSha.stdout === mergeBase.stdout;
+  const reviewBase = baseOk && !baseIsTip ? mergeBase.stdout : `${commitSha}~1`;
   const r = await runWithRateLimitFallback(
     (m) =>
       sb.run({
