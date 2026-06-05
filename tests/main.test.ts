@@ -52,6 +52,7 @@ import {
   serializeDotenv,
   extractCategorySweep,
   priorFindingsResolved,
+  resolveReviewBase,
   WRITE_PROJECT_DOTENV_COMMAND,
   __resetTransientStateForTests,
   type Deps,
@@ -4441,5 +4442,36 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
     const issue = feed.issues.find((i) => i.number === 400);
     expect(issue?.phase).toBe("deferred");
     expect(feed.totals.requeued).toBe(1);
+  });
+});
+
+describe("resolveReviewBase", () => {
+  it("returns the merge-base SHA on a normal feature branch", () => {
+    const reviewBase = resolveReviewBase(
+      { ok: true, stdout: "aaaa1111", stderr: "" },
+      { ok: true, stdout: "bbbb2222", stderr: "" },
+      "bbbb2222",
+    );
+    expect(reviewBase).toBe("aaaa1111");
+  });
+
+  it("falls back to the tip's parent when the base can't be resolved", () => {
+    const reviewBase = resolveReviewBase(
+      { ok: false, stdout: "", stderr: "fatal" },
+      { ok: true, stdout: "bbbb2222", stderr: "" },
+      "bbbb2222",
+    );
+    expect(reviewBase).toBe("bbbb2222~1");
+  });
+
+  it("falls back to the tip's parent when the merge-base IS the tip", () => {
+    // This is the case that would otherwise produce an empty diff
+    // (`git diff base..tip` with base === tip) and rubber-stamp the review.
+    const reviewBase = resolveReviewBase(
+      { ok: true, stdout: "bbbb2222", stderr: "" },
+      { ok: true, stdout: "bbbb2222", stderr: "" },
+      "bbbb2222",
+    );
+    expect(reviewBase).toBe("bbbb2222~1");
   });
 });

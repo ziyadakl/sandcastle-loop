@@ -60,6 +60,8 @@ We chose **B**. Concretely (settled):
 
 ## Resolved: where the viewer and its dependency footprint live (was the open trade-off)
 
+> **Superseded 2026-06-04 — see "Amendment — B2 reversed" below.** Recorded here as history.
+
 The load-bearing question was **B1 (bundle the viewer inside the round-tripped
 `.sandcastle/` payload) vs B2 (keep it a sibling outside the payload)**, because
 `.sandcastle/` is *copied* into every consumer repo and overwritten on
@@ -79,7 +81,9 @@ deps.
 This keeps the loop's runtime footprint unchanged and matches the ADR's original
 recommendation.
 
-**Amended — B2 reversed (2026-06-04).** The viewer (`sandcastle-watch.tsx` +
+## Amendment — B2 reversed (2026-06-04)
+
+The viewer (`sandcastle-watch.tsx` +
 `reducer.ts`) now lives at `.sandcastle/watch/`, inside the round-tripped
 payload, importing the schema from `.sandcastle/lib/status/schema.ts` (the
 `src/status/schema.ts` twin is deleted). B2's premise — "non-watchers never
