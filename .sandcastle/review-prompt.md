@@ -39,21 +39,28 @@ sentences) why the rebuttal didn't change your mind.
 
 # THE DIFF — what the implementer changed
 
-<branch-diff>
+<commit-messages>
 
-!`git log -1 --format="%B" {{COMMIT_SHA}}`
+!`git log --format="%n=== %h %s ===%n%n%b" {{REVIEW_BASE}}..{{COMMIT_SHA}}`
 
-</branch-diff>
+</commit-messages>
 
 <branch-files>
 
-!`git diff --stat {{COMMIT_SHA}}~1 {{COMMIT_SHA}}`
+!`git diff --stat {{REVIEW_BASE}} {{COMMIT_SHA}}`
 
 </branch-files>
 
 <branch-patch>
+# The CUMULATIVE branch diff (fork point → tip), not just the last commit —
+# an implementer may split work across a WIP commit + a final commit, and the
+# reviewer must see all of it (issue #340). Bounded to the first 200KB: a
+# whole-branch diff is unbounded and a huge patch crashes this prompt with
+# "Prompt is too long" (same failure the e2e log below was capped to avoid).
+# The complete file inventory is always in <branch-files> --stat above, so a
+# capped body never hides which files changed.
 
-!`git diff {{COMMIT_SHA}}~1 {{COMMIT_SHA}}`
+!`git diff {{REVIEW_BASE}} {{COMMIT_SHA}} | node -e "const fs=require('fs');const s=fs.readFileSync(0,'utf8');const LIMIT=200000;if(s.length>LIMIT){process.stdout.write(s.slice(0,LIMIT)+'\n\n[branch patch truncated — showing first '+LIMIT+' of '+s.length+' chars; full file list is in <branch-files> --stat above]\n');}else{process.stdout.write(s);}"`
 
 </branch-patch>
 
@@ -106,6 +113,24 @@ implementer self-attests. If COMMIT_TOUCHED_UI=no AND
 SPEC_REQUIRES_PLAYWRIGHT=no, the story is genuinely backend-only and N/A
 on e2e.
 
+NON-BEHAVIORAL UI CARVE-OUT. There is one exception to the "first checkbox
+MUST be `[x]`" rule above. If COMMIT_TOUCHED_UI=yes BUT
+SPEC_REQUIRES_PLAYWRIGHT=no AND every UI-file hunk in the diff is
+NON-BEHAVIORAL, the e2e cert is N/A and an unchecked first box does NOT
+block. A UI-file change is NON-BEHAVIORAL only if every hunk is confined to:
+adding/removing `export` keywords; type-only annotations or type imports;
+comments, whitespace, or formatting; or changes solely in test files
+(`*.test.tsx`, `*.spec.tsx`, `__tests__/`). Anything that changes rendered
+JSX, component logic, props, hooks, state, or styling is BEHAVIORAL — the
+carve-out does NOT apply and the cert stays mandatory. This carve-out NEVER
+applies when SPEC_REQUIRES_PLAYWRIGHT=yes: a spec that ships a `playwright
+test` command demands the cert no matter how export-only the diff looks. To
+use the carve-out you MUST justify the downgrade in the CATEGORY SWEEP with
+this exact line (so it is auditable, not silent):
+`- Execution evidence: n/a (UI-file touch is export-only/non-behavioral, no playwright in spec)`
+The `n/a (...)` form is required — free-text justification is parsed as a
+finding and will block.
+
 OUTPUT-SUPPRESSION CHECK (Wave 3 / M5 — driver-attested ground truth): if
 OUTPUT_SUPPRESSION_EVIDENCE is non-empty, this is an automatic HARD
 finding regardless of any other evidence. Emit:
@@ -137,7 +162,8 @@ the implementer was required to run it and save output to
 4. Did the test reach its assertion (no auth-redirect, no "skipped", no
    bail signals)?
 5. Does the certification block in the commit body have all checkboxes
-   `[x]` when SPEC_REQUIRES_PLAYWRIGHT=yes or COMMIT_TOUCHED_UI=yes?
+   `[x]` when SPEC_REQUIRES_PLAYWRIGHT=yes, or when COMMIT_TOUCHED_UI=yes
+   AND the non-behavioral UI carve-out (above) does NOT apply?
 
 <!-- variant:assertion-patterns -->
 # EVIDENCE QUOTE — STRICT verification of the certification's `e2eAssertionLine` field
@@ -186,7 +212,12 @@ spec is explicitly about auth, treat those tokens as legitimate;
 otherwise treat as bail.
 
 If the certification block is missing or the first checkbox conflicts with
-driver ground truth, emit `HAS_BLOCKERS` with a HARD finding.
+driver ground truth, emit `HAS_BLOCKERS` with a HARD finding — UNLESS the
+non-behavioral UI carve-out above applies (COMMIT_TOUCHED_UI=yes,
+SPEC_REQUIRES_PLAYWRIGHT=no, all UI hunks non-behavioral), in which case an
+unchecked first box is expected and you MUST instead record the carve-out on
+the Execution-evidence sweep line. A missing certification block is still a
+HARD finding regardless of the carve-out.
 
 # CODE QUALITY REVIEW
 
