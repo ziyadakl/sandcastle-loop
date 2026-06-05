@@ -2992,6 +2992,23 @@ async function runReviewer(
       ? models.reviewer.escalations[0]
       : undefined;
   const skillsInvoked = opts.skillsInvoked ?? [];
+  // Review the whole branch vs its fork point, not just the tip commit's
+  // delta (issue #340 false-quarantined a WIP+final-commit branch). Computed
+  // on the HOST where full history is reliable, then passed as a concrete SHA
+  // so the in-prompt `git diff` runs against two tip-reachable objects and can
+  // never exit non-zero — a failing bang-command crashes the entire review.
+  // Fallback to the tip's parent keeps the degenerate/unresolvable case
+  // identical to the prior single-commit behavior.
+  const mergeBase = runGit(
+    ctx.args.repoRoot,
+    "merge-base",
+    ctx.args.branch,
+    commitSha,
+  );
+  const reviewBase =
+    mergeBase.ok && mergeBase.stdout.length > 0
+      ? mergeBase.stdout
+      : `${commitSha}~1`;
   const r = await runWithRateLimitFallback(
     (m) =>
       sb.run({
@@ -3004,6 +3021,7 @@ async function runReviewer(
           ITERATION: String(ctx.iteration),
           ISSUE_NUMBER: String(ctx.issueNumber),
           COMMIT_SHA: commitSha,
+          REVIEW_BASE: reviewBase,
           BRANCH: ctx.issue.branch,
           IMPLEMENTER_REBUTTAL: opts.implementerRebuttal ?? "",
           SKILLS_INVOKED:

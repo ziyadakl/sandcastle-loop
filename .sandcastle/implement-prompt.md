@@ -607,9 +607,21 @@ start it; the loop never manages the dev server.
    end. No reformatting, no abbreviation, no creative wording.** Mark each
    box with `[x]` for YES, leave as `[ ]` for NO. If you check the "story
    does not require e2e" branch, you DO NOT touch the e2e checkboxes —
-   leave them as `[ ]` and the reviewer will treat them as N/A. Otherwise,
-   EVERY e2e checkbox must be `[x]` for the commit to ship; ANY unchecked
-   box on a UI story means HALT instead of commit:
+   leave them as `[ ]` and the reviewer will treat them as N/A.
+   NON-BEHAVIORAL UI TOUCH. If the diff touches a `.tsx` / `.jsx` / `.vue`
+   under `apps/` but the spec has NO `playwright test` command AND every
+   UI-file hunk is NON-BEHAVIORAL — confined to: adding/removing
+   `export` keywords; type-only annotations or type imports; comments,
+   whitespace, or formatting; or changes solely in test files
+   (`*.test.tsx`, `*.spec.tsx`, `__tests__/`) — then this is NOT a UI story
+   for e2e purposes. Leave the
+   first box (and all e2e boxes) `[ ]`; the reviewer's non-behavioral UI
+   carve-out treats them N/A. Do NOT HALT and do NOT fabricate a cert.
+   Anything that changes rendered JSX, component logic, props, hooks, state,
+   or styling IS behavioral — check the boxes and run e2e. If the reviewer
+   disagrees and blocks anyway, the rebuttal channel is your escape hatch.
+   Otherwise, EVERY e2e checkbox must be `[x]` for the commit to ship; ANY
+   unchecked box on a BEHAVIORAL UI story means HALT instead of commit:
 
    ```
    --- e2e verification certification ---

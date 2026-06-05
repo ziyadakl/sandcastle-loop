@@ -108,3 +108,93 @@ describe("lint-gate ↔ prompt contract", () => {
     expect(reviewPrompt).toMatch(/Lint \/ code style/);
   });
 });
+
+describe("reviewer reviews the cumulative branch diff (issue #340)", () => {
+  const reviewPrompt = readFileSync(
+    join(sandcastleDir, "review-prompt.md"),
+    "utf8",
+  );
+
+  it("the review diff is computed against {{REVIEW_BASE}}, not the tip's parent", () => {
+    // #340: an implementer split work across a WIP + final commit; the reviewer
+    // saw only `git diff COMMIT_SHA~1 COMMIT_SHA` (the final slice) and
+    // false-quarantined complete, passing work. The fix widens the diff to the
+    // whole branch via a host-computed merge-base passed as {{REVIEW_BASE}}.
+    expect(reviewPrompt).toContain("{{REVIEW_BASE}}");
+    // The tip-only delta must be gone from the diff commands.
+    expect(reviewPrompt).not.toMatch(/COMMIT_SHA\}\}~1/);
+  });
+
+  it("REVIEW_BASE is host-computed via merge-base and wired into runReviewer promptArgs", () => {
+    // lint-placeholders already gates placeholder→promptArg presence; this
+    // pins the *source* of the value so the cumulative-diff wiring can't be
+    // silently reverted to a single-commit base.
+    expect(mainSource).toMatch(/\bREVIEW_BASE:/);
+    expect(mainSource).toContain('"merge-base"');
+  });
+
+  it("the cumulative branch patch is bounded so a large branch can't crash the prompt", () => {
+    // Widening from one commit to the whole branch removes the natural size
+    // bound; an unbounded patch re-opens the "Prompt is too long" crash the
+    // e2e log cap was added to prevent. The patch body is capped (the --stat
+    // file inventory stays complete).
+    expect(reviewPrompt).toMatch(/branch patch truncated/);
+  });
+});
+
+describe("non-behavioral UI carve-out ↔ prompt contract (issue #342)", () => {
+  const reviewPrompt = readFileSync(
+    join(sandcastleDir, "review-prompt.md"),
+    "utf8",
+  );
+
+  it("review-prompt.md defines the carve-out, scoped to no-playwright specs", () => {
+    // #342: clean test-only code that only added `export` keywords to a .tsx
+    // was hard-blocked because COMMIT_TOUCHED_UI=yes forced the e2e cert. The
+    // carve-out waives it for non-behavioral touches, but ONLY when the spec
+    // has no playwright command — that scope is the wall against abuse.
+    expect(reviewPrompt).toMatch(/non-behavioral UI carve-out/i);
+    expect(reviewPrompt).toMatch(/NEVER\s+applies\s+when\s+SPEC_REQUIRES_PLAYWRIGHT=yes/i);
+  });
+
+  it("the carve-out lists the behavioral exclusions (so it can't be read as a blanket waiver)", () => {
+    expect(reviewPrompt).toMatch(/rendered\s+JSX/i);
+    expect(reviewPrompt).toMatch(/props, hooks, state, or styling/i);
+  });
+
+  it("the downgrade requires the exact auditable n/a sweep line", () => {
+    expect(reviewPrompt).toMatch(/Execution evidence: n\/a \([^)]*export-only/);
+  });
+
+  it("the sweep line parses as n/a (not a finding) via extractCategorySweep", async () => {
+    // The carve-out is useless if its own justification line blocks. Confirm
+    // the `n/a (...)` form classifies as n/a, not finding.
+    const { extractCategorySweep } = await import("../.sandcastle/main.mjs");
+    const sweep = extractCategorySweep(
+      [
+        "CATEGORY SWEEP:",
+        "- Execution evidence: n/a (UI-file touch is export-only/non-behavioral, no playwright in spec)",
+        "- Spec fit: ok",
+        "- Test coverage: ok",
+        "- Type safety: ok",
+        "- Security: ok",
+        "- Error handling: ok",
+        "- Edge cases: ok",
+        "- Skill discipline: n/a (no SANDCASTLE.md)",
+        "- Migration schema qualification: n/a (no sql)",
+        "- Lint / code style: n/a (no lint script)",
+        "SWEEP COMPLETE.",
+      ].join("\n"),
+    );
+    expect(sweep).not.toBeNull();
+    expect(sweep!.get("execution evidence")).toBe("n/a");
+  });
+
+  it("the non-behavioral definition is symmetric between review-prompt and implement-prompt (can't drift)", () => {
+    expect(reviewPrompt).toMatch(/non-behavioral/i);
+    expect(implementPrompt).toMatch(/non-behavioral/i);
+    // both sides name the export-keyword case as the canonical example
+    expect(reviewPrompt).toMatch(/`export` keywords/);
+    expect(implementPrompt).toMatch(/`export` keywords/);
+  });
+});
