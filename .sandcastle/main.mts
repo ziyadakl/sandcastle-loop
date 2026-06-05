@@ -1232,6 +1232,25 @@ function runGit(repoRoot: string, ...gitArgs: string[]): GitRunResult {
 }
 
 /**
+ * Decide the base ref the reviewer diffs against — pure (no IO) so the
+ * empty-diff guard is unit-testable. The highest-stakes branch is `baseIsTip`:
+ * when the merge-base equals the tip, the commit is already an ancestor of the
+ * base, `git diff base..tip` is EMPTY, and the reviewer would see nothing and
+ * rubber-stamp (issue #340's inverse failure). Falls back to the tip's parent
+ * (`<sha>~1`, the prior single-commit behavior) for that case AND when the base
+ * can't be resolved.
+ */
+export function resolveReviewBase(
+  mergeBase: GitRunResult,
+  tipSha: GitRunResult,
+  commitSha: string,
+): string {
+  const baseOk = mergeBase.ok && mergeBase.stdout.length > 0;
+  const baseIsTip = baseOk && tipSha.ok && tipSha.stdout === mergeBase.stdout;
+  return baseOk && !baseIsTip ? mergeBase.stdout : `${commitSha}~1`;
+}
+
+/**
  * Stable certification token the implementer writes in the commit body when
  * the project's lint passes, and the lint-gate backstop greps for. Kept in
  * sync with implement-prompt.md by a prompt-contract rot-guard test.
@@ -3005,15 +3024,7 @@ async function runReviewer(
     commitSha,
   );
   const tipSha = runGit(ctx.args.repoRoot, "rev-parse", commitSha);
-  const baseOk = mergeBase.ok && mergeBase.stdout.length > 0;
-  // Fall back to the tip's parent when the base can't be resolved, OR when the
-  // merge-base IS the tip — i.e. the commit is already an ancestor of the base
-  // (staging re-review, post-merge recovery, or issue.branch === args.branch).
-  // There `git diff <base>..<tip>` would be EMPTY, making the reviewer see
-  // nothing and rubber-stamp — strictly worse than the false-quarantine this
-  // fixes. The `~1` fallback keeps both cases identical to the prior behavior.
-  const baseIsTip = baseOk && tipSha.ok && tipSha.stdout === mergeBase.stdout;
-  const reviewBase = baseOk && !baseIsTip ? mergeBase.stdout : `${commitSha}~1`;
+  const reviewBase = resolveReviewBase(mergeBase, tipSha, commitSha);
   const r = await runWithRateLimitFallback(
     (m) =>
       sb.run({
