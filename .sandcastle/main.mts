@@ -2583,7 +2583,7 @@ export async function runImplementer(
   // invoked them. Missing iterations array (legacy test mocks) yields [].
   const skillsInvoked: string[] = [];
   for (const it of r.iterations ?? []) {
-    const sessionPath = resolveSessionFilePath(it, ctx.args.repoRoot);
+    const sessionPath = await resolveSessionFilePath(it);
     for (const name of extractSkillInvocationsFromSession(sessionPath)) {
       skillsInvoked.push(name);
     }
@@ -4745,7 +4745,7 @@ export async function runMain(
           // affected issues (see post-merge-review-prompt.md).
           const fixerSkillsInvoked: string[] = [];
           for (const fxIt of fixerResult?.iterations ?? []) {
-            const sessionPath = resolveSessionFilePath(fxIt, args.repoRoot);
+            const sessionPath = await resolveSessionFilePath(fxIt);
             for (const name of extractSkillInvocationsFromSession(sessionPath)) {
               fixerSkillsInvoked.push(name);
             }

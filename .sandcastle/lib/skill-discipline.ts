@@ -45,58 +45,55 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { findClaudeSessionOnHost } from "@ai-hero/sandcastle";
 
 // ---------------------------------------------------------------------------
-// Session-path resolution (SDK sessionFilePath, with sessionId fallback)
+// Session-path resolution (SDK sessionFilePath, with a by-id host scan)
 // ---------------------------------------------------------------------------
-
-/**
- * Match `@ai-hero/sandcastle`'s `SessionStore.encodeProjectPath` exactly:
- * root-like paths preserved; otherwise drop trailing separators, drop a
- * leading Windows drive-letter colon, then `/` and `\` → `-`. Drift here
- * would silently point the fallback at a non-existent file and the loop
- * would behave as if no skills were ever invoked.
- */
-function encodeProjectPath(cwd: string): string {
-  const isRoot = cwd === "/" || /^[A-Za-z]:[\\/]?$/.test(cwd);
-  const normalized = isRoot ? cwd : cwd.replace(/[\\/]+$/, "");
-  return normalized.replace(/^([A-Za-z]):/, "$1").replace(/[\\/]/g, "-");
-}
 
 /**
  * Resolve the JSONL session file path for an iteration result.
  *
- * Prefer the SDK's `sessionFilePath` when present — it's authoritative
- * (the SDK chose it). Fall back to constructing the host path from
- * `sessionId` + `repoRoot` using Claude Code's
- * `~/.claude/projects/<encoded>/` layout (see `encodeProjectPath` in
- * `@ai-hero/sandcastle/dist/SessionStore.js`).
+ * Prefer the SDK's `sessionFilePath` when present — it's authoritative (the
+ * SDK chose it). Otherwise locate the file by the iteration's globally-unique
+ * `sessionId`, scanning every `~/.claude/projects/<encoded-cwd>/` directory
+ * via the SDK's `findClaudeSessionOnHost`.
  *
- * Why the fallback exists: `IterationResult.sessionFilePath` is only
- * populated when the SDK is wired with a `bindMountHandle` (sandbox-
- * backed session transfer). On normal host-backed orchestration it stays
- * `undefined` even though the session JSONL exists at the conventional
- * path — a consumer that reads only `sessionFilePath` then returns `[]`
- * and quarantines every iteration for "no skills invoked". Audit Issue 1
- * (2026-05-30) — fixed in affinity-tracker `24204d2f6`, propagated here.
+ * Why scan by id rather than reconstruct the path from a cwd: Claude Code
+ * runs inside the sandbox at a different working directory than the host
+ * `repoRoot`, so it writes its session JSONL under the CONTAINER cwd slug
+ * (e.g. `-home-agent-workspace`), never the host slug (e.g.
+ * `-home-deploy-dev-affinity-tracker`). Reconstructing a host-cwd path can
+ * never match the container slug → file "not found" → zero skills read →
+ * every typed issue silently quarantines. The session id is the one key
+ * stable across the host/container boundary, so we search by it. This also
+ * covers the mac-host profile uniformly (no container, host slug) — the scan
+ * finds the file wherever it landed.
  *
- * Returns `undefined` when neither source can produce a path (`HOME`
- * unset + caller didn't override). Existence is NOT checked here; the
- * caller (`extractSkillInvocationsFromSession`) handles missing files.
+ * Why the fallback exists at all: `IterationResult.sessionFilePath` is only
+ * populated when the SDK is wired with a `bindMountHandle` (sandbox-backed
+ * session transfer). On the worktree-copy pipeline it stays `undefined` even
+ * though the JSONL exists on the host — a consumer that reads only
+ * `sessionFilePath` then returns `[]` and quarantines every iteration for
+ * "no skills invoked". Audit Issue 1 (2026-05-30); container-slug fix
+ * (2026-06-05, affinity-tracker sandcastle-feedback).
+ *
+ * `projectsDir` overrides the scanned root (defaults to `~/.claude/projects`
+ * inside `findClaudeSessionOnHost`); used by tests. Returns `undefined` when
+ * neither source yields a path. The by-id scan only returns paths that exist;
+ * an SDK-provided `sessionFilePath` is returned without an existence check
+ * (the caller `extractSkillInvocationsFromSession` tolerates a missing file).
  */
-export function resolveSessionFilePath(
+export async function resolveSessionFilePath(
   iteration: { readonly sessionFilePath?: string; readonly sessionId?: string },
-  repoRoot: string,
-  homeDir?: string,
-): string | undefined {
+  projectsDir?: string,
+): Promise<string | undefined> {
   if (iteration.sessionFilePath !== undefined && iteration.sessionFilePath !== "") {
     return iteration.sessionFilePath;
   }
   if (iteration.sessionId === undefined || iteration.sessionId === "") return undefined;
-  const home = homeDir ?? process.env.HOME;
-  if (home === undefined || home === "") return undefined;
-  const encoded = encodeProjectPath(repoRoot);
-  return join(home, ".claude", "projects", encoded, `${iteration.sessionId}.jsonl`);
+  const { path } = await findClaudeSessionOnHost(iteration.sessionId, projectsDir);
+  return path;
 }
 
 // ---------------------------------------------------------------------------
