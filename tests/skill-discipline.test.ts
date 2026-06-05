@@ -23,7 +23,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeHostSessionPath } from "@ai-hero/sandcastle";
 import {
   extractSkillInvocationsFromSession,
   filterPlanByTypeLabels,
@@ -270,133 +269,82 @@ describe("extractSkillInvocationsFromSession", () => {
   });
 });
 
-// Audit Issue 1 (2026-05-30): IterationResult.sessionFilePath is only
-// populated when bindMountHandle is wired. On normal host-backed
-// orchestration it's undefined and every iteration was being credited
-// with zero skill invocations. resolveSessionFilePath falls back to
-// `~/.claude/projects/<encoded(repoRoot)>/<sessionId>.jsonl`.
+// Audit Issue 1 (2026-05-30) + container-slug fix (2026-06-05): the SDK only
+// populates IterationResult.sessionFilePath when bindMountHandle is wired; on
+// the worktree-copy pipeline it's undefined, so the gate must locate the
+// session JSONL itself. Claude runs inside the sandbox at a different cwd than
+// the host repoRoot, writing its JSONL under the CONTAINER slug
+// (e.g. `-home-agent-workspace`), never the host slug
+// (e.g. `-home-deploy-dev-affinity-tracker`). Reconstructing a host-cwd path
+// can never match → zero skills read → every typed issue silently quarantines.
+// Resolution locates the file by its globally-unique session id, scanning the
+// project slugs via the SDK's findClaudeSessionOnHost — so the slug name is
+// irrelevant and host/container/mac-host are handled uniformly.
 describe("resolveSessionFilePath", () => {
-  it("returns sessionFilePath verbatim when the SDK provided one", () => {
+  let projectsDir: string;
+  beforeEach(() => {
+    projectsDir = mkdtempSync(join(tmpdir(), "sandcastle-projects-"));
+  });
+  afterEach(() => {
+    rmSync(projectsDir, { recursive: true, force: true });
+  });
+
+  const writeSession = (slug: string, sessionId: string): string => {
+    const slugDir = join(projectsDir, slug);
+    mkdirSync(slugDir, { recursive: true });
+    const p = join(slugDir, `${sessionId}.jsonl`);
+    writeFileSync(p, "", "utf8");
+    return p;
+  };
+
+  it("returns sessionFilePath verbatim when the SDK provided one", async () => {
     const explicit = "/some/sdk/chosen/path.jsonl";
-    expect(
+    await expect(
       resolveSessionFilePath(
         { sessionFilePath: explicit, sessionId: "abc-123" },
-        "/Users/ziyadakl/Dev/Sandcastle",
-        "/Users/ziyadakl",
+        projectsDir,
       ),
-    ).toBe(explicit);
+    ).resolves.toBe(explicit);
   });
 
-  it("falls back to the conventional Mac-style path when only sessionId is set", () => {
-    expect(
-      resolveSessionFilePath(
-        { sessionId: "abc-123" },
-        "/Users/ziyadakl/Dev/Sandcastle",
-        "/Users/ziyadakl",
-      ),
-    ).toBe(
-      "/Users/ziyadakl/.claude/projects/-Users-ziyadakl-Dev-Sandcastle/abc-123.jsonl",
-    );
+  it("treats an empty sessionFilePath as absent and falls back to the by-id scan", async () => {
+    const p = writeSession("-home-agent-workspace", "s2");
+    await expect(
+      resolveSessionFilePath({ sessionFilePath: "", sessionId: "s2" }, projectsDir),
+    ).resolves.toBe(p);
   });
 
-  it("falls back to the conventional VPS path documented in the audit", () => {
-    // Affinity-tracker's deploy host — the exact path the audit references.
-    expect(
-      resolveSessionFilePath(
-        { sessionId: "xyz-789" },
-        "/home/agent/workspace",
-        "/home/deploy",
-      ),
-    ).toBe(
-      "/home/deploy/.claude/projects/-home-agent-workspace/xyz-789.jsonl",
-    );
+  it("finds the JSONL by session id when it was written under the container cwd slug", async () => {
+    // The regression: the host repoRoot slug would be
+    // `-home-deploy-dev-affinity-tracker`, but Claude wrote under the
+    // container slug. By-id resolution finds it regardless of slug.
+    const sessionId = "de9814f3-aaaa-bbbb-cccc-000000000000";
+    const p = writeSession("-home-agent-workspace", sessionId);
+    await expect(
+      resolveSessionFilePath({ sessionId }, projectsDir),
+    ).resolves.toBe(p);
   });
 
-  it("normalises a repoRoot with a trailing separator before encoding", () => {
-    expect(
-      resolveSessionFilePath(
-        { sessionId: "s1" },
-        "/home/agent/workspace/",
-        "/home/deploy",
-      ),
-    ).toBe(
-      "/home/deploy/.claude/projects/-home-agent-workspace/s1.jsonl",
-    );
+  it("finds the JSONL under a host worktree slug too (mac-host profile parity)", async () => {
+    const p = writeSession("-Users-ziyadakl-Dev-Sandcastle", "abc-123");
+    await expect(
+      resolveSessionFilePath({ sessionId: "abc-123" }, projectsDir),
+    ).resolves.toBe(p);
   });
 
-  it("treats empty sessionFilePath as absent and uses the fallback", () => {
-    expect(
-      resolveSessionFilePath(
-        { sessionFilePath: "", sessionId: "s2" },
-        "/r",
-        "/h",
-      ),
-    ).toBe("/h/.claude/projects/-r/s2.jsonl");
+  it("returns undefined when no session with that id exists under projectsDir", async () => {
+    writeSession("-home-agent-workspace", "present-id");
+    await expect(
+      resolveSessionFilePath({ sessionId: "absent-id" }, projectsDir),
+    ).resolves.toBeUndefined();
   });
 
-  it("returns undefined when neither sessionFilePath nor sessionId is available", () => {
-    expect(resolveSessionFilePath({}, "/r", "/h")).toBeUndefined();
-    expect(resolveSessionFilePath({ sessionId: "" }, "/r", "/h")).toBeUndefined();
+  it("returns undefined when neither sessionFilePath nor sessionId is available", async () => {
+    await expect(resolveSessionFilePath({}, projectsDir)).resolves.toBeUndefined();
+    await expect(
+      resolveSessionFilePath({ sessionId: "" }, projectsDir),
+    ).resolves.toBeUndefined();
   });
-
-  it("returns undefined when HOME cannot be determined and no homeDir override is given", () => {
-    const prevHome = process.env.HOME;
-    try {
-      delete process.env.HOME;
-      expect(
-        resolveSessionFilePath({ sessionId: "s3" }, "/r"),
-      ).toBeUndefined();
-    } finally {
-      if (prevHome !== undefined) process.env.HOME = prevHome;
-    }
-  });
-
-  it("reads HOME from process.env when no override is given", () => {
-    const prevHome = process.env.HOME;
-    try {
-      process.env.HOME = "/tmp/fake-home";
-      expect(
-        resolveSessionFilePath(
-          { sessionId: "s4" },
-          "/work/proj",
-        ),
-      ).toBe("/tmp/fake-home/.claude/projects/-work-proj/s4.jsonl");
-    } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// SDK drift guard — resolver must point at the SAME session file the SDK does
-// ---------------------------------------------------------------------------
-//
-// resolveSessionFilePath's sessionId fallback hand-mirrors @ai-hero/sandcastle's
-// project-path encoding (skill-discipline.ts `encodeProjectPath`, copied
-// byte-for-byte from the SDK). If a future SDK bump ever changes that encoding,
-// THIS fails loudly instead of the skill-discipline gate silently abstaining —
-// resolving a non-existent path and behaving as if no skills were invoked (the
-// documented silent-abstention failure class; see docs/adr/0006). The oracle is
-// the SDK's now-public `claudeHostSessionPath`, so the guard tracks upstream
-// automatically rather than re-encoding our own assumption.
-describe("SDK drift guard — resolveSessionFilePath matches the SDK's session path", () => {
-  const projectsOf = (home: string) => join(home, ".claude", "projects");
-  const cases: ReadonlyArray<{ repoRoot: string; sessionId: string; home: string }> = [
-    { repoRoot: "/Users/ziyadakl/Dev/Sandcastle", sessionId: "abc-123", home: "/Users/ziyadakl" },
-    { repoRoot: "/home/agent/workspace", sessionId: "xyz-789", home: "/home/deploy" },
-    { repoRoot: "/work/proj", sessionId: "s4", home: "/tmp/fake-home" },
-    { repoRoot: "/", sessionId: "s1", home: "/h" },
-    { repoRoot: "/trailing/slash/", sessionId: "s3", home: "/h" },
-    { repoRoot: "C:\\Users\\dev\\proj", sessionId: "s2", home: "/h" },
-  ];
-  for (const { repoRoot, sessionId, home } of cases) {
-    it(`matches the SDK for repoRoot=${repoRoot}`, () => {
-      const ours = resolveSessionFilePath({ sessionId }, repoRoot, home);
-      const sdk = claudeHostSessionPath(repoRoot, sessionId, projectsOf(home));
-      expect(ours).toBe(sdk);
-    });
-  }
 });
 
 describe("filterPlanByTypeLabels", () => {
