@@ -31,6 +31,10 @@ const WANTED_DEPS = [
   "proper-lockfile",
   "@types/proper-lockfile",
   "zod",
+  // UI trio for the `.sandcastle/watch/` viewer (sandcastle:watch).
+  "ink",
+  "react",
+  "@types/react",
 ];
 
 function fail(msg) {
@@ -113,6 +117,10 @@ function injectIntoProjectPackageJson() {
 
   projPkg.scripts = projPkg.scripts ?? {};
   projPkg.scripts.sandcastle = "bash .sandcastle/sandcastle-wrapper.sh";
+  projPkg.scripts["sandcastle:watch"] =
+    "tsx .sandcastle/watch/sandcastle-watch.tsx";
+  projPkg.scripts["sandcastle:check-upstream"] =
+    "tsx .sandcastle/scripts/check-upstream.mts";
 
   projPkg.devDependencies = projPkg.devDependencies ?? {};
   const versions = loadDevDepVersions();

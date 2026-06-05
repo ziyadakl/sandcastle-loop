@@ -7,15 +7,16 @@
  * than blanking out — a torn write, a transient IO error, or a freshly-deleted
  * file must never flicker the dashboard to empty.
  *
- * The schema is the single source of truth (see `src/status/schema.ts`). The
- * `.js` extension on the import is correct for `tsx`/Bundler resolution.
+ * The schema is the single source of truth (see
+ * `.sandcastle/lib/status/schema.ts`). The `.js` extension on the import is
+ * correct for `tsx`/Bundler resolution.
  */
 import {
   SandcastleStatusSchema,
   STATUS_SCHEMA_VERSION,
   STALE_AFTER_MS,
   type SandcastleStatus,
-} from "../../src/status/schema.js";
+} from "../lib/status/schema.js";
 
 /** Result of attempting to read the status file off disk. */
 export type ReadResult =

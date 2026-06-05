@@ -34,7 +34,7 @@ import type {
   IssuePhase,
   SandcastleStatus,
   StatusIssue,
-} from "../../src/status/schema.js";
+} from "../lib/status/schema.js";
 
 const POLL_MS = 250;
 

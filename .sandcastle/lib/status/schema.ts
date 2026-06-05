@@ -3,13 +3,14 @@
  * `<repoRoot>/.sandcastle/status.json` on every state transition, and the
  * `sandcastle-watch` viewer reads to render its live dashboard.
  *
- * DUAL TREE — this file is duplicated at `src/status/schema.ts`. The two copies
- * MUST stay byte-identical (same convention as `verdicts/schemas.ts` ↔ its
- * `src` twin, see CONTEXT.md). The loop imports the `.sandcastle/lib` copy at
- * runtime; the viewer imports the `src` copy. The zod schema is the single
- * source of truth — `SandcastleStatus` is its inferred type, so a schema edit
- * can never drift from the type consumers use. Bump `STATUS_SCHEMA_VERSION`
- * (and the viewer's tolerance) on any breaking shape change.
+ * SINGLE SOURCE OF TRUTH — this is the one copy of the status-feed schema. The
+ * loop's status store (`.sandcastle/lib/status/store.ts`) and the
+ * `.sandcastle/watch/` viewer (`sandcastle-watch.tsx` + `reducer.ts`) both
+ * import it directly, so there is no twin to keep in sync. The zod schema is
+ * the single source of truth — `SandcastleStatus` is its inferred type, so a
+ * schema edit can never drift from the type consumers use. Bump
+ * `STATUS_SCHEMA_VERSION` (and the viewer's tolerance) on any breaking shape
+ * change.
  */
 
 import { z } from "zod";

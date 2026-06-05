@@ -79,6 +79,21 @@ deps.
 This keeps the loop's runtime footprint unchanged and matches the ADR's original
 recommendation.
 
+**Amended — B2 reversed (2026-06-04).** The viewer (`sandcastle-watch.tsx` +
+`reducer.ts`) now lives at `.sandcastle/watch/`, inside the round-tripped
+payload, importing the schema from `.sandcastle/lib/status/schema.ts` (the
+`src/status/schema.ts` twin is deleted). B2's premise — "non-watchers never
+pay for Ink" — was already half-void: `/sandcastle-update` injects the
+template's full `devDependencies` block, so every consumer who updates already
+installs `ink`/`react`/`@types/react`. (It survived only for fresh-`init`
+consumers, because `bin/init.mjs` curated `WANTED_DEPS` and omitted the UI trio
+— a gap this change closes.) The loop's *runtime* footprint is unchanged:
+`.sandcastle/main.mts` never imports the viewer; it runs on-demand via
+`sandcastle:watch`. So bundling the viewer inside `.sandcastle/` adds nothing to
+what the loop loads, while fixing the real bug: the viewer now propagates to
+consumers through the same copy path as the rest of the template, with no
+path-guard relaxation in `/sandcastle-update`.
+
 ## Implementation — Phase 1 (2026-06-04, built and green)
 
 The status feed + dashboard are implemented and covered (585 tests green,
