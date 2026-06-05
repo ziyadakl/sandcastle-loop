@@ -142,3 +142,22 @@ typecheck clean). Design decisions made during the build:
 - Phase 1 (status feed + dashboard) is independently shippable and is itself the
   polished dashboard; Phases 2–3 add progress/cost/keybindings and optional
   history.
+
+## Consumer portability constraint
+
+The viewer ships through the round-tripped payload, so it must run on consumers
+**not** on this template's favorable env — i.e. not necessarily React 19.2 with a
+root `tsconfig.json` carrying `jsx: react-jsx`. Two constraints follow, both
+enforced at the source level by `tests/watch-viewer-portability.test.ts`:
+
+- **`ink` is pinned `< 7`.** ink 7 hard-requires React 19.2's `useEffectEvent`,
+  which `ReferenceError`-crashes consumers pinned to React 19.1.x. Do not bump
+  `ink` to 7 without first raising the consumer React floor to 19.2.
+- **`sandcastle-watch.tsx` imports `React` by default**, not only the named
+  hooks. A consumer with no root tsconfig falls to the classic
+  `React.createElement` JSX transform, which needs `React` in scope. The import
+  is transform-agnostic — do not "tidy" it as unused.
+
+Both defects are invisible in this repo's own environment (which is why they
+shipped); they surfaced on the affinity-tracker consumer and were fixed there in
+`979a02a0d`.

@@ -27,7 +27,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { render, Box, Text, useApp, useInput } from "ink";
-import { useEffect, useState } from "react";
+// `React` must be imported by default, not just the named hooks: a consumer
+// with no root tsconfig falls to esbuild's classic `React.createElement` JSX
+// transform (tsx resolves jsx config from cwd, not this file's dir), which
+// needs `React` in scope or `render(<App/>)` throws `ReferenceError`. Harmless
+// under the automatic transform — do NOT "tidy" it as unused. See ADR 0008 and
+// tests/watch-viewer-portability.test.ts.
+import React, { useEffect, useState } from "react";
 
 import { reduce, type ReadResult, type ViewState } from "./reducer.js";
 import type {
