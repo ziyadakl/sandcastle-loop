@@ -93,6 +93,17 @@ export const StatusRunSchema = z.object({
   maxConcurrent: z.number().int().positive(),
 });
 
+/**
+ * Run-level activity the loop writes around CROSS-ISSUE steps that belong to no
+ * single issue — planning the batch, merging it, gating the merged result,
+ * cleaning up. The viewer shows it as the "running" panel's subtitle when no
+ * per-issue phase is active, so the panel never falsely reads "idle" while the
+ * loop is busy between issues. `RunActivity` is the write-side contract (the
+ * compiler constrains what the loop emits); the SCHEMA field below is a
+ * permissive `z.string()` on purpose — see its note.
+ */
+export type RunActivity = "planning" | "merging" | "reviewing" | "cleanup";
+
 export const SandcastleStatusSchema = z.object({
   schemaVersion: z.literal(STATUS_SCHEMA_VERSION),
   state: RunStateSchema,
@@ -101,6 +112,17 @@ export const SandcastleStatusSchema = z.object({
   issues: z.array(StatusIssueSchema),
   /** ISO-8601 of the last write. Its age is the loop's liveness signal. */
   updatedAt: z.string(),
+  /**
+   * Optional run-level activity label (see `RunActivity`). PERMISSIVE on read:
+   * a `z.string()`, NOT a `z.enum`. An enum would reject any value it doesn't
+   * know, and `safeParse` failure is treated as a torn read → frozen "stale"
+   * viewer. So the day a newer loop emits a 5th label, an OLDER viewer that
+   * hasn't synced this schema would freeze. A bare string keeps future
+   * additions non-breaking; the viewer falls back to rendering the raw word.
+   * Additive + optional ⇒ no STATUS_SCHEMA_VERSION bump (zod strips unknowns;
+   * absent ⇒ undefined).
+   */
+  activity: z.string().optional(),
 });
 
 export type SandcastleStatus = z.infer<typeof SandcastleStatusSchema>;

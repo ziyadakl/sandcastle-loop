@@ -22,6 +22,7 @@ import { join, dirname, basename } from "node:path";
 import {
   type SandcastleStatus,
   type IssuePhase,
+  type RunActivity,
   STATUS_SCHEMA_VERSION,
   HEARTBEAT_MS,
 } from "./schema.js";
@@ -72,6 +73,14 @@ export interface StatusStore {
   setPlan(issues: ReadonlyArray<StatusPlanInput>): void;
   setIssuePhase(issueNumber: number, phase: IssuePhase, detail?: string): void;
   recordOutcome(issueNumber: number, outcome: StatusOutcomeInput): void;
+  /**
+   * Set (or clear, with `null`) the run-level activity label for CROSS-ISSUE
+   * steps that no per-issue phase covers — planning, merging, post-merge
+   * review, cleanup. Drives the viewer's "running" panel subtitle so it never
+   * shows a false "idle" between issues. Synchronous mutate-then-commit like
+   * every other mutator.
+   */
+  setActivity(activity: RunActivity | null): void;
   /**
    * Begin emitting periodic keep-alive writes (every `HEARTBEAT_MS`) that
    * re-stamp `updatedAt` so the viewer's staleness gate doesn't false-fire
@@ -234,8 +243,16 @@ export function createStatusStore(
       commit();
     },
 
+    setActivity(activity: RunActivity | null): void {
+      // `undefined` so JSON.stringify drops the key entirely when cleared —
+      // the viewer then sees no activity and falls back to its idle copy.
+      status.activity = activity ?? undefined;
+      commit();
+    },
+
     finish(reason: "done" | "stopped" | "restarting"): void {
       status.state = reason;
+      status.activity = undefined; // run over — no stale activity on the feed
       stopHeartbeat(); // the run is over — stop the keep-alive
       recomputeRunning();
       commit();
