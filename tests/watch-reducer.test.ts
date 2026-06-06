@@ -155,4 +155,45 @@ describe("reduce", () => {
     expect(s.banner).toBe("stale");
     expect(s.lastError).toBe("EIO");
   });
+
+  it("identical consecutive good reads → SAME ViewState reference (dedup)", () => {
+    // Same bytes, same banner ⇒ same reference, so React/Ink skip the repaint.
+    // This is what stops a quiet feed from jittering 4×/sec on unchanged content.
+    const first = reduce(EMPTY, ok(validRaw), VALID_NOW);
+    const second = reduce(first, ok(validRaw), VALID_NOW);
+    expect(second).toBe(first);
+  });
+
+  it("same bytes but now past the stale window → re-renders (NOT deduped)", () => {
+    const fresh = reduce(EMPTY, ok(validRaw), VALID_NOW);
+    expect(fresh.banner).toBeNull();
+    const later = reduce(fresh, ok(validRaw), VALID_NOW + STALE_AFTER_MS + 1_000);
+    expect(later).not.toBe(fresh); // banner crossed to stale → new state
+    expect(later.banner).toBe("stale");
+    expect(later.status?.run.repo).toBe("affinity-tracker");
+  });
+
+  it("a good read after a torn read re-renders the recovery (dedup off across error)", () => {
+    const good = reduce(EMPTY, ok(validRaw), VALID_NOW);
+    const torn = reduce(good, ok("{bad"), VALID_NOW); // stale; drops raw
+    const recovered = reduce(torn, ok(validRaw), VALID_NOW);
+    expect(recovered).not.toBe(torn);
+    expect(recovered.banner).toBeNull();
+    expect(recovered.status?.run.repo).toBe("affinity-tracker");
+  });
+
+  it("preserves the optional activity field through a good read", () => {
+    const withActivity = JSON.stringify({ ...validStatus, activity: "merging" });
+    const s = reduce(EMPTY, ok(withActivity), VALID_NOW);
+    expect(s.status?.activity).toBe("merging");
+  });
+
+  it("accepts an UNKNOWN activity value (permissive schema → forward-compatible)", () => {
+    // A newer loop emitting a label this viewer doesn't know must NOT be treated
+    // as a torn/outdated read (which would freeze an un-synced consumer's viewer).
+    const future = JSON.stringify({ ...validStatus, activity: "fixer" });
+    const s = reduce(EMPTY, ok(future), VALID_NOW);
+    expect(s.status?.activity).toBe("fixer");
+    expect(s.banner).toBeNull();
+  });
 });
