@@ -161,3 +161,41 @@ enforced at the source level by `tests/watch-viewer-portability.test.ts`:
 Both defects are invisible in this repo's own environment (which is why they
 shipped); they surfaced on the affinity-tracker consumer and were fixed there in
 `979a02a0d`.
+
+## Amendment (2026-06-06): run-level activity + flicker fix
+
+Two follow-on changes after live use surfaced gaps the original design didn't
+cover.
+
+**False "idle".** The panel showed `idle — no active issues` during the loop's
+*cross-issue* steps (planning, merging, post-merge review, cleanup), because the
+feed modelled only per-issue phases and `totals.running`/the active set both
+derive from the same `ACTIVE_PHASES`. The user couldn't tell "working but quiet"
+from "hung" without a session + `tail -f`. Fix: an **optional, run-level
+`activity` field** on the status schema, written by the orchestrator (`runMain`,
+not the agents — agents can hang/crash; the loop already stamps phases before
+launching each worker) at each cross-issue boundary, and rendered as the panel
+subtitle when no per-issue phase is active.
+
+- The schema field is a **permissive `z.string()`, deliberately NOT a
+  `z.enum`.** An enum rejects unknown values, and the reducer treats a parse
+  failure as a torn read → a frozen "stale" viewer. So an enum would freeze any
+  consumer that hadn't yet synced a new label (e.g. a future `fixer`). The
+  write side keeps a TS `RunActivity` union for compile-time safety; the viewer
+  falls back to rendering the raw word for values it doesn't recognise.
+- **Additive + optional ⇒ no `STATUS_SCHEMA_VERSION` bump.** zod strips unknown
+  keys (old viewer + new file = OK) and an absent field is `undefined` (new
+  viewer + old file = OK), so it's forward- and backward-compatible.
+
+**Flicker on a short terminal.** The dashboard's natural height could exceed the
+viewport; since the alt screen hides scrollback but does NOT prevent
+scroll-on-overflow, every repaint scrolled and the visible slice jittered. Two
+fixes, neither of which re-introduces the rejected full-screen bounded box (see
+"single rounded panel" above):
+
+- The reducer **dedups** — an unchanged poll returns the SAME `ViewState`
+  reference, so React/Ink skip the repaint entirely (a quiet feed never repaints
+  unchanged content).
+- The render is **sized to fit**: `computeRecentCap` (pure, in `watch/layout.ts`,
+  unit-tested without a TTY) trims the elastic "recent" strip so total lines ≤
+  terminal rows. `App` tracks `process.stdout.rows` and re-fits on resize.
