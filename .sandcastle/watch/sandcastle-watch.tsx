@@ -5,10 +5,16 @@
  * the resulting `ViewState` with Ink.
  *
  * The dashboard runs on the alternate screen buffer (htop/lazygit/k9s style):
- * `render(<App/>)` repaints in place on every state change, and the reducer
- * keeps the last-good snapshot on screen across torn writes, so there's no
- * flicker to manage here. An input sink puts the TTY in raw mode so scroll
- * keystrokes don't echo as escape-sequence spam.
+ * `render(<App/>)` repaints in place. Two things keep that flicker-free:
+ *   - the reducer DEDUPS — an unchanged poll returns the SAME `ViewState`
+ *     reference, so React/Ink skip the repaint entirely (a quiet feed, e.g. a
+ *     long merge between heartbeats, never repaints unchanged content); and
+ *   - the render is SIZED TO FIT the terminal height (`computeRecentCap` trims
+ *     the elastic "recent" strip) so content never exceeds the viewport — Ink
+ *     can't scroll-jitter content it never overflows. The alt screen hides
+ *     scrollback but does NOT prevent scroll-on-overflow, so fitting is on us.
+ * An input sink puts the TTY in raw mode so scroll keystrokes don't echo as
+ * escape-sequence spam.
  *
  * VISUAL LANGUAGE (see docs/adr/0008). Two ideas keep it legible on ANY theme:
  *   1. Real color is rationed — one warm-coral accent (#FB8359, a brightened
@@ -36,8 +42,10 @@ import { render, Box, Text, useApp, useInput } from "ink";
 import React, { useEffect, useState } from "react";
 
 import { reduce, type ReadResult, type ViewState } from "./reducer.js";
+import { computeRecentCap } from "./layout.js";
 import type {
   IssuePhase,
+  RunActivity,
   SandcastleStatus,
   StatusIssue,
 } from "../lib/status/schema.js";
@@ -90,9 +98,6 @@ const MUTED_FG: string | undefined = undefined;
 const W = { marker: 2, num: 6, title: 38, phase: 13 } as const;
 /** Outer width of the running panel = grid + paddingX(1·2) + border(1·2). */
 const RULE_W = W.marker + W.num + W.title + W.phase + 4;
-/** Cap the "recent" strip so a long history can't grow the inline render. */
-const RECENT_CAP = 6;
-
 /** Phases where the issue is actively being worked by an agent. */
 const ACTIVE_PHASES: ReadonlySet<IssuePhase> = new Set<IssuePhase>([
   "implementer",
@@ -151,6 +156,23 @@ const PHASE_LABEL: Record<IssuePhase, string> = {
   "needs-human": "needs-you",
   deferred: "deferred",
 };
+
+/**
+ * Run-level activity → panel subtitle. The schema field is a permissive string
+ * (see schema.ts), so `activityLabel` falls back to the raw word + "…" for any
+ * value a NEWER loop emits that this viewer doesn't know yet — never silently
+ * back to "idle".
+ */
+const ACTIVITY_LABEL: Record<RunActivity, string> = {
+  planning: "planning…",
+  merging: "merging…",
+  reviewing: "reviewing merge…",
+  cleanup: "cleaning up…",
+};
+
+function activityLabel(activity: string): string {
+  return ACTIVITY_LABEL[activity as RunActivity] ?? `${activity}…`;
+}
 
 const BANNER_TEXT: Record<NonNullable<ViewState["banner"]>, string> = {
   waiting: "waiting for loop…",
@@ -315,8 +337,20 @@ function IssueRow({ issue }: { issue: StatusIssue }) {
   );
 }
 
-/** The one bordered panel: the live region. Border hugs the fixed-width grid. */
-function RunningPanel({ active }: { active: readonly StatusIssue[] }) {
+/**
+ * The one bordered panel: the live region. Border hugs the fixed-width grid.
+ * When no issue is in an active phase, the run-level `activity` (planning /
+ * merging / reviewing / cleanup — the cross-issue steps that own no issue) is
+ * shown so the panel never falsely reads "idle" while the loop is busy. Only a
+ * truly idle feed (no active issues AND no activity) shows the idle copy.
+ */
+function RunningPanel({
+  active,
+  activity,
+}: {
+  active: readonly StatusIssue[];
+  activity?: string;
+}) {
   return (
     <Box
       flexDirection="column"
@@ -327,10 +361,12 @@ function RunningPanel({ active }: { active: readonly StatusIssue[] }) {
       <Text bold color={tint(C.accent)}>
         ▶ running
       </Text>
-      {active.length === 0 ? (
-        <Text color={MUTED_FG}>idle — no active issues</Text>
-      ) : (
+      {active.length > 0 ? (
         active.map((issue) => <IssueRow key={issue.number} issue={issue} />)
+      ) : activity ? (
+        <Text color={tint(C.accent)}>{activityLabel(activity)}</Text>
+      ) : (
+        <Text color={MUTED_FG}>idle — no active issues</Text>
       )}
     </Box>
   );
@@ -385,7 +421,14 @@ function Banner({ banner }: { banner: NonNullable<ViewState["banner"]> }) {
   );
 }
 
-export function Dashboard({ state }: { state: ViewState }) {
+export function Dashboard({
+  state,
+  rows = Number.POSITIVE_INFINITY,
+}: {
+  state: ViewState;
+  /** Terminal height; defaults to ∞ (show everything) when rendered headless. */
+  rows?: number;
+}) {
   const { status, banner } = state;
 
   // No snapshot yet — only a banner (or a bare hint) to show.
@@ -402,7 +445,28 @@ export function Dashboard({ state }: { state: ViewState }) {
 
   const active = status.issues.filter((i) => ACTIVE_PHASES.has(i.phase));
   const recentAll = status.issues.filter((i) => TERMINAL_PHASES.has(i.phase));
-  const recent = recentAll.slice(0, RECENT_CAP);
+
+  // Lines rendered AROUND the recent strip, using the panel's REAL body height
+  // (idle/activity = 1 line; otherwise each active issue is 1 line + 1 if it
+  // carries a detail sub-line). Keep this in sync with the JSX below.
+  const panelBodyLines =
+    active.length === 0
+      ? 1
+      : active.reduce((n, i) => n + 1 + (i.detail ? 1 : 0), 0);
+  const coreLines =
+    1 /* root marginTop */ +
+    1 /* Header */ +
+    1 /* Rule */ +
+    1 /* Counts */ +
+    1 /* panel marginTop */ +
+    (3 + panelBodyLines) /* panel: border×2 + title + body */ +
+    (banner ? 2 /* banner marginTop + line */ : 0);
+  const cap = computeRecentCap({
+    rows,
+    coreLines,
+    recentTotal: recentAll.length,
+  });
+  const recent = recentAll.slice(0, cap);
   const hiddenRecent = recentAll.length - recent.length;
 
   return (
@@ -412,7 +476,7 @@ export function Dashboard({ state }: { state: ViewState }) {
       <Counts totals={status.totals} />
 
       <Box marginTop={1}>
-        <RunningPanel active={active} />
+        <RunningPanel active={active} activity={status.activity} />
       </Box>
 
       {recent.length > 0 ? (
@@ -436,6 +500,10 @@ export function Dashboard({ state }: { state: ViewState }) {
 function App({ statusPath }: { statusPath: string }) {
   const { exit } = useApp();
   const [view, setView] = useState<ViewState>({ status: null, banner: null });
+  // Terminal height drives how much we render (see `computeRecentCap`). Tracked
+  // in state — separate from the data path — so a resize forces a re-fit even
+  // when the reducer dedups an unchanged poll to the same reference.
+  const [rows, setRows] = useState<number>(process.stdout.rows ?? 24);
 
   // Input sink → raw mode. Without an active input hook Ink leaves the TTY in
   // cooked mode, so scrolling — which the terminal translates to cursor-key
@@ -461,7 +529,15 @@ function App({ statusPath }: { statusPath: string }) {
     return () => clearInterval(id);
   }, [statusPath]);
 
-  return <Dashboard state={view} />;
+  useEffect(() => {
+    const onResize = (): void => setRows(process.stdout.rows ?? 24);
+    process.stdout.on("resize", onResize);
+    return () => {
+      process.stdout.removeListener("resize", onResize);
+    };
+  }, []);
+
+  return <Dashboard state={view} rows={rows} />;
 }
 
 // ---------------------------------------------------------------------------

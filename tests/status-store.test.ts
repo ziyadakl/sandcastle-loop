@@ -170,4 +170,31 @@ describe("StatusStore", () => {
     b.store.finish("restarting");
     expect(b.store.snapshot().state).toBe("restarting");
   });
+
+  it("setActivity writes the run-level activity into the serialized snapshot", () => {
+    const { store, writes } = makeStore();
+    store.setActivity("merging");
+
+    expect(JSON.parse(writes.at(-1)!.content).activity).toBe("merging");
+    expect(store.snapshot().activity).toBe("merging");
+    // Still a valid snapshot with the new optional field present.
+    expect(SandcastleStatusSchema.safeParse(store.snapshot()).success).toBe(true);
+  });
+
+  it("setActivity(null) clears the field (dropped from JSON entirely)", () => {
+    const { store, writes } = makeStore();
+    store.setActivity("planning");
+    store.setActivity(null);
+
+    const last = JSON.parse(writes.at(-1)!.content);
+    expect("activity" in last).toBe(false);
+    expect(store.snapshot().activity).toBeUndefined();
+  });
+
+  it("finish() clears any lingering activity so a finished run shows none", () => {
+    const { store } = makeStore();
+    store.setActivity("cleanup");
+    store.finish("done");
+    expect(store.snapshot().activity).toBeUndefined();
+  });
 });

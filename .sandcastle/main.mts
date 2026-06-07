@@ -4173,6 +4173,11 @@ export async function runMain(
         };
       }
 
+      // Run-level activity for the viewer: the cross-issue planning window
+      // (covers the planner run plus the brief post-setPlan, pre-implementer
+      // gap where issues are `planned` and no per-issue phase is active yet).
+      statusStore.setActivity("planning");
+
       // Phase 1: planner (or one-shot bypass)
       let plan: PlanIssue[];
       // Per-issue required-skills lookup, populated below if SANDCASTLE.md
@@ -4546,6 +4551,10 @@ export async function runMain(
         deps.log("no shipped branches this cycle — skipping merge phase");
         continue;
       }
+      // Run-level activity: merging starts here (after the stall/circuit-breaker
+      // gates, which `return` without finishing — labelling earlier would freeze
+      // the feed on "merging"). Covers the staging prelude + the merger run.
+      statusStore.setActivity("merging");
       const mergedIssueNums = mergedBranches
         .map((b) => Number(b.id))
         .filter((n) => Number.isInteger(n) && n > 0);
@@ -4633,6 +4642,7 @@ export async function runMain(
       // the same skill-discipline checks at the rollup level that the per-issue
       // reviewer already does. Built once per iteration and reused by both the
       // first-pass and (if it runs) the escalated reviewer pass.
+      statusStore.setActivity("reviewing"); // run-level: post-merge review + fixer ladder
       const skillsInvokedByIssue = new Map<string, readonly string[]>();
       for (const c of completed) {
         if (c.outcome.status === "ok") {
@@ -4949,6 +4959,7 @@ export async function runMain(
         ? postMergeMarker === "POST_MERGE_ALL_CLEAR" && mergerOk && ffSucceeded
         : mergerOk;
       if (cleanupGate) {
+        statusStore.setActivity("cleanup"); // run-level: worktree/branch cleanup
         const okIssues = completed.filter((c) => c.outcome.status === "ok");
         const candidateBranches = okIssues.map((c) => c.issue.branch);
         const landedBranches = verifyLandedBranches(

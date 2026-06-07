@@ -37,11 +37,33 @@ export type ViewState = {
   status: SandcastleStatus | null;
   banner: Banner;
   lastError?: string;
+  /**
+   * The raw bytes that produced `status`, kept so a poll reading the SAME bytes
+   * can short-circuit to the same `ViewState` reference (see `reduce`). Set only
+   * on a good snapshot; dropped on error/torn branches so the next good read
+   * always re-renders the recovery.
+   */
+  raw?: string;
 };
 
 function errMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/**
+ * The banner a good, non-terminal-or-terminal snapshot implies at `nowMs`.
+ * Terminal run states (`done`/`stopped`) are AUTHORITATIVE and time-independent;
+ * otherwise liveness is inferred from write-age against `STALE_AFTER_MS`. Shared
+ * by the dedup short-circuit and the full parse path so they can't drift.
+ */
+function liveBanner(status: SandcastleStatus, nowMs: number): Banner {
+  if (status.state === "done") return "done";
+  if (status.state === "stopped") return "stopped";
+  const updatedMs = Date.parse(status.updatedAt);
+  const isStale =
+    Number.isFinite(updatedMs) && nowMs - updatedMs > STALE_AFTER_MS;
+  return isStale ? "stale" : null;
 }
 
 /**
@@ -67,6 +89,21 @@ export function reduce(
       banner: prev.status ? "stale" : prev.banner ?? "stale",
       lastError: errMessage(read.error),
     };
+  }
+
+  // Dedup: bytes identical to the last good snapshot. The parsed data can't have
+  // changed, so re-derive only the time-sensitive banner; if it (and the error
+  // state) are unchanged, return the SAME reference so React/Ink skip the repaint
+  // entirely. This is what stops a quiet feed — e.g. a long merge between 2-min
+  // heartbeats — from jittering as it repaints unchanged content every poll.
+  if (
+    prev.raw !== undefined &&
+    read.raw === prev.raw &&
+    prev.status !== null &&
+    prev.lastError === undefined &&
+    liveBanner(prev.status, nowMs) === prev.banner
+  ) {
+    return prev;
   }
 
   // We have raw bytes. Parse defensively — a torn write is normal under polling.
@@ -98,19 +135,9 @@ export function reduce(
   // run stops writing by design and must NOT be relabeled "stale — loop may have
   // stopped". Non-terminal states (running / restarting) can still go stale if
   // the feed stops advancing — a crashed loop, or a hot-reload relaunch that
-  // hung. NB: a healthy `running` phase that takes longer than STALE_AFTER_MS
-  // also trips this, because the store only writes on transitions (no
-  // heartbeat) — that's a worker-side gap, not something the reducer can fix.
-  if (parsed.data.state === "done") {
-    return { status: parsed.data, banner: "done" };
-  }
-  if (parsed.data.state === "stopped") {
-    return { status: parsed.data, banner: "stopped" };
-  }
-
-  const updatedMs = Date.parse(parsed.data.updatedAt);
-  const isStale =
-    Number.isFinite(updatedMs) && nowMs - updatedMs > STALE_AFTER_MS;
-
-  return { status: parsed.data, banner: isStale ? "stale" : null };
+  // hung. The store re-stamps `updatedAt` every HEARTBEAT_MS (store.ts
+  // `startHeartbeat`, wired in main.mts), so a long-but-healthy phase stays
+  // fresh; only a feed quiet for longer than STALE_AFTER_MS (≈ a dead loop)
+  // trips the stale banner. `raw` is stashed so the next identical poll dedups.
+  return { status: parsed.data, banner: liveBanner(parsed.data, nowMs), raw: read.raw };
 }
