@@ -1,6 +1,9 @@
 node_modules/
 dist/
 .env
+# Long-lived Claude subscription token (from `claude setup-token`) for
+# container auth on macOS — see docs/adr/0011. Never commit it.
+.sandcastle/.oauth.env
 *.log
 !tests/fixtures/**/*.log
 .tsbuildinfo

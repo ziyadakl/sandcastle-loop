@@ -50,6 +50,7 @@ import {
   hasCodeDiff,
   parseWorktreeList,
   serializeDotenv,
+  oauthTokenEnv,
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
@@ -2520,6 +2521,29 @@ describe("serializeDotenv", () => {
     expect(
       parseWithRealDotenv(out, { FOO: "should-not-substitute" }).LIT,
     ).toBe("${FOO}-suffix");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// oauthTokenEnv — subscription token forwarded into the container (ADR 0011).
+// The no-op-when-unset behavior is what keeps the Linux/VPS file-mount path
+// and API-key setups untouched, so it's asserted alongside the happy path.
+// ---------------------------------------------------------------------------
+
+describe("oauthTokenEnv", () => {
+  it("forwards CLAUDE_CODE_OAUTH_TOKEN when set", () => {
+    expect(oauthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-abc" })).toEqual(
+      { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-abc" },
+    );
+  });
+
+  it("is empty when the var is unset (file-mount / API-key path untouched)", () => {
+    expect(oauthTokenEnv({})).toEqual({});
+  });
+
+  it("is empty when the var is blank or whitespace-only", () => {
+    expect(oauthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "" })).toEqual({});
+    expect(oauthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "   " })).toEqual({});
   });
 });
 
