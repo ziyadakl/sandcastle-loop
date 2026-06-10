@@ -1040,6 +1040,26 @@ export function serializeDotenv(env: Record<string, string>): string {
 }
 
 /**
+ * Container env fragment carrying the long-lived Claude subscription token.
+ *
+ * On macOS the `claude` CLI stores its subscription OAuth token in the login
+ * Keychain rather than `~/.claude/.credentials.json`, so the bind-mounted
+ * `~/.claude` dir carries no credential into the Linux container and every
+ * agent reports "Not logged in". A token from `claude setup-token`, exported as
+ * CLAUDE_CODE_OAUTH_TOKEN, is forwarded via `containerEnv` — the only channel
+ * that reliably survives into `handle.run`. Empty when unset/blank so the
+ * Linux/VPS file-mount path (and API-key setups) are untouched. See ADR 0011.
+ */
+export function oauthTokenEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const token = env.CLAUDE_CODE_OAUTH_TOKEN;
+  return token && token.trim() !== ""
+    ? { CLAUDE_CODE_OAUTH_TOKEN: token }
+    : {};
+}
+
+/**
  * Shell command run inside the sandbox at boot to materialize `.env` from
  * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
  * properties (atomic 0o600, backup-on-existing, no shell redirection)
@@ -1880,10 +1900,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // an env var (instead of a shell heredoc inside the hook command) keeps
   // secrets out of the command string we log. See `writeProjectDotenv`
   // above for the full rationale.
+  // Subscription auth into the container: forward CLAUDE_CODE_OAUTH_TOKEN when
+  // set (no-op otherwise). Required on macOS where the token lives in the
+  // Keychain, not a mountable file. See oauthTokenEnv / ADR 0011.
   const containerEnv: Record<string, string> = {
     ...projectEnv,
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
+    ...oauthTokenEnv(),
   };
 
   // Pick sandbox provider once. Both docker and mac-host implement the same
