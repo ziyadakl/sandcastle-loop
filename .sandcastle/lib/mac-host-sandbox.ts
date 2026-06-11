@@ -1,7 +1,16 @@
 import path from "node:path";
-import { existsSync, rmSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import {
+  existsSync,
+  rmSync,
+  readFileSync,
+  mkdtempSync,
+  copyFileSync,
+  appendFileSync,
+} from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
+import { backendForModel } from "../providers.js";
 
 const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
@@ -135,6 +144,56 @@ function readCommitsSince(wtPath: string, forkSha: string): { sha: string }[] {
   }
 }
 
+/**
+ * Stage `.sandcastle/AGENTS.md` to the worktree root for codex runs — the
+ * mac-host mirror of the docker `onSandboxReady` hook (`stageCodexAgentsMd` in
+ * main.mts). Codex reads `AGENTS.md` from its cwd (the worktree root), but ours
+ * ships at `.sandcastle/AGENTS.md`, so it must be copied up.
+ *
+ * Same guards as the docker hook:
+ *   - No-clobber: skip when the source is absent OR the project already has its
+ *     own root `AGENTS.md` (never overwrite a consumer's file).
+ *   - Git-exclude our copy so the agent can't commit it. `.git` is a FILE in a
+ *     worktree, so a literal `.git/info/exclude` path fails ("Not a directory")
+ *     — resolve it via `git rev-parse --git-path info/exclude`, which is correct
+ *     in both worktrees and plain repos. Best-effort: a failed exclude is not
+ *     fatal to the run.
+ *
+ * Called only on the per-sandbox (worktree) path, never the top-level run path,
+ * whose cwd is the real repo root — mirroring docker, which has no top-level
+ * hook and must not litter the operator's working tree.
+ */
+function stageCodexAgentsMdIntoWorktree(wtPath: string): void {
+  const src = path.join(wtPath, ".sandcastle", "AGENTS.md");
+  const dst = path.join(wtPath, "AGENTS.md");
+  if (!existsSync(src) || existsSync(dst)) return;
+  // Fail-closed (ADR 0010), matching the docker mirror's `|| true`: AGENTS.md
+  // delivery is best-effort cosmetic, so BOTH the copy and the git-exclude are
+  // inside the try — a failure here must never abort the run.
+  try {
+    copyFileSync(src, dst);
+    const rel = execFileSync(
+      "git",
+      ["rev-parse", "--git-path", "info/exclude"],
+      { cwd: wtPath, stdio: ["ignore", "pipe", "ignore"] },
+    )
+      .toString("utf8")
+      .trim();
+    const exPath = path.resolve(wtPath, rel);
+    const existing = existsSync(exPath) ? readFileSync(exPath, "utf8") : "";
+    const alreadyExcluded = existing
+      .split("\n")
+      .some((line) => line.trim() === "AGENTS.md");
+    if (!alreadyExcluded) {
+      const prefix =
+        existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+      appendFileSync(exPath, `${prefix}AGENTS.md\n`);
+    }
+  } catch {
+    // best-effort: copy/exclude failure does not fail the run.
+  }
+}
+
 async function spawnAgent(
   cwd: string,
   runSpec: MacHostRunSpec | MacHostTopLevelRunSpec,
@@ -178,8 +237,51 @@ async function spawnAgent(
             "--model", runSpec.model,
             "--dangerously-skip-permissions",
           ];
-  const pipePromptToStdin = mode !== "legacy-positional";
-  const failOnNonZero = mode !== "legacy-positional";
+  // Codex backend (ADR 0012): when the model id resolves to the codex backend,
+  // spawn the `codex` binary instead of `claude`. This swaps the binary and
+  // argv at the spawn site below.
+  //
+  // codex exec reads the prompt from stdin (no positional prompt arg) and
+  // writes ONLY its final agent message to the `-o <file>` path. Its stdout
+  // under `--json` is JSONL events, NOT the final message — so for parity with
+  // the claude path (whose stdout IS the final message that parseVerdict
+  // consumes) we must read the `-o` file back and return THAT as `stdout`. The
+  // JSONL stream is still buffered/echoed below to drive the idle timer and
+  // give live visibility.
+  const isCodex = backendForModel(runSpec.model) === "codex";
+
+  // `mode` is a CLAUDE-only concept (its three values all key off claude test
+  // seams), so codex must not inherit claude's stdin/exit policy from it. Codex
+  // always pipes the prompt to stdin and always fails on non-zero exit. For
+  // claude, `isCodex` is false so these are byte-equivalent to the originals.
+  const pipePromptToStdin = isCodex || mode !== "legacy-positional";
+  const failOnNonZero = isCodex || mode !== "legacy-positional";
+
+  const codexBin = process.env.SANDCASTLE_MAC_HOST_CODEX_BIN ?? "codex";
+  // Last-message sink lives in tmpdir, never the worktree: concurrent sessions
+  // share the working tree, and a file in cwd risks being committed by the
+  // agent. Absolute path so codex's `-C <cwd>` rebasing can't relocate it.
+  const codexOutFile = isCodex
+    ? path.join(mkdtempSync(path.join(tmpdir(), "sandcastle-codex-")), "last-message.txt")
+    : "";
+  // `--dangerously-bypass-approvals-and-sandbox` is required for headless
+  // operation: without it codex blocks on interactive approval prompts that
+  // have no TTY to answer them. The docker path passes the SAME flag (via the
+  // sandcastle SDK's codex args), so this is not a mac-host-specific relaxation.
+  // The difference is the mitigation: docker runs codex inside the container
+  // sandbox, whereas on mac-host the agent runs on the host — its isolation is
+  // the per-sandbox git worktree (`-C cwd`, a throwaway checkout), NOT codex's
+  // own sandbox. That worktree boundary is the safety model here.
+  const codexArgs = [
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-m", runSpec.model,
+    "-C", cwd,
+    "-o", codexOutFile,
+  ];
+  const spawnBin = isCodex ? codexBin : claudeBin;
+  const spawnArgs = isCodex ? codexArgs : claudeArgs;
 
   const childEnv = { ...process.env, ...env };
   const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
@@ -193,7 +295,7 @@ async function spawnAgent(
       if (!settled) { settled = true; resolve(val); }
     };
 
-    const child = spawn(claudeBin, claudeArgs, {
+    const child = spawn(spawnBin, spawnArgs, {
       cwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -261,6 +363,27 @@ async function spawnAgent(
       // commits: read git log on the worktree branch since createSandbox,
       // or return [] when running outside any worktree (forkSha === null).
       const commits = forkSha !== null ? readCommitsSince(cwd, forkSha) : [];
+      // Codex parity: return the `-o` last-message file (the final agent text),
+      // NOT the JSONL stdout buffer, so it flows through parseVerdict exactly
+      // like the claude path. Read it before cleanup; a 0-exit with a missing
+      // or unreadable file is a hard error (no fallback to the JSONL buffer,
+      // which would feed garbage to the verdict parser).
+      if (isCodex) {
+        let finalMessage: string;
+        try {
+          finalMessage = readFileSync(codexOutFile, "utf8");
+        } catch (err) {
+          rmSync(path.dirname(codexOutFile), { recursive: true, force: true });
+          safeReject(new Error(
+            `run "${runSpec.name}": codex exited 0 but its last-message file ` +
+              `was not written (${codexOutFile}): ${(err as Error).message}`,
+          ));
+          return;
+        }
+        rmSync(path.dirname(codexOutFile), { recursive: true, force: true });
+        safeResolve({ stdout: finalMessage, commits });
+        return;
+      }
       safeResolve({ stdout: stdoutBuf, commits });
     });
   });
@@ -290,6 +413,13 @@ export function macHostSandbox(
         branch: spec.branch,
         worktreePath: wtPath,
         async run(runSpec): Promise<MacHostRunHandle> {
+          // Codex-only, no-clobber, git-excluded AGENTS.md delivery into the
+          // worktree — the mac-host mirror of the docker onSandboxReady hook.
+          // Per-sandbox path only; the top-level run() below (cwd = repo root)
+          // must never have our copy written into it.
+          if (backendForModel(runSpec.model) === "codex") {
+            stageCodexAgentsMdIntoWorktree(wtPath);
+          }
           return await spawnAgent(wtPath, runSpec, opts.env ?? {}, forkSha, opts);
         },
         async close() {

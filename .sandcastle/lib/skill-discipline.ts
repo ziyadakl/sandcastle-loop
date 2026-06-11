@@ -45,7 +45,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { findClaudeSessionOnHost } from "@ai-hero/sandcastle";
+import { findClaudeSessionOnHost, findCodexSessionOnHost } from "@ai-hero/sandcastle";
+import { backendForModel } from "../providers.js";
+import { extractSkillInvocationsFromCodexSession } from "./codex-session.js";
 
 // ---------------------------------------------------------------------------
 // Session-path resolution (SDK sessionFilePath, with a by-id host scan)
@@ -172,6 +174,75 @@ export function extractSkillInvocationsFromSession(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Backend-aware resolve + extract (Claude OR Codex, ADR 0012)
+// ---------------------------------------------------------------------------
+
+/**
+ * Backend-aware variant of {@link resolveSessionFilePath} for the Codex
+ * agent backend. Locates a Codex *rollout* JSONL on the host by the
+ * iteration's session id via the SDK's `findCodexSessionOnHost` — the Codex
+ * analogue of `findClaudeSessionOnHost`. Rollouts live under
+ * `~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`; the SDK does the
+ * date-nested scan so we never reconstruct the path.
+ *
+ * Prefers an SDK-provided `sessionFilePath` when present (authoritative),
+ * exactly like the Claude resolver. `sessionsDir` overrides the scanned root
+ * (defaults to `~/.codex/sessions` inside `findCodexSessionOnHost`); used by
+ * tests. Returns `undefined` when neither source yields a path.
+ */
+export async function resolveCodexSessionFilePath(
+  iteration: { readonly sessionFilePath?: string; readonly sessionId?: string },
+  sessionsDir?: string,
+): Promise<string | undefined> {
+  if (iteration.sessionFilePath !== undefined && iteration.sessionFilePath !== "") {
+    return iteration.sessionFilePath;
+  }
+  if (iteration.sessionId === undefined || iteration.sessionId === "") return undefined;
+  const { path } = await findCodexSessionOnHost(iteration.sessionId, sessionsDir);
+  return path;
+}
+
+/**
+ * Resolve an iteration's session file and extract the ordered list of skills
+ * the agent invoked, dispatching on the agent backend the run used.
+ *
+ * This is the single backend-aware entry point the orchestrator should call
+ * for `SKILLS_INVOKED` ground truth. It does NOT change the existing
+ * Claude-only exports ({@link resolveSessionFilePath} +
+ * {@link extractSkillInvocationsFromSession}), which stay in place for the
+ * existing callers and tests:
+ *
+ *   - `backendForModel(model) === "codex"` → resolve the Codex rollout via
+ *     {@link resolveCodexSessionFilePath} and parse it with
+ *     {@link extractSkillInvocationsFromCodexSession} (Codex records a skill
+ *     use as a shell-exec function_call that reads `skills/<name>/SKILL.md`,
+ *     NOT a dedicated `Skill` tool_use; see `codex-session.ts`).
+ *   - otherwise (claude / kimi / glm — all the `claude` backend) → resolve via
+ *     {@link resolveSessionFilePath} and parse with
+ *     {@link extractSkillInvocationsFromSession} (unchanged Claude path).
+ *
+ * Both branches return the same shape — an ordered, deduplication-free list of
+ * invoked skill names — so {@link validateRequiredSkillsInvoked} consumes the
+ * result identically regardless of backend.
+ *
+ * `dirOverride` is forwarded to the relevant resolver's scan-root parameter
+ * (`projectsDir` for Claude, `sessionsDir` for Codex); used by tests. The
+ * extractor never throws, so a missing/undefined path yields `[]`.
+ */
+export async function resolveAndExtractSkillInvocations(
+  iteration: { readonly sessionFilePath?: string; readonly sessionId?: string },
+  model: string,
+  dirOverride?: string,
+): Promise<readonly string[]> {
+  if (backendForModel(model) === "codex") {
+    const path = await resolveCodexSessionFilePath(iteration, dirOverride);
+    return extractSkillInvocationsFromCodexSession(path);
+  }
+  const path = await resolveSessionFilePath(iteration, dirOverride);
+  return extractSkillInvocationsFromSession(path);
 }
 
 /**

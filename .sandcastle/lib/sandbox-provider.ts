@@ -1,7 +1,7 @@
 import * as sandcastle from "@ai-hero/sandcastle";
 import type { SandboxHooks } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { envForModel } from "../providers.js";
+import { envForModel, backendForModel } from "../providers.js";
 import { macHostSandbox } from "./mac-host-sandbox.js";
 
 import type {
@@ -23,7 +23,34 @@ type Mount = { hostPath: string; sandboxPath: string; readonly?: boolean };
 const AUTH_MOUNTS: readonly Mount[] = [
   { hostPath: "~/.claude", sandboxPath: "/home/agent/.claude" },
   { hostPath: "~/.config/gh", sandboxPath: "/home/agent/.config/gh" },
+  // Codex subscription auth (ADR 0012). Read-write so the in-container `codex`
+  // can refresh the token file mid-run. PRODUCTION mechanism (locked): a shared
+  // read-write bind-mount, NOT per-sandbox copy-in. The loop runs up to
+  // `maxConcurrent` (default 3) sandboxes at once, all sharing this one file.
+  // Under OAuth refresh-token rotation, copy-in is the WORSE model — each
+  // sandbox holds its own copy, so the first to rotate invalidates every
+  // sibling AND the host, a permanent desync needing a manual `codex login`.
+  // The shared mount instead converges everyone on one always-current file; its
+  // only residual risk is a transient race if two sandboxes refresh at the same
+  // instant, and that self-heals at the file level on the next read. So
+  // bind-mount dominates copy-in regardless of whether the token rotates.
+  // Container uid 1001 can write the mount (verified, ADR 0012). Harmless for
+  // claude/kimi/glm runs (ignored).
+  { hostPath: "~/.codex", sandboxPath: "/home/agent/.codex" },
 ];
+
+/**
+ * Pick the agent backend for a model (ADR 0012). Codex models run
+ * `sandcastle.codex` (subscription auth via the mounted `~/.codex`); everything
+ * else runs `claudeCode` with the provider's endpoint env. Both call sites
+ * (top-level run + per-sandbox run) route through here so the choice is made in
+ * exactly one place.
+ */
+function agentForModel(model: string) {
+  return backendForModel(model) === "codex"
+    ? sandcastle.codex(model)
+    : sandcastle.claudeCode(model, { env: envForModel(model) });
+}
 
 function buildMounts(extra?: readonly Mount[]): { mounts: Mount[] } {
   return extra && extra.length > 0
@@ -99,9 +126,7 @@ export function makeDockerProvider(
         cwd: spec.cwd ?? config.repoRoot,
         name: spec.name,
         maxIterations: spec.maxIterations ?? 1,
-        agent: sandcastle.claudeCode(spec.model, {
-          env: envForModel(spec.model),
-        }),
+        agent: agentForModel(spec.model),
         promptFile: spec.promptFile,
         promptArgs: spec.promptArgs,
         idleTimeoutSeconds: spec.idleTimeoutSeconds,
@@ -126,9 +151,7 @@ export function makeDockerProvider(
           const r = await handle.run({
             name: opts.name,
             maxIterations: opts.maxIterations ?? 1,
-            agent: sandcastle.claudeCode(opts.model, {
-              env: envForModel(opts.model),
-            }),
+            agent: agentForModel(opts.model),
             promptFile: opts.promptFile,
             promptArgs: opts.promptArgs,
             idleTimeoutSeconds: opts.idleTimeoutSeconds,

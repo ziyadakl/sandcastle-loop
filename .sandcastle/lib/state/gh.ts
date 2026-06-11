@@ -13,6 +13,30 @@ const execFileP = promisify(execFile);
 const GH_BIN = "gh";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * Directory every host-side `gh` invocation resolves its repo against. `gh`
+ * picks its target repo from the git remote of its working directory, so when
+ * the loop is pointed at a `--repo-root` different from the launch cwd (e.g. a
+ * sub-worktree, or `node main.mts --repo-root ../other`), an unset cwd makes
+ * every issue list/edit/close silently hit the LAUNCH repo instead of the
+ * managed one. There is exactly one host repo per loop process, so a single
+ * module-level value is correct (and concurrency-safe: the per-sandbox agents
+ * run their own `gh` inside their containers/worktrees, never through here).
+ *
+ * MUST be set once via {@link configureGh} at the top of `runMain`, before any
+ * gh call. Left unset, calls fall back to the process cwd (legacy behavior).
+ */
+let ghRepoRoot: string | undefined;
+
+/**
+ * Bind the working directory all subsequent host-side `gh` calls resolve
+ * against. Call once at loop startup with `args.repoRoot`. Passing `undefined`
+ * clears it (used by tests to restore the process-cwd default between cases).
+ */
+export function configureGh(opts: { readonly cwd?: string }): void {
+  ghRepoRoot = opts.cwd;
+}
+
 interface RunResult {
   stdout: string;
   stderr: string;
@@ -132,6 +156,7 @@ export function isRetryableGhError(err: unknown): boolean {
 async function runGh(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<RunResult> {
   try {
     const { stdout, stderr } = await execFileP(GH_BIN, args, {
+      cwd: ghRepoRoot,
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
     });

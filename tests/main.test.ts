@@ -51,11 +51,13 @@ import {
   parseWorktreeList,
   serializeDotenv,
   oauthTokenEnv,
+  ghTokenEnv,
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
+  STAGE_CODEX_AGENTS_MD_COMMAND,
   __resetTransientStateForTests,
   type Deps,
   type SandcastleArgs,
@@ -2548,6 +2550,31 @@ describe("oauthTokenEnv", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ghTokenEnv — GitHub CLI token forwarded into the container. On macOS the gh
+// keyring token never reaches the Linux container via the ~/.config/gh mount
+// (Keychain-stored, absent from hosts.yml), so in-container `gh` (incl. the
+// planner prompt's `!`gh issue list …`` shell-expansion blocks) 401s without
+// this forward. No-op-when-unset keeps the Linux/VPS on-disk-token path intact.
+// ---------------------------------------------------------------------------
+
+describe("ghTokenEnv", () => {
+  it("forwards GH_TOKEN when set", () => {
+    expect(ghTokenEnv({ GH_TOKEN: "gho_abc123" })).toEqual({
+      GH_TOKEN: "gho_abc123",
+    });
+  });
+
+  it("is empty when the var is unset (on-disk-token path untouched)", () => {
+    expect(ghTokenEnv({})).toEqual({});
+  });
+
+  it("is empty when the var is blank or whitespace-only", () => {
+    expect(ghTokenEnv({ GH_TOKEN: "" })).toEqual({});
+    expect(ghTokenEnv({ GH_TOKEN: "   " })).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
 // buildDefaultDeps writeProjectDotenv hook — structural assertions on the
 // shell command that materializes `.env` inside the sandbox at boot.
 // ---------------------------------------------------------------------------
@@ -2632,6 +2659,33 @@ describe("registerContext7Mcp hook", () => {
     expect(mainSource).toMatch(
       /onSandboxReady:\s*\[[^\]]*registerContext7Mcp[^\]]*\]/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STAGE_CODEX_AGENTS_MD_COMMAND — docker hook that stages the Codex AGENTS.md
+// into the worktree. Like the context7 hook it MUST fail closed so a cosmetic
+// copy can never abort the onSandboxReady boot chain (ADR 0010).
+// ---------------------------------------------------------------------------
+
+describe("STAGE_CODEX_AGENTS_MD_COMMAND hook", () => {
+  const cmd = STAGE_CODEX_AGENTS_MD_COMMAND;
+
+  it("no-clobbers: copies only when our source exists and no AGENTS.md is present", () => {
+    expect(cmd.includes("[ -f .sandcastle/AGENTS.md ]")).toBe(true);
+    expect(cmd.includes("[ ! -f AGENTS.md ]")).toBe(true);
+    expect(cmd.includes("cp .sandcastle/AGENTS.md AGENTS.md")).toBe(true);
+  });
+
+  it("resolves info/exclude via git (worktree-safe) and git-excludes our copy", () => {
+    // `.git` is a FILE in a worktree, so a literal `.git/info/exclude` path
+    // fails — must go through `git rev-parse --git-path`.
+    expect(cmd.includes("git rev-parse --git-path info/exclude")).toBe(true);
+    expect(cmd.includes("echo AGENTS.md >>")).toBe(true);
+  });
+
+  it("fails closed (`|| true`) so it can never abort the boot chain", () => {
+    expect(cmd.trimEnd().endsWith("|| true")).toBe(true);
   });
 });
 

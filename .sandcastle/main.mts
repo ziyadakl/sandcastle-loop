@@ -31,6 +31,7 @@ import * as os from "node:os";
 import { defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
+  configureGh,
   claimViaLabel,
   quarantineViaLabel,
   releaseViaLabel,
@@ -55,13 +56,12 @@ import {
   snapshotImportedFiles,
   detectImportedFileChange,
 } from "./lib/restart-detector.js";
-import { models } from "./models.js";
+import { models, codexModels } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   CritiqueCriticalError,
   critiqueErrorReasonCode,
-  extractSkillInvocationsFromSession,
-  resolveSessionFilePath,
+  resolveAndExtractSkillInvocations,
   filterPlanByTypeLabels,
   findLoadableRubrics,
   MissingRequiredSkillsError,
@@ -70,9 +70,11 @@ import {
 } from "./lib/skill-discipline.js";
 import {
   envForModel,
+  backendForModel,
   defaultCodingModelFor,
   isProviderName,
   type ProviderName,
+  type AgentBackend,
 } from "./providers.js";
 import { worktreePathFor } from "./lib/worktree-path.js";
 import {
@@ -182,6 +184,13 @@ export interface SandcastleArgs {
    * by default).
    */
   provider?: ProviderName;
+  /**
+   * Agent backend for this run (ADR 0012). `"codex"` routes every role —
+   * including retry-ladder escalations and the post-merge fixer — to Codex
+   * models via {@link roleModelsFor}; `"claude"` (or undefined) uses
+   * `models.ts`. Set by `--backend`. Undefined is treated as `"claude"`.
+   */
+  backend?: AgentBackend;
   /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
@@ -474,6 +483,11 @@ Optional:
                             Anthropic uses the local Claude subscription.
                             Default: no override — implementer uses
                             models.implementer.default from models.ts.
+  --backend NAME            Agent backend for the run: claude (default) or
+                            codex. codex routes every role to Codex models
+                            (codexModels in models.ts → sandcastle.codex) and
+                            authenticates via the mounted ~/.codex subscription
+                            (ADR 0012). Cannot combine with --provider.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -534,6 +548,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
+      "backend": { type: "string" },
       "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
@@ -581,11 +596,99 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     }
     provider = values.provider;
   }
+
+  // --backend selects the agent backend (ADR 0012). "codex" routes every role
+  // to Codex models (dispatched to sandcastle.codex by backendForModel);
+  // "claude" (default) uses models.ts. --provider (kimi/glm/anthropic) is a
+  // claude-backend-only endpoint switch and cannot combine with codex.
+  // --backend may be given explicitly, or INFERRED from an explicit
+  // --implementer-model (ADR 0012). The two must not disagree, or policy
+  // (escalations/role defaults, which key off `args.backend`) would silently
+  // split from dispatch (the agent factory + AGENTS.md staging, which key off
+  // the model). So:
+  //   - both given and they conflict  → hard-error (you said two opposite things)
+  //   - only the model given          → infer the backend from it
+  //   - neither                       → default claude
+  // --implementer-model is the SOLE inference source; the other role-model
+  // flags are validated against the resolved backend below (never inferred), so
+  // after that check the invariant holds for EVERY role: backendForModel(roleModel)
+  // === backend.
+  const explicitBackend: AgentBackend | undefined = (() => {
+    const v = values.backend;
+    if (v === undefined) return undefined;
+    if (v !== "claude" && v !== "codex") {
+      throw new Error(
+        `--backend: expected one of claude|codex, got ${JSON.stringify(v)}`,
+      );
+    }
+    return v;
+  })();
+  const explicitImplModel = values["implementer-model"];
+  const implModelBackend =
+    explicitImplModel !== undefined ? backendForModel(explicitImplModel) : undefined;
+  if (
+    explicitBackend !== undefined &&
+    implModelBackend !== undefined &&
+    explicitBackend !== implModelBackend
+  ) {
+    throw new Error(
+      `--backend ${explicitBackend} contradicts --implementer-model ` +
+        `"${explicitImplModel}" (a ${implModelBackend} model). Pass a matching ` +
+        `model, or drop --backend to infer it from the model.`,
+    );
+  }
+  const backend: AgentBackend = explicitBackend ?? implModelBackend ?? "claude";
+  if (backend === "codex" && provider !== undefined) {
+    throw new Error(
+      "--provider applies only to the claude backend; it cannot combine with --backend codex",
+    );
+  }
+
+  // Reconcile the OTHER role-model flags against the resolved backend. A
+  // sandcastle run is single-backend end-to-end: escalations, skill-discipline,
+  // and AGENTS.md staging all key off `args.backend`, while per-role dispatch
+  // keys off each role's model (agentForModel / backendForModel). A cross-backend
+  // role model (e.g. `--backend codex --reviewer-model <claude-id>`) would
+  // silently run that role on the other agent — the same split-brain the
+  // implementer reconcile above closes. These flags are validated, NOT inferred
+  // (only --implementer-model infers, per ADR 0012). Hard-error at parse so the
+  // contradiction surfaces before any run.
+  const roleModelFlags: ReadonlyArray<readonly [string, string | undefined]> = [
+    ["--planner-model", values["planner-model"]],
+    ["--reviewer-model", values["reviewer-model"]],
+    ["--critique-model", values["critique-model"]],
+    ["--merger-model", values["merger-model"]],
+    ["--post-merge-reviewer-model", values["post-merge-reviewer-model"]],
+    ["--recovery-model", values["recovery-model"]],
+  ];
+  const mismatchedRoleModels: Array<{ flag: string; model: string; modelBackend: AgentBackend }> =
+    [];
+  for (const [flag, value] of roleModelFlags) {
+    if (value === undefined) continue;
+    const modelBackend = backendForModel(value);
+    if (modelBackend !== backend) {
+      mismatchedRoleModels.push({ flag, model: value, modelBackend });
+    }
+  }
+  if (mismatchedRoleModels.length > 0) {
+    const details = mismatchedRoleModels
+      .map((m) => `${m.flag} "${m.model}" (a ${m.modelBackend} model)`)
+      .join("; ");
+    throw new Error(
+      `backend resolved to "${backend}", but ${details} ` +
+        `${mismatchedRoleModels.length === 1 ? "is" : "are"} for a different backend. ` +
+        `A sandcastle run uses one backend for every role: pass matching ${backend} ` +
+        `model(s), or set --backend to match.`,
+    );
+  }
+
+  const roleModels = roleModelsFor({ backend });
+
   const implementerModel =
-    values["implementer-model"] ??
+    explicitImplModel ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
-      : models.implementer.default);
+      : roleModels.implementer.default);
 
   const sandbox: "docker" | "mac-host" = (() => {
     const v = values.sandbox;
@@ -606,14 +709,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
-    plannerModel: values["planner-model"] ?? models.planner.default,
+    plannerModel: values["planner-model"] ?? roleModels.planner.default,
     implementerModel,
-    reviewerModel: values["reviewer-model"] ?? models.reviewer.default,
-    critiqueModel: values["critique-model"] ?? models.critique.default,
-    mergerModel: values["merger-model"] ?? models.merger.default,
+    backend,
+    reviewerModel: values["reviewer-model"] ?? roleModels.reviewer.default,
+    critiqueModel: values["critique-model"] ?? roleModels.critique.default,
+    mergerModel: values["merger-model"] ?? roleModels.merger.default,
     postMergeReviewerModel:
-      values["post-merge-reviewer-model"] ?? models.postMergeReviewer.default,
-    recoveryModel: values["recovery-model"] ?? models.recovery.default,
+      values["post-merge-reviewer-model"] ?? roleModels.postMergeReviewer.default,
+    recoveryModel: values["recovery-model"] ?? roleModels.recovery.default,
     implementerTimeoutSec:
       parsePositiveInt(
         values["implementer-timeout-sec"],
@@ -674,6 +778,17 @@ function detectBranchOr(fallback: string): string {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Role-model map for a run's agent backend (ADR 0012). Codex runs draw every
+ * role — defaults, retry-ladder escalations, and the post-merge fixer — from
+ * `codexModels`; everything else uses the Claude `models` map. Reading
+ * escalations through this (not `models.X` directly) is what keeps a
+ * `--backend codex` run from silently escalating onto a Claude model.
+ */
+function roleModelsFor(a: { readonly backend?: AgentBackend }) {
+  return a.backend === "codex" ? codexModels : models;
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -1060,6 +1175,35 @@ export function oauthTokenEnv(
 }
 
 /**
+ * Container env fragment carrying the GitHub CLI token.
+ *
+ * Same macOS-Keychain class of bug as `oauthTokenEnv` (ADR 0011): on macOS the
+ * `gh` CLI stores its OAuth token in the login Keychain (the keyring), NOT in
+ * `~/.config/gh/hosts.yml` (which carries only the account name, no
+ * `oauth_token` field). The bind-mounted `~/.config/gh` therefore reaches the
+ * Linux container with no usable credential, and the container has no Keychain
+ * — so every in-container `gh` call (notably the planner prompt's `!`gh issue
+ * list …`` shell-expansion blocks, run by the SDK's `preprocessPrompt` via
+ * `sandbox.exec`) fails with `HTTP 401: Requires authentication`.
+ *
+ * Forwarding `GH_TOKEN` via `containerEnv` is the only channel that crosses
+ * into the container (mirrors the subscription-token fix). Empty when unset/
+ * blank so the Linux/VPS path (where `gh` reads a real on-disk token from the
+ * mounted config) is untouched.
+ *
+ * NOTE: this forwards whatever `process.env.GH_TOKEN` resolved to via
+ * `loadDotenv`. A good shell export shadows the stale `~/.config/sandcastle/.env`
+ * value; if launched WITHOUT exporting a fresh token, the stale `.env` value
+ * would be forwarded and 401 again. Keep the host `.env` token current.
+ */
+export function ghTokenEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const token = env.GH_TOKEN;
+  return token && token.trim() !== "" ? { GH_TOKEN: token } : {};
+}
+
+/**
  * Shell command run inside the sandbox at boot to materialize `.env` from
  * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
  * properties (atomic 0o600, backup-on-existing, no shell redirection)
@@ -1126,6 +1270,24 @@ export const REGISTER_CONTEXT7_MCP_COMMAND =
   `https://mcp.context7.com/mcp ` +
   `--header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY" >/dev/null 2>&1 || true; ` +
   `fi`;
+
+/**
+ * Docker `onSandboxReady` staging command for the Codex `AGENTS.md` file. Copies
+ * `.sandcastle/AGENTS.md` up to the worktree root (where Codex reads it) only
+ * when the project ships our source AND has no `AGENTS.md` of its own
+ * (no-clobber), then git-excludes our copy so the agent can't commit it.
+ * `info/exclude` is resolved via `git rev-parse --git-path` because `.git` is a
+ * FILE in a worktree (a literal path fails). FAILS CLOSED (`|| true`, ADR 0010):
+ * a best-effort cosmetic copy must never abort the onSandboxReady chain. The
+ * mac-host mirror is `stageCodexAgentsMdIntoWorktree` in `mac-host-sandbox.ts` —
+ * keep the two in lockstep.
+ */
+export const STAGE_CODEX_AGENTS_MD_COMMAND =
+  "if [ -f .sandcastle/AGENTS.md ] && [ ! -f AGENTS.md ]; then " +
+  "cp .sandcastle/AGENTS.md AGENTS.md; " +
+  'ex="$(git rev-parse --git-path info/exclude)"; ' +
+  'grep -qxF AGENTS.md "$ex" 2>/dev/null || echo AGENTS.md >> "$ex"; ' +
+  "fi || true";
 
 function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
@@ -1874,12 +2036,22 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // Docker `onSandboxReady` hooks. mac-host never reaches sandcastle.createSandbox
   // so it carries no analogous concept; if mac-host ever grows hook support
   // it'll live in MacHostProviderConfig, not as a shared variable.
+  // Codex reads AGENTS.md from the agent's cwd (the worktree root), but ours
+  // ships at .sandcastle/AGENTS.md. The staging command (no-clobber, git-excluded,
+  // fail-closed) is STAGE_CODEX_AGENTS_MD_COMMAND; the mac-host mirror is
+  // stageCodexAgentsMdIntoWorktree. Claude/Kimi/GLM runs skip this entirely.
+  // `isCodexRun` gates on the spawn model (matching the agent factory / mac-host
+  // router); escalations/role defaults gate on `args.backend`. The parse-time
+  // reconcile guarantees the two agree. See ADR 0012 / WS-A2.
+  const isCodexRun = backendForModel(args.implementerModel) === "codex";
+  const stageCodexAgentsMd = { command: STAGE_CODEX_AGENTS_MD_COMMAND };
   const dockerHooks = {
     sandbox: {
       onSandboxReady: [
         writeProjectDotenv,
         registerContext7Mcp,
         { command: "CI=true pnpm install" },
+        ...(isCodexRun ? [stageCodexAgentsMd] : []),
       ],
     },
   } as const;
@@ -1908,6 +2080,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
     ...oauthTokenEnv(),
+    // GH_TOKEN forwarded last so a shell/host-level token wins over any stale
+    // GH_TOKEN that leaked in via the target project's .env (projectEnv). On
+    // macOS the gh keyring token never reaches the container via the
+    // ~/.config/gh mount (Keychain-stored, not in hosts.yml) — see ghTokenEnv.
+    ...ghTokenEnv(),
   };
 
   // Pick sandbox provider once. Both docker and mac-host implement the same
@@ -2600,7 +2777,9 @@ export async function runImplementer(
   // throws a rate-limit error. Attempt 2 is already on the escalation, so no
   // further fallback — it just throws and the pipeline catch handles it.
   const fallbackModel =
-    attemptNumber === 1 ? models.implementer.escalations[0] : undefined;
+    attemptNumber === 1
+      ? roleModelsFor(ctx.args).implementer.escalations[0]
+      : undefined;
   const r = await runWithRateLimitFallback(
     (model) =>
       sb.run({
@@ -2649,8 +2828,11 @@ export async function runImplementer(
   // invoked them. Missing iterations array (legacy test mocks) yields [].
   const skillsInvoked: string[] = [];
   for (const it of r.iterations ?? []) {
-    const sessionPath = await resolveSessionFilePath(it);
-    for (const name of extractSkillInvocationsFromSession(sessionPath)) {
+    // Backend-aware (ADR 0012): for Codex iterations this resolves the
+    // ~/.codex rollout and parses skill-reads; for Claude it walks the
+    // ~/.claude session JSONL as before. primaryModel reflects this run's
+    // backend (all iterations share it).
+    for (const name of await resolveAndExtractSkillInvocations(it, primaryModel)) {
       skillsInvoked.push(name);
     }
   }
@@ -3074,7 +3256,7 @@ async function runReviewer(
   // reviewer-retry pass (already on escalations[0]) has no further fallback.
   const fallbackModel =
     primaryModel === ctx.args.reviewerModel
-      ? models.reviewer.escalations[0]
+      ? roleModelsFor(ctx.args).reviewer.escalations[0]
       : undefined;
   const skillsInvoked = opts.skillsInvoked ?? [];
   // Review the whole branch vs its fork point, not just the tip commit's
@@ -3523,8 +3705,8 @@ async function runIssuePipeline(
     }
 
     // Reviewer attempt 1 marked HAS_BLOCKERS. Decide retry vs quarantine.
-    const implEscalations = models.implementer.escalations;
-    const revEscalations = models.reviewer.escalations;
+    const implEscalations = roleModelsFor(ctx.args).implementer.escalations;
+    const revEscalations = roleModelsFor(ctx.args).reviewer.escalations;
     const canRetry =
       ctx.args.retryEnabled &&
       implEscalations.length > 0 &&
@@ -3993,6 +4175,11 @@ export async function runMain(
   args: SandcastleArgs,
   deps: Deps,
 ): Promise<RunMainResult> {
+  // Point every host-side `gh` call at the managed repo, not the launch cwd, so
+  // a `--repo-root` other than cwd resolves correctly (see configureGh). Set
+  // first, before the startup reconciliation issues its first `gh issue list`.
+  configureGh({ cwd: args.repoRoot });
+
   let consecutiveFailures = 0;
   let lastFailingIssue: number | undefined;
   const shippedIssues: number[] = [];
@@ -4048,6 +4235,18 @@ export async function runMain(
   } else {
     deps.log(
       `No SANDCASTLE.md at repo root — skill discipline disabled (no type:-label enforcement)`,
+    );
+  }
+
+  // Codex backend has an empty escalation ladder by design (ADR 0012:
+  // codexModels.*.escalations === []), so a failing role quarantines on first
+  // failure with no model-tier retry/recovery. Warn once at startup because
+  // --recovery / --no-retry then have no escalation effect — silent under the
+  // claude defaults but surprising for an operator who set them expecting a
+  // retry tier.
+  if (args.backend === "codex") {
+    deps.log(
+      `backend: codex — no escalation/recovery tier (empty ladder, ADR 0012): a failing role quarantines on first failure; --recovery / --no-retry have no model-escalation effect this run`,
     );
   }
 
@@ -4774,8 +4973,13 @@ export async function runMain(
         stagingActive &&
         postMergeMarker === "POST_MERGE_ISSUES_FOUND"
       ) {
+        // Route the fixer model through the run's backend (ADR 0012), via the
+        // SAME `roleModelsFor(args)` source every other role uses — never a
+        // second derivation off the model, which could split from args.backend.
+        const fixerSrc = roleModelsFor(args);
         const fixerModel =
-          models.postMergeFixer.escalations[0] ?? models.postMergeFixer.default;
+          fixerSrc.postMergeFixer.escalations[0] ??
+          fixerSrc.postMergeFixer.default;
         deps.log(
           `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
         );
@@ -4821,8 +5025,10 @@ export async function runMain(
           // affected issues (see post-merge-review-prompt.md).
           const fixerSkillsInvoked: string[] = [];
           for (const fxIt of fixerResult?.iterations ?? []) {
-            const sessionPath = await resolveSessionFilePath(fxIt);
-            for (const name of extractSkillInvocationsFromSession(sessionPath)) {
+            for (const name of await resolveAndExtractSkillInvocations(
+              fxIt,
+              fixerModel,
+            )) {
               fixerSkillsInvoked.push(name);
             }
           }
@@ -4869,7 +5075,7 @@ export async function runMain(
           }
 
           const reviewerEscModel =
-            models.postMergeReviewer.escalations[0] ??
+            roleModelsFor(args).postMergeReviewer.escalations[0] ??
             args.postMergeReviewerModel;
           deps.log(
             `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,

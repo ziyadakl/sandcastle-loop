@@ -23,9 +23,13 @@
  * variable name to hold the key. The dispatcher gets this right per call —
  * you cannot just set both globally because they'd clobber each other.
  *
- * Codex (OpenAI's CLI) is intentionally excluded — it's a different binary
- * and would need `sandcastle.codex(...)` instead of `claudeCode(...)`. Out of
- * scope for this dispatcher.
+ * Codex (OpenAI's CLI) is a different *agent backend*, not an Anthropic
+ * endpoint — it runs `sandcastle.codex(...)` instead of `claudeCode(...)` and
+ * authenticates via a `~/.codex/auth.json` subscription file, not ANTHROPIC_*
+ * env. It is dispatched on the separate `AgentBackend` axis below
+ * (`backendForModel`), which `sandbox-provider.ts` uses to pick the agent
+ * factory. The provider dispatch in this file governs only the claude-backend
+ * endpoints (anthropic / kimi / glm). See ADR 0012.
  */
 
 export type ProviderName = "anthropic" | "kimi" | "glm";
@@ -106,4 +110,35 @@ export function defaultCodingModelFor(name: ProviderName): string {
 
 export function isProviderName(s: string): s is ProviderName {
   return s === "anthropic" || s === "kimi" || s === "glm";
+}
+
+// ---------------------------------------------------------------------------
+// Agent backend axis (ADR 0012)
+//
+// Distinct from the provider axis above: the *backend* is which agent binary /
+// SDK factory drives a run — Claude Code (`claudeCode`) or OpenAI Codex
+// (`codex`). anthropic / kimi / glm are all the *claude* backend (the same
+// `claude` binary, differing only by endpoint env). Codex is the first
+// non-claude backend: a different binary, subscription auth via a mounted
+// `~/.codex/auth.json` file rather than ANTHROPIC_* env.
+// ---------------------------------------------------------------------------
+
+export type AgentBackend = "claude" | "codex";
+
+/**
+ * Detect which agent backend a model ID belongs to. OpenAI / Codex model IDs
+ * (`gpt-*`, `o1`/`o3`/`o4-*`, or anything containing `codex`) run on the Codex
+ * backend; everything else (`claude-*`, `kimi-*`, `glm-*`) runs on Claude Code.
+ *
+ * Codex models authenticate via the mounted `~/.codex` subscription file, so
+ * `envForModel` is NOT consulted for them — it would throw (no ANTHROPIC key).
+ * `sandbox-provider.ts` branches on this to pick `sandcastle.codex(...)` vs
+ * `sandcastle.claudeCode(...)`.
+ */
+export function backendForModel(modelId: string): AgentBackend {
+  const id = modelId.toLowerCase();
+  if (id.includes("codex") || id.startsWith("gpt-") || /^o[1-9]/.test(id)) {
+    return "codex";
+  }
+  return "claude";
 }
