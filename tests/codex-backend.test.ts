@@ -101,4 +101,46 @@ describe("--backend flag (parseSandcastleArgs)", () => {
       parseSandcastleArgs(["--iterations", "1", "--backend", "bogus"]),
     ).toThrow(/backend/i);
   });
+
+  it("infers codex backend from an explicit codex --implementer-model (no --backend)", () => {
+    const { args } = parseSandcastleArgs([
+      "--iterations",
+      "1",
+      "--implementer-model",
+      "gpt-5.1-codex",
+    ]);
+    // The whole run flips to codex — not just the implementer — so policy
+    // (escalations/role defaults) can't split from dispatch (agent factory).
+    expect(args.backend).toBe("codex");
+    expect(args.implementerModel).toBe("gpt-5.1-codex");
+    expect(args.plannerModel).toBe(codexModels.planner.default);
+    expect(args.reviewerModel).toBe(codexModels.reviewer.default);
+    expect(backendForModel(args.implementerModel)).toBe("codex");
+  });
+
+  it("hard-errors when --backend codex contradicts a claude --implementer-model", () => {
+    expect(() =>
+      parseSandcastleArgs([
+        "--iterations",
+        "1",
+        "--backend",
+        "codex",
+        "--implementer-model",
+        "claude-sonnet-4-6",
+      ]),
+    ).toThrow(/contradict/i);
+  });
+
+  it("hard-errors when --backend claude contradicts a codex --implementer-model", () => {
+    expect(() =>
+      parseSandcastleArgs([
+        "--iterations",
+        "1",
+        "--backend",
+        "claude",
+        "--implementer-model",
+        "gpt-5.1-codex",
+      ]),
+    ).toThrow(/contradict/i);
+  });
 });

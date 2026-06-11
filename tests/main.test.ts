@@ -56,6 +56,7 @@ import {
   resolveReviewBase,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
+  STAGE_CODEX_AGENTS_MD_COMMAND,
   __resetTransientStateForTests,
   type Deps,
   type SandcastleArgs,
@@ -2632,6 +2633,33 @@ describe("registerContext7Mcp hook", () => {
     expect(mainSource).toMatch(
       /onSandboxReady:\s*\[[^\]]*registerContext7Mcp[^\]]*\]/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STAGE_CODEX_AGENTS_MD_COMMAND — docker hook that stages the Codex AGENTS.md
+// into the worktree. Like the context7 hook it MUST fail closed so a cosmetic
+// copy can never abort the onSandboxReady boot chain (ADR 0010).
+// ---------------------------------------------------------------------------
+
+describe("STAGE_CODEX_AGENTS_MD_COMMAND hook", () => {
+  const cmd = STAGE_CODEX_AGENTS_MD_COMMAND;
+
+  it("no-clobbers: copies only when our source exists and no AGENTS.md is present", () => {
+    expect(cmd.includes("[ -f .sandcastle/AGENTS.md ]")).toBe(true);
+    expect(cmd.includes("[ ! -f AGENTS.md ]")).toBe(true);
+    expect(cmd.includes("cp .sandcastle/AGENTS.md AGENTS.md")).toBe(true);
+  });
+
+  it("resolves info/exclude via git (worktree-safe) and git-excludes our copy", () => {
+    // `.git` is a FILE in a worktree, so a literal `.git/info/exclude` path
+    // fails — must go through `git rev-parse --git-path`.
+    expect(cmd.includes("git rev-parse --git-path info/exclude")).toBe(true);
+    expect(cmd.includes("echo AGENTS.md >>")).toBe(true);
+  });
+
+  it("fails closed (`|| true`) so it can never abort the boot chain", () => {
+    expect(cmd.trimEnd().endsWith("|| true")).toBe(true);
   });
 });
 

@@ -600,9 +600,18 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   // to Codex models (dispatched to sandcastle.codex by backendForModel);
   // "claude" (default) uses models.ts. --provider (kimi/glm/anthropic) is a
   // claude-backend-only endpoint switch and cannot combine with codex.
-  const backend: AgentBackend = (() => {
+  // --backend may be given explicitly, or INFERRED from an explicit
+  // --implementer-model (ADR 0012). The two must not disagree, or policy
+  // (escalations/role defaults, which key off `args.backend`) would silently
+  // split from dispatch (the agent factory + AGENTS.md staging, which key off
+  // the model). So:
+  //   - both given and they conflict  → hard-error (you said two opposite things)
+  //   - only the model given          → infer the backend from it
+  //   - neither                       → default claude
+  // After this block the invariant holds: backendForModel(implementerModel) === backend.
+  const explicitBackend: AgentBackend | undefined = (() => {
     const v = values.backend;
-    if (v === undefined) return "claude";
+    if (v === undefined) return undefined;
     if (v !== "claude" && v !== "codex") {
       throw new Error(
         `--backend: expected one of claude|codex, got ${JSON.stringify(v)}`,
@@ -610,6 +619,21 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     }
     return v;
   })();
+  const explicitImplModel = values["implementer-model"];
+  const implModelBackend =
+    explicitImplModel !== undefined ? backendForModel(explicitImplModel) : undefined;
+  if (
+    explicitBackend !== undefined &&
+    implModelBackend !== undefined &&
+    explicitBackend !== implModelBackend
+  ) {
+    throw new Error(
+      `--backend ${explicitBackend} contradicts --implementer-model ` +
+        `"${explicitImplModel}" (a ${implModelBackend} model). Pass a matching ` +
+        `model, or drop --backend to infer it from the model.`,
+    );
+  }
+  const backend: AgentBackend = explicitBackend ?? implModelBackend ?? "claude";
   if (backend === "codex" && provider !== undefined) {
     throw new Error(
       "--provider applies only to the claude backend; it cannot combine with --backend codex",
@@ -618,7 +642,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   const roleModels = backend === "codex" ? codexModels : models;
 
   const implementerModel =
-    values["implementer-model"] ??
+    explicitImplModel ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
       : roleModels.implementer.default);
@@ -1174,6 +1198,24 @@ export const REGISTER_CONTEXT7_MCP_COMMAND =
   `https://mcp.context7.com/mcp ` +
   `--header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY" >/dev/null 2>&1 || true; ` +
   `fi`;
+
+/**
+ * Docker `onSandboxReady` staging command for the Codex `AGENTS.md` file. Copies
+ * `.sandcastle/AGENTS.md` up to the worktree root (where Codex reads it) only
+ * when the project ships our source AND has no `AGENTS.md` of its own
+ * (no-clobber), then git-excludes our copy so the agent can't commit it.
+ * `info/exclude` is resolved via `git rev-parse --git-path` because `.git` is a
+ * FILE in a worktree (a literal path fails). FAILS CLOSED (`|| true`, ADR 0010):
+ * a best-effort cosmetic copy must never abort the onSandboxReady chain. The
+ * mac-host mirror is `stageCodexAgentsMdIntoWorktree` in `mac-host-sandbox.ts` —
+ * keep the two in lockstep.
+ */
+export const STAGE_CODEX_AGENTS_MD_COMMAND =
+  "if [ -f .sandcastle/AGENTS.md ] && [ ! -f AGENTS.md ]; then " +
+  "cp .sandcastle/AGENTS.md AGENTS.md; " +
+  'ex="$(git rev-parse --git-path info/exclude)"; ' +
+  'grep -qxF AGENTS.md "$ex" 2>/dev/null || echo AGENTS.md >> "$ex"; ' +
+  "fi || true";
 
 function parseDotenvFile(filePath: string): Record<string, string> {
   let raw: string;
@@ -1923,22 +1965,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // so it carries no analogous concept; if mac-host ever grows hook support
   // it'll live in MacHostProviderConfig, not as a shared variable.
   // Codex reads AGENTS.md from the agent's cwd (the worktree root), but ours
-  // ships at .sandcastle/AGENTS.md. For codex runs, stage it to the root at
-  // sandbox boot — but ONLY if the project has no AGENTS.md of its own (no
-  // clobber), and git-exclude our copy so the agent can't accidentally commit
-  // it. Claude/Kimi/GLM runs skip this entirely. See ADR 0012 / WS-A2.
+  // ships at .sandcastle/AGENTS.md. The staging command (no-clobber, git-excluded,
+  // fail-closed) is STAGE_CODEX_AGENTS_MD_COMMAND; the mac-host mirror is
+  // stageCodexAgentsMdIntoWorktree. Claude/Kimi/GLM runs skip this entirely.
+  // `isCodexRun` gates on the spawn model (matching the agent factory / mac-host
+  // router); escalations/role defaults gate on `args.backend`. The parse-time
+  // reconcile guarantees the two agree. See ADR 0012 / WS-A2.
   const isCodexRun = backendForModel(args.implementerModel) === "codex";
-  const stageCodexAgentsMd = {
-    command:
-      "if [ -f .sandcastle/AGENTS.md ] && [ ! -f AGENTS.md ]; then " +
-      "cp .sandcastle/AGENTS.md AGENTS.md; " +
-      // Resolve info/exclude via git: in a worktree `.git` is a FILE, not a
-      // dir, so a literal `.git/info/exclude` path fails ("Not a directory")
-      // and our copy would stay committable. `--git-path` resolves correctly
-      // in both worktrees and plain repos.
-      'ex="$(git rev-parse --git-path info/exclude)"; ' +
-      'grep -qxF AGENTS.md "$ex" 2>/dev/null || echo AGENTS.md >> "$ex"; fi',
-  };
+  const stageCodexAgentsMd = { command: STAGE_CODEX_AGENTS_MD_COMMAND };
   const dockerHooks = {
     sandbox: {
       onSandboxReady: [
@@ -4845,13 +4879,10 @@ export async function runMain(
         stagingActive &&
         postMergeMarker === "POST_MERGE_ISSUES_FOUND"
       ) {
-        // Route the fixer model through the run's backend (ADR 0012): under
-        // --backend codex the implementer model is a Codex model, so the fixer
-        // must be too — otherwise it would silently run on Claude.
-        const fixerSrc =
-          backendForModel(args.implementerModel) === "codex"
-            ? codexModels
-            : models;
+        // Route the fixer model through the run's backend (ADR 0012), via the
+        // SAME `roleModelsFor(args)` source every other role uses — never a
+        // second derivation off the model, which could split from args.backend.
+        const fixerSrc = roleModelsFor(args);
         const fixerModel =
           fixerSrc.postMergeFixer.escalations[0] ??
           fixerSrc.postMergeFixer.default;

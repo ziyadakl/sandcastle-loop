@@ -167,8 +167,11 @@ function stageCodexAgentsMdIntoWorktree(wtPath: string): void {
   const src = path.join(wtPath, ".sandcastle", "AGENTS.md");
   const dst = path.join(wtPath, "AGENTS.md");
   if (!existsSync(src) || existsSync(dst)) return;
-  copyFileSync(src, dst);
+  // Fail-closed (ADR 0010), matching the docker mirror's `|| true`: AGENTS.md
+  // delivery is best-effort cosmetic, so BOTH the copy and the git-exclude are
+  // inside the try — a failure here must never abort the run.
   try {
+    copyFileSync(src, dst);
     const rel = execFileSync(
       "git",
       ["rev-parse", "--git-path", "info/exclude"],
@@ -187,7 +190,7 @@ function stageCodexAgentsMdIntoWorktree(wtPath: string): void {
       appendFileSync(exPath, `${prefix}AGENTS.md\n`);
     }
   } catch {
-    // best-effort: failing to git-exclude our copy does not fail the run.
+    // best-effort: copy/exclude failure does not fail the run.
   }
 }
 

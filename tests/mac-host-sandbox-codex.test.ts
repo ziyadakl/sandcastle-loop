@@ -259,4 +259,27 @@ describe("macHostSandbox codex backend", () => {
     // Top-level cwd is the operator's real repo root — must never be littered.
     expect(existsSync(path.join(repoRoot, "AGENTS.md"))).toBe(false);
   });
+
+  it("fail-closed: a staging copy failure does not abort the run", async () => {
+    process.env.SANDCASTLE_MAC_HOST_CODEX_BIN = writeFakeCodexFinal(repoRoot);
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/fail-closed" });
+    // Make the SOURCE a directory so copyFileSync throws (EISDIR). The run must
+    // still succeed — AGENTS.md delivery is best-effort cosmetic (ADR 0010).
+    mkdirSync(path.join(handle.worktreePath, ".sandcastle", "AGENTS.md"), {
+      recursive: true,
+    });
+    writeFileSync(path.join(handle.worktreePath, "p.md"), "x");
+
+    const result = await handle.run({
+      name: "fail-closed",
+      model: "gpt-5-codex",
+      promptFile: "p.md",
+      idleTimeoutSeconds: 30,
+    });
+
+    expect(result.stdout).toBe("FINAL"); // run completed despite the copy throw
+    expect(existsSync(path.join(handle.worktreePath, "AGENTS.md"))).toBe(false);
+    await handle.close();
+  });
 });
