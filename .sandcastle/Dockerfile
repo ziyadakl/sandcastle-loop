@@ -79,6 +79,16 @@ ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # ---------------------------------------------------------------------------
+# OpenAI Codex CLI (ADR 0012) — the alternate agent backend. Installed as the
+# agent user so the binary lands in $HOME's npm-global bin (already on PATH)
+# and its `~/.codex/` config dir matches the runtime mount layout. The npm
+# package fetches the right platform binary at build time, so building on macOS
+# still yields the linux binary inside the image. Inert unless a run selects a
+# Codex model — harmless for claude/kimi/glm runs.
+# ---------------------------------------------------------------------------
+RUN npm install -g @openai/codex
+
+# ---------------------------------------------------------------------------
 # Corepack — Node 16+ ships corepack which provides pnpm/yarn shims.
 # Affinity-tracker and similar monorepos use pnpm's workspace:* protocol
 # which npm refuses to parse. Enabling corepack means our onSandboxReady

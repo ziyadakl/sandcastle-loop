@@ -29,6 +29,30 @@ Agent runs that gate-check the implementer's commits before they ship.
 **Recovery**:
 Off by default; enabled with `--recovery on`. When on, runs a single retry of the implementer with the same model before quarantining. (Earlier design had a fixer/recovery escalation ladder; that was cut — see "Keep-vs-cut criterion" below.)
 
+**Agent backend**:
+Which coding-agent binary/SDK factory drives a run — `claudeCode()` (Claude
+Code) or `codex()` (OpenAI Codex). A new axis introduced by ADR 0012, and
+deliberately distinct from two axes it is easy to conflate:
+- **Sandbox** — *where* a run executes: `docker` vs `mac-host` (the `--sandbox`
+  flag, the `SandboxHandle` interface).
+- **Provider** — *which Anthropic-compatible endpoint/auth*: `anthropic` /
+  `kimi` / `glm`. All three drive the **same** `claude` binary and differ only
+  by injected env (`providers.ts`).
+Codex is the first backend that is a genuinely *different binary*, so it is not
+just another "provider" — `sandbox-provider.ts` routes both agent call sites
+through an `agentForModel()` dispatch that picks the backend. Auth differs by
+backend: Claude subscription via the macOS Keychain / a forwarded OAuth token
+(ADR 0011); Codex subscription via `codex login` → a `~/.codex/auth.json` file
+mounted **read-write** (ADR 0012).
+
+**AGENTS.md**:
+Codex's instruction layer — the file Codex reads before any work. On the Codex
+backend it is the natural home for the per-issue required design-principle
+skills: the Codex-side equivalent of the `{{REQUIRED_SKILLS}}` prompt
+scaffolding the Claude path threads (ADR 0006 v3.2). Distinct from
+`SANDCASTLE.md` (the consumer gate *config* mapping `type:<label>` → required
+principles) and from the prompt files. See ADR 0012.
+
 **Merger stash window**:
 While the merger phase runs (the step that integrates the iteration's per-issue branches into the integration branch), `.sandcastle/` is temporarily stashed to git stash to avoid conflicts with the in-progress merge. Host edits to `.sandcastle/` files during that window land in the stash and reappear when the merger completes — they're not lost, just temporarily invisible. Don't panic if a file in `.sandcastle/` looks empty or unexpectedly different mid-iteration.
 

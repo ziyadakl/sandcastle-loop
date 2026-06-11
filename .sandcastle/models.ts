@@ -36,4 +36,24 @@ export const models = {
   recovery:          { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
 } as const satisfies Record<string, RoleConfig>;
 
+/**
+ * Codex backend model defaults (ADR 0012). Selected by `--backend codex`, which
+ * swaps the per-role fallback from `models` to this map. `gpt-5.5` is the
+ * spike-verified default for codex-cli 0.139.0; `backendForModel` routes any
+ * `gpt-*` / `*codex*` / `o[1-9]` id to `sandcastle.codex()`. Per-role tuning is
+ * via Codex reasoning *effort* (CodexOptions.effort), not the model string, so
+ * all roles share one model id for now; escalations are empty (no model-tier
+ * retry ladder defined for Codex yet — a follow-up).
+ */
+export const codexModels = {
+  planner:           { default: "gpt-5.5", escalations: [] },
+  implementer:       { default: "gpt-5.5", escalations: [] },
+  reviewer:          { default: "gpt-5.5", escalations: [] },
+  critique:          { default: "gpt-5.5", escalations: [] },
+  merger:            { default: "gpt-5.5", escalations: [] },
+  postMergeReviewer: { default: "gpt-5.5", escalations: [] },
+  postMergeFixer:    { default: "gpt-5.5", escalations: [] },
+  recovery:          { default: "gpt-5.5", escalations: [] },
+} as const satisfies Record<keyof typeof models, RoleConfig>;
+
 export type ModelRole = keyof typeof models;

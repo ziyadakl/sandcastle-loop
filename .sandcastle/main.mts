@@ -55,13 +55,12 @@ import {
   snapshotImportedFiles,
   detectImportedFileChange,
 } from "./lib/restart-detector.js";
-import { models } from "./models.js";
+import { models, codexModels } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   CritiqueCriticalError,
   critiqueErrorReasonCode,
-  extractSkillInvocationsFromSession,
-  resolveSessionFilePath,
+  resolveAndExtractSkillInvocations,
   filterPlanByTypeLabels,
   findLoadableRubrics,
   MissingRequiredSkillsError,
@@ -70,9 +69,11 @@ import {
 } from "./lib/skill-discipline.js";
 import {
   envForModel,
+  backendForModel,
   defaultCodingModelFor,
   isProviderName,
   type ProviderName,
+  type AgentBackend,
 } from "./providers.js";
 import { worktreePathFor } from "./lib/worktree-path.js";
 import {
@@ -182,6 +183,13 @@ export interface SandcastleArgs {
    * by default).
    */
   provider?: ProviderName;
+  /**
+   * Agent backend for this run (ADR 0012). `"codex"` routes every role —
+   * including retry-ladder escalations and the post-merge fixer — to Codex
+   * models via {@link roleModelsFor}; `"claude"` (or undefined) uses
+   * `models.ts`. Set by `--backend`. Undefined is treated as `"claude"`.
+   */
+  backend?: AgentBackend;
   /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
@@ -474,6 +482,11 @@ Optional:
                             Anthropic uses the local Claude subscription.
                             Default: no override — implementer uses
                             models.implementer.default from models.ts.
+  --backend NAME            Agent backend for the run: claude (default) or
+                            codex. codex routes every role to Codex models
+                            (codexModels in models.ts → sandcastle.codex) and
+                            authenticates via the mounted ~/.codex subscription
+                            (ADR 0012). Cannot combine with --provider.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -534,6 +547,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
+      "backend": { type: "string" },
       "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
@@ -581,11 +595,33 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     }
     provider = values.provider;
   }
+
+  // --backend selects the agent backend (ADR 0012). "codex" routes every role
+  // to Codex models (dispatched to sandcastle.codex by backendForModel);
+  // "claude" (default) uses models.ts. --provider (kimi/glm/anthropic) is a
+  // claude-backend-only endpoint switch and cannot combine with codex.
+  const backend: AgentBackend = (() => {
+    const v = values.backend;
+    if (v === undefined) return "claude";
+    if (v !== "claude" && v !== "codex") {
+      throw new Error(
+        `--backend: expected one of claude|codex, got ${JSON.stringify(v)}`,
+      );
+    }
+    return v;
+  })();
+  if (backend === "codex" && provider !== undefined) {
+    throw new Error(
+      "--provider applies only to the claude backend; it cannot combine with --backend codex",
+    );
+  }
+  const roleModels = backend === "codex" ? codexModels : models;
+
   const implementerModel =
     values["implementer-model"] ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
-      : models.implementer.default);
+      : roleModels.implementer.default);
 
   const sandbox: "docker" | "mac-host" = (() => {
     const v = values.sandbox;
@@ -606,14 +642,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
-    plannerModel: values["planner-model"] ?? models.planner.default,
+    plannerModel: values["planner-model"] ?? roleModels.planner.default,
     implementerModel,
-    reviewerModel: values["reviewer-model"] ?? models.reviewer.default,
-    critiqueModel: values["critique-model"] ?? models.critique.default,
-    mergerModel: values["merger-model"] ?? models.merger.default,
+    backend,
+    reviewerModel: values["reviewer-model"] ?? roleModels.reviewer.default,
+    critiqueModel: values["critique-model"] ?? roleModels.critique.default,
+    mergerModel: values["merger-model"] ?? roleModels.merger.default,
     postMergeReviewerModel:
-      values["post-merge-reviewer-model"] ?? models.postMergeReviewer.default,
-    recoveryModel: values["recovery-model"] ?? models.recovery.default,
+      values["post-merge-reviewer-model"] ?? roleModels.postMergeReviewer.default,
+    recoveryModel: values["recovery-model"] ?? roleModels.recovery.default,
     implementerTimeoutSec:
       parsePositiveInt(
         values["implementer-timeout-sec"],
@@ -674,6 +711,17 @@ function detectBranchOr(fallback: string): string {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Role-model map for a run's agent backend (ADR 0012). Codex runs draw every
+ * role — defaults, retry-ladder escalations, and the post-merge fixer — from
+ * `codexModels`; everything else uses the Claude `models` map. Reading
+ * escalations through this (not `models.X` directly) is what keeps a
+ * `--backend codex` run from silently escalating onto a Claude model.
+ */
+function roleModelsFor(a: { readonly backend?: AgentBackend }) {
+  return a.backend === "codex" ? codexModels : models;
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -1874,12 +1922,30 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // Docker `onSandboxReady` hooks. mac-host never reaches sandcastle.createSandbox
   // so it carries no analogous concept; if mac-host ever grows hook support
   // it'll live in MacHostProviderConfig, not as a shared variable.
+  // Codex reads AGENTS.md from the agent's cwd (the worktree root), but ours
+  // ships at .sandcastle/AGENTS.md. For codex runs, stage it to the root at
+  // sandbox boot — but ONLY if the project has no AGENTS.md of its own (no
+  // clobber), and git-exclude our copy so the agent can't accidentally commit
+  // it. Claude/Kimi/GLM runs skip this entirely. See ADR 0012 / WS-A2.
+  const isCodexRun = backendForModel(args.implementerModel) === "codex";
+  const stageCodexAgentsMd = {
+    command:
+      "if [ -f .sandcastle/AGENTS.md ] && [ ! -f AGENTS.md ]; then " +
+      "cp .sandcastle/AGENTS.md AGENTS.md; " +
+      // Resolve info/exclude via git: in a worktree `.git` is a FILE, not a
+      // dir, so a literal `.git/info/exclude` path fails ("Not a directory")
+      // and our copy would stay committable. `--git-path` resolves correctly
+      // in both worktrees and plain repos.
+      'ex="$(git rev-parse --git-path info/exclude)"; ' +
+      'grep -qxF AGENTS.md "$ex" 2>/dev/null || echo AGENTS.md >> "$ex"; fi',
+  };
   const dockerHooks = {
     sandbox: {
       onSandboxReady: [
         writeProjectDotenv,
         registerContext7Mcp,
         { command: "CI=true pnpm install" },
+        ...(isCodexRun ? [stageCodexAgentsMd] : []),
       ],
     },
   } as const;
@@ -2600,7 +2666,9 @@ export async function runImplementer(
   // throws a rate-limit error. Attempt 2 is already on the escalation, so no
   // further fallback — it just throws and the pipeline catch handles it.
   const fallbackModel =
-    attemptNumber === 1 ? models.implementer.escalations[0] : undefined;
+    attemptNumber === 1
+      ? roleModelsFor(ctx.args).implementer.escalations[0]
+      : undefined;
   const r = await runWithRateLimitFallback(
     (model) =>
       sb.run({
@@ -2649,8 +2717,11 @@ export async function runImplementer(
   // invoked them. Missing iterations array (legacy test mocks) yields [].
   const skillsInvoked: string[] = [];
   for (const it of r.iterations ?? []) {
-    const sessionPath = await resolveSessionFilePath(it);
-    for (const name of extractSkillInvocationsFromSession(sessionPath)) {
+    // Backend-aware (ADR 0012): for Codex iterations this resolves the
+    // ~/.codex rollout and parses skill-reads; for Claude it walks the
+    // ~/.claude session JSONL as before. primaryModel reflects this run's
+    // backend (all iterations share it).
+    for (const name of await resolveAndExtractSkillInvocations(it, primaryModel)) {
       skillsInvoked.push(name);
     }
   }
@@ -3074,7 +3145,7 @@ async function runReviewer(
   // reviewer-retry pass (already on escalations[0]) has no further fallback.
   const fallbackModel =
     primaryModel === ctx.args.reviewerModel
-      ? models.reviewer.escalations[0]
+      ? roleModelsFor(ctx.args).reviewer.escalations[0]
       : undefined;
   const skillsInvoked = opts.skillsInvoked ?? [];
   // Review the whole branch vs its fork point, not just the tip commit's
@@ -3523,8 +3594,8 @@ async function runIssuePipeline(
     }
 
     // Reviewer attempt 1 marked HAS_BLOCKERS. Decide retry vs quarantine.
-    const implEscalations = models.implementer.escalations;
-    const revEscalations = models.reviewer.escalations;
+    const implEscalations = roleModelsFor(ctx.args).implementer.escalations;
+    const revEscalations = roleModelsFor(ctx.args).reviewer.escalations;
     const canRetry =
       ctx.args.retryEnabled &&
       implEscalations.length > 0 &&
@@ -4774,8 +4845,16 @@ export async function runMain(
         stagingActive &&
         postMergeMarker === "POST_MERGE_ISSUES_FOUND"
       ) {
+        // Route the fixer model through the run's backend (ADR 0012): under
+        // --backend codex the implementer model is a Codex model, so the fixer
+        // must be too — otherwise it would silently run on Claude.
+        const fixerSrc =
+          backendForModel(args.implementerModel) === "codex"
+            ? codexModels
+            : models;
         const fixerModel =
-          models.postMergeFixer.escalations[0] ?? models.postMergeFixer.default;
+          fixerSrc.postMergeFixer.escalations[0] ??
+          fixerSrc.postMergeFixer.default;
         deps.log(
           `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
         );
@@ -4821,8 +4900,10 @@ export async function runMain(
           // affected issues (see post-merge-review-prompt.md).
           const fixerSkillsInvoked: string[] = [];
           for (const fxIt of fixerResult?.iterations ?? []) {
-            const sessionPath = await resolveSessionFilePath(fxIt);
-            for (const name of extractSkillInvocationsFromSession(sessionPath)) {
+            for (const name of await resolveAndExtractSkillInvocations(
+              fxIt,
+              fixerModel,
+            )) {
               fixerSkillsInvoked.push(name);
             }
           }
@@ -4869,7 +4950,7 @@ export async function runMain(
           }
 
           const reviewerEscModel =
-            models.postMergeReviewer.escalations[0] ??
+            roleModelsFor(args).postMergeReviewer.escalations[0] ??
             args.postMergeReviewerModel;
           deps.log(
             `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,

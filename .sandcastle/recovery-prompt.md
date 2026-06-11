@@ -166,8 +166,11 @@ service unavailable):
 
 - Commit any partial work with prefix
   `SANDCASTLE(it={{ITERATION}} recover issue={{ISSUE_NUMBER}}) HALT:`.
-- Output `<promise>HALT</promise>` on its own line followed by a
-  one-paragraph explanation.
+- Write the one-paragraph explanation FIRST, then emit
+  `<promise>HALT</promise>` as the FINAL line of your output — nothing
+  after it. (The orchestrator extracts the verdict from the last
+  non-empty line; an explanation placed after the marker breaks
+  extraction. See the Output ending section below.)
 - Do NOT edit GitHub labels (the orchestrator will quarantine via
   `needs-human`).
 
