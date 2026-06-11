@@ -13,6 +13,7 @@ export {
 } from "./prd.js";
 
 export {
+  configureGh,
   transitionLabel,
   closeIssue,
   getIssueBody,

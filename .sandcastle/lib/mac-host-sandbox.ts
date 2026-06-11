@@ -264,6 +264,14 @@ async function spawnAgent(
   const codexOutFile = isCodex
     ? path.join(mkdtempSync(path.join(tmpdir(), "sandcastle-codex-")), "last-message.txt")
     : "";
+  // `--dangerously-bypass-approvals-and-sandbox` is required for headless
+  // operation: without it codex blocks on interactive approval prompts that
+  // have no TTY to answer them. The docker path passes the SAME flag (via the
+  // sandcastle SDK's codex args), so this is not a mac-host-specific relaxation.
+  // The difference is the mitigation: docker runs codex inside the container
+  // sandbox, whereas on mac-host the agent runs on the host — its isolation is
+  // the per-sandbox git worktree (`-C cwd`, a throwaway checkout), NOT codex's
+  // own sandbox. That worktree boundary is the safety model here.
   const codexArgs = [
     "exec",
     "--json",

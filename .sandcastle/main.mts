@@ -31,6 +31,7 @@ import * as os from "node:os";
 import { defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
 
 import {
+  configureGh,
   claimViaLabel,
   quarantineViaLabel,
   releaseViaLabel,
@@ -608,7 +609,10 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   //   - both given and they conflict  → hard-error (you said two opposite things)
   //   - only the model given          → infer the backend from it
   //   - neither                       → default claude
-  // After this block the invariant holds: backendForModel(implementerModel) === backend.
+  // --implementer-model is the SOLE inference source; the other role-model
+  // flags are validated against the resolved backend below (never inferred), so
+  // after that check the invariant holds for EVERY role: backendForModel(roleModel)
+  // === backend.
   const explicitBackend: AgentBackend | undefined = (() => {
     const v = values.backend;
     if (v === undefined) return undefined;
@@ -639,7 +643,46 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "--provider applies only to the claude backend; it cannot combine with --backend codex",
     );
   }
-  const roleModels = backend === "codex" ? codexModels : models;
+
+  // Reconcile the OTHER role-model flags against the resolved backend. A
+  // sandcastle run is single-backend end-to-end: escalations, skill-discipline,
+  // and AGENTS.md staging all key off `args.backend`, while per-role dispatch
+  // keys off each role's model (agentForModel / backendForModel). A cross-backend
+  // role model (e.g. `--backend codex --reviewer-model <claude-id>`) would
+  // silently run that role on the other agent — the same split-brain the
+  // implementer reconcile above closes. These flags are validated, NOT inferred
+  // (only --implementer-model infers, per ADR 0012). Hard-error at parse so the
+  // contradiction surfaces before any run.
+  const roleModelFlags: ReadonlyArray<readonly [string, string | undefined]> = [
+    ["--planner-model", values["planner-model"]],
+    ["--reviewer-model", values["reviewer-model"]],
+    ["--critique-model", values["critique-model"]],
+    ["--merger-model", values["merger-model"]],
+    ["--post-merge-reviewer-model", values["post-merge-reviewer-model"]],
+    ["--recovery-model", values["recovery-model"]],
+  ];
+  const mismatchedRoleModels: Array<{ flag: string; model: string; modelBackend: AgentBackend }> =
+    [];
+  for (const [flag, value] of roleModelFlags) {
+    if (value === undefined) continue;
+    const modelBackend = backendForModel(value);
+    if (modelBackend !== backend) {
+      mismatchedRoleModels.push({ flag, model: value, modelBackend });
+    }
+  }
+  if (mismatchedRoleModels.length > 0) {
+    const details = mismatchedRoleModels
+      .map((m) => `${m.flag} "${m.model}" (a ${m.modelBackend} model)`)
+      .join("; ");
+    throw new Error(
+      `backend resolved to "${backend}", but ${details} ` +
+        `${mismatchedRoleModels.length === 1 ? "is" : "are"} for a different backend. ` +
+        `A sandcastle run uses one backend for every role: pass matching ${backend} ` +
+        `model(s), or set --backend to match.`,
+    );
+  }
+
+  const roleModels = roleModelsFor({ backend });
 
   const implementerModel =
     explicitImplModel ??
@@ -4132,6 +4175,11 @@ export async function runMain(
   args: SandcastleArgs,
   deps: Deps,
 ): Promise<RunMainResult> {
+  // Point every host-side `gh` call at the managed repo, not the launch cwd, so
+  // a `--repo-root` other than cwd resolves correctly (see configureGh). Set
+  // first, before the startup reconciliation issues its first `gh issue list`.
+  configureGh({ cwd: args.repoRoot });
+
   let consecutiveFailures = 0;
   let lastFailingIssue: number | undefined;
   const shippedIssues: number[] = [];
@@ -4187,6 +4235,18 @@ export async function runMain(
   } else {
     deps.log(
       `No SANDCASTLE.md at repo root — skill discipline disabled (no type:-label enforcement)`,
+    );
+  }
+
+  // Codex backend has an empty escalation ladder by design (ADR 0012:
+  // codexModels.*.escalations === []), so a failing role quarantines on first
+  // failure with no model-tier retry/recovery. Warn once at startup because
+  // --recovery / --no-retry then have no escalation effect — silent under the
+  // claude defaults but surprising for an operator who set them expecting a
+  // retry tier.
+  if (args.backend === "codex") {
+    deps.log(
+      `backend: codex — no escalation/recovery tier (empty ladder, ADR 0012): a failing role quarantines on first failure; --recovery / --no-retry have no model-escalation effect this run`,
     );
   }
 

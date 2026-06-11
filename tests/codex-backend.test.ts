@@ -143,4 +143,59 @@ describe("--backend flag (parseSandcastleArgs)", () => {
       ]),
     ).toThrow(/contradict/i);
   });
+
+  // Non-implementer role flags are validated (not inferred) against the resolved
+  // backend — closing the split-brain the implementer reconcile left open for
+  // --reviewer-model / --planner-model / etc.
+  it("hard-errors when --backend codex gets a claude --reviewer-model", () => {
+    expect(() =>
+      parseSandcastleArgs([
+        "--iterations",
+        "1",
+        "--backend",
+        "codex",
+        "--reviewer-model",
+        "claude-sonnet-4-6",
+      ]),
+    ).toThrow(/different backend/i);
+  });
+
+  it("hard-errors on a lone codex --reviewer-model (backend defaults claude, no inference from non-implementer flags)", () => {
+    expect(() =>
+      parseSandcastleArgs([
+        "--iterations",
+        "1",
+        "--reviewer-model",
+        "gpt-5.1-codex",
+      ]),
+    ).toThrow(/different backend/i);
+  });
+
+  it("names every mismatched role flag in the error", () => {
+    expect(() =>
+      parseSandcastleArgs([
+        "--iterations",
+        "1",
+        "--backend",
+        "codex",
+        "--planner-model",
+        "claude-sonnet-4-6",
+        "--reviewer-model",
+        "claude-haiku-4-5",
+      ]),
+    ).toThrow(/--planner-model.*--reviewer-model/s);
+  });
+
+  it("accepts a codex --reviewer-model under --backend codex", () => {
+    const { args } = parseSandcastleArgs([
+      "--iterations",
+      "1",
+      "--backend",
+      "codex",
+      "--reviewer-model",
+      "gpt-5.1-codex",
+    ]);
+    expect(args.reviewerModel).toBe("gpt-5.1-codex");
+    expect(args.backend).toBe("codex");
+  });
 });
