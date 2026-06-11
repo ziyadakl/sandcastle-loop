@@ -51,6 +51,7 @@ import {
   parseWorktreeList,
   serializeDotenv,
   oauthTokenEnv,
+  ghTokenEnv,
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
@@ -2545,6 +2546,31 @@ describe("oauthTokenEnv", () => {
   it("is empty when the var is blank or whitespace-only", () => {
     expect(oauthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "" })).toEqual({});
     expect(oauthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "   " })).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ghTokenEnv — GitHub CLI token forwarded into the container. On macOS the gh
+// keyring token never reaches the Linux container via the ~/.config/gh mount
+// (Keychain-stored, absent from hosts.yml), so in-container `gh` (incl. the
+// planner prompt's `!`gh issue list …`` shell-expansion blocks) 401s without
+// this forward. No-op-when-unset keeps the Linux/VPS on-disk-token path intact.
+// ---------------------------------------------------------------------------
+
+describe("ghTokenEnv", () => {
+  it("forwards GH_TOKEN when set", () => {
+    expect(ghTokenEnv({ GH_TOKEN: "gho_abc123" })).toEqual({
+      GH_TOKEN: "gho_abc123",
+    });
+  });
+
+  it("is empty when the var is unset (on-disk-token path untouched)", () => {
+    expect(ghTokenEnv({})).toEqual({});
+  });
+
+  it("is empty when the var is blank or whitespace-only", () => {
+    expect(ghTokenEnv({ GH_TOKEN: "" })).toEqual({});
+    expect(ghTokenEnv({ GH_TOKEN: "   " })).toEqual({});
   });
 });
 

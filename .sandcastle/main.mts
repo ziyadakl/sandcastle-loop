@@ -1132,6 +1132,35 @@ export function oauthTokenEnv(
 }
 
 /**
+ * Container env fragment carrying the GitHub CLI token.
+ *
+ * Same macOS-Keychain class of bug as `oauthTokenEnv` (ADR 0011): on macOS the
+ * `gh` CLI stores its OAuth token in the login Keychain (the keyring), NOT in
+ * `~/.config/gh/hosts.yml` (which carries only the account name, no
+ * `oauth_token` field). The bind-mounted `~/.config/gh` therefore reaches the
+ * Linux container with no usable credential, and the container has no Keychain
+ * — so every in-container `gh` call (notably the planner prompt's `!`gh issue
+ * list …`` shell-expansion blocks, run by the SDK's `preprocessPrompt` via
+ * `sandbox.exec`) fails with `HTTP 401: Requires authentication`.
+ *
+ * Forwarding `GH_TOKEN` via `containerEnv` is the only channel that crosses
+ * into the container (mirrors the subscription-token fix). Empty when unset/
+ * blank so the Linux/VPS path (where `gh` reads a real on-disk token from the
+ * mounted config) is untouched.
+ *
+ * NOTE: this forwards whatever `process.env.GH_TOKEN` resolved to via
+ * `loadDotenv`. A good shell export shadows the stale `~/.config/sandcastle/.env`
+ * value; if launched WITHOUT exporting a fresh token, the stale `.env` value
+ * would be forwarded and 401 again. Keep the host `.env` token current.
+ */
+export function ghTokenEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const token = env.GH_TOKEN;
+  return token && token.trim() !== "" ? { GH_TOKEN: token } : {};
+}
+
+/**
  * Shell command run inside the sandbox at boot to materialize `.env` from
  * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
  * properties (atomic 0o600, backup-on-existing, no shell redirection)
@@ -2008,6 +2037,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
     ...oauthTokenEnv(),
+    // GH_TOKEN forwarded last so a shell/host-level token wins over any stale
+    // GH_TOKEN that leaked in via the target project's .env (projectEnv). On
+    // macOS the gh keyring token never reaches the container via the
+    // ~/.config/gh mount (Keychain-stored, not in hosts.yml) — see ghTokenEnv.
+    ...ghTokenEnv(),
   };
 
   // Pick sandbox provider once. Both docker and mac-host implement the same
