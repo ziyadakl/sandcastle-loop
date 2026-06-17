@@ -401,6 +401,12 @@ export function getPriorityFromLabels(labels: string[]): Priority {
  *
  * Capped at 100 to bound runtime; v1 loop only ever needs the head of the
  * queue.
+ *
+ * ⚠️ NOT THE BLOCKER GATE. Returns the raw `ready-for-agent` pool with NO
+ * blocked-issue filtering. Blocked issues are excluded by the PLANNER AGENT
+ * (HARD RULE 2 in `.sandcastle/plan-prompt.md`), not here. See
+ * docs/adr/0013-blocker-handling.md. (This is the stale `src/` twin; the
+ * canonical copy is `.sandcastle/lib/state/gh.ts`.)
  */
 export async function listReadyIssues(): Promise<ReadyIssueSummary[]> {
   const { stdout } = await runGh([
@@ -468,6 +474,11 @@ export async function listReadyIssues(): Promise<ReadyIssueSummary[]> {
  * Single `gh issue edit` call (--add-label + --remove-label) so the labels
  * flip together; if the call fails the caller can retry without leaking a
  * half-claimed state.
+ *
+ * ⚠️ NOT THE BLOCKER GATE. Claiming performs NO `Blocked by:` check — it
+ * trusts that the PLANNER AGENT already excluded blocked issues (HARD RULE 2
+ * in `.sandcastle/plan-prompt.md`). See docs/adr/0013-blocker-handling.md.
+ * (This is the stale `src/` twin; canonical is `.sandcastle/lib/state/gh.ts`.)
  */
 export async function claimViaLabel(issueNum: number): Promise<void> {
   if (!Number.isInteger(issueNum) || issueNum <= 0) {

@@ -2194,6 +2194,13 @@ export function parsePlan(stdout: string): PlanIssue[] {
  * blockers (`Blocked by: #313, #314`); each `#N` after the directive (up to
  * the end of that line) is captured. Returns a de-duplicated, ascending list.
  *
+ * ⚠️ NOT THE BLOCKER GATE. This parser only feeds `buildBlockedByNote` (the
+ * advisory "nothing claimable" exit message). It does NOT decide what gets
+ * dispatched, and removing it would not let a blocked issue run. Blocked
+ * issues are excluded by the PLANNER AGENT, which follows HARD RULE 2 in
+ * `.sandcastle/plan-prompt.md`. The enforcement lives in a prompt, not in
+ * this code — see docs/adr/0013-blocker-handling.md for why.
+ *
  * Exported for unit testing.
  */
 export function parseBlockedBy(body: string): number[] {
