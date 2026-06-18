@@ -372,7 +372,11 @@ function RunningPanel({
   );
 }
 
-function RecentRow({ issue }: { issue: StatusIssue }) {
+// The recent strip renders either history entries (primary) or live issues
+// (fallback); both satisfy this minimal shared shape.
+type RecentItem = Pick<StatusIssue, "number" | "title" | "phase">;
+
+function RecentRow({ issue }: { issue: RecentItem }) {
   // Recent rows: full-brightness semantic hue (merged-green / needs-you-amber)
   // or default fg (deferred). The running panel's border + position carry the
   // hierarchy now — the labels render bright per the user's "brighten" request.
@@ -444,7 +448,14 @@ export function Dashboard({
   }
 
   const active = status.issues.filter((i) => ACTIVE_PHASES.has(i.phase));
-  const recentAll = status.issues.filter((i) => TERMINAL_PHASES.has(i.phase));
+  // The completed strip is backed by the persistent, cross-iteration `history`
+  // (newest first). It falls back to the current batch's terminal issues when
+  // history is absent/empty (e.g. a status.json written by a pre-history loop),
+  // so the strip never regresses to empty for older feeds.
+  const recentAll: RecentItem[] =
+    status.history.length > 0
+      ? [...status.history].reverse()
+      : status.issues.filter((i) => TERMINAL_PHASES.has(i.phase));
 
   // Lines rendered AROUND the recent strip, using the panel's REAL body height
   // (idle/activity = 1 line; otherwise each active issue is 1 line + 1 if it
@@ -483,8 +494,8 @@ export function Dashboard({
         <Box marginTop={1} flexDirection="column">
           <Text color={MUTED_FG}>recent</Text>
           <Rule />
-          {recent.map((issue) => (
-            <RecentRow key={issue.number} issue={issue} />
+          {recent.map((issue, idx) => (
+            <RecentRow key={`${issue.number}-${idx}`} issue={issue} />
           ))}
           {hiddenRecent > 0 ? (
             <Text color={MUTED_FG}> +{hiddenRecent} more</Text>
