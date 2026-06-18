@@ -23,6 +23,7 @@ const status: SandcastleStatus = {
   run: { branch: "docs/x", repo: "affinity-tracker", startedAt: "2026-06-06T00:00:00.000Z", iterations: { current: 1, total: 50 }, maxConcurrent: 2 },
   totals: { merged: 8, needsHuman: 0, requeued: 0, running: 0 },
   issues,
+  history: [],
   updatedAt: "2026-06-06T18:00:00.000Z",
   activity: "merging",
 };

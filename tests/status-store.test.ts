@@ -15,6 +15,7 @@ import {
   SandcastleStatusSchema,
   HEARTBEAT_MS,
 } from "../.sandcastle/lib/status/schema.js";
+import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 
 const FIXED_NOW = "2026-06-04T12:00:00.000Z";
 
@@ -196,5 +197,115 @@ describe("StatusStore", () => {
     store.setActivity("cleanup");
     store.finish("done");
     expect(store.snapshot().activity).toBeUndefined();
+  });
+
+  // --- history persistence tests ---
+
+  it("history accumulates terminal outcomes across multiple issues", () => {
+    const { store } = makeStore();
+    store.setPlan([
+      { number: 10, title: "add feature A", branch: "agent/issue-10" },
+      { number: 11, title: "fix bug B", branch: "agent/issue-11" },
+    ]);
+    store.recordOutcome(10, { status: "ok" });
+    store.recordOutcome(11, { status: "deferred" });
+
+    const snap = store.snapshot();
+    expect(snap.history).toHaveLength(2);
+
+    const entry10 = snap.history.find((e) => e.number === 10)!;
+    expect(entry10.number).toBe(10);
+    expect(entry10.title).toBe("add feature A");
+    expect(entry10.branch).toBe("agent/issue-10");
+    expect(entry10.phase).toBe("merged");
+    expect(typeof entry10.completedAt).toBe("string");
+
+    const entry11 = snap.history.find((e) => e.number === 11)!;
+    expect(entry11.number).toBe(11);
+    expect(entry11.phase).toBe("deferred");
+    expect(typeof entry11.completedAt).toBe("string");
+  });
+
+  it("history survives a re-plan: issues overwritten, history preserved", () => {
+    const { store } = makeStore();
+    store.setPlan([{ number: 20, title: "initial issue", branch: "agent/issue-20" }]);
+    store.recordOutcome(20, { status: "ok" });
+
+    // history has 1 entry after first batch
+    expect(store.snapshot().history).toHaveLength(1);
+
+    // re-plan with a fresh batch
+    store.setPlan([
+      { number: 30, title: "new issue A", branch: "agent/issue-30" },
+      { number: 31, title: "new issue B", branch: "agent/issue-31" },
+    ]);
+
+    const snap = store.snapshot();
+    // history still has the old entry — not cleared
+    expect(snap.history).toHaveLength(1);
+    expect(snap.history[0]!.number).toBe(20);
+
+    // issues reflects the NEW batch only
+    expect(snap.issues).toHaveLength(2);
+    expect(snap.issues.map((i) => i.number).sort()).toEqual([30, 31]);
+  });
+
+  it("backward compat: v1 file without history field still parses and defaults to []", () => {
+    const { store } = makeStore();
+    store.setPlan([{ number: 5, title: "t", branch: "b" }]);
+    const snap = store.snapshot() as Record<string, unknown>;
+
+    // Simulate an old v1 snapshot that pre-dates the history field
+    delete snap["history"];
+    expect("history" in snap).toBe(false);
+
+    const result = SandcastleStatusSchema.safeParse(snap);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.history).toEqual([]);
+    }
+  });
+
+  it("schema stays valid through a full lifecycle WITH history; schemaVersion is still 1", () => {
+    const { store } = makeStore();
+    store.startIteration(1);
+    store.setPlan([
+      { number: 337, title: "backfilled txns uncategorized", branch: "agent/issue-337" },
+      { number: 339, title: "scope setUserEnabled to team", branch: "agent/issue-339" },
+    ]);
+    store.setIssuePhase(337, "implementer");
+    store.setIssuePhase(339, "reviewer");
+    store.recordOutcome(339, { status: "ok", finalMarker: "ALL_CLEAR" });
+    store.recordOutcome(337, { status: "quarantined", finalMarker: "HAS_BLOCKERS" });
+
+    const snap = store.snapshot();
+    const parsed = SandcastleStatusSchema.safeParse(snap);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.schemaVersion).toBe(1);
+      // Both issues got outcomes, so history should have 2 entries
+      expect(parsed.data.history).toHaveLength(2);
+    }
+  });
+
+  it("re-recording the same issue across iterations appends a second history row (NO dedup); per-phase counts mirror totals", () => {
+    // INTENT LOCK: history is a log of terminal OUTCOMES, not a set of issues.
+    // An issue deferred (requeued) then later merged legitimately produces two
+    // rows — one per totals increment. Deduping on issue number would orphan a
+    // pill's count (e.g. requeued=1 with an empty drill-down). Do NOT "tidy"
+    // this into a dedup: that breaks the history<->totals correspondence.
+    const { store } = makeStore();
+    store.setPlan([{ number: 40, title: "flaky", branch: "agent/issue-40" }]);
+    store.recordOutcome(40, { status: "deferred" }); // requeued in iteration 1
+    // re-plan the same issue (fresh planned entry) and merge it in iteration 2
+    store.setPlan([{ number: 40, title: "flaky", branch: "agent/issue-40" }]);
+    store.recordOutcome(40, { status: "ok" }); // merged in iteration 2
+
+    const s = store.snapshot();
+    expect(s.history).toHaveLength(2);
+    expect(s.history.map((e) => e.phase)).toEqual(["deferred", "merged"]);
+    // Each pill's count equals the number of history rows for that phase.
+    expect(s.history.filter((e) => e.phase === "deferred")).toHaveLength(s.totals.requeued);
+    expect(s.history.filter((e) => e.phase === "merged")).toHaveLength(s.totals.merged);
   });
 });
