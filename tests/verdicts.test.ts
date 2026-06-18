@@ -192,6 +192,80 @@ describe("extractMarker (tolerant)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// extractMarker — "contains" mode (regression: #416/#417)
+// The post-merge reviewer sometimes writes its verdict marker INSIDE a closing
+// sentence instead of on a bare line; tolerant mode threw MarkerNotFoundError
+// and the whole merged batch was wrongly quarantined. "contains" accepts a
+// marker embedded anywhere in the LAST non-empty line, and fails closed if two
+// distinct markers appear. The first two strings are the verbatim
+// `Last line was:` values captured from the #417 / #416 run.
+// ---------------------------------------------------------------------------
+
+const POST_MERGE_MARKERS = [
+  "POST_MERGE_ALL_CLEAR",
+  "POST_MERGE_ISSUES_FOUND",
+] as const;
+
+describe("extractMarker (contains mode)", () => {
+  it("accepts the #417 last line (marker mid-sentence, prose before and after)", () => {
+    const lastLine =
+      "The last background task (the lint wait-loop) has finished. All checks " +
+      "are complete and nothing changes my verdict — `integration-candidate` is " +
+      "healthy and the review already returned POST_MERGE_ALL_CLEAR. No further " +
+      "action needed.";
+    expect(
+      extractMarker(lastLine, POST_MERGE_MARKERS, { mode: "contains" }),
+    ).toBe("POST_MERGE_ALL_CLEAR");
+  });
+
+  it("accepts the #416 last line (markdown-bold marker mid-sentence)", () => {
+    const lastLine =
+      "Review is done: **POST_MERGE_ALL_CLEAR**. No further work pending.";
+    expect(
+      extractMarker(lastLine, POST_MERGE_MARKERS, { mode: "contains" }),
+    ).toBe("POST_MERGE_ALL_CLEAR");
+  });
+
+  it("still considers ONLY the last non-empty line (earlier mentions ignored)", () => {
+    const text =
+      "I first leaned toward POST_MERGE_ISSUES_FOUND but re-checked.\n\n" +
+      "Everything passed: POST_MERGE_ALL_CLEAR.";
+    expect(
+      extractMarker(text, POST_MERGE_MARKERS, { mode: "contains" }),
+    ).toBe("POST_MERGE_ALL_CLEAR");
+  });
+
+  it("fails closed when the last line contains BOTH markers (ambiguous)", () => {
+    const lastLine =
+      "Torn between POST_MERGE_ALL_CLEAR and POST_MERGE_ISSUES_FOUND here.";
+    expect(() =>
+      extractMarker(lastLine, POST_MERGE_MARKERS, { mode: "contains" }),
+    ).toThrow(MarkerNotFoundError);
+  });
+
+  it("throws when the last line contains no marker at all", () => {
+    expect(() =>
+      extractMarker(
+        "Still investigating staging, no verdict yet.",
+        POST_MERGE_MARKERS,
+        { mode: "contains" },
+      ),
+    ).toThrow(MarkerNotFoundError);
+  });
+
+  it("contains mode is OPT-IN: the default (tolerant) still rejects an embedded marker", () => {
+    // Locks the scoping decision — loosening must NOT leak into the shared
+    // tolerant default, or roles like the reviewer would accept hedged mentions.
+    expect(() =>
+      extractMarker(
+        "Review is done: POST_MERGE_ALL_CLEAR. Nothing else.",
+        POST_MERGE_MARKERS,
+      ),
+    ).toThrow(MarkerNotFoundError);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // extractMarker — strict mode
 // ---------------------------------------------------------------------------
 

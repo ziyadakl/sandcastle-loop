@@ -90,7 +90,7 @@ export class VerdictParseError extends Error {
 // Marker extraction
 // ---------------------------------------------------------------------------
 
-export type MarkerMode = "tolerant" | "strict";
+export type MarkerMode = "tolerant" | "strict" | "contains";
 
 export interface ExtractMarkerOptions {
   /**
@@ -104,6 +104,17 @@ export interface ExtractMarkerOptions {
    * "strict": the last non-empty line must be EXACTLY the marker (or the
    * `<promise>HALT</promise>` element for HALT), with only leading/trailing
    * whitespace allowed. This is the discipline the new prompts enforce.
+   *
+   * "contains": the marker may appear ANYWHERE in the last non-empty line —
+   * e.g. concluding a sentence: "Review is done: **POST_MERGE_ALL_CLEAR**.".
+   * Accept iff EXACTLY ONE distinct allowed marker is present as a substring;
+   * if two+ appear the verdict is ambiguous and we fail closed (throw). Still
+   * only the LAST line is examined, so earlier reasoning never counts. NOTE:
+   * a single-marker line is accepted even if phrased conditionally ("would be
+   * X if…"), so use this mode ONLY where the final line is reliably a verdict
+   * (the post-merge reviewer — see ADR/regression #416/#417). It assumes the
+   * allowed markers are not substrings of one another (true for the post-merge
+   * pair); for roles that must reject hedged mentions, keep tolerant/strict.
    */
   mode?: MarkerMode;
 }
@@ -154,6 +165,21 @@ export function extractMarker<M extends string>(
       canonical === trimmed || trimmed === HALT_PROMISE;
     if (acceptable && allowedSet.has(canonical)) {
       return canonical as M;
+    }
+    throw new MarkerNotFoundError(allowed, lastNonEmpty, preview);
+  }
+
+  if (mode === "contains") {
+    // The marker may be embedded anywhere in the last non-empty line (the
+    // model concluded with a sentence instead of a bare marker line). Accept
+    // iff EXACTLY ONE distinct allowed marker appears; two+ is an ambiguous
+    // verdict, so fail closed. Substring match handles markdown decoration
+    // (`**MARKER**`) and trailing punctuation for free. See the mode note above
+    // for the conditional-mention caveat — only post-merge opts into this.
+    const present = allowed.filter((m) => lastNonEmpty.includes(m));
+    const distinct = [...new Set<string>(present)];
+    if (distinct.length === 1) {
+      return distinct[0] as M;
     }
     throw new MarkerNotFoundError(allowed, lastNonEmpty, preview);
   }

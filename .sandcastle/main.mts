@@ -4934,10 +4934,16 @@ export async function runMain(
               ),
             },
           });
-          const marker = extractMarker(r.stdout, [
-            "POST_MERGE_ALL_CLEAR",
-            "POST_MERGE_ISSUES_FOUND",
-          ] as const);
+          // "contains" mode: the reviewer sometimes writes its verdict marker
+          // inside a closing sentence ("Review is done: POST_MERGE_ALL_CLEAR.")
+          // rather than on a bare line — that wrongly quarantined whole merged
+          // batches (#416/#417). Accept the marker embedded in the last line,
+          // fail-closed if both markers appear. Other roles keep stricter modes.
+          const marker = extractMarker(
+            r.stdout,
+            ["POST_MERGE_ALL_CLEAR", "POST_MERGE_ISSUES_FOUND"] as const,
+            { mode: "contains" },
+          );
           deps.log(
             `post-merge review: ${marker || "(no marker emitted)"}`,
           );

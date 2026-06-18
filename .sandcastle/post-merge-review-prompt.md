@@ -139,3 +139,15 @@ itself):
 
 The marker MUST be a bare word on a line by itself, as the LAST non-empty
 line of your response.
+
+Do NOT wrap the marker in a sentence. These are WRONG — the verdict line
+must not read like prose:
+
+- WRONG: `Review is done: **POST_MERGE_ALL_CLEAR**. No further work pending.`
+- WRONG: `…and the review already returned POST_MERGE_ALL_CLEAR. No further action needed.`
+
+RIGHT — the final line is exactly:
+
+```
+POST_MERGE_ALL_CLEAR
+```
