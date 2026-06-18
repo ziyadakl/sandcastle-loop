@@ -7,13 +7,16 @@
  * stories overnight when an agent mentioned "ALL_CLEAR" mid-reasoning then
  * revised to HAS_BLOCKERS. We replicate the awk-tight discipline here.
  *
- * Two extraction modes:
+ * Three extraction modes:
  *   - tolerant: matches `^[[:space:][:punct:]]*MARKER[[:space:][:punct:]]*$`
  *     on the last non-empty line, allowing markdown decoration like
  *     `**ALL_CLEAR**`, `### HAS_BLOCKERS`, `> FIXED`, etc.
  *   - strict: matches `^[[:space:]]*MARKER[[:space:]]*$` only — bare on its
  *     own line, no surrounding chars. New prompts (prompt.md.local-fork,
  *     recovery-prompt.md.local-fork) instruct agents to use this form.
+ *   - contains: the marker may appear anywhere in the last non-empty line,
+ *     accepted iff exactly one allowed marker is present (post-merge reviewer
+ *     only). See `ExtractMarkerOptions` in parse.ts for the authoritative def.
  *
  * The HALT promise is special: agents emit `<promise>HALT</promise>` rather
  * than the bare word HALT. The schemas store the canonical short form

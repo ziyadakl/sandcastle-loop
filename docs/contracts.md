@@ -42,7 +42,7 @@ Inferred types (`*Parsed`) match `src/types.ts` exactly — guarded at compile t
 ### Parse (`./parse`)
 
 ```ts
-type MarkerMode = "tolerant" | "strict"
+type MarkerMode = "tolerant" | "strict" | "contains"
 interface ExtractMarkerOptions { mode?: MarkerMode }
 interface ParseVerdictOptions  { alreadyAssistantText?: boolean; ... }
 
