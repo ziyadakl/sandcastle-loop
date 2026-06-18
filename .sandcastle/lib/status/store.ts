@@ -23,6 +23,7 @@ import {
   type SandcastleStatus,
   type IssuePhase,
   type RunActivity,
+  type StatusHistoryEntry,
   STATUS_SCHEMA_VERSION,
   HEARTBEAT_MS,
 } from "./schema.js";
@@ -151,6 +152,7 @@ export function createStatusStore(
     },
     totals: { merged: 0, needsHuman: 0, requeued: 0, running: 0 },
     issues: [],
+    history: [],
     updatedAt: now(),
   };
 
@@ -238,6 +240,21 @@ export function createStatusStore(
       }
       if (issue && outcome.finalMarker !== undefined) {
         issue.detail = outcome.finalMarker;
+      }
+      // Append-only history of terminal outcomes. INVARIANT: `issue` is always
+      // found here in practice — `recordOutcome` is only ever called for numbers
+      // drawn from the same plan that `setPlan` recorded. The totals above are
+      // bumped unconditionally, so a `findIssue` miss would leave history short
+      // of totals; the guard is defensive, not an expected branch.
+      if (issue) {
+        const entry: StatusHistoryEntry = {
+          number: issue.number,
+          title: issue.title,
+          branch: issue.branch,
+          phase: issue.phase,
+          completedAt: now(),
+        };
+        status.history.push(entry);
       }
       recomputeRunning();
       commit();

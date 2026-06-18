@@ -59,6 +59,15 @@ export const RunStateSchema = z.enum([
 ]);
 export type RunState = z.infer<typeof RunStateSchema>;
 
+export const StatusHistoryEntrySchema = z.object({
+  number: z.number().int().positive(),
+  title: z.string(),
+  branch: z.string(),
+  phase: IssuePhaseSchema,
+  completedAt: z.string(), // ISO-8601
+});
+export type StatusHistoryEntry = z.infer<typeof StatusHistoryEntrySchema>;
+
 export const StatusIssueSchema = z.object({
   number: z.number().int().positive(),
   title: z.string(),
@@ -123,6 +132,11 @@ export const SandcastleStatusSchema = z.object({
    * absent ⇒ undefined).
    */
   activity: z.string().optional(),
+  /** Append-only log of terminal issue outcomes; NEVER truncated. Unlike
+   *  `issues` (overwritten each plan), this preserves every completed issue's
+   *  identity so a viewer can list what's behind each total. Optional+defaulted
+   *  for backward compat — old v1 files lacking it parse to []. */
+  history: z.array(StatusHistoryEntrySchema).default([]),
 });
 
 export type SandcastleStatus = z.infer<typeof SandcastleStatusSchema>;

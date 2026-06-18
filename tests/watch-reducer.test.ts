@@ -42,6 +42,7 @@ const validStatus: SandcastleStatus = {
       phase: "implementer",
     },
   ],
+  history: [],
   updatedAt: VALID_UPDATED_AT,
 };
 
