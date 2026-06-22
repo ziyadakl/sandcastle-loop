@@ -28,13 +28,18 @@ This is an autonomous review (no human in the loop until you produce a verdict).
    - **what** — one sentence describing the specific violation
    - **fix** — one sentence proposing the change
 
-   ### Severity definitions
-   - **P0** — fundamental design-vocabulary violation. Ban list (`.impeccable.md`) hit. UI-breaking visual regression. Brand-damaging copy. Examples: side-stripe borders on chrome, gradient text on body copy, manufactured-FOMO microcopy, accessibility ARIA missing on interactive controls.
-   - **P1** — clear principle violation worth fixing before merge. Examples: passive-voice corporate microcopy, hardcoded grays where themed tokens exist, breakpoint-chain layouts where `auto-fit` would be cleaner, all-caps body text.
-   - **P2** — worth fixing later, doesn't block merge. Examples: minor token drift, slightly inconsistent spacing scale, mixed icon families.
-   - **P3** — nitpick / optional polish. Examples: variable gap sizes inside a multi-cluster element, single-glyph inconsistency.
+   ### Objective vs subjective — what blocks
+   A finding earns **blocking** severity (P0/P1) ONLY when it is an **OBJECTIVE, verifiable defect** — one pinned to a loaded rubric rule or a measurable fact, so a second critic would flag it the same way. Examples: `.impeccable.md` ban-list hits, missing accessibility ARIA, contrast below the documented ratio, hardcoded grays where a themed token exists, a breakpoint layout that measurably misaligns, or a written voice-principle violation (e.g. the rubric prohibits long uppercase on chrome).
 
-   **P3 nitpicks NEVER escalate severity.** A list of 50 P3 nitpicks is still a CLEAN verdict. Critique gates on principle violations, not aesthetic preference.
+   **Subjective polish does NOT block.** A taste/phrasing preference NOT pinned to a written rule — "this copy reads procedural", "could be warmer", taste-level spacing, icon-family mixing — is demoted to a **non-gating NOTE** (P2/P3). List it under `## Findings` if useful, but it keeps the verdict `CRITIQUE_CLEAN`. Subjective findings can nitpick forever; gating on them is what parks shippable work at needs-human (affinity-tracker #454/#470).
+
+   ### Severity definitions
+   - **P0** — fundamental design-vocabulary violation (objective). `.impeccable.md` ban-list hit, UI-breaking visual regression, or missing accessibility ARIA on interactive controls. Examples: side-stripe borders on chrome, gradient text on body copy, manufactured-FOMO microcopy.
+   - **P1** — clear, verifiable principle violation worth fixing before merge (objective — pinned to a loaded rubric or a measurable fact). Examples: hardcoded grays where themed tokens exist, contrast below the documented ratio, a breakpoint-chain layout that measurably misaligns, all-caps body text where the rubric prohibits uppercase on chrome.
+   - **P2** — worth fixing later, doesn't block merge. Examples: minor token drift, slightly inconsistent spacing scale, mixed icon families, copy that reads a little procedural.
+   - **P3** — nitpick / optional polish. Examples: variable gap sizes inside a multi-cluster element, single-glyph inconsistency, tone/phrasing preference.
+
+   **P3 nitpicks NEVER escalate severity.** A list of 50 P3 nitpicks is still a CLEAN verdict. Critique gates on objective principle violations, not aesthetic preference.
 
 5. **Emit verdict.** Determine the verdict from your findings:
    - Zero P0 + zero P1 → `CRITIQUE_CLEAN` (bare, on its own line, no surrounding markup)
