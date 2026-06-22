@@ -43,8 +43,10 @@ Land four changes in the template (`.sandcastle/` + `main.mts`), each test-locke
    launch check: resolve the launch checkout's `HEAD` and the tip of
    `--branch`; if both resolve and differ, error out and tell the operator to
    `git checkout <branch>` (or pass the `--branch` they meant). It skips safely
-   when the branch ref doesn't resolve (brand-new branch / detached HEAD), so the
-   no-`--branch` default case is unaffected. This promotes the existing easily-
+   when the branch ref doesn't resolve (detached HEAD, or a brand-new branch
+   with no ref yet). When `--branch` is omitted it defaults to the current
+   branch, so HEAD equals the tip and the gate simply passes — the common case
+   is never blocked. This promotes the existing easily-
    missed warning into a hard gate — the audit's top recommendation. The
    `preflight` `exec` helper was extended to capture stdout (the check compares
    `rev-parse` output); all other checks ignore it and pre-existing exec mocks
