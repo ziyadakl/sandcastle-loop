@@ -237,6 +237,15 @@ Beyond the execution-evidence check above, evaluate the diff for:
 5. **Error handling.** Failure paths with no fallback or logging?
 6. **Edge cases.** Off-by-one, empty arrays, null inputs, concurrent access?
 
+**Credential carve-out.** The project's documented test-credential pattern —
+`process.env.ADMIN_PASSWORD ?? "<default>"` and its siblings
+(`TEST_USER_PASSWORD`, `E2E_PASSWORD`, …) used uniformly across the e2e suite —
+is NOT a credential leak; do NOT flag it. The implementer prompt explicitly
+tells the builder "Credentials are not blockers" and to reuse this exact
+pattern, so quarantining it is an unsatisfiable contradiction no retry can
+fix. Real secrets still block: production/live API keys, tokens, or a
+committed `.env` carrying live values.
+
 Skip cosmetic / SOFT findings entirely — DO NOT block on naming, comment
 phrasing, or "prefer this pattern" suggestions.
 
@@ -266,7 +275,9 @@ Category-specific guidance:
 - **Test coverage**: do new/changed behaviours have tests that actually
   exercise the change?
 - **Type safety**: unsafe casts, `any` types, unchecked assumptions?
-- **Security**: injection vulnerabilities, credential leaks, etc.?
+- **Security**: injection vulnerabilities, credential leaks, etc.? (The
+  documented `ADMIN_PASSWORD ?? "<default>"` test-credential pattern is NOT a
+  leak — see the credential carve-out above.)
 - **Error handling**: failure paths with no fallback or logging?
 - **Edge cases**: off-by-one, empty arrays, null inputs, concurrent access?
 - **Skill discipline**: only if SANDCASTLE.md exists at the repo root.

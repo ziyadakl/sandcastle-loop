@@ -198,3 +198,59 @@ describe("non-behavioral UI carve-out ↔ prompt contract (issue #342)", () => {
     expect(implementPrompt).toMatch(/`export` keywords/);
   });
 });
+
+describe("credential carve-out ↔ prompt contract (audit Issue 1)", () => {
+  const reviewPrompt = readFileSync(
+    join(sandcastleDir, "review-prompt.md"),
+    "utf8",
+  );
+
+  it("review-prompt.md carves out the documented test-credential pattern so the reviewer can't false-quarantine it", () => {
+    // affinity-tracker #454: the implementer prompt tells the builder
+    // "Credentials are not blockers" and to reuse the project's ADMIN_PASSWORD
+    // test pattern, while the reviewer flagged that exact line as a credential
+    // leak — an unsatisfiable contradiction no retry can fix. The carve-out
+    // makes the documented test-credential pattern explicitly NOT a leak.
+    expect(reviewPrompt).toMatch(/credential carve-out/i);
+    expect(reviewPrompt).toMatch(/ADMIN_PASSWORD/);
+  });
+
+  it("the credential carve-out is scoped, not a blanket waiver (real secrets still block)", () => {
+    // The carve-out is useless if it can be read as "never flag credentials".
+    // It must name what still blocks: production/live secrets.
+    expect(reviewPrompt).toMatch(/production|live (secret|value|key)/i);
+  });
+
+  it("the credential rule is symmetric between implement-prompt and review-prompt (can't drift)", () => {
+    // The audit's core ask: a credential rule must never be added to one side
+    // without the other (the implementer-says-use-it / reviewer-flags-it split
+    // is what caused the deadlock). Both prompts must reference the rule.
+    expect(implementPrompt).toMatch(/Credentials are not blockers/i);
+    expect(reviewPrompt).toMatch(
+      /Credentials are not blockers|documented test-credential/i,
+    );
+  });
+});
+
+describe("critique objective/subjective rule ↔ prompt contract (audit Issue 2)", () => {
+  const critiquePrompt = readFileSync(
+    join(sandcastleDir, "critique-prompt.md"),
+    "utf8",
+  );
+
+  it("restricts blocking severity to OBJECTIVE defects and demotes SUBJECTIVE polish", () => {
+    // affinity-tracker #454/#470 parked shippable work over subjective copy-tone
+    // findings ("reads procedural"). The rule restricts blocking severity to
+    // objective, verifiable defects and demotes taste/phrasing preferences.
+    expect(critiquePrompt).toMatch(/objective/i);
+    expect(critiquePrompt).toMatch(/subjective/i);
+    expect(critiquePrompt).toMatch(/does NOT block|non-gating/i);
+  });
+
+  it("subjective findings are demoted to a non-gating NOTE that keeps CRITIQUE_CLEAN", () => {
+    // The whole point: a subjective finding must NOT flip the verdict. The rule
+    // ties subjective polish to a NOTE that preserves the CLEAN marker.
+    expect(critiquePrompt).toMatch(/note/i);
+    expect(critiquePrompt).toMatch(/CRITIQUE_CLEAN/);
+  });
+});
