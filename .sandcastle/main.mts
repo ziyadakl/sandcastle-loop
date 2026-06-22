@@ -25,7 +25,14 @@
 
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  appendFileSync,
+} from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { defaultImageName } from "@ai-hero/sandcastle/sandboxes/docker";
@@ -461,7 +468,9 @@ Optional:
                             When it fires, the in-flight agent is
                             aborted. Default: 3600 (60 min).
   --consecutive-failure-limit N Default: 3.
-  --log-file PATH           Tee output to this file.
+  --log-file PATH           Tee output to this file. Default:
+                            <repo>/.sandcastle/run.log (gitignored), truncated
+                            per run so a hard death stays diagnosable.
   --dry-run                 Skip claim/quarantine/markDone side effects.
   --recovery off            Disable the single recovery pass that fires on
                             any pipeline error. Default: on (recovery uses
@@ -955,7 +964,10 @@ export interface PreflightResult {
  * directly with their own runners.
  */
 export function preflight(args: SandcastleArgs, opts: {
-  exec?: (bin: string, args: readonly string[]) => { ok: boolean; stderr?: string };
+  exec?: (
+    bin: string,
+    args: readonly string[],
+  ) => { ok: boolean; stdout?: string; stderr?: string };
   fileExists?: (p: string) => boolean;
   listMigrations?: (repoRoot: string) => string[];
   getEnv?: (key: string) => string | undefined;
@@ -965,8 +977,13 @@ export function preflight(args: SandcastleArgs, opts: {
     opts.exec ??
     ((bin, a) => {
       try {
-        execFileSync(bin, [...a], { stdio: ["ignore", "ignore", "pipe"] });
-        return { ok: true };
+        // Capture stdout (the branch-base check below compares rev-parse
+        // output). Other checks ignore it. stderr piped for error messages.
+        const stdout = execFileSync(bin, [...a], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        return { ok: true, stdout };
       } catch (err) {
         return { ok: false, stderr: (err as Error).message };
       }
@@ -1079,6 +1096,43 @@ export function preflight(args: SandcastleArgs, opts: {
           "mean it (and own propagating the patch upstream yourself).",
       );
     }
+  }
+
+  // 9. Launch-checkout HEAD must be on the --branch tip. Worker worktrees are
+  // cut from the launch checkout's CURRENT HEAD (`git worktree add` branches
+  // off HEAD), NOT from --branch. If the checkout drifted off the feature
+  // branch (e.g. left on an old work/next snapshot or integration-candidate),
+  // every worker builds on a stale base and dependent issues HALT/conflict —
+  // the affinity-tracker branch-base trap (ADR 0014). Refuse to launch on a
+  // confirmed divergence rather than warn. Skip safely when the branch ref
+  // doesn't resolve (brand-new branch / detached HEAD) or when stdout wasn't
+  // captured (mocked exec) — only a confirmed HEAD≠tip mismatch is fatal.
+  const headRev = exec("git", ["-C", args.repoRoot, "rev-parse", "HEAD"]);
+  const branchRev = exec("git", [
+    "-C",
+    args.repoRoot,
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `refs/heads/${args.branch}`,
+  ]);
+  if (
+    headRev.ok &&
+    branchRev.ok &&
+    headRev.stdout !== undefined &&
+    branchRev.stdout !== undefined &&
+    headRev.stdout.trim() !== "" &&
+    branchRev.stdout.trim() !== "" &&
+    headRev.stdout.trim() !== branchRev.stdout.trim()
+  ) {
+    errors.push(
+      `launch checkout HEAD (${headRev.stdout.trim().slice(0, 12)}) is not on ` +
+        `the --branch tip '${args.branch}' (${branchRev.stdout.trim().slice(0, 12)}). ` +
+        `Worker worktrees are cut from the launch checkout's HEAD, so they ` +
+        `would build on a stale base and dependent issues would fail. Run ` +
+        `\`git -C ${args.repoRoot} checkout ${args.branch}\` (or pass the ` +
+        `--branch you actually intend) and re-run the loop.`,
+    );
   }
 
   return { ok: errors.length === 0, errors };
@@ -1988,6 +2042,48 @@ export function withHardCeiling<T>(
 // ---------------------------------------------------------------------------
 
 /**
+ * Resolve the loop's run-log path and return a best-effort line appender.
+ *
+ * The loop's stdout/stderr is otherwise ephemeral, so after a hard death there
+ * is no on-disk record of why it died — the post-mortem gap from the
+ * affinity-tracker session audit. This writes every log line to a known path:
+ * `<repoRoot>/.sandcastle/run.log` by default (already gitignored), or the
+ * `--log-file` override, so the last run is always inspectable.
+ *
+ * The file is truncated once when the appender is created (one fresh log per
+ * run; the post-mortem cares about the last run). Each line is flushed with
+ * `appendFileSync` (no buffering) so a hard death loses nothing. All writes are
+ * best-effort: a non-writable path silently disables file logging and never
+ * throws, mirroring the status-store's non-fatal `onError` philosophy — a
+ * log-write failure must never take the loop down.
+ *
+ * Exported for unit testing.
+ */
+export function createRunLogAppender(opts: {
+  logFile?: string;
+  repoRoot: string;
+}): (line: string) => void {
+  const target =
+    opts.logFile ?? path.join(opts.repoRoot, ".sandcastle", "run.log");
+  let ready = false;
+  try {
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, ""); // truncate once per run
+    ready = true;
+  } catch {
+    ready = false; // non-writable path → file logging silently disabled
+  }
+  return (line: string): void => {
+    if (!ready) return;
+    try {
+      appendFileSync(target, line);
+    } catch {
+      // best-effort; a log-write failure must never break the loop
+    }
+  };
+}
+
+/**
  * Build the production {@link Deps} bag — wires sandcastle.run /
  * sandcastle.createSandbox / src/state/gh.ts wrappers / src/migrations/.
  *
@@ -2119,6 +2215,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     label: string,
     invoke: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> => withHardCeiling(ceilingMs, label, invoke);
+
+  // Tee every log line to a known on-disk run log (default
+  // .sandcastle/run.log, gitignored) so a hard death is diagnosable
+  // post-mortem — the loop's stderr is otherwise ephemeral.
+  const appendRunLog = createRunLogAppender({
+    logFile: args.logFile,
+    repoRoot: args.repoRoot,
+  });
 
   return {
     async run(spec) {
@@ -2298,9 +2402,11 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     },
     log(line) {
       process.stderr.write(`${line}\n`);
+      appendRunLog(`${line}\n`);
     },
     logError(line) {
       process.stderr.write(`ERROR: ${line}\n`);
+      appendRunLog(`ERROR: ${line}\n`);
     },
   };
 }
@@ -2740,7 +2846,11 @@ export async function runImplementer(
   sb: SandboxHandle,
   ctx: PipelineCtx,
   opts: {
-    attemptNumber?: 1 | 2 | 3;
+    // Attempt index: 1 = first pass, ≥2 = retry rounds. Dynamic now that the
+    // critique retry cap is configurable (CRITIQUE_MAX_RETRIES), so a plain
+    // number rather than a fixed 1|2|3 literal union. Used only in comparisons
+    // / the ATTEMPT_NUMBER prompt arg — never as an index.
+    attemptNumber?: number;
     model?: string;
     reviewerFeedback?: string;
     critiqueFeedback?: string;
@@ -3389,6 +3499,12 @@ const CRITIQUE_MARKERS = [
 ] as const;
 type CritiqueVerdict = (typeof CRITIQUE_MARKERS)[number];
 
+// Max implementer↔critique retry rounds before a NEEDS_FIXES verdict
+// quarantines (ADR 0014). Raised 1→2: a single retry parked too many
+// salvageable visual/copy slices at needs-human (affinity-tracker #454/#470).
+// The path is first-pass → retry → retry → quarantine.
+const CRITIQUE_MAX_RETRIES = 2;
+
 /**
  * Run the critique gate (ADR 0006) for one issue and return the
  * (possibly retry-refreshed) postSha. Steps: no-rubric preflight →
@@ -3504,9 +3620,11 @@ export async function runCritique(
     throw new CritiqueCriticalError(a1.stdout, typeLabel);
   }
   if (a1.marker === "CRITIQUE_NEEDS_FIXES") {
-    // v2 retry path (ADR 0006): one implementer pass with critique findings
-    // as feedback, then re-critique. Ship on CLEAN, quarantine on still
-    // NEEDS_FIXES or any CRITICAL.
+    // Retry path (ADR 0006 / 0014): re-run the implementer with the critique
+    // findings as feedback, then re-critique. Ship on CLEAN; quarantine on a
+    // CRITICAL at any point, a malformed retry verdict, or CRITIQUE_MAX_RETRIES
+    // exhausted still NEEDS_FIXES. The cap is 2 (raised from 1, ADR 0014):
+    // first-pass → retry → retry → quarantine.
     if (!ctx.args.retryEnabled) {
       ctx.deps.log(
         `[critique] issue=${ctx.issueNumber} NEEDS_FIXES — retry disabled (--no-retry), quarantining`,
@@ -3515,39 +3633,55 @@ export async function runCritique(
         retryExhausted: true,
       });
     }
-    ctx.deps.log(
-      `[critique] issue=${ctx.issueNumber} attempt 1 NEEDS_FIXES — ` +
-        `re-running implementer on ${ctx.args.implementerModel} with critique feedback`,
-    );
-    const implFix = await runImplementer(sandbox, ctx, {
-      attemptNumber: 2,
-      critiqueFeedback: a1.stdout,
-      requiredSkills,
+    // `attempt` is the implementer attemptNumber for this retry round (2, 3, …);
+    // retry N = attempt N+1. `verdict` carries the latest NEEDS_FIXES findings
+    // forward as the next implementer's feedback.
+    let verdict = a1;
+    for (let attempt = 2; attempt <= CRITIQUE_MAX_RETRIES + 1; attempt++) {
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} attempt ${attempt - 1} NEEDS_FIXES — ` +
+          `re-running implementer on ${ctx.args.implementerModel} with critique ` +
+          `feedback (retry ${attempt - 1}/${CRITIQUE_MAX_RETRIES})`,
+      );
+      const implFix = await runImplementer(sandbox, ctx, {
+        attemptNumber: attempt,
+        critiqueFeedback: verdict.stdout,
+        requiredSkills,
+      });
+      // Refresh postSha — mirrors the HAS_BLOCKERS retry pattern. Without this,
+      // the caller's migration-journal validation runs on a stale SHA range and
+      // silently skips any new migrations the retry-implementer added.
+      postSha = sandbox.worktreePath
+        ? await ctx.deps.captureSha(sandbox.worktreePath)
+        : (implFix.commits[implFix.commits.length - 1]?.sha ?? postSha);
+      verdict = await dispatchCritique(
+        `critique-retry attempt ${attempt} (issue=${ctx.issueNumber})`,
+      );
+      if (verdict.marker === null) {
+        // Malformed retry verdict — fail closed as retry-exhausted.
+        throw new CritiqueCriticalError(verdict.stdout, typeLabel, {
+          retryExhausted: true,
+        });
+      }
+      ctx.deps.log(
+        `[critique] issue=${ctx.issueNumber} attempt ${attempt} verdict=${verdict.marker}`,
+      );
+      if (verdict.marker === "CRITIQUE_CLEAN") {
+        return { postSha }; // fixed — ship
+      }
+      if (verdict.marker === "CRITIQUE_CRITICAL") {
+        // Structural; retry won't help — stop early.
+        throw new CritiqueCriticalError(verdict.stdout, typeLabel, {
+          retryExhausted: true,
+          criticalAfterRetry: true,
+        });
+      }
+      // else still CRITIQUE_NEEDS_FIXES → loop again if retries remain
+    }
+    // All retries exhausted, still NEEDS_FIXES.
+    throw new CritiqueCriticalError(verdict.stdout, typeLabel, {
+      retryExhausted: true,
     });
-    // Refresh postSha — mirrors the HAS_BLOCKERS retry pattern. Without
-    // this, the caller's migration-journal validation block runs on a stale
-    // SHA range and silently skips any new migrations the retry-implementer
-    // added.
-    postSha = sandbox.worktreePath
-      ? await ctx.deps.captureSha(sandbox.worktreePath)
-      : (implFix.commits[implFix.commits.length - 1]?.sha ?? postSha);
-    const a2 = await dispatchCritique(
-      `critique-retry (issue=${ctx.issueNumber})`,
-    );
-    if (a2.marker === null) {
-      throw new CritiqueCriticalError(a2.stdout, typeLabel, {
-        retryExhausted: true,
-      });
-    }
-    ctx.deps.log(
-      `[critique] issue=${ctx.issueNumber} attempt 2 verdict=${a2.marker}`,
-    );
-    if (a2.marker !== "CRITIQUE_CLEAN") {
-      throw new CritiqueCriticalError(a2.stdout, typeLabel, {
-        retryExhausted: true,
-        criticalAfterRetry: a2.marker === "CRITIQUE_CRITICAL",
-      });
-    }
   }
   return { postSha };
 }

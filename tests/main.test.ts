@@ -47,6 +47,7 @@ import {
   hasLintScript,
   commitMessageHasLintCert,
   classifyLintCert,
+  createRunLogAppender,
   hasCodeDiff,
   parseWorktreeList,
   serializeDotenv,
@@ -1916,6 +1917,63 @@ describe("sandcastle-loop main.mts — .sandcastle/main.mts dirty-check prefligh
   });
 });
 
+describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
+  // Worker worktrees are cut from the launch checkout's CURRENT HEAD, not from
+  // --branch. If the checkout drifted off the feature branch, every worker
+  // builds on a stale base and dependent issues fail (affinity-tracker branch-
+  // base trap). preflight refuses to launch on a confirmed HEAD≠branch-tip
+  // divergence. baseArgs().branch is "feature/work".
+  //
+  // exec mock: canned shas for the two rev-parse calls; everything else (gh,
+  // docker, dirty-check, …) returns ok so only the branch-base check is tested.
+  function execFor(headSha: string, branchSha: string | null) {
+    return (bin: string, a: readonly string[]) => {
+      if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
+        return { ok: true, stdout: `${headSha}\n` };
+      }
+      if (
+        bin === "git" &&
+        a.includes("rev-parse") &&
+        a.some((x) => x.startsWith("refs/heads/"))
+      ) {
+        return branchSha === null
+          ? { ok: false, stderr: "" } // ref doesn't resolve
+          : { ok: true, stdout: `${branchSha}\n` };
+      }
+      return { ok: true };
+    };
+  }
+  const hasBranchError = (errors: readonly string[]) =>
+    errors.some((e) => /launch checkout HEAD/i.test(e));
+
+  it("refuses to launch when launch HEAD != --branch tip", () => {
+    const res = preflight(baseArgs(), {
+      exec: execFor("aaaa1111", "bbbb2222"),
+    });
+    expect(res.ok).toBe(false);
+    expect(hasBranchError(res.errors)).toBe(true);
+  });
+
+  it("passes when launch HEAD == --branch tip", () => {
+    const res = preflight(baseArgs(), {
+      exec: execFor("aaaa1111", "aaaa1111"),
+    });
+    expect(hasBranchError(res.errors)).toBe(false);
+  });
+
+  it("skips the check when the branch ref doesn't resolve (new branch / detached)", () => {
+    const res = preflight(baseArgs(), { exec: execFor("aaaa1111", null) });
+    expect(hasBranchError(res.errors)).toBe(false);
+  });
+
+  it("is inert when exec doesn't capture stdout (legacy mocks → no false positive)", () => {
+    // The other preflight tests mock exec as () => ({ ok: true }) with no
+    // stdout; the branch-base check must be a no-op for them.
+    const res = preflight(baseArgs(), { exec: () => ({ ok: true }) });
+    expect(hasBranchError(res.errors)).toBe(false);
+  });
+});
+
 describe("sandcastle-loop main.mts — staging worktree", () => {
   // Helper: initialise a real git repo with one commit on `main`.
   function initTempRepo(): { repoRoot: string; cleanup: () => void } {
@@ -2578,6 +2636,52 @@ describe("ghTokenEnv", () => {
 // buildDefaultDeps writeProjectDotenv hook — structural assertions on the
 // shell command that materializes `.env` inside the sandbox at boot.
 // ---------------------------------------------------------------------------
+
+describe("createRunLogAppender — loop run-log (audit Mistake 2)", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-runlog-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("defaults to <repoRoot>/.sandcastle/run.log and appends each line", () => {
+    const append = createRunLogAppender({ repoRoot: tmp });
+    append("first line\n");
+    append("second line\n");
+    const logPath = path.join(tmp, ".sandcastle", "run.log");
+    expect(readFileSync(logPath, "utf8")).toBe("first line\nsecond line\n");
+  });
+
+  it("honors an explicit logFile override", () => {
+    const custom = path.join(tmp, "custom-run.log");
+    const append = createRunLogAppender({ repoRoot: tmp, logFile: custom });
+    append("hello\n");
+    expect(readFileSync(custom, "utf8")).toBe("hello\n");
+  });
+
+  it("truncates once per run (each loop starts a fresh log, not append-across-runs)", () => {
+    const logPath = path.join(tmp, ".sandcastle", "run.log");
+    const first = createRunLogAppender({ repoRoot: tmp });
+    first("old run line\n");
+    // A second appender = a new run → truncates the prior run's log.
+    const second = createRunLogAppender({ repoRoot: tmp });
+    second("new run line\n");
+    expect(readFileSync(logPath, "utf8")).toBe("new run line\n");
+  });
+
+  it("is best-effort: a non-writable path disables file logging without throwing", () => {
+    // repoRoot whose parent is a FILE (not a dir) → mkdir fails. The loop must
+    // never die on a log-write failure (mirrors the status-store onError path).
+    const notADir = path.join(tmp, "iam-a-file");
+    writeFileSync(notADir, "x");
+    const append = createRunLogAppender({
+      repoRoot: path.join(notADir, "nested"),
+    });
+    expect(() => append("line\n")).not.toThrow();
+  });
+});
 
 describe("buildDefaultDeps writeProjectDotenv hook", () => {
   const cmd = WRITE_PROJECT_DOTENV_COMMAND;
@@ -3889,7 +3993,8 @@ describe("post-merge fixer skill-discipline union (telemetry helper)", () => {
 describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
   const ISSUE = 7;
   const A1 = `critique (issue=${ISSUE})`;
-  const A2 = `critique-retry (issue=${ISSUE})`;
+  const A2 = `critique-retry attempt 2 (issue=${ISSUE})`;
+  const A3 = `critique-retry attempt 3 (issue=${ISSUE})`;
   // runImplementer names the attempt-2 critique-retry leg with this bare
   // marker (see the name ternary in runImplementer's sb.run spec).
   const IMPL = "implementer-critique-retry";
@@ -4015,6 +4120,26 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
     expect(names).toEqual([A1, IMPL, A2]);
   });
 
+  it("NEEDS_FIXES → retry → NEEDS_FIXES → retry → CLEAN → ships on the 2nd retry (cap=2)", async () => {
+    // The capability the cap raise buys: a slice that's still imperfect after
+    // one retry gets a second before quarantine (affinity-tracker #454/#470).
+    const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
+      [IMPL]: {
+        stdout: implementerStdout({ ghIssue: ISSUE }),
+        commits: [{ sha: "retry-sha" }],
+        iterations: [{ sessionFilePath: implJsonl }],
+      },
+      [A2]: { stdout: "still off\n\nCRITIQUE_NEEDS_FIXES", commits: [] },
+      [A3]: { stdout: "fixed now\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const r = await runCritique(sandbox, critiqueCtx(), "post-sha");
+    expect(r.postSha).toBe("retry-sha");
+    // First retry still NEEDS_FIXES, second retry CLEAN → ship.
+    expect(names).toEqual([A1, IMPL, A2, IMPL, A3]);
+  });
+
   it("NEEDS_FIXES → retry → CRITICAL → throws critical-introduced-by-retry", async () => {
     const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
     const { sandbox } = makeCritiqueSandbox({
@@ -4034,9 +4159,9 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
     expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-retry-critical");
   });
 
-  it("NEEDS_FIXES → retry → still NEEDS_FIXES → quarantines retry-exhausted", async () => {
+  it("NEEDS_FIXES → retry → NEEDS_FIXES → retry → still NEEDS_FIXES → quarantines retry-exhausted (cap=2)", async () => {
     const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
-    const { sandbox } = makeCritiqueSandbox({
+    const { sandbox, names } = makeCritiqueSandbox({
       [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
       [IMPL]: {
         stdout: implementerStdout({ ghIssue: ISSUE }),
@@ -4044,6 +4169,7 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
         iterations: [{ sessionFilePath: implJsonl }],
       },
       [A2]: { stdout: "## Findings\n\n1. P1\n\nCRITIQUE_NEEDS_FIXES", commits: [] },
+      [A3]: { stdout: "## Findings\n\n1. P1\n\nCRITIQUE_NEEDS_FIXES", commits: [] },
     });
     const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
     expect(err).toBeInstanceOf(CritiqueCriticalError);
@@ -4053,6 +4179,8 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
     expect(critiqueErrorReasonCode(e).reasonCode).toBe(
       "critique-retry-exhausted",
     );
+    // Two full retry rounds before quarantine (cap raised 1→2, ADR 0014).
+    expect(names).toEqual([A1, IMPL, A2, IMPL, A3]);
   });
 
   it("retry attempt-2 malformed marker → quarantines retry-exhausted (not retry-critical)", async () => {
