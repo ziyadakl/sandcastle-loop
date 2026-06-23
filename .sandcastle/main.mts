@@ -51,7 +51,7 @@ import {
   LABEL_READY,
   acquireSingleInstanceLock,
 } from "./lib/state/index.js";
-import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS } from "./lib/verdicts/index.js";
+import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import {
@@ -5093,7 +5093,7 @@ export async function runMain(
           // (affinity-tracker #475), which the prompt now forbids but we
           // survive once if it slips through. Both classes are non-verdicts
           // on clean code, so retry once on the same model before giving up.
-          const isNoVerdict = (err as Error).name === "MarkerNotFoundError";
+          const isNoVerdict = err instanceof MarkerNotFoundError;
           if (retryOnStall && (STALL_RE.test(msg) || isNoVerdict)) {
             deps.logError(
               `post-merge review ${isNoVerdict ? "emitted no verdict" : "stalled"} (${msg}) — retrying once on same model`,

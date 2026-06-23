@@ -539,7 +539,7 @@ describe("sandcastle-loop main.mts — happy path", () => {
   });
 });
 
-describe("sandcastle-loop main.mts — post-merge reviewer stall retry", () => {
+describe("sandcastle-loop main.mts — post-merge reviewer stall / no-verdict retry", () => {
   // Regression for affinity-tracker #197: the post-merge reviewer went
   // silent past the 600s idle timeout, the SDK aborted it, and the
   // catch path quarantined perfectly good code. A stall is

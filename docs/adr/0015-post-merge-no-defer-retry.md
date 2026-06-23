@@ -45,9 +45,10 @@ survives it once if it still happens.
 
 2. **`main.mts` — `runPostMergeReviewer` no-verdict retry.** Broaden the single-retry
    condition so it also fires on a no-verdict `MarkerNotFoundError`, not only on
-   `STALL_RE`-matching stalls. The error reaches the catch raw, so the class is read
-   off `(err as Error).name === "MarkerNotFoundError"` (the name is set in
-   `lib/verdicts/parse.ts`) — no new import. The recursive call keeps
+   `STALL_RE`-matching stalls. The error reaches the catch raw, so the class is
+   matched canonically with `err instanceof MarkerNotFoundError` (the symbol is
+   added to the existing `./lib/verdicts` import — no cast, rename-safe, no new
+   import statement). The recursive call keeps
    `retryOnStall=false`, so the retry stays single-shot: a reviewer that fails to
    verdict twice still falls through to quarantine. The log line distinguishes
    `emitted no verdict` from `stalled` for diagnosis.
@@ -75,4 +76,5 @@ survives it once if it still happens.
 - **Retry on every throw, not just stall + no-verdict.** Rejected: a genuine SDK auth
   error (`401`) or other hard fault should fail fast, not burn a second reviewer pass.
   The existing test "non-stall throw → no retry, single attempt" pins this, and the
-  no-verdict carve-out is matched by error name rather than widening to all errors.
+  no-verdict carve-out is matched by error type (`instanceof MarkerNotFoundError`)
+  rather than widening to all errors.
