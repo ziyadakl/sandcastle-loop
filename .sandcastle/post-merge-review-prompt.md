@@ -114,6 +114,16 @@ row or by recovery) → HAS_BLOCKERS for the rollup.
 
 # DO NOT
 
+- Do NOT defer, stall, or "stand by." You get EXACTLY ONE turn — the
+  orchestrator runs you with `maxIterations=1` and reads only THIS response
+  for a verdict. Run every check (typecheck, tests, lint) synchronously to
+  completion NOW, in this turn. NEVER set up a background/async "waiter,"
+  never say "I'll report back when the suite finishes," never end your turn
+  waiting on a result. A slow test suite is NOT a reason to defer: wait for it
+  inline; if it genuinely cannot finish, emit `POST_MERGE_ISSUES_FOUND` with
+  the reason. If you end without a marker, EVERY merged issue is quarantined
+  as if it failed — even when the code is clean. Silence is the single most
+  destructive outcome here.
 - Do NOT push to origin.
 - Do NOT edit code or commit anything (you are a reviewer, not implementer).
 - Do NOT re-merge anything or rebase.

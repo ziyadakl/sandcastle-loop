@@ -254,3 +254,40 @@ describe("critique objective/subjective rule ↔ prompt contract (audit Issue 2)
     expect(critiquePrompt).toMatch(/CRITIQUE_CLEAN/);
   });
 });
+
+describe("post-merge no-defer rule ↔ no-verdict retry contract (ADR 0015)", () => {
+  const postMergePrompt = readFileSync(
+    join(sandcastleDir, "post-merge-review-prompt.md"),
+    "utf8",
+  );
+  const mainSource = readFileSync(join(sandcastleDir, "main.mts"), "utf8");
+
+  it("post-merge-review-prompt.md forbids the reviewer from deferring its single-turn verdict", () => {
+    // affinity-tracker #475: the reviewer ended its one turn without a marker
+    // ("standing by for the suite result before issuing the verdict") and a
+    // clean integration was quarantined. The prompt must forbid deferral and
+    // tell the reviewer it gets exactly one turn — this is the load-bearing
+    // half of the fix (the retry below is only the backstop).
+    expect(postMergePrompt).toMatch(/do not defer/i);
+    expect(postMergePrompt).toMatch(/one turn/i);
+  });
+
+  it("the no-defer rule sits outside the test-runner variant region so it survives assembly", () => {
+    // The rule is useless if a profile's variant override strips it on
+    // assembly. It must live after the test-runner variant's close marker,
+    // i.e. outside any <!-- variant:... --> region.
+    const ruleIdx = postMergePrompt.search(/do not defer/i);
+    const variantClose = postMergePrompt.indexOf(
+      "<!-- /variant:test-runner-post-merge-review -->",
+    );
+    expect(variantClose).toBeGreaterThanOrEqual(0);
+    expect(ruleIdx).toBeGreaterThan(variantClose);
+  });
+
+  it("runPostMergeReviewer survives a no-verdict turn by retrying on MarkerNotFoundError", () => {
+    // The code half: a no-verdict turn surfaces as MarkerNotFoundError, which
+    // is NOT stall-shaped, so it must be matched explicitly (canonically, via
+    // instanceof — not a brittle name string) and share the single-shot retry.
+    expect(mainSource).toMatch(/err instanceof MarkerNotFoundError/);
+  });
+});

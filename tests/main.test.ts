@@ -539,7 +539,7 @@ describe("sandcastle-loop main.mts — happy path", () => {
   });
 });
 
-describe("sandcastle-loop main.mts — post-merge reviewer stall retry", () => {
+describe("sandcastle-loop main.mts — post-merge reviewer stall / no-verdict retry", () => {
   // Regression for affinity-tracker #197: the post-merge reviewer went
   // silent past the 600s idle timeout, the SDK aborted it, and the
   // catch path quarantined perfectly good code. A stall is
@@ -578,6 +578,53 @@ describe("sandcastle-loop main.mts — post-merge reviewer stall retry", () => {
     expect(b.state.quarantines).toEqual([]);
     expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([197]);
     // Two post-merge-reviewer calls prove the retry actually fired.
+    const postMergeCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "post-merge-reviewer",
+    );
+    expect(postMergeCalls).toHaveLength(2);
+  });
+
+  it("no verdict on first attempt (no marker) + ALL_CLEAR on retry → no quarantine, issue ships", async () => {
+    // Regression for affinity-tracker #475: the reviewer ran but ended its
+    // single turn WITHOUT emitting a marker ("…standing by for the suite
+    // result before issuing the verdict"). extractMarker throws
+    // MarkerNotFoundError — which is NOT stall-shaped — so the stall-only
+    // retry never fired and a clean integration was quarantined. A
+    // no-verdict turn is now treated like a stall: retry once on the same
+    // model before giving up.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "475", title: "deferred verdict", branch: "agent/issue-475" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 475 }),
+      commits: [{ sha: "good-sha" }],
+    });
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    // First post-merge attempt defers instead of verdicting — no marker
+    // anywhere in the output, so extractMarker throws MarkerNotFoundError.
+    b.enqueue("post-merge-reviewer", {
+      stdout:
+        "Reviewing the integration. I've set up a blocking waiter; standing " +
+        "by for the api suite result before issuing the verdict.",
+    });
+    // Retry produces a real verdict.
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([475]);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([475]);
+    // Two post-merge-reviewer calls prove the no-verdict retry actually fired.
     const postMergeCalls = b.state.runCalls.filter(
       (c) => c.spec.name === "post-merge-reviewer",
     );
