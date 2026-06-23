@@ -5087,11 +5087,16 @@ export async function runMain(
           // Stall-class errors (SDK idle timeout, hard ceiling, etc.) are
           // environmental — the reviewer never got a chance to verdict.
           // Quarantining merged issues here destroys good code (observed on
-          // affinity-tracker #197). Retry once on the same model before
-          // giving up.
-          if (retryOnStall && STALL_RE.test(msg)) {
+          // affinity-tracker #197). A MarkerNotFoundError is the sibling
+          // failure: the reviewer ran but ended its single turn WITHOUT a
+          // verdict — it deferred / "stood by" instead of emitting a marker
+          // (affinity-tracker #475), which the prompt now forbids but we
+          // survive once if it slips through. Both classes are non-verdicts
+          // on clean code, so retry once on the same model before giving up.
+          const isNoVerdict = (err as Error).name === "MarkerNotFoundError";
+          if (retryOnStall && (STALL_RE.test(msg) || isNoVerdict)) {
             deps.logError(
-              `post-merge review stalled (${msg}) — retrying once on same model`,
+              `post-merge review ${isNoVerdict ? "emitted no verdict" : "stalled"} (${msg}) — retrying once on same model`,
             );
             return runPostMergeReviewer(
               model,
