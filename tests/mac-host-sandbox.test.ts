@@ -362,6 +362,10 @@ describe("applyPromptArgs", () => {
       // must too — keep this key set in sync with main.mts promptArgs.
       REQUIRED_SKILLS: "",
       CRITIQUE_FEEDBACK: "",
+      // Audit #22 missing-envelope one-shot re-ask placeholder. runImplementer
+      // supplies this on every dispatch ("" on the normal pass, populated on
+      // the re-ask), so this substitution path must too.
+      ENVELOPE_REASK: "",
     };
     const out = applyPromptArgs(raw, args);
     const PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;

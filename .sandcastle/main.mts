@@ -51,7 +51,7 @@ import {
   LABEL_READY,
   acquireSingleInstanceLock,
 } from "./lib/state/index.js";
-import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError } from "./lib/verdicts/index.js";
+import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import {
@@ -2879,6 +2879,25 @@ export async function runImplementer(
      * `type:cleanup` requires none) → same no-op result.
      */
     requiredSkills?: readonly string[];
+    /**
+     * One-shot guard for the missing-envelope re-ask (audit #22). When the
+     * implementer emits a real STORY_COMPLETE (not a `<rebuttal>`, not a
+     * HALT) but drops the REQUIRED fenced ```json``` certification envelope,
+     * `parseVerdict` throws {@link VerdictParseError} — a class neither
+     * `isTransientError` nor `STALL_RE` covers, so the whole pass would be
+     * wasted (recovery burn → quarantine, or immediate quarantine under
+     * `--recovery off`). Instead we re-run the implementer ONCE with a terse
+     * appended instruction surfaced via the `{{ENVELOPE_REASK}}` prompt
+     * placeholder.
+     *
+     * `false`/`undefined` (default) on the FIRST pass → on a genuine
+     * missing-envelope failure, recurse once with this flag set `true`.
+     * `true` → this IS the re-ask: the `{{ENVELOPE_REASK}}` placeholder is
+     * populated AND a second missing-envelope failure propagates as before
+     * (the boolean can never recurse more than once). Mirrors the
+     * single-retry discipline of `retryOnStall` in `runPostMergeReviewer`.
+     */
+    envelopeReask?: boolean;
   } = {},
 ): Promise<{
   commits: readonly { sha: string }[];
@@ -2928,6 +2947,19 @@ export async function runImplementer(
           // conditional block can detect "gate disabled for this slice"
           // without templating errors.
           REQUIRED_SKILLS: opts.requiredSkills?.join(", ") ?? "",
+          // Audit #22: populated ONLY on the one-shot re-ask after the
+          // implementer dropped the fenced ```json``` certification envelope
+          // before STORY_COMPLETE. Empty string on the normal first pass so
+          // the prompt's conditional block stays inert. The placeholder lint
+          // (tests/lint-placeholders.test.ts) requires {{ENVELOPE_REASK}} in
+          // implement-prompt.md to have this matching key.
+          ENVELOPE_REASK: opts.envelopeReask
+            ? "Your previous final message ended without the REQUIRED fenced " +
+              "```json``` certification envelope before STORY_COMPLETE. " +
+              "Do NOT redo any work — your commits are already on the branch. " +
+              "Re-emit ONLY your final message, ending with the json envelope " +
+              "followed by the STORY_COMPLETE marker."
+            : "",
         },
       }),
     primaryModel,
@@ -3013,12 +3045,38 @@ export async function runImplementer(
     }
   })();
   if (!rebuttalPresent && !halted) {
+    // Dual-mode parse (stream-json first, assistant-text fallback). On a
+    // genuine missing-envelope failure — the implementer emitted a real
+    // STORY_COMPLETE but dropped the fenced ```json``` certification
+    // envelope — both attempts raise VerdictParseError. That class is NOT
+    // covered by isTransientError / STALL_RE, so without intervention the
+    // whole pass is wasted (recovery burn → quarantine, or immediate
+    // quarantine under --recovery off). Re-ask the implementer ONCE for just
+    // the envelope (audit #22), guarded by opts.envelopeReask so it can
+    // never recurse more than once. We catch VerdictParseError ONLY
+    // (instanceof) — any other thrown class (and the second re-ask failure)
+    // propagates unchanged, exactly as before.
+    let parseErr: unknown = null;
     try {
       parseVerdict(r.stdout, ImplementerOutputSchema);
     } catch {
-      parseVerdict(r.stdout, ImplementerOutputSchema, {
-        alreadyAssistantText: true,
-      });
+      try {
+        parseVerdict(r.stdout, ImplementerOutputSchema, {
+          alreadyAssistantText: true,
+        });
+      } catch (err2) {
+        parseErr = err2;
+      }
+    }
+    if (parseErr !== null) {
+      if (parseErr instanceof VerdictParseError && !opts.envelopeReask) {
+        ctx.deps.logError(
+          `implementer (issue=${ctx.issueNumber}) emitted STORY_COMPLETE ` +
+            `without the required json envelope — re-asking once for the envelope`,
+        );
+        return runImplementer(sb, ctx, { ...opts, envelopeReask: true });
+      }
+      throw parseErr;
     }
   }
   return { ...r, skillsInvoked };
