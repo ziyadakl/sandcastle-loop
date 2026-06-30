@@ -297,9 +297,36 @@ Category-specific guidance:
   6. If SANDCASTLE.md does not exist or has no section matching the
      ticket's type, mark this category `n/a`.
 
-  A missing Required tool is a HARD finding — emit HAS_BLOCKERS.
-  Over-invocation (extra tools beyond required) is never a finding;
-  only under-invocation is.
+  ENVIRONMENT-AWARENESS CARVE-OUT. A "missing" Required tool is only a
+  HARD finding if that tool COULD have run in this sandbox. Some Required
+  tools are ENVIRONMENTALLY UNRUNNABLE here: the sandbox is
+  credential-less and has no live application, so any tool whose job is to
+  drive a running app or reach an external service it cannot reach — the
+  canonical case is `verify` ("boot the app", needs a live server +
+  credentials) — physically cannot be invoked, no matter how diligent the
+  implementer. Treating those identically to a tool that COULD have run
+  but wasn't is an unsatisfiable contradiction no retry can fix. So:
+    - A Required tool that needs a live running app or external
+      credentials the sandbox does not provide (e.g. `verify`) is NOT an
+      automatic HARD finding. Record it on the skill-discipline sweep
+      line as `n/a (tool unrunnable in sandbox: <reason>)` instead of
+      emitting HAS_BLOCKERS for it.
+    - A Required tool that CAN run headless in the credential-less
+      sandbox (e.g. `critique`, `audit`, `impeccable`, `layout`, and any
+      other purely-static analysis or codegen tool) stays STRICT: if it
+      is missing from SKILLS_INVOKED it remains a HARD finding. Do NOT
+      use this carve-out to wave through a normally-runnable tool.
+  When a ticket's only missing Required tool is an unrunnable one, the
+  skill-discipline sweep line is `n/a (...)` — not a finding. If a
+  runnable Required tool is also missing, that one still emits the finding
+  above.
+
+  A missing Required tool is a HARD finding — emit HAS_BLOCKERS — UNLESS
+  the environment-awareness carve-out above applies (the tool is
+  environmentally unrunnable in this sandbox), in which case you MUST
+  instead record the auditable `n/a (tool unrunnable in sandbox: <reason>)`
+  sweep line. Over-invocation (extra tools beyond required) is never a
+  finding; only under-invocation of a RUNNABLE tool is.
 
 - **Migration schema qualification** — only if the diff includes any
   new or modified `.sql` file under `packages/db/migrations/` (or
