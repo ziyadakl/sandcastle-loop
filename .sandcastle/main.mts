@@ -1513,7 +1513,7 @@ export function __setStagingWorktreePathForTests(p: string): void {
   stagingWorktreePath = p;
 }
 
-interface GitRunResult {
+export interface GitRunResult {
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -1825,6 +1825,135 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
     if (wtPath !== "") entries.push({ path: wtPath, branch });
   }
   return entries;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree-health: boot prune + lazy createSandbox repair (audit issue #1)
+// ---------------------------------------------------------------------------
+//
+// A single corrupt git worktree — e.g. a leftover `00000000` directory whose
+// `.git` link is gone, producing `git worktree list -> couldn't read
+// .git/packed-refs` — used to kill the WHOLE loop. The fatal `git worktree
+// list --porcelain` runs INSIDE the vendored SDK (`WorktreeManager.create ->
+// listWorktrees`) which throws with no catch, so the very first `createSandbox`
+// blows up the run. We can't patch the vendored SDK.
+//
+// SAFEST-REBUILD shape (this rework). The earlier fix was destructive and
+// didn't actually repair:
+//
+//   Defect A (DATA-LOSS): it selected ANY non-root worktree whose dir
+//   momentarily failed an `existsSync` check and then ran
+//   `git worktree remove --force` + recursive `rmSync` on it. On this host
+//   MULTIPLE loops share one workspace, so a sibling loop's LIVE worktree that
+//   briefly fails `existsSync` (mid-op, EACCES, TOCTOU) got force-deleted —
+//   destroying real work.
+//
+//   Defect B (DOESN'T REPAIR): when `git worktree list` returned `!ok` (the
+//   real corruption symptom) it ran `git worktree prune` (which fails the SAME
+//   way on packed-refs corruption) and returned having repaired nothing; and
+//   the `existsSync` detector structurally can't see a dir-present-but-
+//   internally-corrupt worktree. So the loop still died on SDK re-enumeration.
+//
+// The rebuild:
+//   1. NO manual deletion. `git worktree prune` NEVER removes a live/healthy
+//      worktree — it only clears administrative registrations for worktrees
+//      whose working tree is gone — so it is the only safe tool here.
+//   2. A cheap, harmless boot `git worktree prune` to clear dangling regs.
+//   3. The FIRST sandbox create is wrapped so that on a worktree-enumeration
+//      failure we prune ONCE and retry ONCE; if it STILL fails we exit with a
+//      clear, actionable error. NEVER delete, NEVER loop.
+
+/**
+ * Cheap, NON-DESTRUCTIVE boot pass: a single best-effort `git worktree prune`
+ * to clear dangling administrative registrations (worktrees whose working tree
+ * is gone). Runs ONCE, early in the boot sequence (after preflight, before
+ * staging + the first sandbox).
+ *
+ * `git worktree prune` never touches a live/healthy worktree, so this cannot
+ * destroy a sibling loop's work — the destructive `remove --force` + `rmSync`
+ * path that did exactly that has been removed entirely.
+ *
+ * NEVER throws — a failure (including the corrupt-packed-refs case, where prune
+ * itself fails) logs a warning and the loop continues. The actual repair for
+ * that case happens lazily in {@link createSandboxWithWorktreeRepair}.
+ */
+export function pruneCorruptWorktrees(
+  repoRoot: string,
+  log: (line: string) => void,
+  deps: { git?: (repoRoot: string, ...gitArgs: string[]) => GitRunResult } = {},
+): void {
+  const git = deps.git ?? runGit;
+  try {
+    const pruned = git(repoRoot, "worktree", "prune");
+    if (!pruned.ok) {
+      log(
+        `[worktree-health] boot 'git worktree prune' failed (continuing): ` +
+          `${pruned.stderr || "unknown"}`,
+      );
+    }
+  } catch (err) {
+    // Absolute backstop: this pass must NEVER kill the loop.
+    log(
+      `[worktree-health] boot prune errored (continuing): ` +
+        `${(err as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Wrap the FIRST sandbox create with a one-shot, NON-DESTRUCTIVE repair.
+ *
+ * The vendored SDK enumerates worktrees inside `createSandbox`
+ * (`WorktreeManager.create -> listWorktrees`); a corrupt registration makes
+ * that throw and there's no SDK catch. So we try the create once, and on
+ * failure run `git worktree prune` ONCE (the only safe repair — it never
+ * removes a live worktree) and retry the create ONCE. If it STILL fails, we
+ * surface a clear, actionable error rather than dying silently or looping.
+ *
+ * NEVER deletes a worktree and NEVER loops. Provider-agnostic: it takes the
+ * provider's own `createSandbox` as `create`, so it works identically across
+ * docker / mac-host / codex. Injectable `git` keeps it unit-testable without a
+ * real corrupt repo.
+ */
+export async function createSandboxWithWorktreeRepair(
+  create: () => Promise<SandboxHandle>,
+  git: (repoRoot: string, ...gitArgs: string[]) => GitRunResult,
+  repoRoot: string,
+  log: (line: string) => void,
+): Promise<SandboxHandle> {
+  try {
+    return await create();
+  } catch (firstErr) {
+    log(
+      `[worktree-health] first sandbox create failed (${(firstErr as Error).message}); ` +
+        `attempting 'git worktree prune' once, then one retry`,
+    );
+    // The only safe repair: prune dangling registrations. Best-effort — if it
+    // fails (corrupt packed-refs fails prune the same way), we still try the
+    // retry once, then surface a clear error below.
+    try {
+      const pruned = git(repoRoot, "worktree", "prune");
+      if (!pruned.ok) {
+        log(
+          `[worktree-health] 'git worktree prune' failed: ${pruned.stderr || "unknown"}`,
+        );
+      }
+    } catch (pruneErr) {
+      log(
+        `[worktree-health] 'git worktree prune' threw: ${(pruneErr as Error).message}`,
+      );
+    }
+
+    try {
+      return await create();
+    } catch (secondErr) {
+      throw new Error(
+        `sandcastle: corrupt git worktree state the loop can't auto-repair — ` +
+          `run 'git worktree prune' / manual cleanup, then restart: ` +
+          `${(secondErr as Error).message}`,
+      );
+    }
+  }
 }
 
 /**
@@ -2269,6 +2398,107 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     repoRoot: args.repoRoot,
   });
 
+  // One-shot guard for the worktree-health lazy repair (audit issue #1). The
+  // vendored SDK enumerates worktrees inside the FIRST createSandbox; a corrupt
+  // registration makes that throw uncaught. Only the first create needs the
+  // prune-once-and-retry-once repair — once the loop is running the per-branch
+  // pre-clean below keeps each subsequent box clean.
+  let firstSandboxRepairDone = false;
+
+  const log = (line: string): void => {
+    process.stderr.write(`${line}\n`);
+    appendRunLog(`${line}\n`);
+  };
+
+  // Raw, provider-agnostic sandbox create (pre-clean + provider.createSandbox).
+  // The exported `createSandbox` dep routes the FIRST call through the
+  // worktree-health lazy repair, then calls this directly thereafter.
+  const createSandboxRaw = async (
+    spec: CreateSandboxSpec,
+  ): Promise<SandboxHandle> => {
+    // Pre-clean any stale worktree from a prior killed iteration. The
+    // SDK's `cp -R src dest` (`CopyToWorktree.js:29,32`) has no
+    // pre-clean: if `dest` already exists, `cp -R` recurses into it,
+    // building `dest/node_modules/node_modules/...` until disk
+    // exhaustion. Real bug — bit affinity-tracker iteration 1 of the
+    // budgeting branch. The SDK's `WorktreeManager.create()` handles a
+    // missing path correctly via plain `git worktree add`, so this
+    // guard hands it a clean slate. Three-tier fallback covers:
+    //   1. Registered worktree (normal post-killed-iteration state)
+    //      → `git worktree remove --force` clears reg + dir.
+    //   2. Orphan dir git doesn't know about → `rmSync` removes it.
+    //   3. Dangling registration with no dir → `git worktree prune`
+    //      clears the registration so a fresh `add` succeeds.
+    // Note: the mac-host provider runs its own pre-clean inside
+    // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
+    // The outer pre-clean here is redundant on the mac-host path but
+    // idempotent — letting it run keeps the orchestrator-side cleanup
+    // contract identical across providers.
+    const wtPath = path.join(args.repoRoot, worktreePathFor(spec.branch));
+    if (existsSync(wtPath)) {
+      try {
+        execFileSync("git", ["worktree", "remove", "--force", wtPath], {
+          cwd: args.repoRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        rmSync(wtPath, { recursive: true, force: true });
+      }
+    }
+    try {
+      execFileSync("git", ["worktree", "prune"], {
+        cwd: args.repoRoot,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      // Best-effort. If a stale registration survives, the SDK's
+      // collision-reuse path (WorktreeManager.js:~120) will hit it
+      // first via `listWorktrees` and then fail loudly when
+      // `hasUncommittedChanges` runs `git status` inside the now-
+      // missing path. The error surfaces — just not through
+      // `worktree add`.
+    }
+
+    // Work around the SDK bug where createSandbox hardcodes
+    // agentProviderEnv: {}, dropping per-call env injection. We bake the
+    // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
+    // into sandbox.env so it actually reaches the container. Anthropic
+    // models return {} from envForModel (subscription path), so this is
+    // a no-op for the default Anthropic case.
+    const implEnv = envForModel(spec.implementerModel);
+    const sandboxEnv = { ...containerEnv, ...implEnv };
+
+    const handle = await provider.createSandbox({
+      branch: spec.branch,
+      mounts: spec.mounts,
+      sandboxEnv,
+    });
+    return {
+      branch: handle.branch,
+      worktreePath: handle.worktreePath,
+      run: async (opts) => {
+        const r = await withCeiling(
+          `sandbox run "${opts.name}"`,
+          (signal) => handle.run({ ...opts, signal }),
+        );
+        // Forward the SDK's per-iteration session-capture metadata —
+        // both `sessionFilePath` (when capture is wired) and `sessionId`
+        // (always present for Claude agents) so the downstream consumer
+        // can fall back to the conventional path layout. See
+        // resolveSessionFilePath / the seam definition on RunHandle.
+        return {
+          stdout: r.stdout,
+          commits: r.commits,
+          iterations: r.iterations?.map((it) => ({
+            sessionFilePath: it.sessionFilePath,
+            sessionId: it.sessionId,
+          })),
+        };
+      },
+      close: () => handle.close(),
+    };
+  };
+
   return {
     async run(spec) {
       // Top-level runs (planner, merger) don't need `pnpm install` — the
@@ -2282,91 +2512,21 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
-      // Pre-clean any stale worktree from a prior killed iteration. The
-      // SDK's `cp -R src dest` (`CopyToWorktree.js:29,32`) has no
-      // pre-clean: if `dest` already exists, `cp -R` recurses into it,
-      // building `dest/node_modules/node_modules/...` until disk
-      // exhaustion. Real bug — bit affinity-tracker iteration 1 of the
-      // budgeting branch. The SDK's `WorktreeManager.create()` handles a
-      // missing path correctly via plain `git worktree add`, so this
-      // guard hands it a clean slate. Three-tier fallback covers:
-      //   1. Registered worktree (normal post-killed-iteration state)
-      //      → `git worktree remove --force` clears reg + dir.
-      //   2. Orphan dir git doesn't know about → `rmSync` removes it.
-      //   3. Dangling registration with no dir → `git worktree prune`
-      //      clears the registration so a fresh `add` succeeds.
-      // Note: the mac-host provider runs its own pre-clean inside
-      // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
-      // The outer pre-clean here is redundant on the mac-host path but
-      // idempotent — letting it run keeps the orchestrator-side cleanup
-      // contract identical across providers.
-      const wtPath = path.join(
-        args.repoRoot,
-        worktreePathFor(spec.branch),
-      );
-      if (existsSync(wtPath)) {
-        try {
-          execFileSync(
-            "git",
-            ["worktree", "remove", "--force", wtPath],
-            { cwd: args.repoRoot, stdio: ["ignore", "pipe", "pipe"] },
-          );
-        } catch {
-          rmSync(wtPath, { recursive: true, force: true });
-        }
+      // The vendored SDK enumerates worktrees inside createSandbox; a corrupt
+      // registration makes the FIRST create throw uncaught and kills the loop.
+      // Route the first create through the non-destructive lazy repair (prune
+      // once, retry once, else a clear actionable error). Subsequent creates go
+      // straight through — the per-branch pre-clean keeps them clean.
+      if (!firstSandboxRepairDone) {
+        firstSandboxRepairDone = true;
+        return await createSandboxWithWorktreeRepair(
+          () => createSandboxRaw(spec),
+          runGit,
+          args.repoRoot,
+          log,
+        );
       }
-      try {
-        execFileSync("git", ["worktree", "prune"], {
-          cwd: args.repoRoot,
-          stdio: ["ignore", "pipe", "ignore"],
-        });
-      } catch {
-        // Best-effort. If a stale registration survives, the SDK's
-        // collision-reuse path (WorktreeManager.js:~120) will hit it
-        // first via `listWorktrees` and then fail loudly when
-        // `hasUncommittedChanges` runs `git status` inside the now-
-        // missing path. The error surfaces — just not through
-        // `worktree add`.
-      }
-
-      // Work around the SDK bug where createSandbox hardcodes
-      // agentProviderEnv: {}, dropping per-call env injection. We bake the
-      // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
-      // into sandbox.env so it actually reaches the container. Anthropic
-      // models return {} from envForModel (subscription path), so this is
-      // a no-op for the default Anthropic case.
-      const implEnv = envForModel(spec.implementerModel);
-      const sandboxEnv = { ...containerEnv, ...implEnv };
-
-      const handle = await provider.createSandbox({
-        branch: spec.branch,
-        mounts: spec.mounts,
-        sandboxEnv,
-      });
-      return {
-        branch: handle.branch,
-        worktreePath: handle.worktreePath,
-        run: async (opts) => {
-          const r = await withCeiling(
-            `sandbox run "${opts.name}"`,
-            (signal) => handle.run({ ...opts, signal }),
-          );
-          // Forward the SDK's per-iteration session-capture metadata —
-          // both `sessionFilePath` (when capture is wired) and `sessionId`
-          // (always present for Claude agents) so the downstream consumer
-          // can fall back to the conventional path layout. See
-          // resolveSessionFilePath / the seam definition on RunHandle.
-          return {
-            stdout: r.stdout,
-            commits: r.commits,
-            iterations: r.iterations?.map((it) => ({
-              sessionFilePath: it.sessionFilePath,
-              sessionId: it.sessionId,
-            })),
-          };
-        },
-        close: () => handle.close(),
-      };
+      return await createSandboxRaw(spec);
     },
     async claim(n) {
       if (args.dryRun) return dryLog("claim", n);
@@ -2445,10 +2605,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         return "";
       }
     },
-    log(line) {
-      process.stderr.write(`${line}\n`);
-      appendRunLog(`${line}\n`);
-    },
+    log,
     logError(line) {
       process.stderr.write(`ERROR: ${line}\n`);
       appendRunLog(`ERROR: ${line}\n`);
@@ -5662,6 +5819,14 @@ if (isMain()) {
     }
 
     const deps = buildDefaultDeps(args);
+
+    // Defensive worktree-health pass (audit issue #1). A single corrupt git
+    // worktree (e.g. a `00000000` dir) makes the vendored SDK's
+    // `WorktreeManager.create -> listWorktrees` throw with no catch, killing
+    // the whole loop on the FIRST createSandbox. We can't patch the SDK, so
+    // prune the bad entry here — before staging + the first sandbox. This is
+    // best-effort and NEVER throws.
+    pruneCorruptWorktrees(args.repoRoot, deps.log);
 
     // Set up the dedicated staging worktree before runMain so the merger
     // phase always has a valid cwd that ISN'T the launch worktree. This is
