@@ -19,10 +19,20 @@ combined state still passes tests.
 For each branch in the list above, in order:
 
 1. Run `git merge <branch> --no-edit`.
-2. If there are merge conflicts, resolve them intelligently by reading both
-   sides of each conflict marker and choosing the correct resolution.
-   Don't blindly take "ours" or "theirs" — understand what each side
-   intended.
+2. If there are merge conflicts, resolve them with discipline — don't blindly
+   take "ours" or "theirs", and never `git merge --abort`:
+   a. **Understand each side's intent first.** For each conflicting hunk,
+      find the primary source of both changes — read the commit messages on
+      the incoming branch (`git log <branch>`) and the issue/PR it closes
+      (see ISSUES above) — so you know *why* each side was written, not just
+      what it says.
+   b. **Preserve both intents where possible.** Where the two changes are
+      compatible, keep both. Where they genuinely conflict, pick the side
+      matching this iteration's goal and note the trade-off in the commit
+      body. Do NOT invent new behaviour to bridge them.
+   c. **Guard test files especially.** A "kept both" or "took theirs"
+      resolution that silently drops an assertion is a real bug — verify no
+      test coverage was lost before staging the file.
 <!-- variant:test-runner-merge -->
 3. After resolving conflicts (or if there were none), run
    `npm run typecheck` and `npm run test` (or the project's equivalents,
