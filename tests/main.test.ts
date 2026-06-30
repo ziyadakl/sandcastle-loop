@@ -60,6 +60,7 @@ import {
   REGISTER_CONTEXT7_MCP_COMMAND,
   STAGE_CODEX_AGENTS_MD_COMMAND,
   __resetTransientStateForTests,
+  __setStagingWorktreePathForTests,
   type Deps,
   type SandcastleArgs,
   type SandboxRunSpec,
@@ -2529,6 +2530,126 @@ function parseWithRealDotenv(
       .parsed ?? {};
   return expanded;
 }
+
+// Audit issue #4: a failed FINAL fast-forward promotion leaves merged +
+// post-merge-certified work stranded on `integration-candidate`, yet the run
+// historically still exited `done` / code 0 — a silent lie about success.
+// After the fix the run must finish `unhealthy` and exit non-zero so both the
+// operator's shell AND the viewer see the failure.
+describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)", () => {
+  function initStagingRepo(): {
+    repoRoot: string;
+    stagingPath: string;
+    gitEnv: NodeJS.ProcessEnv;
+    cleanup: () => void;
+  } {
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-"));
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+
+    git(repoRoot, "init", "-q", "-b", "main");
+    git(repoRoot, "config", "user.email", "test@example.com");
+    git(repoRoot, "config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    git(repoRoot, "add", "README.md");
+    git(repoRoot, "commit", "-q", "-m", "init");
+    // The integration branch the loop promotes onto, and the staging branch it
+    // certifies on. `feature/work` matches baseArgs().branch.
+    git(repoRoot, "branch", "feature/work");
+    git(repoRoot, "branch", "integration-candidate");
+    // Dedicated staging worktree on integration-candidate (what boot would set
+    // up). Place it OUTSIDE repoRoot so the loop's own .sandcastle path is clean.
+    const stagingPath = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-staging-"));
+    rmSync(stagingPath, { recursive: true, force: true });
+    git(repoRoot, "worktree", "add", "-q", stagingPath, "integration-candidate");
+    return {
+      repoRoot,
+      stagingPath,
+      gitEnv,
+      cleanup: () => {
+        rmSync(repoRoot, { recursive: true, force: true });
+        rmSync(stagingPath, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("finishes `unhealthy` and exits non-zero when the final FF refuses", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // The merger runs AFTER `resetStagingToIntegrationTip` (which makes
+      // staging == integration) and BEFORE the final fast-forward. Have the
+      // merger side-effect advance `feature/work` (the integration branch) with
+      // a brand-new commit via a throwaway worktree. Staging is then NO LONGER
+      // an ancestor of integration → divergence; with no live worktree on
+      // `feature/work`, the final fast-forward REFUSES → promotionFailed.
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        const handle = await realRun(spec);
+        if (spec.name === "merger") {
+          const wt = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-divert-"));
+          rmSync(wt, { recursive: true, force: true });
+          const git = (cwd: string, ...args: string[]): string =>
+            execFileSync("git", args, {
+              cwd,
+              env: gitEnv,
+              encoding: "utf8",
+            }).trim();
+          git(repoRoot, "worktree", "add", "-q", wt, "feature/work");
+          writeFileSync(path.join(wt, "operator.ts"), "export const OP = 1;\n");
+          git(wt, "add", "operator.ts");
+          git(wt, "commit", "-q", "-m", "operator hotfix — diverges integration");
+          git(repoRoot, "worktree", "remove", "--force", wt);
+        }
+        return handle;
+      };
+
+      const result = await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      // The run must NOT report success.
+      expect(result.exitCode).not.toBe(0);
+      // The status feed's terminal state must be `unhealthy`, not `done`.
+      const statusRaw = readFileSync(
+        path.join(repoRoot, ".sandcastle", "status.json"),
+        "utf8",
+      );
+      const status = JSON.parse(statusRaw) as SandcastleStatus;
+      expect(status.state).toBe("unhealthy");
+      // And the failure must be logged loudly.
+      expect(
+        b.state.errors.some((l) => l.includes("final promotion")),
+      ).toBe(true);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      cleanup();
+    }
+  });
+});
 
 describe("serializeDotenv", () => {
   it("empty record → empty string", () => {

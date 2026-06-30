@@ -89,7 +89,7 @@ export interface StatusStore {
    * stops it. Call once after construction (production only).
    */
   startHeartbeat(): void;
-  finish(reason: "done" | "stopped" | "restarting"): void;
+  finish(reason: "done" | "stopped" | "restarting" | "unhealthy"): void;
   /** Defensive copy of the current snapshot (tests / inspection). */
   snapshot(): SandcastleStatus;
 }
@@ -267,7 +267,7 @@ export function createStatusStore(
       commit();
     },
 
-    finish(reason: "done" | "stopped" | "restarting"): void {
+    finish(reason: "done" | "stopped" | "restarting" | "unhealthy"): void {
       status.state = reason;
       status.activity = undefined; // run over — no stale activity on the feed
       stopHeartbeat(); // the run is over — stop the keep-alive

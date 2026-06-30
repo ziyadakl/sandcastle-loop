@@ -4353,6 +4353,13 @@ export async function runMain(
   // in a known-bad state, or null if last iteration finished clean. Used to
   // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
   let lastFailedStagingIteration: number | null = null;
+  // Run-level health flag (audit issue #4). Set true when a final fast-forward
+  // promotion REFUSES — merged+reviewed work is then stranded on
+  // `integration-candidate` and the integration branch was NOT advanced.
+  // A run that ends with this flag set must NOT report `done`/exit 0: it exits
+  // non-zero and finishes the status feed as `unhealthy` so the failure is
+  // visible to both the operator's shell and the viewer.
+  let promotionFailed = false;
   // Sandbox-health detector: count consecutive iterations where EVERY
   // outcome was a stall (hard-ceiling fire / SDK idle timeout). When the
   // sandbox itself is degraded (orbstack memory pressure, docker hung,
@@ -4761,7 +4768,19 @@ export async function runMain(
         }
         deps.log(`no claimable issues — exiting cleanly${note}`);
         // Clean terminal exit (queue drained) — the common overnight-completion
-        // path. Mark the feed done, same as out-of-iterations below.
+        // path. Mark the feed done, same as out-of-iterations below. EXCEPT
+        // when an earlier iteration's final promotion refused: that left
+        // certified work stranded on `integration-candidate`, so this run is
+        // NOT a clean success — finish `unhealthy` and exit non-zero (audit #4).
+        if (promotionFailed) {
+          statusStore.finish("unhealthy");
+          return {
+            exitCode: 1,
+            iterationsRun,
+            shippedIssues,
+            quarantinedIssues,
+          };
+        }
         statusStore.finish("done");
         return {
           exitCode: 0,
@@ -5312,8 +5331,18 @@ export async function runMain(
             }
             lastFailedStagingIteration = null;
           } else {
-            // Fast-forward refused — treat as a staging failure.
+            // Fast-forward refused — treat as a staging failure. The merged +
+            // post-merge-reviewer-certified work is now stranded on
+            // `integration-candidate` and the integration branch was NOT
+            // advanced. Flag the whole run unhealthy so it can't exit
+            // `done`/0 and silently lie that the work shipped (audit #4).
             lastFailedStagingIteration = it;
+            promotionFailed = true;
+            deps.logError(
+              `[sandcastle it=${it}] final promotion to ${args.branch} FAILED — ` +
+                `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
+                `unhealthy (non-zero). Human triage required.`,
+            );
           }
         } else {
           // Staging failed certification (post-fixer too) OR merger failed
@@ -5403,6 +5432,25 @@ export async function runMain(
     }
 
     // Out of iterations.
+    // A failed final promotion (audit #4) overrides the clean out-of-cycles
+    // outcome — but NOT an explicit operator interrupt (SIGINT/SIGTERM), which
+    // is its own deliberate `stopped`. When promotion failed and we weren't
+    // interrupted, finish `unhealthy` and exit non-zero so the stranded work
+    // can't masquerade as a clean "out of cycles" success.
+    if (promotionFailed && !shuttingDown) {
+      deps.logError(
+        `out of iterations (${args.iterations}) — but a final promotion FAILED ` +
+          `earlier; exiting unhealthy (code 1). Certified work is stranded on ` +
+          `${STAGING_BRANCH}.`,
+      );
+      statusStore.finish("unhealthy");
+      return {
+        exitCode: 1,
+        iterationsRun,
+        shippedIssues,
+        quarantinedIssues,
+      };
+    }
     deps.log(
       `out of iterations (${args.iterations}) — exiting with code 2 (clean — just out of cycles)`,
     );

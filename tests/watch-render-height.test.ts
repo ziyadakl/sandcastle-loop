@@ -9,7 +9,10 @@ import { describe, it, expect } from "vitest";
 import React from "react";
 import { render } from "ink";
 import { Dashboard } from "../.sandcastle/watch/sandcastle-watch.js";
-import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
+import {
+  STATUS_SCHEMA_VERSION,
+  type SandcastleStatus,
+} from "../.sandcastle/lib/status/schema.js";
 
 const issues = Array.from({ length: 8 }, (_, i) => ({
   number: 100 + i,
@@ -18,7 +21,7 @@ const issues = Array.from({ length: 8 }, (_, i) => ({
   phase: "merged" as const,
 }));
 const status: SandcastleStatus = {
-  schemaVersion: 1,
+  schemaVersion: STATUS_SCHEMA_VERSION,
   state: "running",
   run: { branch: "docs/x", repo: "affinity-tracker", startedAt: "2026-06-06T00:00:00.000Z", iterations: { current: 1, total: 50 }, maxConcurrent: 2 },
   totals: { merged: 8, needsHuman: 0, requeued: 0, running: 0 },
