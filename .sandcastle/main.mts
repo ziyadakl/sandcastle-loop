@@ -1924,6 +1924,19 @@ export async function createSandboxWithWorktreeRepair(
   try {
     return await create();
   } catch (firstErr) {
+    // Does the original failure actually look like the worktree-enumeration
+    // corruption this repair targets (the SDK's `git worktree list` /
+    // packed-refs throw)? If not — a transient provider error, disk-full,
+    // EACCES from the pre-clean, etc. — the prune+retry is incidental and we
+    // must NOT relabel the failure as worktree corruption (it would send the
+    // operator chasing a git problem that isn't there). We still prune+retry
+    // once (cheap, harmless, and a transient error may clear), but on a second
+    // failure we surface the REAL error untouched unless it's worktree-shaped.
+    const looksLikeWorktreeCorruption = (msg: string): boolean =>
+      /worktree|packed-refs|\.git\b/i.test(msg);
+    const firstWasWorktree = looksLikeWorktreeCorruption(
+      (firstErr as Error).message,
+    );
     log(
       `[worktree-health] first sandbox create failed (${(firstErr as Error).message}); ` +
         `attempting 'git worktree prune' once, then one retry`,
@@ -1947,11 +1960,21 @@ export async function createSandboxWithWorktreeRepair(
     try {
       return await create();
     } catch (secondErr) {
-      throw new Error(
-        `sandcastle: corrupt git worktree state the loop can't auto-repair — ` +
-          `run 'git worktree prune' / manual cleanup, then restart: ` +
-          `${(secondErr as Error).message}`,
-      );
+      // Only claim worktree corruption when the failure is actually
+      // worktree-shaped (either the original or the post-prune failure). For an
+      // unrelated cause, rethrow the real error unchanged so its message, type,
+      // and stack survive — no misleading "run git worktree prune" advice.
+      if (
+        firstWasWorktree ||
+        looksLikeWorktreeCorruption((secondErr as Error).message)
+      ) {
+        throw new Error(
+          `sandcastle: corrupt git worktree state the loop can't auto-repair — ` +
+            `run 'git worktree prune' / manual cleanup, then restart: ` +
+            `${(secondErr as Error).message}`,
+        );
+      }
+      throw secondErr;
     }
   }
 }

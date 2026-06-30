@@ -189,4 +189,28 @@ describe("createSandboxWithWorktreeRepair (lazy retry-once on enumeration failur
     expect(calls.some((c) => c[1] === "remove")).toBe(false);
     expect(calls.some((c) => c.includes("--force"))).toBe(false);
   });
+
+  it("when the failure is NOT worktree-related, surfaces the REAL error unchanged (no misleading 'corrupt git worktree state' relabel)", async () => {
+    const { fakeGit } = makeFakeGit();
+    let createCount = 0;
+    const realErr = new Error("Provider request timed out after 30000ms");
+
+    // A transient/provider error (nothing to do with git worktrees). The
+    // wrapper still prunes + retries once (cheap, harmless), but on a second
+    // failure it must NOT relabel this as worktree corruption — it must rethrow
+    // the ORIGINAL error so the operator sees the true cause.
+    const promise = createSandboxWithWorktreeRepair(
+      async () => {
+        createCount += 1;
+        throw realErr;
+      },
+      fakeGit,
+      "/repo",
+      () => {},
+    );
+
+    await expect(promise).rejects.toBe(realErr); // same error object, unchanged
+    await expect(promise).rejects.not.toThrow(/corrupt git worktree state/i);
+    expect(createCount).toBe(2); // still tried once + retried once
+  });
 });
