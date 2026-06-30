@@ -3520,6 +3520,31 @@ describe("parseBlockedBy", () => {
     expect(parseBlockedBy("See #5 for context.")).toEqual([]);
     expect(parseBlockedBy("")).toEqual([]);
   });
+
+  it("extracts `#N` refs under a `## Blocked by` markdown header (list + bare)", () => {
+    expect(
+      parseBlockedBy("Do the thing.\n\n## Blocked by\n- #42\n#43\n"),
+    ).toEqual([42, 43]);
+  });
+
+  it("accepts `### Blocked by` header at any heading level, case-insensitively", () => {
+    expect(parseBlockedBy("### blocked by\n* #7\n")).toEqual([7]);
+  });
+
+  it("stops collecting header refs at a blank line or the next heading", () => {
+    expect(
+      parseBlockedBy("## Blocked by\n- #1\n- #2\n\n#999 unrelated\n"),
+    ).toEqual([1, 2]);
+    expect(
+      parseBlockedBy("## Blocked by\n- #1\n## Notes\n#999 unrelated\n"),
+    ).toEqual([1]);
+  });
+
+  it("merges header-form and inline-form blockers, deduped + sorted", () => {
+    expect(
+      parseBlockedBy("Blocked by: #5\n\n## Blocked by\n- #3\n- #5\n"),
+    ).toEqual([3, 5]);
+  });
 });
 
 describe("buildBlockedByNote", () => {

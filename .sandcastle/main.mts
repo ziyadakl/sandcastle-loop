@@ -2471,11 +2471,16 @@ export function parsePlan(stdout: string): PlanIssue[] {
 }
 
 /**
- * Extract the issue numbers a body declares it is blocked by. Recognises the
- * directive `Blocked by: #N` and the hyphenated `Blocked-by: #N`, both
- * case-insensitively, with flexible whitespace. A single line may name several
- * blockers (`Blocked by: #313, #314`); each `#N` after the directive (up to
- * the end of that line) is captured. Returns a de-duplicated, ascending list.
+ * Extract the issue numbers a body declares it is blocked by. Recognises TWO
+ * forms (matching planner HARD RULE 2 in `.sandcastle/plan-prompt.md`):
+ *   1. Inline directive `Blocked by: #N` / hyphenated `Blocked-by: #N`, both
+ *      case-insensitively with flexible whitespace. A single line may name
+ *      several blockers (`Blocked by: #313, #314`); each `#N` after the
+ *      directive (up to the end of that line) is captured.
+ *   2. Markdown header `## Blocked by` (any heading level, no colon) followed
+ *      by `#N` refs on the lines below — collected until the next blank line
+ *      or the next heading.
+ * Returns a de-duplicated, ascending list merged across both forms.
  *
  * ⚠️ NOT THE BLOCKER GATE. This parser only feeds `buildBlockedByNote` (the
  * advisory "nothing claimable" exit message). It does NOT decide what gets
@@ -2489,15 +2494,31 @@ export function parsePlan(stdout: string): PlanIssue[] {
 export function parseBlockedBy(body: string): number[] {
   if (typeof body !== "string" || body.length === 0) return [];
   const found = new Set<number>();
+  const addRefs = (text: string): void => {
+    for (const ref of text.matchAll(/#(\d+)/g)) {
+      const n = Number(ref[1]);
+      if (Number.isInteger(n) && n > 0) found.add(n);
+    }
+  };
+  // Form 1 — inline directive: `Blocked by: #N` (case-insensitive, hyphen ok).
   // Match the directive, then sweep the rest of that line for `#N` tokens.
   const directive = /blocked[\s-]*by\s*:\s*([^\n\r]*)/gi;
   let m: RegExpExecArray | null;
   while ((m = directive.exec(body)) !== null) {
-    const rest = m[1] ?? "";
-    const refs = rest.matchAll(/#(\d+)/g);
-    for (const ref of refs) {
-      const n = Number(ref[1]);
-      if (Number.isInteger(n) && n > 0) found.add(n);
+    addRefs(m[1] ?? "");
+  }
+  // Form 2 — markdown header: a `## Blocked by` / `### Blocked by` heading (no
+  // colon) followed by `#N` refs on the lines below it. Collect refs until the
+  // next blank line or the next heading, matching the planner's HARD RULE 2.
+  const lines = body.split(/\r?\n/);
+  const header = /^\s*#{1,6}\s*blocked[\s-]*by\s*$/i;
+  for (let i = 0; i < lines.length; i++) {
+    if (!header.test(lines[i]!)) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j]!;
+      if (line.trim() === "") break; // blank line ends the block
+      if (/^\s*#{1,6}\s/.test(line)) break; // next markdown heading ends it
+      addRefs(line);
     }
   }
   return [...found].sort((a, b) => a - b);
