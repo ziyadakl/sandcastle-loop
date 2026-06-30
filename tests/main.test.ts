@@ -41,6 +41,8 @@ import {
   preflight,
   loadDotenv,
   isTransientServerError,
+  isOutputCapError,
+  maxOutputTokensEnv,
   ensureStagingWorktree,
   fastForwardIntegration,
   detectChangedLockfiles,
@@ -1454,6 +1456,50 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     for (const msg of negative) {
       expect(isTransientServerError(msg)).toBe(false);
     }
+  });
+
+  it("isOutputCapError matches output-token-cap shapes case-insensitively", () => {
+    const positive = [
+      "max_tokens reached",
+      "Requested 50000 tokens exceeds the maximum output tokens of 32000",
+      "the response exceeds the maximum output tokens",
+      "output too long",
+      "OUTPUT TOO LONG to render",
+      "Claude's response exceeded the maximum output token limit",
+      "claudes response exceeded the limit", // apostrophe-less variant
+      '{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 4096 > 8192, the maximum"}}',
+    ];
+    for (const msg of positive) {
+      expect(isOutputCapError(msg)).toBe(true);
+    }
+    const negative = [
+      "agent crashed",
+      "implementer made no commits",
+      "rate_limit_error",
+      "The server had an error while processing your request",
+      "reviewer marked HAS_BLOCKERS",
+      "a token was found in the config", // "token" alone must not match
+      "the output of the test was wrong", // "output" alone must not match
+      "this exceeds the budget", // "exceeds" alone must not match
+    ];
+    for (const msg of negative) {
+      expect(isOutputCapError(msg)).toBe(false);
+    }
+  });
+
+  it("maxOutputTokensEnv sets a default only when unset/blank", () => {
+    // Unset → default applied.
+    expect(maxOutputTokensEnv({})).toEqual({
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000",
+    });
+    // Blank → treated as unset, default applied.
+    expect(maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "   " })).toEqual(
+      { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000" },
+    );
+    // Explicit user value → never clobbered.
+    expect(
+      maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
+    ).toEqual({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" });
   });
 
   it("recovery throws transient 5xx → defers (release, no quarantine)", async () => {
