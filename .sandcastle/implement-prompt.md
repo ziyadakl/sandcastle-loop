@@ -757,6 +757,19 @@ End your run with one of:
 Once complete, output `<promise>COMPLETE</promise>` after the
 `STORY_COMPLETE` marker so Sandcastle's run loop terminates cleanly.
 
+# ENVELOPE RE-ASK — only when the block below is non-empty
+
+{{ENVELOPE_REASK}}
+
+If the line above is non-empty, the host has detected that your previous
+final message ended with `STORY_COMPLETE` but WITHOUT the required fenced
+`json` certification envelope. This is your one and only re-ask. Do NOT
+redo, re-run, or re-commit any work — your commits are already on the
+branch. Simply re-emit your final message: the certification envelope (the
+LAST fenced `json` block, per the OUTPUT section above) followed by
+`STORY_COMPLETE` and then `<promise>COMPLETE</promise>`. If the line above
+is empty, ignore this section entirely.
+
 # FINAL RULE
 
 ONLY WORK ON ISSUE #{{ISSUE_NUMBER}}. Do not branch off into adjacent

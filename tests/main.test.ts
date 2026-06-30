@@ -79,6 +79,7 @@ import {
   critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
+import { VerdictParseError } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
@@ -4230,6 +4231,257 @@ describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", ()
       string
     >;
     expect(promptArgs.REQUIRED_SKILLS).toBe("");
+  });
+});
+
+describe("runImplementer missing-envelope one-shot re-ask (audit #22)", () => {
+  // When the implementer emits a real STORY_COMPLETE but DROPS the required
+  // fenced ```json``` certification envelope, parseVerdict throws
+  // VerdictParseError — a class neither isTransientError nor STALL_RE covers,
+  // so the whole pass would be wasted (recovery burn → quarantine, or
+  // immediate quarantine under --recovery off). The fix re-runs the
+  // implementer ONCE for just the envelope, guarded so it can never recurse
+  // more than once.
+
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-envelope-reask-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** A real STORY_COMPLETE assistant message WITH the fenced json envelope. */
+  function validEnvelopeStdout(ghIssue: number): string {
+    const envelope = {
+      storyId: `gh-${ghIssue}`,
+      ghIssue,
+      e2eVerdict: "passed",
+      uiTouched: false,
+      certificationPresent: true,
+      marker: "STORY_COMPLETE",
+      storyType: "backend-only",
+      e2eRequired: false,
+      e2eActuallyRan: true,
+      testCommandUsed: "npm test",
+      e2eAssertionLine: "✓ does the thing",
+      outputNotFiltered: true,
+      testReachedFeature: true,
+    };
+    return (
+      "All done.\n\n```json\n" +
+      JSON.stringify(envelope, null, 2) +
+      "\n```\n\nSTORY_COMPLETE\n\n<promise>COMPLETE</promise>"
+    );
+  }
+
+  /** A STORY_COMPLETE message that DROPS the json envelope (the #22 bug). */
+  function noEnvelopeStdout(): string {
+    return (
+      "All done — everything works.\n\nSTORY_COMPLETE\n\n" +
+      "<promise>COMPLETE</promise>"
+    );
+  }
+
+  /** Sandbox whose run() returns a sequence of stdouts (one per call),
+   *  records every opts it was invoked with, and points each iteration at a
+   *  fully-invoked-skills session JSONL so the skill-discipline gate is inert.
+   *  Each call has one commit so attempt-1 requireCommits passes. */
+  function makeSequencingSandbox(
+    stdouts: readonly string[],
+    sessionFilePath: string,
+  ): SandboxHandle & { captured: Record<string, unknown>[] } {
+    const captured: Record<string, unknown>[] = [];
+    let call = 0;
+    const sb: SandboxHandle = {
+      branch: "agent/issue-1",
+      run: async (opts) => {
+        captured.push(opts as unknown as Record<string, unknown>);
+        const stdout = stdouts[Math.min(call, stdouts.length - 1)] ?? "";
+        call += 1;
+        return {
+          stdout,
+          commits: [{ sha: `sha-${call}` }],
+          iterations: [{ sessionFilePath }],
+        } satisfies RunHandle;
+      },
+      close: async () => undefined,
+    };
+    return Object.assign(sb, { captured });
+  }
+
+  function baseCtx() {
+    return {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 22,
+      issue: { id: "22", title: "drops envelope", branch: "agent/issue-1" },
+      status: testStatusStore,
+    };
+  }
+
+  it("re-asks exactly ONCE and succeeds when the re-ask returns a valid envelope", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeSequencingSandbox(
+      [noEnvelopeStdout(), validEnvelopeStdout(22)],
+      jsonl,
+    );
+    const ctx = baseCtx();
+
+    // Must NOT throw — the re-ask returns a valid envelope.
+    const r = await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+    expect(r.stdout).toMatch(/STORY_COMPLETE/);
+
+    // Exactly two runs: the original + ONE re-ask.
+    expect(sandbox.captured).toHaveLength(2);
+
+    // First call: ENVELOPE_REASK is empty (normal pass).
+    const firstArgs = sandbox.captured[0]?.promptArgs as Record<string, string>;
+    expect(firstArgs.ENVELOPE_REASK).toBe("");
+
+    // Second call: ENVELOPE_REASK is the populated re-ask instruction.
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/STORY_COMPLETE/);
+  });
+
+  it("one-shot guard caps the re-ask at one — a second missing envelope propagates VerdictParseError", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    // Both the original AND the re-ask drop the envelope.
+    const sandbox = makeSequencingSandbox(
+      [noEnvelopeStdout(), noEnvelopeStdout()],
+      jsonl,
+    );
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, { attemptNumber: 1 }),
+    ).rejects.toThrowError(VerdictParseError);
+
+    // Exactly two runs total — the guard prevented a third (second re-ask).
+    expect(sandbox.captured).toHaveLength(2);
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+  });
+
+  it("does NOT re-ask when the first pass already carries a valid envelope", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeSequencingSandbox([validEnvelopeStdout(22)], jsonl);
+    const ctx = baseCtx();
+
+    await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+
+    // Only ONE run — no re-ask fired.
+    expect(sandbox.captured).toHaveLength(1);
+    const firstArgs = sandbox.captured[0]?.promptArgs as Record<string, string>;
+    expect(firstArgs.ENVELOPE_REASK).toBe("");
+  });
+
+  // ── self-defeat regression (the DEFECT this rework fixes) ──────────────
+  //
+  // The original #22 fix recurses via `return runImplementer(sb, ctx, {
+  // ...opts, envelopeReask: true })`. attemptNumber is NOT threaded, so it
+  // re-defaults to 1 and requireCommits recomputes to true. A COMPLIANT
+  // re-ask only RE-EMITS the envelope: it writes NO new commits and invokes
+  // NO skills (the work was already done + certified on the first turn).
+  // Pre-fix, that re-ask turn hits the skill-discipline gate (throws
+  // MissingRequiredSkillsError) or the no-commits throw ("implementer made
+  // no commits") and the issue is wrongly quarantined — the feature
+  // self-defeats. Both gates must be skipped on an envelope re-ask.
+  //
+  // This sandbox controls commits AND the session JSONL PER CALL so the
+  // re-ask turn is a genuine compliant re-ask: zero commits, zero skills.
+  function makePerCallSandbox(
+    turns: readonly { stdout: string; commits: readonly { sha: string }[]; sessionFilePath: string }[],
+  ): SandboxHandle & { captured: Record<string, unknown>[] } {
+    const captured: Record<string, unknown>[] = [];
+    let call = 0;
+    const sb: SandboxHandle = {
+      branch: "agent/issue-1",
+      run: async (opts) => {
+        captured.push(opts as unknown as Record<string, unknown>);
+        const turn = turns[Math.min(call, turns.length - 1)]!;
+        call += 1;
+        return {
+          stdout: turn.stdout,
+          commits: turn.commits,
+          iterations: [{ sessionFilePath: turn.sessionFilePath }],
+        } satisfies RunHandle;
+      },
+      close: async () => undefined,
+    };
+    return Object.assign(sb, { captured });
+  }
+
+  it("re-ask with required skills succeeds even though the re-ask makes no commits and invokes no skills (self-defeat regression)", async () => {
+    // Turn 1: STORY_COMPLETE without the envelope, BUT the work is done —
+    // it committed and it invoked the one required skill ("critique").
+    const turn1Jsonl = writeSessionJsonl(tmp, "turn1.jsonl", ["critique"]);
+    // Turn 2 (the re-ask): a valid envelope but ZERO commits and ZERO skills
+    // invoked — exactly what a compliant "just re-emit the envelope" turn
+    // looks like.
+    const turn2Jsonl = writeSessionJsonl(tmp, "turn2.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: noEnvelopeStdout(), commits: [{ sha: "sha-1" }], sessionFilePath: turn1Jsonl },
+      { stdout: validEnvelopeStdout(22), commits: [], sessionFilePath: turn2Jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    // Pre-fix this REJECTS (MissingRequiredSkillsError or "implementer made
+    // no commits") on the re-ask turn. Post-fix it RESOLVES.
+    const r = await runImplementer(sandbox, ctx, {
+      attemptNumber: 1,
+      requiredSkills: ["critique"],
+    });
+    expect(r.stdout).toMatch(/STORY_COMPLETE/);
+
+    // Exactly two runs: original + ONE re-ask.
+    expect(sandbox.captured).toHaveLength(2);
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+  });
+
+  it("FIRST attempt (not a re-ask) STILL enforces the skill-discipline gate", async () => {
+    // A first attempt that commits but does NOT invoke the required skill
+    // must still throw — the re-ask carve-out must not weaken the first pass.
+    const jsonl = writeSessionJsonl(tmp, "nogate.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: validEnvelopeStdout(22), commits: [{ sha: "sha-1" }], sessionFilePath: jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, {
+        attemptNumber: 1,
+        requiredSkills: ["critique"],
+      }),
+    ).rejects.toThrowError(MissingRequiredSkillsError);
+  });
+
+  it("FIRST attempt (not a re-ask) STILL enforces the no-commits throw", async () => {
+    // A first attempt with a valid envelope but ZERO commits and no required
+    // skills must still throw "implementer made no commits".
+    const jsonl = writeSessionJsonl(tmp, "nocommits.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: validEnvelopeStdout(22), commits: [], sessionFilePath: jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, { attemptNumber: 1 }),
+    ).rejects.toThrowError(/implementer made no commits/);
   });
 });
 
