@@ -50,12 +50,18 @@ export const IssuePhaseSchema = z.enum([
 ]);
 export type IssuePhase = z.infer<typeof IssuePhaseSchema>;
 
-/** Run lifecycle. `restarting` is the exit-75 hot-reload window. */
+/**
+ * Run lifecycle. `restarting` is the exit-75 hot-reload window. `unhealthy` is
+ * a terminal FAILURE state: the run finished but left merged+reviewed work
+ * stranded on `integration-candidate` because the final fast-forward promotion
+ * refused — the loop must NOT report this as `done`/success (audit issue #4).
+ */
 export const RunStateSchema = z.enum([
   "running",
   "done",
   "stopped",
   "restarting",
+  "unhealthy",
 ]);
 export type RunState = z.infer<typeof RunStateSchema>;
 

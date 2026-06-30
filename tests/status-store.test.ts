@@ -172,6 +172,16 @@ describe("StatusStore", () => {
     expect(b.store.snapshot().state).toBe("restarting");
   });
 
+  it("finish('unhealthy') records the unhealthy terminal state and stays schema-valid", () => {
+    const { store } = makeStore();
+    store.finish("unhealthy");
+    const snap = store.snapshot();
+    expect(snap.state).toBe("unhealthy");
+    // The new terminal state must round-trip through the schema, otherwise the
+    // loop's own write of status.json would be rejected by viewers re-parsing it.
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
   it("setActivity writes the run-level activity into the serialized snapshot", () => {
     const { store, writes } = makeStore();
     store.setActivity("merging");
