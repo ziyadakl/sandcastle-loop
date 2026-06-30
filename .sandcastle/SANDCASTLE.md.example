@@ -17,6 +17,16 @@ diff must pass the critique sub-agent graded against `<name>`'s rubric
 quarantined rather than silently shipped (ADR 0006 v3 fail-loud preflight).
 Delete this `# SANDCASTLE.md (EXAMPLE…)` title line after copying.
 
+**`Required:` bullets under a `type:X` section MUST be headless-runnable
+skills.** A tool that needs a live running app or external credentials (e.g.
+`verify`) must be attached via a `tool:` label / `Opt in via tool:` block
+below, never as a `type:`-section `Required:` bullet — the parser that builds
+the host skill-discipline gate's required-skill list deliberately skips
+`tool:` bullets, so a tool listed correctly under `Opt in via tool:` never
+reaches that gate at all. List it under `Required:` instead and the host gate
+will quarantine the issue before the reviewer's unrunnable-tool carve-out
+(review-prompt.md) ever gets a chance to apply.
+
 **Install a rubric for every principle you list**, or that type's issues will be
 quarantined. The `type:new-component` example below lists `impeccable` and
 `layout`, so a verbatim copy quarantines your first `type:new-component` issue

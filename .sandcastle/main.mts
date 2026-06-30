@@ -3225,6 +3225,26 @@ export async function runImplementer(
   // diff. Two-gate is more robust than either alone: implementer must
   // invoke Skill() AND the diff must pass critique AND the rubric must
   // be loadable.
+  //
+  // Sibling-gate note (#3, "demote sibling gates together" rationale): the
+  // reviewer prompt (review-prompt.md) has an ENVIRONMENT-AWARENESS CARVE-OUT
+  // that lets a Required tool which physically can't run in the
+  // credential-less sandbox (e.g. `verify`, which needs a live running app)
+  // be recorded as `n/a (tool unrunnable in sandbox: <reason>)` instead of a
+  // HARD finding. This host gate deliberately got NO matching carve-out, and
+  // that's by design, not omission: `opts.requiredSkills` is sourced from
+  // parseRequiredSkillsByType (skill-discipline.ts), whose parser
+  // structurally SKIPS `tool:` bullets when collecting a `type:` section's
+  // `Required:` list (see the `token.startsWith("tool:")` guard there) — the
+  // canonical way to attach `verify` to a ticket is a `tool:verify` label /
+  // an `Opt in via tool:` block, which this gate never sees. So
+  // opts.requiredSkills can only ever contain `type:`-section `Required:`
+  // skills, which are headless-runnable by project convention (see
+  // .sandcastle/SANDCASTLE.md.example). An unrunnable tool would only reach
+  // this gate if a consumer mis-configures SANDCASTLE.md by listing it as a
+  // bare `Required:` bullet instead of a `tool:` opt-in — a config error this
+  // gate is right to catch, not a false positive to carve around.
+  //
   // `!opts.envelopeReask`: a re-ask (audit #22) is a pure envelope re-emit —
   // the work was already done + certified on the first turn, so a COMPLIANT
   // re-ask legitimately invokes NO skills. Without this carve-out the gate
