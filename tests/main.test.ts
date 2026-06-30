@@ -41,6 +41,8 @@ import {
   preflight,
   loadDotenv,
   isTransientServerError,
+  isOutputCapError,
+  maxOutputTokensEnv,
   ensureStagingWorktree,
   fastForwardIntegration,
   detectChangedLockfiles,
@@ -1455,6 +1457,91 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     for (const msg of negative) {
       expect(isTransientServerError(msg)).toBe(false);
     }
+  });
+
+  it("isOutputCapError matches output-token-cap shapes case-insensitively", () => {
+    const positive = [
+      "max_tokens reached",
+      "Requested 50000 tokens exceeds the maximum output tokens of 32000",
+      "the response exceeds the maximum output tokens",
+      "output too long",
+      "OUTPUT TOO LONG to render",
+      "Claude's response exceeded the maximum output token limit",
+      "claudes response exceeded the limit", // apostrophe-less variant
+    ];
+    for (const msg of positive) {
+      expect(isOutputCapError(msg)).toBe(true);
+    }
+    const negative = [
+      "agent crashed",
+      "implementer made no commits",
+      "rate_limit_error",
+      "The server had an error while processing your request",
+      "reviewer marked HAS_BLOCKERS",
+      "a token was found in the config", // "token" alone must not match
+      "the output of the test was wrong", // "output" alone must not match
+      "this exceeds the budget", // "exceeds" alone must not match
+      // Permanent-error guard: a permanent-error slug must short-circuit to
+      // false even if cap-ish phrasing appears alongside it.
+      "invalid_api_key",
+      // Audit #2 rework: these are PERMANENT errors, not output-cap. Retrying
+      // can't fix an oversized HTTP payload or a too-high config value, so
+      // they must NOT be deferred/retried under isOutputCapError.
+      "HTTP 413: Payload exceeds the maximum allowed size", // unrelated to output tokens
+      "max_tokens: 65536 exceeds the maximum of 32768", // too-high config, not a runtime truncation
+      // Moved from the positive set: a too-high-config validation error
+      // (config asked for more max_tokens than the model allows) is a
+      // permanent config error, not a genuine output-cap/truncation.
+      '{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 4096 > 8192, the maximum"}}',
+    ];
+    for (const msg of negative) {
+      expect(isOutputCapError(msg)).toBe(false);
+    }
+  });
+
+  it("maxOutputTokensEnv sets a default only when unset/blank", () => {
+    // Unset → default applied.
+    expect(maxOutputTokensEnv({})).toEqual({
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000",
+    });
+    // Blank → treated as unset, default applied.
+    expect(maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "   " })).toEqual(
+      { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000" },
+    );
+    // Explicit user value → never clobbered.
+    expect(
+      maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
+    ).toEqual({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" });
+  });
+
+  it("maxOutputTokensEnv honors a value set only in the project .env, not just process.env (audit #2 rework)", () => {
+    // Real call-site bug: containerEnv used to call `...maxOutputTokensEnv()`
+    // with NO arg (process.env only), even though projectEnv (the target
+    // repo's `.env`/`.env.local`, via readProjectEnv) is spread into
+    // containerEnv first. A value present ONLY in projectEnv — not
+    // process.env — was invisible to the function and got overwritten by
+    // the 32000 default, contradicting the docstring's "never clobbered"
+    // claim. The fix takes projectEnv as an explicit second parameter so
+    // the call site can pass it through.
+    const projectEnv: Record<string, string> = {
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "96000",
+    };
+    const shellEnv: NodeJS.ProcessEnv = {}; // process.env: NOT set here
+
+    expect(maxOutputTokensEnv(shellEnv, projectEnv)).toEqual({
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "96000",
+    });
+
+    // Shell-wins precedence (house style — mirrors ghTokenEnv being spread
+    // last at the containerEnv call site so a fresh shell/host token wins
+    // over a stale project-.env value): when BOTH set it, the shell value
+    // wins.
+    expect(
+      maxOutputTokensEnv(
+        { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "12000" },
+        projectEnv,
+      ),
+    ).toEqual({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "12000" });
   });
 
   it("recovery throws transient 5xx → defers (release, no quarantine)", async () => {

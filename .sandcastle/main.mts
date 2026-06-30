@@ -1257,6 +1257,43 @@ export function ghTokenEnv(
   return token && token.trim() !== "" ? { GH_TOKEN: token } : {};
 }
 
+/** Default cap (in tokens) forwarded as CLAUDE_CODE_MAX_OUTPUT_TOKENS when the
+ * operator hasn't set one. Comfortably above a normal implementer/reviewer
+ * turn so we don't truncate real work, but bounded so a runaway response
+ * surfaces as a recognizable cap error (see isOutputCapError) instead of
+ * burning the whole context window. */
+const DEFAULT_MAX_OUTPUT_TOKENS = "32000";
+
+/**
+ * Container env fragment that sets a sane CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ * default. Nothing set this anywhere before (audit issue #2), so the agent
+ * ran with the CLI's built-in cap and a large response could overflow it and
+ * surface as the silent-quarantine output-cap error.
+ *
+ * Conservative: only fills in the default when NEITHER source has a (non-
+ * blank) value. `env` is checked first so a fresh shell export always wins
+ * (house style — mirrors `ghTokenEnv` being spread last at the call site so
+ * a shell/host token wins over a stale project-`.env` one); `projectEnv`
+ * (the target repo's `.env`/`.env.local`, see `readProjectEnv`) is the
+ * fallback so a value set ONLY there still survives instead of being
+ * clobbered by the 32000 default. Only the literal default is ever
+ * "clobbering" — an explicit value from either source always wins.
+ */
+export function maxOutputTokensEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  projectEnv: Record<string, string> = {},
+): Record<string, string> {
+  const fromShell = env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+  if (fromShell && fromShell.trim() !== "") {
+    return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: fromShell };
+  }
+  const fromProject = projectEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+  if (fromProject && fromProject.trim() !== "") {
+    return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: fromProject };
+  }
+  return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: DEFAULT_MAX_OUTPUT_TOKENS };
+}
+
 /**
  * Shell command run inside the sandbox at boot to materialize `.env` from
  * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
@@ -2175,6 +2212,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     ...projectEnv,
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
+    // Sane output-token cap so a large response surfaces as a recognizable,
+    // bounded-retryable cap error (isOutputCapError) instead of overflowing
+    // the CLI's built-in ceiling. Preserves an operator-set value from
+    // EITHER source (shell env wins over project .env, mirroring ghTokenEnv
+    // below); only falls back to the 32000 default when neither sets it.
+    // projectEnv must be passed explicitly — process.env alone would miss a
+    // value set only in the target repo's .env (audit #2 rework).
+    ...maxOutputTokensEnv(process.env, projectEnv),
     ...oauthTokenEnv(),
     // GH_TOKEN forwarded last so a shell/host-level token wins over any stale
     // GH_TOKEN that leaked in via the target project's .env (projectEnv). On
@@ -3284,6 +3329,59 @@ function isTransientError(msg: string): boolean {
   return isRateLimitError(msg) || isTransientServerError(msg);
 }
 
+/**
+ * Match an output-token-cap failure: the model's response hit the
+ * `max_tokens` / maximum-output-tokens ceiling and the SDK surfaced it as an
+ * error rather than a usable completion. Before this predicate existed, such
+ * a message matched none of the classifiers above and fell through to a
+ * SILENT generic quarantine — operators saw "pipeline halted" with no clue
+ * the real cause was a truncated response (audit issue #2).
+ *
+ * Treated as bounded-retryable (see the pipeline catch): a re-run can produce
+ * a shorter response, or the raised `CLAUDE_CODE_MAX_OUTPUT_TOKENS` default
+ * (see `maxOutputTokensEnv`) can give the model enough headroom. Bounded by
+ * MAX_DEFERRALS so it can't loop forever on a genuinely too-large task.
+ *
+ * Guarded by `isPermanentError` first, matching the sibling predicates
+ * (`isRateLimitError` / `isTransientServerError`): a permanent-error slug
+ * (e.g. `invalid_api_key`) always wins, even if cap-ish phrasing also
+ * appears in the message.
+ *
+ * Patterns are anchored to phrasing that co-occurs with the cap so bare words
+ * ("token", "output", "exceeds") don't false-positive on unrelated prose, and
+ * so permanent (non-retryable) errors that merely mention "maximum" don't
+ * get misclassified as a retryable output-cap — notably HTTP-413 ("Payload
+ * exceeds the maximum allowed size") and too-high-config validation errors
+ * ("max_tokens: 65536 exceeds the maximum of 32768"). Both mention "exceeds
+ * the maximum" but neither is a genuine runtime output-truncation, and
+ * retrying can't fix either (audit #2 rework):
+ *   - `max_tokens` (not followed by `: N` / `= N`) — SDK / API snake_case
+ *                                        slug for a genuine runtime cap hit
+ *                                        ("max_tokens reached"); the negative
+ *                                        lookahead excludes the
+ *                                        config-validation comparison shape
+ *                                        ("max_tokens: 65536 exceeds...",
+ *                                        "max_tokens: 4096 > 8192") which is
+ *                                        a permanent too-high-config error,
+ *                                        not a runtime truncation
+ *   - `maximum output tokens?`           — Anthropic prose (with optional
+ *                                        "the", singular or plural "token")
+ *   - `output too long`                  — generic truncation phrasing
+ *   - `exceeds the maximum output tokens?` — token-anchored variant of the
+ *                                        generic "exceeds the maximum" (the
+ *                                        bare/unanchored form was dropped —
+ *                                        it false-positived on HTTP-413 and
+ *                                        config-validation errors)
+ *   - `Claude'?s response exceeded`      — Claude-specific overflow phrasing,
+ *                                        apostrophe optional
+ */
+export function isOutputCapError(msg: string): boolean {
+  if (isPermanentError(msg)) return false;
+  return /\bmax_tokens\b(?!\s*[:=]\s*\d)|maximum output tokens?|output too long|exceeds the maximum output tokens?|claude'?s response exceeded/i.test(
+    msg,
+  );
+}
+
 // Circuit breaker: if a (role, primary) pair fallbacks BREAKER_THRESHOLD times
 // within BREAKER_WINDOW_MS, skip the primary entirely for subsequent calls
 // until the rolling window empties. Protects against a known-broken primary
@@ -4109,6 +4207,13 @@ async function runIssuePipeline(
       }
     }
     const transientVerdict = isTransientError(errMsg);
+    // Output-token-cap detection: the model's response hit the max-output
+    // ceiling and surfaced as an error. Distinct from transient (it's not a
+    // vendor blip) and from a code-level halt (the work may be fine, just too
+    // long). Deferred with a bounded budget so a re-run with the raised
+    // CLAUDE_CODE_MAX_OUTPUT_TOKENS default (or a naturally shorter response)
+    // can succeed, instead of the silent generic quarantine it used to get.
+    const outputCapVerdict = !transientVerdict && isOutputCapError(errMsg);
     // Stall detection: surface "the sandbox stopped responding" failures
     // distinctly from "the spec was bad" failures so runMain can pause
     // the loop after a streak (sandbox-level problem, not code-level).
@@ -4134,6 +4239,10 @@ async function runIssuePipeline(
     const tryDefer = async (
       kind: string,
       causeMsg: string,
+      // Marker recorded on the deferred outcome. Defaults to the transient
+      // marker; the output-token-cap path passes a distinct one so the cause
+      // stays recognizable instead of being conflated with a 5xx/rate-limit.
+      deferMarker: string = "TRANSIENT_ERROR",
     ): Promise<IssueOutcome | null> => {
       const c = (deferralCounts.get(ctx.issueNumber) ?? 0) + 1;
       if (c > MAX_DEFERRALS) {
@@ -4151,7 +4260,7 @@ async function runIssuePipeline(
       ctx.deps.log(deferReason);
       try {
         await ctx.deps.release(ctx.issueNumber, deferReason);
-        return { status: "deferred", finalMarker: "TRANSIENT_ERROR" };
+        return { status: "deferred", finalMarker: deferMarker };
       } catch (releaseErr) {
         ctx.deps.logError(
           `[issue=${ctx.issueNumber}] release failed: ${(releaseErr as Error).message} — falling through to quarantine`,
@@ -4170,14 +4279,31 @@ async function runIssuePipeline(
       // fall through to quarantine on budget exhaustion or release failure
     }
 
+    // Defer an output-token-cap failure with a DISTINCT marker so it never
+    // disappears into a generic quarantine (audit #2). Bounded by the same
+    // MAX_DEFERRALS budget; on exhaustion it falls through to a quarantine
+    // whose reason still names the cap cause via the reason string below.
+    if (outputCapVerdict) {
+      const deferred = await tryDefer(
+        "output-token-cap error",
+        errMsg,
+        "OUTPUT_TOKEN_CAP",
+      );
+      if (deferred) return deferred;
+      // fall through to quarantine on budget exhaustion or release failure
+    }
+
     // Opt-in single recovery pass with the implementer model. If recovery
     // succeeds, mark done; otherwise fall through to quarantine. Skip recovery
     // entirely on transient errors — they already deferred above (and recovery
     // uses Opus which would just burn quota on a problem the model can't fix).
+    // Also skip on an output-cap error: a recovery pass would just hit the same
+    // ceiling, and it already deferred above.
     if (
       ctx.args.recoveryEnabled &&
       sandbox &&
-      !transientVerdict
+      !transientVerdict &&
+      !outputCapVerdict
     ) {
       ctx.status.setIssuePhase(ctx.issueNumber, "recovery");
       ctx.deps.log(
@@ -4302,7 +4428,7 @@ async function runIssuePipeline(
     // future un-quarantine + re-claim starts fresh at attempt 1/MAX_DEFERRALS,
     // not partway through the budget.
     deferralCounts.delete(ctx.issueNumber);
-    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}): ${errMsg.slice(0, 400)}`;
+    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}, outputCapVerdict=${outputCapVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: "HALT", stalled };
