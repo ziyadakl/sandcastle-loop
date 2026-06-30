@@ -1476,7 +1476,7 @@ export function __setStagingWorktreePathForTests(p: string): void {
   stagingWorktreePath = p;
 }
 
-interface GitRunResult {
+export interface GitRunResult {
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -1788,6 +1788,139 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
     if (wtPath !== "") entries.push({ path: wtPath, branch });
   }
   return entries;
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time defensive worktree-health pass (audit issue #1)
+// ---------------------------------------------------------------------------
+//
+// A single corrupt git worktree — e.g. a leftover `00000000` directory whose
+// `.git` link is gone, producing `git worktree list -> couldn't read
+// .git/packed-refs` — used to kill the WHOLE loop. The fatal `git worktree
+// list --porcelain` runs INSIDE the vendored SDK (`WorktreeManager.create ->
+// listWorktrees`) which throws with no catch. We can't patch the vendored SDK,
+// so we prune the bad entry HERE, at boot, before the first `createSandbox`,
+// so the SDK's enumeration succeeds. This complements (does not replace) the
+// per-branch pre-clean in `createSandbox`, which only knows about the single
+// branch it's about to provision — not a FOREIGN orphan like `00000000`.
+
+/**
+ * Pure: given parsed worktree entries + an existence check, return the set of
+ * worktree paths that are corrupt/orphaned (registered but their directory is
+ * gone). The launch repo root (`repoRoot`, when supplied) is never selected —
+ * a flaky existence check must not nuke the live checkout.
+ *
+ * Side-effect-free so the prune decision is unit-testable without a real
+ * corrupt repo.
+ */
+export function selectCorruptWorktrees(
+  entries: WorktreeEntry[],
+  exists: (p: string) => boolean,
+  repoRoot?: string,
+): string[] {
+  const safeRoot = repoRoot !== undefined ? path.resolve(repoRoot) : undefined;
+  const out: string[] = [];
+  for (const e of entries) {
+    if (e.path === "") continue;
+    if (safeRoot !== undefined && path.resolve(e.path) === safeRoot) continue;
+    if (!exists(e.path)) out.push(e.path);
+  }
+  return out;
+}
+
+interface PruneWorktreeDeps {
+  /** Non-throwing git runner (defaults to the module-level `runGit`). */
+  git?: (repoRoot: string, ...gitArgs: string[]) => GitRunResult;
+  /** Existence check (defaults to `existsSync`). */
+  exists?: (p: string) => boolean;
+  /** Recursive remove (defaults to `rmSync(p, {recursive,force})`). */
+  rm?: (p: string) => void;
+}
+
+/**
+ * Best-effort, NON-THROWING boot pass that clears corrupt/orphaned git
+ * worktrees so the SDK's `listWorktrees` enumeration can succeed on the first
+ * `createSandbox`. Runs ONCE, early in the boot sequence (after preflight,
+ * before staging + the first sandbox).
+ *
+ * Behavior:
+ *   1. `git worktree list --porcelain`. If it returns `!ok` (the corrupt
+ *      packed-refs symptom) OR lists worktrees whose dirs are missing, run
+ *      `git worktree prune` to clear dangling registrations.
+ *   2. For each orphaned entry, `git worktree remove --force <path>` then
+ *      `rmSync(path)` to clear the dir.
+ *
+ * NEVER throws — every step is wrapped so a failure logs a warning and the
+ * loop continues. The whole point is defensiveness: one bad entry must not
+ * take down the run.
+ */
+export function pruneCorruptWorktrees(
+  repoRoot: string,
+  log: (line: string) => void,
+  deps: PruneWorktreeDeps = {},
+): void {
+  const git = deps.git ?? runGit;
+  const exists = deps.exists ?? ((p: string) => existsSync(p));
+  const rm =
+    deps.rm ?? ((p: string) => rmSync(p, { recursive: true, force: true }));
+
+  try {
+    const listed = git(repoRoot, "worktree", "list", "--porcelain");
+
+    if (!listed.ok) {
+      // The corrupt-packed-refs symptom: the SDK's own `listWorktrees` would
+      // throw here. Try a prune to clear whatever dangling registration is
+      // poisoning enumeration, then bail (we can't parse a list we don't have).
+      log(
+        `[worktree-health] 'git worktree list' failed (${listed.stderr || "unknown"}); ` +
+          `attempting 'git worktree prune' to clear corrupt registrations`,
+      );
+      const pruned = git(repoRoot, "worktree", "prune");
+      if (!pruned.ok) {
+        log(`[worktree-health] 'git worktree prune' failed: ${pruned.stderr}`);
+      }
+      return;
+    }
+
+    const entries = parseWorktreeList(listed.stdout);
+    const corrupt = selectCorruptWorktrees(entries, exists, repoRoot);
+    if (corrupt.length === 0) return;
+
+    log(
+      `[worktree-health] found ${corrupt.length} orphaned worktree(s); pruning: ` +
+        corrupt.join(", "),
+    );
+
+    // Clear dangling registrations first so `remove --force` and the SDK's
+    // later enumeration see a consistent state.
+    const pruned = git(repoRoot, "worktree", "prune");
+    if (!pruned.ok) {
+      log(`[worktree-health] 'git worktree prune' failed: ${pruned.stderr}`);
+    }
+
+    for (const wtPath of corrupt) {
+      const removed = git(repoRoot, "worktree", "remove", "--force", wtPath);
+      if (!removed.ok) {
+        log(
+          `[worktree-health] 'git worktree remove --force ${wtPath}' failed: ` +
+            `${removed.stderr}`,
+        );
+      }
+      try {
+        rm(wtPath);
+      } catch (err) {
+        log(
+          `[worktree-health] rm '${wtPath}' failed: ${(err as Error).message}`,
+        );
+      }
+    }
+  } catch (err) {
+    // Absolute backstop: this pass must NEVER kill the loop.
+    log(
+      `[worktree-health] defensive pass errored (continuing): ` +
+        `${(err as Error).message}`,
+    );
+  }
 }
 
 /**
@@ -5573,6 +5706,14 @@ if (isMain()) {
     }
 
     const deps = buildDefaultDeps(args);
+
+    // Defensive worktree-health pass (audit issue #1). A single corrupt git
+    // worktree (e.g. a `00000000` dir) makes the vendored SDK's
+    // `WorktreeManager.create -> listWorktrees` throw with no catch, killing
+    // the whole loop on the FIRST createSandbox. We can't patch the SDK, so
+    // prune the bad entry here — before staging + the first sandbox. This is
+    // best-effort and NEVER throws.
+    pruneCorruptWorktrees(args.repoRoot, deps.log);
 
     // Set up the dedicated staging worktree before runMain so the merger
     // phase always has a valid cwd that ISN'T the launch worktree. This is
