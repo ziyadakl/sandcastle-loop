@@ -41,6 +41,8 @@ import {
   preflight,
   loadDotenv,
   isTransientServerError,
+  isOutputCapError,
+  maxOutputTokensEnv,
   ensureStagingWorktree,
   fastForwardIntegration,
   detectChangedLockfiles,
@@ -60,6 +62,7 @@ import {
   REGISTER_CONTEXT7_MCP_COMMAND,
   STAGE_CODEX_AGENTS_MD_COMMAND,
   __resetTransientStateForTests,
+  __setStagingWorktreePathForTests,
   type Deps,
   type SandcastleArgs,
   type SandboxRunSpec,
@@ -76,6 +79,7 @@ import {
   critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
+import { VerdictParseError } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
@@ -1456,6 +1460,91 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     }
   });
 
+  it("isOutputCapError matches output-token-cap shapes case-insensitively", () => {
+    const positive = [
+      "max_tokens reached",
+      "Requested 50000 tokens exceeds the maximum output tokens of 32000",
+      "the response exceeds the maximum output tokens",
+      "output too long",
+      "OUTPUT TOO LONG to render",
+      "Claude's response exceeded the maximum output token limit",
+      "claudes response exceeded the limit", // apostrophe-less variant
+    ];
+    for (const msg of positive) {
+      expect(isOutputCapError(msg)).toBe(true);
+    }
+    const negative = [
+      "agent crashed",
+      "implementer made no commits",
+      "rate_limit_error",
+      "The server had an error while processing your request",
+      "reviewer marked HAS_BLOCKERS",
+      "a token was found in the config", // "token" alone must not match
+      "the output of the test was wrong", // "output" alone must not match
+      "this exceeds the budget", // "exceeds" alone must not match
+      // Permanent-error guard: a permanent-error slug must short-circuit to
+      // false even if cap-ish phrasing appears alongside it.
+      "invalid_api_key",
+      // Audit #2 rework: these are PERMANENT errors, not output-cap. Retrying
+      // can't fix an oversized HTTP payload or a too-high config value, so
+      // they must NOT be deferred/retried under isOutputCapError.
+      "HTTP 413: Payload exceeds the maximum allowed size", // unrelated to output tokens
+      "max_tokens: 65536 exceeds the maximum of 32768", // too-high config, not a runtime truncation
+      // Moved from the positive set: a too-high-config validation error
+      // (config asked for more max_tokens than the model allows) is a
+      // permanent config error, not a genuine output-cap/truncation.
+      '{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 4096 > 8192, the maximum"}}',
+    ];
+    for (const msg of negative) {
+      expect(isOutputCapError(msg)).toBe(false);
+    }
+  });
+
+  it("maxOutputTokensEnv sets a default only when unset/blank", () => {
+    // Unset → default applied.
+    expect(maxOutputTokensEnv({})).toEqual({
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000",
+    });
+    // Blank → treated as unset, default applied.
+    expect(maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "   " })).toEqual(
+      { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000" },
+    );
+    // Explicit user value → never clobbered.
+    expect(
+      maxOutputTokensEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" }),
+    ).toEqual({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000" });
+  });
+
+  it("maxOutputTokensEnv honors a value set only in the project .env, not just process.env (audit #2 rework)", () => {
+    // Real call-site bug: containerEnv used to call `...maxOutputTokensEnv()`
+    // with NO arg (process.env only), even though projectEnv (the target
+    // repo's `.env`/`.env.local`, via readProjectEnv) is spread into
+    // containerEnv first. A value present ONLY in projectEnv — not
+    // process.env — was invisible to the function and got overwritten by
+    // the 32000 default, contradicting the docstring's "never clobbered"
+    // claim. The fix takes projectEnv as an explicit second parameter so
+    // the call site can pass it through.
+    const projectEnv: Record<string, string> = {
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "96000",
+    };
+    const shellEnv: NodeJS.ProcessEnv = {}; // process.env: NOT set here
+
+    expect(maxOutputTokensEnv(shellEnv, projectEnv)).toEqual({
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "96000",
+    });
+
+    // Shell-wins precedence (house style — mirrors ghTokenEnv being spread
+    // last at the containerEnv call site so a fresh shell/host token wins
+    // over a stale project-.env value): when BOTH set it, the shell value
+    // wins.
+    expect(
+      maxOutputTokensEnv(
+        { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "12000" },
+        projectEnv,
+      ),
+    ).toEqual({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: "12000" });
+  });
+
   it("recovery throws transient 5xx → defers (release, no quarantine)", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
@@ -2530,6 +2619,126 @@ function parseWithRealDotenv(
   return expanded;
 }
 
+// Audit issue #4: a failed FINAL fast-forward promotion leaves merged +
+// post-merge-certified work stranded on `integration-candidate`, yet the run
+// historically still exited `done` / code 0 — a silent lie about success.
+// After the fix the run must finish `unhealthy` and exit non-zero so both the
+// operator's shell AND the viewer see the failure.
+describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)", () => {
+  function initStagingRepo(): {
+    repoRoot: string;
+    stagingPath: string;
+    gitEnv: NodeJS.ProcessEnv;
+    cleanup: () => void;
+  } {
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-"));
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+
+    git(repoRoot, "init", "-q", "-b", "main");
+    git(repoRoot, "config", "user.email", "test@example.com");
+    git(repoRoot, "config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    git(repoRoot, "add", "README.md");
+    git(repoRoot, "commit", "-q", "-m", "init");
+    // The integration branch the loop promotes onto, and the staging branch it
+    // certifies on. `feature/work` matches baseArgs().branch.
+    git(repoRoot, "branch", "feature/work");
+    git(repoRoot, "branch", "integration-candidate");
+    // Dedicated staging worktree on integration-candidate (what boot would set
+    // up). Place it OUTSIDE repoRoot so the loop's own .sandcastle path is clean.
+    const stagingPath = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-staging-"));
+    rmSync(stagingPath, { recursive: true, force: true });
+    git(repoRoot, "worktree", "add", "-q", stagingPath, "integration-candidate");
+    return {
+      repoRoot,
+      stagingPath,
+      gitEnv,
+      cleanup: () => {
+        rmSync(repoRoot, { recursive: true, force: true });
+        rmSync(stagingPath, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("finishes `unhealthy` and exits non-zero when the final FF refuses", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // The merger runs AFTER `resetStagingToIntegrationTip` (which makes
+      // staging == integration) and BEFORE the final fast-forward. Have the
+      // merger side-effect advance `feature/work` (the integration branch) with
+      // a brand-new commit via a throwaway worktree. Staging is then NO LONGER
+      // an ancestor of integration → divergence; with no live worktree on
+      // `feature/work`, the final fast-forward REFUSES → promotionFailed.
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        const handle = await realRun(spec);
+        if (spec.name === "merger") {
+          const wt = mkdtempSync(path.join(tmpdir(), "sc-unhealthy-divert-"));
+          rmSync(wt, { recursive: true, force: true });
+          const git = (cwd: string, ...args: string[]): string =>
+            execFileSync("git", args, {
+              cwd,
+              env: gitEnv,
+              encoding: "utf8",
+            }).trim();
+          git(repoRoot, "worktree", "add", "-q", wt, "feature/work");
+          writeFileSync(path.join(wt, "operator.ts"), "export const OP = 1;\n");
+          git(wt, "add", "operator.ts");
+          git(wt, "commit", "-q", "-m", "operator hotfix — diverges integration");
+          git(repoRoot, "worktree", "remove", "--force", wt);
+        }
+        return handle;
+      };
+
+      const result = await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      // The run must NOT report success.
+      expect(result.exitCode).not.toBe(0);
+      // The status feed's terminal state must be `unhealthy`, not `done`.
+      const statusRaw = readFileSync(
+        path.join(repoRoot, ".sandcastle", "status.json"),
+        "utf8",
+      );
+      const status = JSON.parse(statusRaw) as SandcastleStatus;
+      expect(status.state).toBe("unhealthy");
+      // And the failure must be logged loudly.
+      expect(
+        b.state.errors.some((l) => l.includes("final promotion")),
+      ).toBe(true);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      cleanup();
+    }
+  });
+});
+
 describe("serializeDotenv", () => {
   it("empty record → empty string", () => {
     expect(serializeDotenv({})).toBe("");
@@ -3520,6 +3729,31 @@ describe("parseBlockedBy", () => {
     expect(parseBlockedBy("See #5 for context.")).toEqual([]);
     expect(parseBlockedBy("")).toEqual([]);
   });
+
+  it("extracts `#N` refs under a `## Blocked by` markdown header (list + bare)", () => {
+    expect(
+      parseBlockedBy("Do the thing.\n\n## Blocked by\n- #42\n#43\n"),
+    ).toEqual([42, 43]);
+  });
+
+  it("accepts `### Blocked by` header at any heading level, case-insensitively", () => {
+    expect(parseBlockedBy("### blocked by\n* #7\n")).toEqual([7]);
+  });
+
+  it("stops collecting header refs at a blank line or the next heading", () => {
+    expect(
+      parseBlockedBy("## Blocked by\n- #1\n- #2\n\n#999 unrelated\n"),
+    ).toEqual([1, 2]);
+    expect(
+      parseBlockedBy("## Blocked by\n- #1\n## Notes\n#999 unrelated\n"),
+    ).toEqual([1]);
+  });
+
+  it("merges header-form and inline-form blockers, deduped + sorted", () => {
+    expect(
+      parseBlockedBy("Blocked by: #5\n\n## Blocked by\n- #3\n- #5\n"),
+    ).toEqual([3, 5]);
+  });
 });
 
 describe("buildBlockedByNote", () => {
@@ -3997,6 +4231,257 @@ describe("runImplementer REQUIRED_SKILLS prompt-arg linkage (ADR 0006 v3.2)", ()
       string
     >;
     expect(promptArgs.REQUIRED_SKILLS).toBe("");
+  });
+});
+
+describe("runImplementer missing-envelope one-shot re-ask (audit #22)", () => {
+  // When the implementer emits a real STORY_COMPLETE but DROPS the required
+  // fenced ```json``` certification envelope, parseVerdict throws
+  // VerdictParseError — a class neither isTransientError nor STALL_RE covers,
+  // so the whole pass would be wasted (recovery burn → quarantine, or
+  // immediate quarantine under --recovery off). The fix re-runs the
+  // implementer ONCE for just the envelope, guarded so it can never recurse
+  // more than once.
+
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sc-envelope-reask-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** A real STORY_COMPLETE assistant message WITH the fenced json envelope. */
+  function validEnvelopeStdout(ghIssue: number): string {
+    const envelope = {
+      storyId: `gh-${ghIssue}`,
+      ghIssue,
+      e2eVerdict: "passed",
+      uiTouched: false,
+      certificationPresent: true,
+      marker: "STORY_COMPLETE",
+      storyType: "backend-only",
+      e2eRequired: false,
+      e2eActuallyRan: true,
+      testCommandUsed: "npm test",
+      e2eAssertionLine: "✓ does the thing",
+      outputNotFiltered: true,
+      testReachedFeature: true,
+    };
+    return (
+      "All done.\n\n```json\n" +
+      JSON.stringify(envelope, null, 2) +
+      "\n```\n\nSTORY_COMPLETE\n\n<promise>COMPLETE</promise>"
+    );
+  }
+
+  /** A STORY_COMPLETE message that DROPS the json envelope (the #22 bug). */
+  function noEnvelopeStdout(): string {
+    return (
+      "All done — everything works.\n\nSTORY_COMPLETE\n\n" +
+      "<promise>COMPLETE</promise>"
+    );
+  }
+
+  /** Sandbox whose run() returns a sequence of stdouts (one per call),
+   *  records every opts it was invoked with, and points each iteration at a
+   *  fully-invoked-skills session JSONL so the skill-discipline gate is inert.
+   *  Each call has one commit so attempt-1 requireCommits passes. */
+  function makeSequencingSandbox(
+    stdouts: readonly string[],
+    sessionFilePath: string,
+  ): SandboxHandle & { captured: Record<string, unknown>[] } {
+    const captured: Record<string, unknown>[] = [];
+    let call = 0;
+    const sb: SandboxHandle = {
+      branch: "agent/issue-1",
+      run: async (opts) => {
+        captured.push(opts as unknown as Record<string, unknown>);
+        const stdout = stdouts[Math.min(call, stdouts.length - 1)] ?? "";
+        call += 1;
+        return {
+          stdout,
+          commits: [{ sha: `sha-${call}` }],
+          iterations: [{ sessionFilePath }],
+        } satisfies RunHandle;
+      },
+      close: async () => undefined,
+    };
+    return Object.assign(sb, { captured });
+  }
+
+  function baseCtx() {
+    return {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber: 22,
+      issue: { id: "22", title: "drops envelope", branch: "agent/issue-1" },
+      status: testStatusStore,
+    };
+  }
+
+  it("re-asks exactly ONCE and succeeds when the re-ask returns a valid envelope", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeSequencingSandbox(
+      [noEnvelopeStdout(), validEnvelopeStdout(22)],
+      jsonl,
+    );
+    const ctx = baseCtx();
+
+    // Must NOT throw — the re-ask returns a valid envelope.
+    const r = await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+    expect(r.stdout).toMatch(/STORY_COMPLETE/);
+
+    // Exactly two runs: the original + ONE re-ask.
+    expect(sandbox.captured).toHaveLength(2);
+
+    // First call: ENVELOPE_REASK is empty (normal pass).
+    const firstArgs = sandbox.captured[0]?.promptArgs as Record<string, string>;
+    expect(firstArgs.ENVELOPE_REASK).toBe("");
+
+    // Second call: ENVELOPE_REASK is the populated re-ask instruction.
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/STORY_COMPLETE/);
+  });
+
+  it("one-shot guard caps the re-ask at one — a second missing envelope propagates VerdictParseError", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    // Both the original AND the re-ask drop the envelope.
+    const sandbox = makeSequencingSandbox(
+      [noEnvelopeStdout(), noEnvelopeStdout()],
+      jsonl,
+    );
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, { attemptNumber: 1 }),
+    ).rejects.toThrowError(VerdictParseError);
+
+    // Exactly two runs total — the guard prevented a third (second re-ask).
+    expect(sandbox.captured).toHaveLength(2);
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+  });
+
+  it("does NOT re-ask when the first pass already carries a valid envelope", async () => {
+    const jsonl = writeSessionJsonl(tmp, "session.jsonl", []);
+    const sandbox = makeSequencingSandbox([validEnvelopeStdout(22)], jsonl);
+    const ctx = baseCtx();
+
+    await runImplementer(sandbox, ctx, { attemptNumber: 1 });
+
+    // Only ONE run — no re-ask fired.
+    expect(sandbox.captured).toHaveLength(1);
+    const firstArgs = sandbox.captured[0]?.promptArgs as Record<string, string>;
+    expect(firstArgs.ENVELOPE_REASK).toBe("");
+  });
+
+  // ── self-defeat regression (the DEFECT this rework fixes) ──────────────
+  //
+  // The original #22 fix recurses via `return runImplementer(sb, ctx, {
+  // ...opts, envelopeReask: true })`. attemptNumber is NOT threaded, so it
+  // re-defaults to 1 and requireCommits recomputes to true. A COMPLIANT
+  // re-ask only RE-EMITS the envelope: it writes NO new commits and invokes
+  // NO skills (the work was already done + certified on the first turn).
+  // Pre-fix, that re-ask turn hits the skill-discipline gate (throws
+  // MissingRequiredSkillsError) or the no-commits throw ("implementer made
+  // no commits") and the issue is wrongly quarantined — the feature
+  // self-defeats. Both gates must be skipped on an envelope re-ask.
+  //
+  // This sandbox controls commits AND the session JSONL PER CALL so the
+  // re-ask turn is a genuine compliant re-ask: zero commits, zero skills.
+  function makePerCallSandbox(
+    turns: readonly { stdout: string; commits: readonly { sha: string }[]; sessionFilePath: string }[],
+  ): SandboxHandle & { captured: Record<string, unknown>[] } {
+    const captured: Record<string, unknown>[] = [];
+    let call = 0;
+    const sb: SandboxHandle = {
+      branch: "agent/issue-1",
+      run: async (opts) => {
+        captured.push(opts as unknown as Record<string, unknown>);
+        const turn = turns[Math.min(call, turns.length - 1)]!;
+        call += 1;
+        return {
+          stdout: turn.stdout,
+          commits: turn.commits,
+          iterations: [{ sessionFilePath: turn.sessionFilePath }],
+        } satisfies RunHandle;
+      },
+      close: async () => undefined,
+    };
+    return Object.assign(sb, { captured });
+  }
+
+  it("re-ask with required skills succeeds even though the re-ask makes no commits and invokes no skills (self-defeat regression)", async () => {
+    // Turn 1: STORY_COMPLETE without the envelope, BUT the work is done —
+    // it committed and it invoked the one required skill ("critique").
+    const turn1Jsonl = writeSessionJsonl(tmp, "turn1.jsonl", ["critique"]);
+    // Turn 2 (the re-ask): a valid envelope but ZERO commits and ZERO skills
+    // invoked — exactly what a compliant "just re-emit the envelope" turn
+    // looks like.
+    const turn2Jsonl = writeSessionJsonl(tmp, "turn2.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: noEnvelopeStdout(), commits: [{ sha: "sha-1" }], sessionFilePath: turn1Jsonl },
+      { stdout: validEnvelopeStdout(22), commits: [], sessionFilePath: turn2Jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    // Pre-fix this REJECTS (MissingRequiredSkillsError or "implementer made
+    // no commits") on the re-ask turn. Post-fix it RESOLVES.
+    const r = await runImplementer(sandbox, ctx, {
+      attemptNumber: 1,
+      requiredSkills: ["critique"],
+    });
+    expect(r.stdout).toMatch(/STORY_COMPLETE/);
+
+    // Exactly two runs: original + ONE re-ask.
+    expect(sandbox.captured).toHaveLength(2);
+    const secondArgs = sandbox.captured[1]?.promptArgs as Record<
+      string,
+      string
+    >;
+    expect(secondArgs.ENVELOPE_REASK).toMatch(/json/i);
+  });
+
+  it("FIRST attempt (not a re-ask) STILL enforces the skill-discipline gate", async () => {
+    // A first attempt that commits but does NOT invoke the required skill
+    // must still throw — the re-ask carve-out must not weaken the first pass.
+    const jsonl = writeSessionJsonl(tmp, "nogate.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: validEnvelopeStdout(22), commits: [{ sha: "sha-1" }], sessionFilePath: jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, {
+        attemptNumber: 1,
+        requiredSkills: ["critique"],
+      }),
+    ).rejects.toThrowError(MissingRequiredSkillsError);
+  });
+
+  it("FIRST attempt (not a re-ask) STILL enforces the no-commits throw", async () => {
+    // A first attempt with a valid envelope but ZERO commits and no required
+    // skills must still throw "implementer made no commits".
+    const jsonl = writeSessionJsonl(tmp, "nocommits.jsonl", []);
+    const sandbox = makePerCallSandbox([
+      { stdout: validEnvelopeStdout(22), commits: [], sessionFilePath: jsonl },
+    ]);
+    const ctx = baseCtx();
+
+    await expect(
+      runImplementer(sandbox, ctx, { attemptNumber: 1 }),
+    ).rejects.toThrowError(/implementer made no commits/);
   });
 });
 

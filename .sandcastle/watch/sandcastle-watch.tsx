@@ -180,6 +180,7 @@ const BANNER_TEXT: Record<NonNullable<ViewState["banner"]>, string> = {
   outdated: "viewer out of date — run an update",
   done: "done — loop finished",
   stopped: "stopped — loop halted",
+  unhealthy: "unhealthy — promotion failed, work stranded",
 };
 
 // `done` is deliberately NEUTRAL, not a celebratory green: the worker currently
@@ -191,6 +192,8 @@ const BANNER_COLOR: Record<NonNullable<ViewState["banner"]>, string> = {
   outdated: C.error,
   done: C.neutral,
   stopped: C.neutral,
+  // A failed promotion is a real failure — paint it red, not neutral.
+  unhealthy: C.error,
 };
 
 const BANNER_GLYPH: Record<NonNullable<ViewState["banner"]>, string> = {
@@ -199,6 +202,7 @@ const BANNER_GLYPH: Record<NonNullable<ViewState["banner"]>, string> = {
   outdated: "●",
   done: "✓",
   stopped: "■",
+  unhealthy: "✗",
 };
 
 function truncate(s: string, max: number): string {
@@ -280,7 +284,13 @@ function Header({ run }: { run: SandcastleStatus["run"] }) {
   );
 }
 
-function Counts({ totals }: { totals: SandcastleStatus["totals"] }) {
+function Counts({
+  totals,
+  state,
+}: {
+  totals: SandcastleStatus["totals"];
+  state: SandcastleStatus["state"];
+}) {
   return (
     <Box>
       <Pill glyph="✓" count={totals.merged} label="merged" color={C.success} />
@@ -300,6 +310,17 @@ function Counts({ totals }: { totals: SandcastleStatus["totals"] }) {
       />
       <Text> </Text>
       <Pill glyph="▶" count={totals.running} label="running" color={C.accent} />
+      {/* Run-level health pill: `unhealthy` is a terminal RUN state (a failed
+          final promotion), not a per-issue total — so it's driven off
+          `status.state`, shown as a single red flag only when the run died
+          unhealthy. A Pill with count 0 renders dimmed/absent, so the healthy
+          case stays clean. */}
+      {state === "unhealthy" ? (
+        <>
+          <Text> </Text>
+          <Pill glyph="✗" count={1} label="unhealthy" color={C.error} />
+        </>
+      ) : null}
     </Box>
   );
 }
@@ -484,7 +505,7 @@ export function Dashboard({
     <Box flexDirection="column" marginTop={1}>
       <Header run={status.run} />
       <Rule />
-      <Counts totals={status.totals} />
+      <Counts totals={status.totals} state={status.state} />
 
       <Box marginTop={1}>
         <RunningPanel active={active} activity={status.activity} />

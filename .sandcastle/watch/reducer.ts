@@ -30,6 +30,7 @@ export type Banner =
   | "outdated"
   | "done"
   | "stopped"
+  | "unhealthy"
   | null;
 
 /** The viewer's render state. `status` is always the last snapshot we trust. */
@@ -53,13 +54,15 @@ function errMessage(error: unknown): string {
 
 /**
  * The banner a good, non-terminal-or-terminal snapshot implies at `nowMs`.
- * Terminal run states (`done`/`stopped`) are AUTHORITATIVE and time-independent;
- * otherwise liveness is inferred from write-age against `STALE_AFTER_MS`. Shared
- * by the dedup short-circuit and the full parse path so they can't drift.
+ * Terminal run states (`done`/`stopped`/`unhealthy`) are AUTHORITATIVE and
+ * time-independent; otherwise liveness is inferred from write-age against
+ * `STALE_AFTER_MS`. Shared by the dedup short-circuit and the full parse path
+ * so they can't drift.
  */
 function liveBanner(status: SandcastleStatus, nowMs: number): Banner {
   if (status.state === "done") return "done";
   if (status.state === "stopped") return "stopped";
+  if (status.state === "unhealthy") return "unhealthy";
   const updatedMs = Date.parse(status.updatedAt);
   const isStale =
     Number.isFinite(updatedMs) && nowMs - updatedMs > STALE_AFTER_MS;

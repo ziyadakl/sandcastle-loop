@@ -11,7 +11,10 @@ import { describe, it, expect } from "vitest";
 import React from "react";
 import { render } from "ink";
 import { Dashboard } from "../.sandcastle/watch/sandcastle-watch.js";
-import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
+import {
+  STATUS_SCHEMA_VERSION,
+  type SandcastleStatus,
+} from "../.sandcastle/lib/status/schema.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -70,7 +73,7 @@ describe("watch recent strip — history-backed rendering", () => {
   it("history-backed, newest-first: shows history entries not planned issues", async () => {
     // history push order: #310, #311, #312 → newest is #312 → should appear first
     const status: SandcastleStatus = {
-      schemaVersion: 1,
+      schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 2, needsHuman: 1 },
@@ -100,7 +103,7 @@ describe("watch recent strip — history-backed rendering", () => {
 
   it("fallback when history empty: shows terminal-phase issues from current batch", async () => {
     const status: SandcastleStatus = {
-      schemaVersion: 1,
+      schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 1 },
@@ -125,7 +128,7 @@ describe("watch recent strip — history-backed rendering", () => {
     }));
 
     const status: SandcastleStatus = {
-      schemaVersion: 1,
+      schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 10 },
@@ -150,7 +153,7 @@ describe("watch recent strip — history-backed rendering", () => {
     // #340 appears twice — first deferred, then later merged. This is intentional
     // (issue re-queued then completed) and the composite key fix must handle it.
     const status: SandcastleStatus = {
-      schemaVersion: 1,
+      schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 1, needsHuman: 1 },

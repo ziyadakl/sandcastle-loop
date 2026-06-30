@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "state": "running",
   "run": {
     "branch": "sandcastle/run-jun4",

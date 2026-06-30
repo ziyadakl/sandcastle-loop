@@ -13,6 +13,7 @@ import {
 } from "../.sandcastle/watch/reducer.js";
 import {
   STALE_AFTER_MS,
+  STATUS_SCHEMA_VERSION,
   type SandcastleStatus,
 } from "../.sandcastle/lib/status/schema.js";
 
@@ -24,7 +25,7 @@ const VALID_UPDATED_AT = "2026-06-04T12:00:00.000Z";
 const VALID_NOW = Date.parse(VALID_UPDATED_AT);
 
 const validStatus: SandcastleStatus = {
-  schemaVersion: 1,
+  schemaVersion: STATUS_SCHEMA_VERSION,
   state: "running",
   run: {
     branch: "sandcastle/run-jun4",
@@ -73,7 +74,11 @@ describe("reduce", () => {
   it("a torn / unparseable read → RETAINS last-good status, banner stale", () => {
     const good = reduce(EMPTY, ok(validRaw), VALID_NOW);
     // Truncated JSON — deterministically fails JSON.parse.
-    const torn = reduce(good, ok('{"schemaVersion":1,"state":"run'), VALID_NOW);
+    const torn = reduce(
+      good,
+      ok(`{"schemaVersion":${STATUS_SCHEMA_VERSION},"state":"run`),
+      VALID_NOW,
+    );
     expect(torn.status).toBe(good.status); // same object, not blanked
     expect(torn.status?.run.repo).toBe("affinity-tracker");
     expect(torn.banner).toBe("stale");
@@ -81,10 +86,31 @@ describe("reduce", () => {
 
   it("a schemaVersion mismatch → RETAINS last-good, banner outdated", () => {
     const good = reduce(EMPTY, ok(validRaw), VALID_NOW);
-    const future = JSON.stringify({ ...validStatus, schemaVersion: 2 });
+    const future = JSON.stringify({
+      ...validStatus,
+      schemaVersion: STATUS_SCHEMA_VERSION + 1,
+    });
     const out = reduce(good, ok(future), VALID_NOW);
     expect(out.status).toBe(good.status); // last-good retained
     expect(out.banner).toBe("outdated");
+  });
+
+  // --- audit issue #4 follow-up: STATUS_SCHEMA_VERSION bump for `unhealthy` ---
+
+  it("version skew (current+1, simulating a newer loop / older viewer) → graceful 'outdated' banner, NOT 'stale'", () => {
+    // Locks the raw-version guard in reducer.ts: it reads `schemaVersion`
+    // BEFORE safeParse, so a version-skewed snapshot is routed to "outdated"
+    // and never reaches (and fails) the strict enum parse. This is the lever
+    // that makes the STATUS_SCHEMA_VERSION bump for `unhealthy` safe — an old
+    // viewer sees a graceful banner instead of a misleading "stale" one that
+    // would hide the real failure.
+    const skewed = JSON.stringify({
+      ...validStatus,
+      schemaVersion: STATUS_SCHEMA_VERSION + 1,
+    });
+    const s = reduce(EMPTY, ok(skewed), VALID_NOW);
+    expect(s.banner).toBe("outdated");
+    expect(s.banner).not.toBe("stale");
   });
 
   it("full sequence: enoent → valid → torn → mismatch keeps last-good throughout", () => {

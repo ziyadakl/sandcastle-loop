@@ -51,7 +51,7 @@ import {
   LABEL_READY,
   acquireSingleInstanceLock,
 } from "./lib/state/index.js";
-import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError } from "./lib/verdicts/index.js";
+import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import {
@@ -1257,6 +1257,43 @@ export function ghTokenEnv(
   return token && token.trim() !== "" ? { GH_TOKEN: token } : {};
 }
 
+/** Default cap (in tokens) forwarded as CLAUDE_CODE_MAX_OUTPUT_TOKENS when the
+ * operator hasn't set one. Comfortably above a normal implementer/reviewer
+ * turn so we don't truncate real work, but bounded so a runaway response
+ * surfaces as a recognizable cap error (see isOutputCapError) instead of
+ * burning the whole context window. */
+const DEFAULT_MAX_OUTPUT_TOKENS = "32000";
+
+/**
+ * Container env fragment that sets a sane CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ * default. Nothing set this anywhere before (audit issue #2), so the agent
+ * ran with the CLI's built-in cap and a large response could overflow it and
+ * surface as the silent-quarantine output-cap error.
+ *
+ * Conservative: only fills in the default when NEITHER source has a (non-
+ * blank) value. `env` is checked first so a fresh shell export always wins
+ * (house style — mirrors `ghTokenEnv` being spread last at the call site so
+ * a shell/host token wins over a stale project-`.env` one); `projectEnv`
+ * (the target repo's `.env`/`.env.local`, see `readProjectEnv`) is the
+ * fallback so a value set ONLY there still survives instead of being
+ * clobbered by the 32000 default. Only the literal default is ever
+ * "clobbering" — an explicit value from either source always wins.
+ */
+export function maxOutputTokensEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  projectEnv: Record<string, string> = {},
+): Record<string, string> {
+  const fromShell = env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+  if (fromShell && fromShell.trim() !== "") {
+    return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: fromShell };
+  }
+  const fromProject = projectEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+  if (fromProject && fromProject.trim() !== "") {
+    return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: fromProject };
+  }
+  return { CLAUDE_CODE_MAX_OUTPUT_TOKENS: DEFAULT_MAX_OUTPUT_TOKENS };
+}
+
 /**
  * Shell command run inside the sandbox at boot to materialize `.env` from
  * `$SANDCASTLE_PROJECT_DOTENV`. Exported so tests can assert structural
@@ -1476,7 +1513,7 @@ export function __setStagingWorktreePathForTests(p: string): void {
   stagingWorktreePath = p;
 }
 
-interface GitRunResult {
+export interface GitRunResult {
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -1788,6 +1825,158 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
     if (wtPath !== "") entries.push({ path: wtPath, branch });
   }
   return entries;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree-health: boot prune + lazy createSandbox repair (audit issue #1)
+// ---------------------------------------------------------------------------
+//
+// A single corrupt git worktree — e.g. a leftover `00000000` directory whose
+// `.git` link is gone, producing `git worktree list -> couldn't read
+// .git/packed-refs` — used to kill the WHOLE loop. The fatal `git worktree
+// list --porcelain` runs INSIDE the vendored SDK (`WorktreeManager.create ->
+// listWorktrees`) which throws with no catch, so the very first `createSandbox`
+// blows up the run. We can't patch the vendored SDK.
+//
+// SAFEST-REBUILD shape (this rework). The earlier fix was destructive and
+// didn't actually repair:
+//
+//   Defect A (DATA-LOSS): it selected ANY non-root worktree whose dir
+//   momentarily failed an `existsSync` check and then ran
+//   `git worktree remove --force` + recursive `rmSync` on it. On this host
+//   MULTIPLE loops share one workspace, so a sibling loop's LIVE worktree that
+//   briefly fails `existsSync` (mid-op, EACCES, TOCTOU) got force-deleted —
+//   destroying real work.
+//
+//   Defect B (DOESN'T REPAIR): when `git worktree list` returned `!ok` (the
+//   real corruption symptom) it ran `git worktree prune` (which fails the SAME
+//   way on packed-refs corruption) and returned having repaired nothing; and
+//   the `existsSync` detector structurally can't see a dir-present-but-
+//   internally-corrupt worktree. So the loop still died on SDK re-enumeration.
+//
+// The rebuild:
+//   1. NO manual deletion. `git worktree prune` NEVER removes a live/healthy
+//      worktree — it only clears administrative registrations for worktrees
+//      whose working tree is gone — so it is the only safe tool here.
+//   2. A cheap, harmless boot `git worktree prune` to clear dangling regs.
+//   3. The FIRST sandbox create is wrapped so that on a worktree-enumeration
+//      failure we prune ONCE and retry ONCE; if it STILL fails we exit with a
+//      clear, actionable error. NEVER delete, NEVER loop.
+
+/**
+ * Cheap, NON-DESTRUCTIVE boot pass: a single best-effort `git worktree prune`
+ * to clear dangling administrative registrations (worktrees whose working tree
+ * is gone). Runs ONCE, early in the boot sequence (after preflight, before
+ * staging + the first sandbox).
+ *
+ * `git worktree prune` never touches a live/healthy worktree, so this cannot
+ * destroy a sibling loop's work — the destructive `remove --force` + `rmSync`
+ * path that did exactly that has been removed entirely.
+ *
+ * NEVER throws — a failure (including the corrupt-packed-refs case, where prune
+ * itself fails) logs a warning and the loop continues. The actual repair for
+ * that case happens lazily in {@link createSandboxWithWorktreeRepair}.
+ */
+export function pruneCorruptWorktrees(
+  repoRoot: string,
+  log: (line: string) => void,
+  deps: { git?: (repoRoot: string, ...gitArgs: string[]) => GitRunResult } = {},
+): void {
+  const git = deps.git ?? runGit;
+  try {
+    const pruned = git(repoRoot, "worktree", "prune");
+    if (!pruned.ok) {
+      log(
+        `[worktree-health] boot 'git worktree prune' failed (continuing): ` +
+          `${pruned.stderr || "unknown"}`,
+      );
+    }
+  } catch (err) {
+    // Absolute backstop: this pass must NEVER kill the loop.
+    log(
+      `[worktree-health] boot prune errored (continuing): ` +
+        `${(err as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Wrap the FIRST sandbox create with a one-shot, NON-DESTRUCTIVE repair.
+ *
+ * The vendored SDK enumerates worktrees inside `createSandbox`
+ * (`WorktreeManager.create -> listWorktrees`); a corrupt registration makes
+ * that throw and there's no SDK catch. So we try the create once, and on
+ * failure run `git worktree prune` ONCE (the only safe repair — it never
+ * removes a live worktree) and retry the create ONCE. If it STILL fails, we
+ * surface a clear, actionable error rather than dying silently or looping.
+ *
+ * NEVER deletes a worktree and NEVER loops. Provider-agnostic: it takes the
+ * provider's own `createSandbox` as `create`, so it works identically across
+ * docker / mac-host / codex. Injectable `git` keeps it unit-testable without a
+ * real corrupt repo.
+ */
+export async function createSandboxWithWorktreeRepair(
+  create: () => Promise<SandboxHandle>,
+  git: (repoRoot: string, ...gitArgs: string[]) => GitRunResult,
+  repoRoot: string,
+  log: (line: string) => void,
+): Promise<SandboxHandle> {
+  try {
+    return await create();
+  } catch (firstErr) {
+    // Does the original failure actually look like the worktree-enumeration
+    // corruption this repair targets (the SDK's `git worktree list` /
+    // packed-refs throw)? If not — a transient provider error, disk-full,
+    // EACCES from the pre-clean, etc. — the prune+retry is incidental and we
+    // must NOT relabel the failure as worktree corruption (it would send the
+    // operator chasing a git problem that isn't there). We still prune+retry
+    // once (cheap, harmless, and a transient error may clear), but on a second
+    // failure we surface the REAL error untouched unless it's worktree-shaped.
+    const looksLikeWorktreeCorruption = (msg: string): boolean =>
+      /worktree|packed-refs|\.git\b/i.test(msg);
+    const firstWasWorktree = looksLikeWorktreeCorruption(
+      (firstErr as Error).message,
+    );
+    log(
+      `[worktree-health] first sandbox create failed (${(firstErr as Error).message}); ` +
+        `attempting 'git worktree prune' once, then one retry`,
+    );
+    // The only safe repair: prune dangling registrations. Best-effort — if it
+    // fails (corrupt packed-refs fails prune the same way), we still try the
+    // retry once, then surface a clear error below.
+    try {
+      const pruned = git(repoRoot, "worktree", "prune");
+      if (!pruned.ok) {
+        log(
+          `[worktree-health] 'git worktree prune' failed: ${pruned.stderr || "unknown"}`,
+        );
+      }
+    } catch (pruneErr) {
+      log(
+        `[worktree-health] 'git worktree prune' threw: ${(pruneErr as Error).message}`,
+      );
+    }
+
+    try {
+      return await create();
+    } catch (secondErr) {
+      // Only claim worktree corruption when the failure is actually
+      // worktree-shaped (either the original or the post-prune failure). For an
+      // unrelated cause, rethrow the real error unchanged so its message, type,
+      // and stack survive — no misleading "run git worktree prune" advice.
+      if (
+        firstWasWorktree ||
+        looksLikeWorktreeCorruption((secondErr as Error).message)
+      ) {
+        throw new Error(
+          `sandcastle: corrupt git worktree state the loop can't auto-repair — ` +
+            `run 'git worktree prune' / manual cleanup, then restart: ` +
+            `${(secondErr as Error).message}`,
+        );
+      }
+      throw secondErr;
+    }
+  }
 }
 
 /**
@@ -2175,6 +2364,14 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     ...projectEnv,
     ...gitEnv,
     SANDCASTLE_PROJECT_DOTENV: serializeDotenv(projectEnv),
+    // Sane output-token cap so a large response surfaces as a recognizable,
+    // bounded-retryable cap error (isOutputCapError) instead of overflowing
+    // the CLI's built-in ceiling. Preserves an operator-set value from
+    // EITHER source (shell env wins over project .env, mirroring ghTokenEnv
+    // below); only falls back to the 32000 default when neither sets it.
+    // projectEnv must be passed explicitly — process.env alone would miss a
+    // value set only in the target repo's .env (audit #2 rework).
+    ...maxOutputTokensEnv(process.env, projectEnv),
     ...oauthTokenEnv(),
     // GH_TOKEN forwarded last so a shell/host-level token wins over any stale
     // GH_TOKEN that leaked in via the target project's .env (projectEnv). On
@@ -2224,6 +2421,107 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     repoRoot: args.repoRoot,
   });
 
+  // One-shot guard for the worktree-health lazy repair (audit issue #1). The
+  // vendored SDK enumerates worktrees inside the FIRST createSandbox; a corrupt
+  // registration makes that throw uncaught. Only the first create needs the
+  // prune-once-and-retry-once repair — once the loop is running the per-branch
+  // pre-clean below keeps each subsequent box clean.
+  let firstSandboxRepairDone = false;
+
+  const log = (line: string): void => {
+    process.stderr.write(`${line}\n`);
+    appendRunLog(`${line}\n`);
+  };
+
+  // Raw, provider-agnostic sandbox create (pre-clean + provider.createSandbox).
+  // The exported `createSandbox` dep routes the FIRST call through the
+  // worktree-health lazy repair, then calls this directly thereafter.
+  const createSandboxRaw = async (
+    spec: CreateSandboxSpec,
+  ): Promise<SandboxHandle> => {
+    // Pre-clean any stale worktree from a prior killed iteration. The
+    // SDK's `cp -R src dest` (`CopyToWorktree.js:29,32`) has no
+    // pre-clean: if `dest` already exists, `cp -R` recurses into it,
+    // building `dest/node_modules/node_modules/...` until disk
+    // exhaustion. Real bug — bit affinity-tracker iteration 1 of the
+    // budgeting branch. The SDK's `WorktreeManager.create()` handles a
+    // missing path correctly via plain `git worktree add`, so this
+    // guard hands it a clean slate. Three-tier fallback covers:
+    //   1. Registered worktree (normal post-killed-iteration state)
+    //      → `git worktree remove --force` clears reg + dir.
+    //   2. Orphan dir git doesn't know about → `rmSync` removes it.
+    //   3. Dangling registration with no dir → `git worktree prune`
+    //      clears the registration so a fresh `add` succeeds.
+    // Note: the mac-host provider runs its own pre-clean inside
+    // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
+    // The outer pre-clean here is redundant on the mac-host path but
+    // idempotent — letting it run keeps the orchestrator-side cleanup
+    // contract identical across providers.
+    const wtPath = path.join(args.repoRoot, worktreePathFor(spec.branch));
+    if (existsSync(wtPath)) {
+      try {
+        execFileSync("git", ["worktree", "remove", "--force", wtPath], {
+          cwd: args.repoRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        rmSync(wtPath, { recursive: true, force: true });
+      }
+    }
+    try {
+      execFileSync("git", ["worktree", "prune"], {
+        cwd: args.repoRoot,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      // Best-effort. If a stale registration survives, the SDK's
+      // collision-reuse path (WorktreeManager.js:~120) will hit it
+      // first via `listWorktrees` and then fail loudly when
+      // `hasUncommittedChanges` runs `git status` inside the now-
+      // missing path. The error surfaces — just not through
+      // `worktree add`.
+    }
+
+    // Work around the SDK bug where createSandbox hardcodes
+    // agentProviderEnv: {}, dropping per-call env injection. We bake the
+    // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
+    // into sandbox.env so it actually reaches the container. Anthropic
+    // models return {} from envForModel (subscription path), so this is
+    // a no-op for the default Anthropic case.
+    const implEnv = envForModel(spec.implementerModel);
+    const sandboxEnv = { ...containerEnv, ...implEnv };
+
+    const handle = await provider.createSandbox({
+      branch: spec.branch,
+      mounts: spec.mounts,
+      sandboxEnv,
+    });
+    return {
+      branch: handle.branch,
+      worktreePath: handle.worktreePath,
+      run: async (opts) => {
+        const r = await withCeiling(
+          `sandbox run "${opts.name}"`,
+          (signal) => handle.run({ ...opts, signal }),
+        );
+        // Forward the SDK's per-iteration session-capture metadata —
+        // both `sessionFilePath` (when capture is wired) and `sessionId`
+        // (always present for Claude agents) so the downstream consumer
+        // can fall back to the conventional path layout. See
+        // resolveSessionFilePath / the seam definition on RunHandle.
+        return {
+          stdout: r.stdout,
+          commits: r.commits,
+          iterations: r.iterations?.map((it) => ({
+            sessionFilePath: it.sessionFilePath,
+            sessionId: it.sessionId,
+          })),
+        };
+      },
+      close: () => handle.close(),
+    };
+  };
+
   return {
     async run(spec) {
       // Top-level runs (planner, merger) don't need `pnpm install` — the
@@ -2237,91 +2535,21 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       return { stdout: result.stdout, commits: result.commits };
     },
     async createSandbox(spec) {
-      // Pre-clean any stale worktree from a prior killed iteration. The
-      // SDK's `cp -R src dest` (`CopyToWorktree.js:29,32`) has no
-      // pre-clean: if `dest` already exists, `cp -R` recurses into it,
-      // building `dest/node_modules/node_modules/...` until disk
-      // exhaustion. Real bug — bit affinity-tracker iteration 1 of the
-      // budgeting branch. The SDK's `WorktreeManager.create()` handles a
-      // missing path correctly via plain `git worktree add`, so this
-      // guard hands it a clean slate. Three-tier fallback covers:
-      //   1. Registered worktree (normal post-killed-iteration state)
-      //      → `git worktree remove --force` clears reg + dir.
-      //   2. Orphan dir git doesn't know about → `rmSync` removes it.
-      //   3. Dangling registration with no dir → `git worktree prune`
-      //      clears the registration so a fresh `add` succeeds.
-      // Note: the mac-host provider runs its own pre-clean inside
-      // `createSandbox` (see lib/mac-host-sandbox.ts:preCleanWorktree).
-      // The outer pre-clean here is redundant on the mac-host path but
-      // idempotent — letting it run keeps the orchestrator-side cleanup
-      // contract identical across providers.
-      const wtPath = path.join(
-        args.repoRoot,
-        worktreePathFor(spec.branch),
-      );
-      if (existsSync(wtPath)) {
-        try {
-          execFileSync(
-            "git",
-            ["worktree", "remove", "--force", wtPath],
-            { cwd: args.repoRoot, stdio: ["ignore", "pipe", "pipe"] },
-          );
-        } catch {
-          rmSync(wtPath, { recursive: true, force: true });
-        }
+      // The vendored SDK enumerates worktrees inside createSandbox; a corrupt
+      // registration makes the FIRST create throw uncaught and kills the loop.
+      // Route the first create through the non-destructive lazy repair (prune
+      // once, retry once, else a clear actionable error). Subsequent creates go
+      // straight through — the per-branch pre-clean keeps them clean.
+      if (!firstSandboxRepairDone) {
+        firstSandboxRepairDone = true;
+        return await createSandboxWithWorktreeRepair(
+          () => createSandboxRaw(spec),
+          runGit,
+          args.repoRoot,
+          log,
+        );
       }
-      try {
-        execFileSync("git", ["worktree", "prune"], {
-          cwd: args.repoRoot,
-          stdio: ["ignore", "pipe", "ignore"],
-        });
-      } catch {
-        // Best-effort. If a stale registration survives, the SDK's
-        // collision-reuse path (WorktreeManager.js:~120) will hit it
-        // first via `listWorktrees` and then fail loudly when
-        // `hasUncommittedChanges` runs `git status` inside the now-
-        // missing path. The error surfaces — just not through
-        // `worktree add`.
-      }
-
-      // Work around the SDK bug where createSandbox hardcodes
-      // agentProviderEnv: {}, dropping per-call env injection. We bake the
-      // implementer's provider env (kimi/glm creds + ANTHROPIC_BASE_URL)
-      // into sandbox.env so it actually reaches the container. Anthropic
-      // models return {} from envForModel (subscription path), so this is
-      // a no-op for the default Anthropic case.
-      const implEnv = envForModel(spec.implementerModel);
-      const sandboxEnv = { ...containerEnv, ...implEnv };
-
-      const handle = await provider.createSandbox({
-        branch: spec.branch,
-        mounts: spec.mounts,
-        sandboxEnv,
-      });
-      return {
-        branch: handle.branch,
-        worktreePath: handle.worktreePath,
-        run: async (opts) => {
-          const r = await withCeiling(
-            `sandbox run "${opts.name}"`,
-            (signal) => handle.run({ ...opts, signal }),
-          );
-          // Forward the SDK's per-iteration session-capture metadata —
-          // both `sessionFilePath` (when capture is wired) and `sessionId`
-          // (always present for Claude agents) so the downstream consumer
-          // can fall back to the conventional path layout. See
-          // resolveSessionFilePath / the seam definition on RunHandle.
-          return {
-            stdout: r.stdout,
-            commits: r.commits,
-            iterations: r.iterations?.map((it) => ({
-              sessionFilePath: it.sessionFilePath,
-              sessionId: it.sessionId,
-            })),
-          };
-        },
-        close: () => handle.close(),
-      };
+      return await createSandboxRaw(spec);
     },
     async claim(n) {
       if (args.dryRun) return dryLog("claim", n);
@@ -2400,10 +2628,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         return "";
       }
     },
-    log(line) {
-      process.stderr.write(`${line}\n`);
-      appendRunLog(`${line}\n`);
-    },
+    log,
     logError(line) {
       process.stderr.write(`ERROR: ${line}\n`);
       appendRunLog(`ERROR: ${line}\n`);
@@ -2471,11 +2696,16 @@ export function parsePlan(stdout: string): PlanIssue[] {
 }
 
 /**
- * Extract the issue numbers a body declares it is blocked by. Recognises the
- * directive `Blocked by: #N` and the hyphenated `Blocked-by: #N`, both
- * case-insensitively, with flexible whitespace. A single line may name several
- * blockers (`Blocked by: #313, #314`); each `#N` after the directive (up to
- * the end of that line) is captured. Returns a de-duplicated, ascending list.
+ * Extract the issue numbers a body declares it is blocked by. Recognises TWO
+ * forms (matching planner HARD RULE 2 in `.sandcastle/plan-prompt.md`):
+ *   1. Inline directive `Blocked by: #N` / hyphenated `Blocked-by: #N`, both
+ *      case-insensitively with flexible whitespace. A single line may name
+ *      several blockers (`Blocked by: #313, #314`); each `#N` after the
+ *      directive (up to the end of that line) is captured.
+ *   2. Markdown header `## Blocked by` (any heading level, no colon) followed
+ *      by `#N` refs on the lines below — collected until the next blank line
+ *      or the next heading.
+ * Returns a de-duplicated, ascending list merged across both forms.
  *
  * ⚠️ NOT THE BLOCKER GATE. This parser only feeds `buildBlockedByNote` (the
  * advisory "nothing claimable" exit message). It does NOT decide what gets
@@ -2489,15 +2719,31 @@ export function parsePlan(stdout: string): PlanIssue[] {
 export function parseBlockedBy(body: string): number[] {
   if (typeof body !== "string" || body.length === 0) return [];
   const found = new Set<number>();
+  const addRefs = (text: string): void => {
+    for (const ref of text.matchAll(/#(\d+)/g)) {
+      const n = Number(ref[1]);
+      if (Number.isInteger(n) && n > 0) found.add(n);
+    }
+  };
+  // Form 1 — inline directive: `Blocked by: #N` (case-insensitive, hyphen ok).
   // Match the directive, then sweep the rest of that line for `#N` tokens.
   const directive = /blocked[\s-]*by\s*:\s*([^\n\r]*)/gi;
   let m: RegExpExecArray | null;
   while ((m = directive.exec(body)) !== null) {
-    const rest = m[1] ?? "";
-    const refs = rest.matchAll(/#(\d+)/g);
-    for (const ref of refs) {
-      const n = Number(ref[1]);
-      if (Number.isInteger(n) && n > 0) found.add(n);
+    addRefs(m[1] ?? "");
+  }
+  // Form 2 — markdown header: a `## Blocked by` / `### Blocked by` heading (no
+  // colon) followed by `#N` refs on the lines below it. Collect refs until the
+  // next blank line or the next heading, matching the planner's HARD RULE 2.
+  const lines = body.split(/\r?\n/);
+  const header = /^\s*#{1,6}\s*blocked[\s-]*by\s*$/i;
+  for (let i = 0; i < lines.length; i++) {
+    if (!header.test(lines[i]!)) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j]!;
+      if (line.trim() === "") break; // blank line ends the block
+      if (/^\s*#{1,6}\s/.test(line)) break; // next markdown heading ends it
+      addRefs(line);
     }
   }
   return [...found].sort((a, b) => a - b);
@@ -2879,6 +3125,25 @@ export async function runImplementer(
      * `type:cleanup` requires none) → same no-op result.
      */
     requiredSkills?: readonly string[];
+    /**
+     * One-shot guard for the missing-envelope re-ask (audit #22). When the
+     * implementer emits a real STORY_COMPLETE (not a `<rebuttal>`, not a
+     * HALT) but drops the REQUIRED fenced ```json``` certification envelope,
+     * `parseVerdict` throws {@link VerdictParseError} — a class neither
+     * `isTransientError` nor `STALL_RE` covers, so the whole pass would be
+     * wasted (recovery burn → quarantine, or immediate quarantine under
+     * `--recovery off`). Instead we re-run the implementer ONCE with a terse
+     * appended instruction surfaced via the `{{ENVELOPE_REASK}}` prompt
+     * placeholder.
+     *
+     * `false`/`undefined` (default) on the FIRST pass → on a genuine
+     * missing-envelope failure, recurse once with this flag set `true`.
+     * `true` → this IS the re-ask: the `{{ENVELOPE_REASK}}` placeholder is
+     * populated AND a second missing-envelope failure propagates as before
+     * (the boolean can never recurse more than once). Mirrors the
+     * single-retry discipline of `retryOnStall` in `runPostMergeReviewer`.
+     */
+    envelopeReask?: boolean;
   } = {},
 ): Promise<{
   commits: readonly { sha: string }[];
@@ -2928,6 +3193,19 @@ export async function runImplementer(
           // conditional block can detect "gate disabled for this slice"
           // without templating errors.
           REQUIRED_SKILLS: opts.requiredSkills?.join(", ") ?? "",
+          // Audit #22: populated ONLY on the one-shot re-ask after the
+          // implementer dropped the fenced ```json``` certification envelope
+          // before STORY_COMPLETE. Empty string on the normal first pass so
+          // the prompt's conditional block stays inert. The placeholder lint
+          // (tests/lint-placeholders.test.ts) requires {{ENVELOPE_REASK}} in
+          // implement-prompt.md to have this matching key.
+          ENVELOPE_REASK: opts.envelopeReask
+            ? "Your previous final message ended without the REQUIRED fenced " +
+              "```json``` certification envelope before STORY_COMPLETE. " +
+              "Do NOT redo any work — your commits are already on the branch. " +
+              "Re-emit ONLY your final message, ending with the json envelope " +
+              "followed by the STORY_COMPLETE marker."
+            : "",
         },
       }),
     primaryModel,
@@ -2970,7 +3248,36 @@ export async function runImplementer(
   // diff. Two-gate is more robust than either alone: implementer must
   // invoke Skill() AND the diff must pass critique AND the rubric must
   // be loadable.
-  if (opts.requiredSkills && opts.requiredSkills.length > 0) {
+  //
+  // Sibling-gate note (#3, "demote sibling gates together" rationale): the
+  // reviewer prompt (review-prompt.md) has an ENVIRONMENT-AWARENESS CARVE-OUT
+  // that lets a Required tool which physically can't run in the
+  // credential-less sandbox (e.g. `verify`, which needs a live running app)
+  // be recorded as `n/a (tool unrunnable in sandbox: <reason>)` instead of a
+  // HARD finding. This host gate deliberately got NO matching carve-out, and
+  // that's by design, not omission: `opts.requiredSkills` is sourced from
+  // parseRequiredSkillsByType (skill-discipline.ts), whose parser
+  // structurally SKIPS `tool:` bullets when collecting a `type:` section's
+  // `Required:` list (see the `token.startsWith("tool:")` guard there) — the
+  // canonical way to attach `verify` to a ticket is a `tool:verify` label /
+  // an `Opt in via tool:` block, which this gate never sees. So
+  // opts.requiredSkills can only ever contain `type:`-section `Required:`
+  // skills, which are headless-runnable by project convention (see
+  // .sandcastle/SANDCASTLE.md.example). An unrunnable tool would only reach
+  // this gate if a consumer mis-configures SANDCASTLE.md by listing it as a
+  // bare `Required:` bullet instead of a `tool:` opt-in — a config error this
+  // gate is right to catch, not a false positive to carve around.
+  //
+  // `!opts.envelopeReask`: a re-ask (audit #22) is a pure envelope re-emit —
+  // the work was already done + certified on the first turn, so a COMPLIANT
+  // re-ask legitimately invokes NO skills. Without this carve-out the gate
+  // would fire on every re-ask (it always sees zero skills) and the feature
+  // would self-defeat into a skill-discipline quarantine.
+  if (
+    opts.requiredSkills &&
+    opts.requiredSkills.length > 0 &&
+    !opts.envelopeReask
+  ) {
     const { missing } = validateRequiredSkillsInvoked(
       opts.requiredSkills,
       skillsInvoked,
@@ -2984,7 +3291,11 @@ export async function runImplementer(
       );
     }
   }
-  if (requireCommits && r.commits.length === 0) {
+  // `!opts.envelopeReask`: same self-defeat hazard. The re-ask recurses with
+  // attemptNumber unthreaded, so requireCommits recomputes to true, but a
+  // compliant re-ask makes NO new commits (the work is already on the
+  // branch) — so this throw must not fire on a re-ask.
+  if (requireCommits && r.commits.length === 0 && !opts.envelopeReask) {
     throw new Error("implementer made no commits");
   }
   // Sandcastle's r.stdout is the parsed `result.result` from claude's final
@@ -3013,12 +3324,38 @@ export async function runImplementer(
     }
   })();
   if (!rebuttalPresent && !halted) {
+    // Dual-mode parse (stream-json first, assistant-text fallback). On a
+    // genuine missing-envelope failure — the implementer emitted a real
+    // STORY_COMPLETE but dropped the fenced ```json``` certification
+    // envelope — both attempts raise VerdictParseError. That class is NOT
+    // covered by isTransientError / STALL_RE, so without intervention the
+    // whole pass is wasted (recovery burn → quarantine, or immediate
+    // quarantine under --recovery off). Re-ask the implementer ONCE for just
+    // the envelope (audit #22), guarded by opts.envelopeReask so it can
+    // never recurse more than once. We catch VerdictParseError ONLY
+    // (instanceof) — any other thrown class (and the second re-ask failure)
+    // propagates unchanged, exactly as before.
+    let parseErr: unknown = null;
     try {
       parseVerdict(r.stdout, ImplementerOutputSchema);
     } catch {
-      parseVerdict(r.stdout, ImplementerOutputSchema, {
-        alreadyAssistantText: true,
-      });
+      try {
+        parseVerdict(r.stdout, ImplementerOutputSchema, {
+          alreadyAssistantText: true,
+        });
+      } catch (err2) {
+        parseErr = err2;
+      }
+    }
+    if (parseErr !== null) {
+      if (parseErr instanceof VerdictParseError && !opts.envelopeReask) {
+        ctx.deps.logError(
+          `implementer (issue=${ctx.issueNumber}) emitted STORY_COMPLETE ` +
+            `without the required json envelope — re-asking once for the envelope`,
+        );
+        return runImplementer(sb, ctx, { ...opts, envelopeReask: true });
+      }
+      throw parseErr;
     }
   }
   return { ...r, skillsInvoked };
@@ -3261,6 +3598,59 @@ export function isTransientServerError(msg: string): boolean {
  * transient error (rate-limit OR 5xx) → defer rather than quarantine. */
 function isTransientError(msg: string): boolean {
   return isRateLimitError(msg) || isTransientServerError(msg);
+}
+
+/**
+ * Match an output-token-cap failure: the model's response hit the
+ * `max_tokens` / maximum-output-tokens ceiling and the SDK surfaced it as an
+ * error rather than a usable completion. Before this predicate existed, such
+ * a message matched none of the classifiers above and fell through to a
+ * SILENT generic quarantine — operators saw "pipeline halted" with no clue
+ * the real cause was a truncated response (audit issue #2).
+ *
+ * Treated as bounded-retryable (see the pipeline catch): a re-run can produce
+ * a shorter response, or the raised `CLAUDE_CODE_MAX_OUTPUT_TOKENS` default
+ * (see `maxOutputTokensEnv`) can give the model enough headroom. Bounded by
+ * MAX_DEFERRALS so it can't loop forever on a genuinely too-large task.
+ *
+ * Guarded by `isPermanentError` first, matching the sibling predicates
+ * (`isRateLimitError` / `isTransientServerError`): a permanent-error slug
+ * (e.g. `invalid_api_key`) always wins, even if cap-ish phrasing also
+ * appears in the message.
+ *
+ * Patterns are anchored to phrasing that co-occurs with the cap so bare words
+ * ("token", "output", "exceeds") don't false-positive on unrelated prose, and
+ * so permanent (non-retryable) errors that merely mention "maximum" don't
+ * get misclassified as a retryable output-cap — notably HTTP-413 ("Payload
+ * exceeds the maximum allowed size") and too-high-config validation errors
+ * ("max_tokens: 65536 exceeds the maximum of 32768"). Both mention "exceeds
+ * the maximum" but neither is a genuine runtime output-truncation, and
+ * retrying can't fix either (audit #2 rework):
+ *   - `max_tokens` (not followed by `: N` / `= N`) — SDK / API snake_case
+ *                                        slug for a genuine runtime cap hit
+ *                                        ("max_tokens reached"); the negative
+ *                                        lookahead excludes the
+ *                                        config-validation comparison shape
+ *                                        ("max_tokens: 65536 exceeds...",
+ *                                        "max_tokens: 4096 > 8192") which is
+ *                                        a permanent too-high-config error,
+ *                                        not a runtime truncation
+ *   - `maximum output tokens?`           — Anthropic prose (with optional
+ *                                        "the", singular or plural "token")
+ *   - `output too long`                  — generic truncation phrasing
+ *   - `exceeds the maximum output tokens?` — token-anchored variant of the
+ *                                        generic "exceeds the maximum" (the
+ *                                        bare/unanchored form was dropped —
+ *                                        it false-positived on HTTP-413 and
+ *                                        config-validation errors)
+ *   - `Claude'?s response exceeded`      — Claude-specific overflow phrasing,
+ *                                        apostrophe optional
+ */
+export function isOutputCapError(msg: string): boolean {
+  if (isPermanentError(msg)) return false;
+  return /\bmax_tokens\b(?!\s*[:=]\s*\d)|maximum output tokens?|output too long|exceeds the maximum output tokens?|claude'?s response exceeded/i.test(
+    msg,
+  );
 }
 
 // Circuit breaker: if a (role, primary) pair fallbacks BREAKER_THRESHOLD times
@@ -4088,6 +4478,13 @@ async function runIssuePipeline(
       }
     }
     const transientVerdict = isTransientError(errMsg);
+    // Output-token-cap detection: the model's response hit the max-output
+    // ceiling and surfaced as an error. Distinct from transient (it's not a
+    // vendor blip) and from a code-level halt (the work may be fine, just too
+    // long). Deferred with a bounded budget so a re-run with the raised
+    // CLAUDE_CODE_MAX_OUTPUT_TOKENS default (or a naturally shorter response)
+    // can succeed, instead of the silent generic quarantine it used to get.
+    const outputCapVerdict = !transientVerdict && isOutputCapError(errMsg);
     // Stall detection: surface "the sandbox stopped responding" failures
     // distinctly from "the spec was bad" failures so runMain can pause
     // the loop after a streak (sandbox-level problem, not code-level).
@@ -4113,6 +4510,10 @@ async function runIssuePipeline(
     const tryDefer = async (
       kind: string,
       causeMsg: string,
+      // Marker recorded on the deferred outcome. Defaults to the transient
+      // marker; the output-token-cap path passes a distinct one so the cause
+      // stays recognizable instead of being conflated with a 5xx/rate-limit.
+      deferMarker: string = "TRANSIENT_ERROR",
     ): Promise<IssueOutcome | null> => {
       const c = (deferralCounts.get(ctx.issueNumber) ?? 0) + 1;
       if (c > MAX_DEFERRALS) {
@@ -4130,7 +4531,7 @@ async function runIssuePipeline(
       ctx.deps.log(deferReason);
       try {
         await ctx.deps.release(ctx.issueNumber, deferReason);
-        return { status: "deferred", finalMarker: "TRANSIENT_ERROR" };
+        return { status: "deferred", finalMarker: deferMarker };
       } catch (releaseErr) {
         ctx.deps.logError(
           `[issue=${ctx.issueNumber}] release failed: ${(releaseErr as Error).message} — falling through to quarantine`,
@@ -4149,14 +4550,31 @@ async function runIssuePipeline(
       // fall through to quarantine on budget exhaustion or release failure
     }
 
+    // Defer an output-token-cap failure with a DISTINCT marker so it never
+    // disappears into a generic quarantine (audit #2). Bounded by the same
+    // MAX_DEFERRALS budget; on exhaustion it falls through to a quarantine
+    // whose reason still names the cap cause via the reason string below.
+    if (outputCapVerdict) {
+      const deferred = await tryDefer(
+        "output-token-cap error",
+        errMsg,
+        "OUTPUT_TOKEN_CAP",
+      );
+      if (deferred) return deferred;
+      // fall through to quarantine on budget exhaustion or release failure
+    }
+
     // Opt-in single recovery pass with the implementer model. If recovery
     // succeeds, mark done; otherwise fall through to quarantine. Skip recovery
     // entirely on transient errors — they already deferred above (and recovery
     // uses Opus which would just burn quota on a problem the model can't fix).
+    // Also skip on an output-cap error: a recovery pass would just hit the same
+    // ceiling, and it already deferred above.
     if (
       ctx.args.recoveryEnabled &&
       sandbox &&
-      !transientVerdict
+      !transientVerdict &&
+      !outputCapVerdict
     ) {
       ctx.status.setIssuePhase(ctx.issueNumber, "recovery");
       ctx.deps.log(
@@ -4281,7 +4699,7 @@ async function runIssuePipeline(
     // future un-quarantine + re-claim starts fresh at attempt 1/MAX_DEFERRALS,
     // not partway through the budget.
     deferralCounts.delete(ctx.issueNumber);
-    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}): ${errMsg.slice(0, 400)}`;
+    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}, outputCapVerdict=${outputCapVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: "HALT", stalled };
@@ -4332,6 +4750,13 @@ export async function runMain(
   // in a known-bad state, or null if last iteration finished clean. Used to
   // tag the failed staging tip as `bad-merge-iter-<N>` before reset.
   let lastFailedStagingIteration: number | null = null;
+  // Run-level health flag (audit issue #4). Set true when a final fast-forward
+  // promotion REFUSES — merged+reviewed work is then stranded on
+  // `integration-candidate` and the integration branch was NOT advanced.
+  // A run that ends with this flag set must NOT report `done`/exit 0: it exits
+  // non-zero and finishes the status feed as `unhealthy` so the failure is
+  // visible to both the operator's shell and the viewer.
+  let promotionFailed = false;
   // Sandbox-health detector: count consecutive iterations where EVERY
   // outcome was a stall (hard-ceiling fire / SDK idle timeout). When the
   // sandbox itself is degraded (orbstack memory pressure, docker hung,
@@ -4740,7 +5165,19 @@ export async function runMain(
         }
         deps.log(`no claimable issues — exiting cleanly${note}`);
         // Clean terminal exit (queue drained) — the common overnight-completion
-        // path. Mark the feed done, same as out-of-iterations below.
+        // path. Mark the feed done, same as out-of-iterations below. EXCEPT
+        // when an earlier iteration's final promotion refused: that left
+        // certified work stranded on `integration-candidate`, so this run is
+        // NOT a clean success — finish `unhealthy` and exit non-zero (audit #4).
+        if (promotionFailed) {
+          statusStore.finish("unhealthy");
+          return {
+            exitCode: 1,
+            iterationsRun,
+            shippedIssues,
+            quarantinedIssues,
+          };
+        }
         statusStore.finish("done");
         return {
           exitCode: 0,
@@ -5291,8 +5728,18 @@ export async function runMain(
             }
             lastFailedStagingIteration = null;
           } else {
-            // Fast-forward refused — treat as a staging failure.
+            // Fast-forward refused — treat as a staging failure. The merged +
+            // post-merge-reviewer-certified work is now stranded on
+            // `integration-candidate` and the integration branch was NOT
+            // advanced. Flag the whole run unhealthy so it can't exit
+            // `done`/0 and silently lie that the work shipped (audit #4).
             lastFailedStagingIteration = it;
+            promotionFailed = true;
+            deps.logError(
+              `[sandcastle it=${it}] final promotion to ${args.branch} FAILED — ` +
+                `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
+                `unhealthy (non-zero). Human triage required.`,
+            );
           }
         } else {
           // Staging failed certification (post-fixer too) OR merger failed
@@ -5382,6 +5829,25 @@ export async function runMain(
     }
 
     // Out of iterations.
+    // A failed final promotion (audit #4) overrides the clean out-of-cycles
+    // outcome — but NOT an explicit operator interrupt (SIGINT/SIGTERM), which
+    // is its own deliberate `stopped`. When promotion failed and we weren't
+    // interrupted, finish `unhealthy` and exit non-zero so the stranded work
+    // can't masquerade as a clean "out of cycles" success.
+    if (promotionFailed && !shuttingDown) {
+      deps.logError(
+        `out of iterations (${args.iterations}) — but a final promotion FAILED ` +
+          `earlier; exiting unhealthy (code 1). Certified work is stranded on ` +
+          `${STAGING_BRANCH}.`,
+      );
+      statusStore.finish("unhealthy");
+      return {
+        exitCode: 1,
+        iterationsRun,
+        shippedIssues,
+        quarantinedIssues,
+      };
+    }
     deps.log(
       `out of iterations (${args.iterations}) — exiting with code 2 (clean — just out of cycles)`,
     );
@@ -5467,6 +5933,14 @@ if (isMain()) {
     }
 
     const deps = buildDefaultDeps(args);
+
+    // Defensive worktree-health pass (audit issue #1). A single corrupt git
+    // worktree (e.g. a `00000000` dir) makes the vendored SDK's
+    // `WorktreeManager.create -> listWorktrees` throw with no catch, killing
+    // the whole loop on the FIRST createSandbox. We can't patch the SDK, so
+    // prune the bad entry here — before staging + the first sandbox. This is
+    // best-effort and NEVER throws.
+    pruneCorruptWorktrees(args.repoRoot, deps.log);
 
     // Set up the dedicated staging worktree before runMain so the merger
     // phase always has a valid cwd that ISN'T the launch worktree. This is

@@ -15,8 +15,24 @@
 
 import { z } from "zod";
 
-/** Incremented on any breaking change to the snapshot shape. */
-export const STATUS_SCHEMA_VERSION = 1;
+/**
+ * Incremented on any breaking change to the snapshot shape.
+ *
+ * Bumped 1 → 2 alongside adding `unhealthy` to `RunStateSchema` (audit issue
+ * #4). `state` is a STRICT `z.enum` (unlike the permissive `activity`
+ * string), so a snapshot containing `state: "unhealthy"` fails
+ * `SandcastleStatusSchema.safeParse` on an old viewer's compiled schema that
+ * doesn't know the new member. `watch/reducer.ts` checks the RAW
+ * `schemaVersion` field before attempting `safeParse`; without this bump that
+ * raw check would see a matching version, proceed to the strict parse, fail
+ * it, and fall into the generic "torn read" branch — surfacing a misleading
+ * "stale" banner that HIDES the very failure state #4 exists to report.
+ * Bumping the version here routes a version-skewed old viewer to the
+ * graceful "outdated" banner instead. Both `store.ts` (writer) and
+ * `reducer.ts` (reader) import this same constant, so a single bump updates
+ * both sides — keep doing that on any future breaking change.
+ */
+export const STATUS_SCHEMA_VERSION = 2;
 
 /**
  * Liveness timing — shared by BOTH sides so they can never drift apart:
@@ -50,12 +66,18 @@ export const IssuePhaseSchema = z.enum([
 ]);
 export type IssuePhase = z.infer<typeof IssuePhaseSchema>;
 
-/** Run lifecycle. `restarting` is the exit-75 hot-reload window. */
+/**
+ * Run lifecycle. `restarting` is the exit-75 hot-reload window. `unhealthy` is
+ * a terminal FAILURE state: the run finished but left merged+reviewed work
+ * stranded on `integration-candidate` because the final fast-forward promotion
+ * refused — the loop must NOT report this as `done`/success (audit issue #4).
+ */
 export const RunStateSchema = z.enum([
   "running",
   "done",
   "stopped",
   "restarting",
+  "unhealthy",
 ]);
 export type RunState = z.infer<typeof RunStateSchema>;
 

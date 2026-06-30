@@ -14,6 +14,7 @@ import {
 import {
   SandcastleStatusSchema,
   HEARTBEAT_MS,
+  STATUS_SCHEMA_VERSION,
 } from "../.sandcastle/lib/status/schema.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 
@@ -172,6 +173,16 @@ describe("StatusStore", () => {
     expect(b.store.snapshot().state).toBe("restarting");
   });
 
+  it("finish('unhealthy') records the unhealthy terminal state and stays schema-valid", () => {
+    const { store } = makeStore();
+    store.finish("unhealthy");
+    const snap = store.snapshot();
+    expect(snap.state).toBe("unhealthy");
+    // The new terminal state must round-trip through the schema, otherwise the
+    // loop's own write of status.json would be rejected by viewers re-parsing it.
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
   it("setActivity writes the run-level activity into the serialized snapshot", () => {
     const { store, writes } = makeStore();
     store.setActivity("merging");
@@ -266,7 +277,7 @@ describe("StatusStore", () => {
     }
   });
 
-  it("schema stays valid through a full lifecycle WITH history; schemaVersion is still 1", () => {
+  it("schema stays valid through a full lifecycle WITH history; schemaVersion matches the current constant", () => {
     const { store } = makeStore();
     store.startIteration(1);
     store.setPlan([
@@ -282,9 +293,36 @@ describe("StatusStore", () => {
     const parsed = SandcastleStatusSchema.safeParse(snap);
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.schemaVersion).toBe(1);
+      expect(parsed.data.schemaVersion).toBe(STATUS_SCHEMA_VERSION);
       // Both issues got outcomes, so history should have 2 entries
       expect(parsed.data.history).toHaveLength(2);
+    }
+  });
+
+  // --- audit issue #4 follow-up: STATUS_SCHEMA_VERSION bump for `unhealthy` ---
+
+  it("STATUS_SCHEMA_VERSION is bumped to 2 (the `unhealthy` run-state is a breaking shape change for old viewers)", () => {
+    // Regression lock: adding the `unhealthy` enum member to RunStateSchema
+    // changes what a valid snapshot looks like. An un-bumped version constant
+    // would let an old (pre-`unhealthy`) viewer pass the raw-version guard in
+    // reducer.ts and then fail safeParse on the unknown enum value, which the
+    // reducer treats as a torn read ("stale") — hiding the very failure state
+    // #4 exists to surface. See `.sandcastle/lib/status/schema.ts`.
+    expect(STATUS_SCHEMA_VERSION).toBe(2);
+  });
+
+  it("a full snapshot with state:'unhealthy' at the current STATUS_SCHEMA_VERSION round-trips through the schema", () => {
+    const { store } = makeStore();
+    store.finish("unhealthy");
+    const snap = store.snapshot();
+
+    expect(snap.schemaVersion).toBe(STATUS_SCHEMA_VERSION);
+    expect(snap.state).toBe("unhealthy");
+
+    const parsed = SandcastleStatusSchema.safeParse(snap);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.state).toBe("unhealthy");
     }
   });
 

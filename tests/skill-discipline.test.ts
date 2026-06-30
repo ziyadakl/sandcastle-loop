@@ -1097,6 +1097,31 @@ describe("parseRequiredSkillsByType", () => {
     expect(parsed.get("type:visual-enhance")).toEqual(["impeccable", "polish"]);
   });
 
+  it("skips a tool: bullet even when mis-configured directly inside a Required: block (#3 sibling-gate structural guarantee)", () => {
+    // SANDCASTLE.md.example documents that `verify`-style unrunnable tools
+    // must be attached via `tool:` labels / `Opt in via tool:` blocks, never
+    // as a bare `type:`-section `Required:` bullet — because the host
+    // skill-discipline gate (validateRequiredSkillsInvoked in main.mts) has
+    // no environment-awareness carve-out and would quarantine the issue
+    // before the reviewer's unrunnable-tool carve-out could apply. That
+    // guidance only holds if the parser defensively drops a `tool:` token
+    // even when a consumer mis-configures it directly under `Required:`
+    // (rather than under a separate `Opt in` block). Locks that guarantee.
+    const md = [
+      "### type:misconfigured",
+      "",
+      "Required:",
+      "",
+      "- impeccable",
+      "- tool:verify",
+      "",
+    ].join("\n");
+    const parsed = parseRequiredSkillsByType(md);
+    expect(parsed.get("type:misconfigured")).toEqual(["impeccable"]);
+    expect(parsed.get("type:misconfigured")).not.toContain("verify");
+    expect(parsed.get("type:misconfigured")).not.toContain("tool:verify");
+  });
+
   it("matches both 'Required:' and 'Required critique dimensions:' block headers", () => {
     const md = [
       "### type:backend",
