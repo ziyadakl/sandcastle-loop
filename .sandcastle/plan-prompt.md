@@ -32,15 +32,24 @@ a `Blocked by: #N` reference is resolved:
    list above already filters for this, but double-check — never schedule an
    issue without that label.
 
-2. **Exclude blocked issues.** If an issue body contains a line of the form
-   `Blocked by: #N` (case-insensitive), look up issue #N in the
-   `<all-open-issues>` list above. If #N is present in `<all-open-issues>`,
-   the block is UNRESOLVED (regardless of #N's current label — it may be
-   `needs-human`, `in-progress`, on hold, or anything else; what matters is
-   that it is still OPEN). M is blocked and you MUST exclude it. Only treat
-   the block as resolved when #N is ABSENT from `<all-open-issues>` (i.e.
-   the issue has been closed or merged). Multiple `Blocked by:` lines stack
-   — ALL must be resolved.
+2. **Exclude blocked issues.** An issue declares its blockers in EITHER of
+   two forms — honor BOTH:
+
+   - **Inline form:** a line of the form `Blocked by: #N` (case-insensitive,
+     hyphen optional). All `#N` references on that line are blockers.
+   - **Header form:** a markdown heading `## Blocked by` (or any level,
+     `# … ###### Blocked by`, no colon). Every `#N` reference on the lines
+     that follow it — up to the next blank line or the next heading — is a
+     blocker.
+
+   For each blocker `#N`, look up issue #N in the `<all-open-issues>` list
+   above. If #N is present in `<all-open-issues>`, the block is UNRESOLVED
+   (regardless of #N's current label — it may be `needs-human`,
+   `in-progress`, on hold, or anything else; what matters is that it is
+   still OPEN). The issue is blocked and you MUST exclude it. Only treat the
+   block as resolved when #N is ABSENT from `<all-open-issues>` (i.e. the
+   issue has been closed or merged). Blockers from BOTH forms stack — ALL
+   referenced `#N` (inline and header) must be resolved.
 
    ⚠️ Truncation guard: if `<all-open-issues>` contains exactly 200
    entries, the `gh issue list --limit 200` call has likely been
