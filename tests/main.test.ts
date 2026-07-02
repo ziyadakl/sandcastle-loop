@@ -2108,6 +2108,56 @@ describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
     const res = preflight(baseArgs(), { exec: () => ({ ok: true }) });
     expect(hasBranchError(res.errors)).toBe(false);
   });
+
+  // ---- Attachment (symbolic-ref) hardening — 2026-07-02 scheduler incident ----
+  // The SHA-only check has a hole: `git branch <run> <base>` with NO checkout
+  // leaves the launch HEAD ATTACHED to <base> while <base> and <run> share a
+  // tip. The SHAs then match, so the SHA check passes — yet fastForwardIntegration
+  // advances <run> through a worktree the launch checkout doesn't own, so every
+  // merged issue re-bases off the stale <base> and re-does the foundation. Assert
+  // branch ATTACHMENT via `git symbolic-ref`, not just SHA equality.
+  //
+  // Mock: symbolic-ref returns the branch HEAD is attached to (or fails =
+  // detached); both rev-parse calls return the SAME sha (the hole).
+  function execAttach(attachedBranch: string | null) {
+    return (bin: string, a: readonly string[]) => {
+      if (bin === "git" && a.includes("symbolic-ref")) {
+        return attachedBranch === null
+          ? { ok: false, stderr: "fatal: ref HEAD is not a symbolic ref" }
+          : { ok: true, stdout: `${attachedBranch}\n` };
+      }
+      if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
+        return { ok: true, stdout: "aaaa1111\n" };
+      }
+      if (
+        bin === "git" &&
+        a.includes("rev-parse") &&
+        a.some((x) => x.startsWith("refs/heads/"))
+      ) {
+        // SAME sha as HEAD → the SHA check is structurally blind here.
+        return { ok: true, stdout: "aaaa1111\n" };
+      }
+      return { ok: true };
+    };
+  }
+  const hasAttachError = (errors: readonly string[]) =>
+    errors.some((e) => /on branch '.*', not the --branch/i.test(e));
+
+  it("refuses when HEAD is attached to a DIFFERENT branch at the same tip (SHA-blind hole)", () => {
+    const res = preflight(baseArgs(), { exec: execAttach("main") });
+    expect(res.ok).toBe(false);
+    expect(hasAttachError(res.errors)).toBe(true);
+  });
+
+  it("passes when HEAD is attached to the --branch (no false positive)", () => {
+    const res = preflight(baseArgs(), { exec: execAttach("feature/work") });
+    expect(hasAttachError(res.errors)).toBe(false);
+  });
+
+  it("does not fire the attachment check on detached HEAD (falls back to SHA compare)", () => {
+    const res = preflight(baseArgs(), { exec: execAttach(null) });
+    expect(hasAttachError(res.errors)).toBe(false);
+  });
 });
 
 describe("sandcastle-loop main.mts — staging worktree", () => {
@@ -2262,7 +2312,15 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
     }
   });
 
-  it("falls back to update-ref when the target branch is not checked out anywhere", () => {
+  // 2026-07-02 scheduler incident: the no-worktree fallback used to `git
+  // update-ref` the target branch — advancing the ref while NO working tree
+  // tracked it, so the launch checkout (parked on a stale base) kept cutting
+  // worker worktrees off the old commit. That is the exact silent-stranding the
+  // disk-drift comment warns about. This path is now only reachable once the run
+  // branch is already stranded (the branch-base preflight gate keeps the launch
+  // worktree ON the run branch in normal operation), so refuse loudly instead of
+  // silently advancing an unowned ref.
+  it("refuses (no silent update-ref) when the target branch is not checked out anywhere", () => {
     const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
     try {
       const git = (...args: string[]): string =>
@@ -2274,13 +2332,24 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
       writeFileSync(path.join(repoRoot, "finance.ts"), "x\n");
       git("add", "finance.ts");
       git("commit", "-q", "-m", "advance");
-      const candidateTip = git("rev-parse", "HEAD");
+      const featBefore = git("rev-parse", "refs/heads/feat-x");
       git("checkout", "-q", "main");
 
       const logs: string[] = [];
-      const ok = fastForwardIntegration(repoRoot, "feat-x", (s) => logs.push(s), () => {});
-      expect(ok).toBe(true);
-      expect(git("rev-parse", "refs/heads/feat-x")).toBe(candidateTip);
+      const errors: string[] = [];
+      const ok = fastForwardIntegration(
+        repoRoot,
+        "feat-x",
+        (s) => logs.push(s),
+        (s) => errors.push(s),
+      );
+
+      expect(ok).toBe(false);
+      // The ref must NOT have moved — no silent advance of an unowned branch.
+      expect(git("rev-parse", "refs/heads/feat-x")).toBe(featBefore);
+      // Loud, actionable refusal naming the missing worktree.
+      expect(errors.some((e) => e.startsWith("fast-forward refused"))).toBe(true);
+      expect(errors.some((e) => /no (live )?worktree/i.test(e))).toBe(true);
       expect(logs.some((l) => l.includes("via worktree merge"))).toBe(false);
     } finally {
       cleanup();

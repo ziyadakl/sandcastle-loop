@@ -1098,41 +1098,77 @@ export function preflight(args: SandcastleArgs, opts: {
     }
   }
 
-  // 9. Launch-checkout HEAD must be on the --branch tip. Worker worktrees are
-  // cut from the launch checkout's CURRENT HEAD (`git worktree add` branches
-  // off HEAD), NOT from --branch. If the checkout drifted off the feature
-  // branch (e.g. left on an old work/next snapshot or integration-candidate),
-  // every worker builds on a stale base and dependent issues HALT/conflict —
-  // the affinity-tracker branch-base trap (ADR 0014). Refuse to launch on a
-  // confirmed divergence rather than warn. Skip safely when the branch ref
-  // doesn't resolve (brand-new branch / detached HEAD) or when stdout wasn't
-  // captured (mocked exec) — only a confirmed HEAD≠tip mismatch is fatal.
-  const headRev = exec("git", ["-C", args.repoRoot, "rev-parse", "HEAD"]);
-  const branchRev = exec("git", [
+  // 9. Launch-checkout HEAD must be ATTACHED TO --branch, not merely at the
+  // same commit. Worker worktrees are cut from the launch checkout's CURRENT
+  // HEAD (`git worktree add` branches off HEAD), NOT from --branch, and
+  // fastForwardIntegration advances --branch through whichever worktree has it
+  // checked out. A SHA-only check has a hole: `git branch <run> <base>` with no
+  // checkout leaves HEAD attached to <base> while <base> and <run> share a tip
+  // — the SHAs match, yet every merged issue re-bases off the stale <base> and
+  // re-does the foundation (the affinity-tracker branch-base trap, ADR 0014;
+  // recurred on the scheduler repo 2026-07-02). So assert branch ATTACHMENT via
+  // `git symbolic-ref` first — that is authoritative and closes the hole. Only
+  // when HEAD is detached or symbolic-ref stdout wasn't captured (mocked exec)
+  // fall back to the SHA comparison, where a confirmed HEAD-sha ≠ branch-tip-sha
+  // divergence is still fatal and equal/unknown skips.
+  const headBranchRef = exec("git", [
     "-C",
     args.repoRoot,
-    "rev-parse",
-    "--verify",
+    "symbolic-ref",
     "--quiet",
-    `refs/heads/${args.branch}`,
+    "--short",
+    "HEAD",
   ]);
-  if (
-    headRev.ok &&
-    branchRev.ok &&
-    headRev.stdout !== undefined &&
-    branchRev.stdout !== undefined &&
-    headRev.stdout.trim() !== "" &&
-    branchRev.stdout.trim() !== "" &&
-    headRev.stdout.trim() !== branchRev.stdout.trim()
-  ) {
-    errors.push(
-      `launch checkout HEAD (${headRev.stdout.trim().slice(0, 12)}) is not on ` +
-        `the --branch tip '${args.branch}' (${branchRev.stdout.trim().slice(0, 12)}). ` +
-        `Worker worktrees are cut from the launch checkout's HEAD, so they ` +
-        `would build on a stale base and dependent issues would fail. Run ` +
-        `\`git -C ${args.repoRoot} checkout ${args.branch}\` (or pass the ` +
-        `--branch you actually intend) and re-run the loop.`,
-    );
+  const attachedBranch =
+    headBranchRef.ok && typeof headBranchRef.stdout === "string"
+      ? headBranchRef.stdout.trim()
+      : "";
+  if (attachedBranch !== "") {
+    // symbolic-ref resolved → attachment is authoritative. When HEAD is
+    // attached to --branch the tips are equal by definition, so this subsumes
+    // the SHA fallback below.
+    if (attachedBranch !== args.branch) {
+      errors.push(
+        `launch checkout is on branch '${attachedBranch}', not the --branch ` +
+          `'${args.branch}'. Worker worktrees are cut from the launch checkout's ` +
+          `HEAD and --branch is advanced through the worktree that has it checked ` +
+          `out, so a mismatch silently re-bases every issue off '${attachedBranch}' ` +
+          `and re-does the foundation — even when the two branches currently share ` +
+          `a commit. Run \`git -C ${args.repoRoot} checkout ${args.branch}\` (or ` +
+          `pass the --branch you actually intend) and re-run the loop.`,
+      );
+    }
+  } else {
+    // Detached HEAD or exec didn't capture stdout (mocked). Fall back to the
+    // SHA comparison — only a confirmed HEAD-sha ≠ branch-tip-sha divergence is
+    // fatal; equal/unknown skips.
+    const headRev = exec("git", ["-C", args.repoRoot, "rev-parse", "HEAD"]);
+    const branchRev = exec("git", [
+      "-C",
+      args.repoRoot,
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `refs/heads/${args.branch}`,
+    ]);
+    if (
+      headRev.ok &&
+      branchRev.ok &&
+      headRev.stdout !== undefined &&
+      branchRev.stdout !== undefined &&
+      headRev.stdout.trim() !== "" &&
+      branchRev.stdout.trim() !== "" &&
+      headRev.stdout.trim() !== branchRev.stdout.trim()
+    ) {
+      errors.push(
+        `launch checkout HEAD (${headRev.stdout.trim().slice(0, 12)}) is not on ` +
+          `the --branch tip '${args.branch}' (${branchRev.stdout.trim().slice(0, 12)}). ` +
+          `Worker worktrees are cut from the launch checkout's HEAD, so they ` +
+          `would build on a stale base and dependent issues would fail. Run ` +
+          `\`git -C ${args.repoRoot} checkout ${args.branch}\` (or pass the ` +
+          `--branch you actually intend) and re-run the loop.`,
+      );
+    }
   }
 
   return { ok: errors.length === 0, errors };
@@ -1988,7 +2024,11 @@ export async function createSandboxWithWorktreeRepair(
  * bare `git update-ref` here would silently strand the working tree on
  * the old snapshot — see commit history for the disk-drift incident.
  *
- * If the branch is not checked out anywhere, fall back to `update-ref`.
+ * If the branch is not checked out anywhere, REFUSE (return false) rather than
+ * `update-ref` the bare ref — advancing a ref no working tree tracks is the
+ * silent-stranding behaviour above, and the branch-base preflight gate keeps
+ * the launch worktree ON the run branch so this path is only reachable once the
+ * branch is already stranded (scheduler incident, 2026-07-02).
  *
  * Divergence fallback (audit 2026-05-30, Issue 7): when an operator
  * commits to `integrationBranch` mid-iteration, staging is no longer an
@@ -2089,21 +2129,23 @@ export function fastForwardIntegration(
     );
     return true;
   }
-  const update = runGit(
-    repoRoot,
-    "update-ref",
-    `refs/heads/${integrationBranch}`,
-    stagingTip,
-    integrationTip,
+  // No worktree has `integrationBranch` checked out. A bare `git update-ref`
+  // here would advance the ref while NO working tree tracks it — the exact
+  // silent-stranding the disk-drift comment above warns about, and the
+  // mechanism behind the 2026-07-02 branch-base incident (the launch checkout,
+  // parked on a stale base, kept cutting worker worktrees off the old commit
+  // while the run branch's ref crept forward underneath it). In normal
+  // operation the branch-base preflight gate keeps the launch worktree ON the
+  // run branch, so this path is only reachable once the run branch is already
+  // stranded. Refuse loudly rather than deepen the corruption.
+  logError(
+    `fast-forward refused: no live worktree has '${integrationBranch}' checked ` +
+      `out, so advancing it would strand the ref off every working tree (the ` +
+      `branch-base trap). The launch checkout must stay on '${integrationBranch}' ` +
+      `for the loop to layer correctly — run \`git -C ${repoRoot} checkout ` +
+      `${integrationBranch}\` and re-run. Skipping promotion this iteration.`,
   );
-  if (!update.ok) {
-    logError(`fast-forward: update-ref failed: ${update.stderr}`);
-    return false;
-  }
-  log(
-    `fast-forward: ${integrationBranch} ${integrationTip.slice(0, 8)} → ${stagingTip.slice(0, 8)}`,
-  );
-  return true;
+  return false;
 }
 
 /**
@@ -2993,11 +3035,10 @@ export function cleanupIssueBranch(
   //
   // Pre-check merge status against `launchBranch` (NOT HEAD): the
   // pipeline calls us from `args.repoRoot`, where HEAD usually matches
-  // the launch branch but doesn't have to. The FF step
-  // (`fastForwardIntegration`) falls back to `git update-ref` when the
-  // launch branch isn't checked out anywhere, which leaves repoRoot's
-  // HEAD pointed at some other branch. Using HEAD here would falsely
-  // report "not merged" and skip cleanup of branches that DID land.
+  // the launch branch but isn't guaranteed to — a mid-run manual checkout
+  // or a detached HEAD can leave repoRoot pointed at some other ref. Using
+  // HEAD here would falsely report "not merged" and skip cleanup of
+  // branches that DID land, so we pin the check to launchBranch explicitly.
   //
   // We then delete via SHA-pinned `update-ref -d` rather than
   // `branch -d`, because `branch -d` performs the same HEAD-based
