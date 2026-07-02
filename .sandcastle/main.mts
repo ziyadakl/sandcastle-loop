@@ -1138,8 +1138,26 @@ export function preflight(args: SandcastleArgs, opts: {
           `pass the --branch you actually intend) and re-run the loop.`,
       );
     }
+  } else if (!headBranchRef.ok) {
+    // symbolic-ref exited non-zero → HEAD is DETACHED (attached to no branch).
+    // The loop cuts worker worktrees from the launch HEAD and advances
+    // --branch through the worktree that has it checked out; a detached HEAD is
+    // attached to nothing, so --branch cannot advance and fastForwardIntegration
+    // refuses every promotion — a mid-run dead-end. Detached *at* the branch tip
+    // also re-creates the branch-base trap the instant --branch first moves.
+    // Refuse at boot rather than let the run stall. (The SHA fallback below is
+    // unreachable in production — real symbolic-ref either resolves or fails; it
+    // survives only for legacy exec mocks that don't capture stdout.)
+    errors.push(
+      `launch checkout has a detached HEAD (attached to no branch), but the loop ` +
+        `advances --branch '${args.branch}' through the launch worktree — a ` +
+        `detached HEAD can't do that, so worker worktrees would strand on the ` +
+        `detached commit and every promotion would be refused. Run ` +
+        `\`git -C ${args.repoRoot} checkout ${args.branch}\` and re-run the loop.`,
+    );
   } else {
-    // Detached HEAD or exec didn't capture stdout (mocked). Fall back to the
+    // headBranchRef.ok but no stdout captured → a legacy exec mock that doesn't
+    // pipe stdout (real exec always captures it). Stay inert and fall back to the
     // SHA comparison — only a confirmed HEAD-sha ≠ branch-tip-sha divergence is
     // fatal; equal/unknown skips.
     const headRev = exec("git", ["-C", args.repoRoot, "rev-parse", "HEAD"]);

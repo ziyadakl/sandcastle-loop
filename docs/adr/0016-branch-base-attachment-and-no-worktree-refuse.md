@@ -65,9 +65,15 @@ Two test-locked template changes, plus the consumer-side skill fix.
 
 - The gate now catches the common "created the branch but didn't check it out"
   mistake even when the branches share a tip — the case 0014 shipped blind to.
-- A launch with a detached HEAD still isn't hard-refused by the attachment check
-  (falls to the SHA path); acceptable — detached-at-tip is rare and the SHA path
-  still catches detached-at-a-divergent-commit.
+- A launch with a **detached HEAD is now hard-refused** at boot: a detached HEAD
+  is attached to no branch, so `--branch` can't advance through the launch
+  worktree and `fastForwardIntegration` (change 2) would refuse every promotion
+  — a mid-run dead-end. Refusing in preflight turns that into a clear boot-time
+  error. This makes the two gates consistent (both require an attached run
+  branch) and closes the case a code review flagged: detached-*at-tip* passed
+  the SHA check yet stalled the run. The SHA fallback is consequently unreachable
+  in production (real `symbolic-ref` either resolves or fails); it survives only
+  so legacy exec mocks that don't capture stdout stay inert.
 - `fastForwardIntegration` can no longer silently advance an unowned ref. If a
   future change legitimately needs a bare-ref fast-forward, it must re-introduce
   it deliberately with its own test — the removed test's expectation was flipped,

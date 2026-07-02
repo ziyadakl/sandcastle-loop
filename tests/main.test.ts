@@ -2154,9 +2154,38 @@ describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
     expect(hasAttachError(res.errors)).toBe(false);
   });
 
-  it("does not fire the attachment check on detached HEAD (falls back to SHA compare)", () => {
+  it("refuses on a real detached HEAD (symbolic-ref fails) — can't attach to --branch", () => {
+    // execAttach(null) models a real detached HEAD: `git symbolic-ref` exits
+    // non-zero. The loop can't advance --branch through a detached worktree, so
+    // every promotion would be refused mid-run — refuse at boot instead.
     const res = preflight(baseArgs(), { exec: execAttach(null) });
+    expect(res.ok).toBe(false);
+    expect(res.errors.some((e) => /detached HEAD/i.test(e))).toBe(true);
+  });
+
+  it("stays inert on the legacy no-stdout mock (symbolic-ref ok but empty) → SHA fallback", () => {
+    // Legacy mocks return { ok: true } with no stdout for symbolic-ref. That is
+    // NOT a detached HEAD (ok is true), so the detached refusal must not fire;
+    // control falls to the SHA comparison, which also skips when tips match.
+    const res = preflight(baseArgs(), {
+      exec: (bin, a) => {
+        if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
+          return { ok: true, stdout: "aaaa1111\n" };
+        }
+        if (
+          bin === "git" &&
+          a.includes("rev-parse") &&
+          a.some((x) => x.startsWith("refs/heads/"))
+        ) {
+          return { ok: true, stdout: "aaaa1111\n" };
+        }
+        // symbolic-ref (and everything else) → ok, no stdout.
+        return { ok: true };
+      },
+    });
+    expect(res.errors.some((e) => /detached HEAD/i.test(e))).toBe(false);
     expect(hasAttachError(res.errors)).toBe(false);
+    expect(hasBranchError(res.errors)).toBe(false);
   });
 });
 
