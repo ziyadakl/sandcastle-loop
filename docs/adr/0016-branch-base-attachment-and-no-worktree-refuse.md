@@ -37,13 +37,18 @@ gate failing to fire while the exact trap it targets recurred: issue #40 re-did
 Two test-locked template changes, plus the consumer-side skill fix.
 
 1. **Assert branch *attachment*, not SHA equality** (`preflight()` check 9). Run
-   `git symbolic-ref --quiet --short HEAD` first; when it resolves a branch name,
-   that is authoritative — refuse if it is not `--branch` (this closes the hole:
-   HEAD attached to `<base>` at the same tip now fails). Only when HEAD is
-   detached or `symbolic-ref` output isn't captured (mocked exec) do we fall back
-   to 0014's SHA comparison. Backward compatible: 0014's four gate tests still
-   pass unchanged because their mocks return no `symbolic-ref` stdout and route
-   to the SHA fallback.
+   `git symbolic-ref --quiet --short HEAD`: when it resolves a branch name, refuse
+   if it is not `--branch` (this closes the hole: HEAD attached to `<base>` at the
+   same tip now fails); when it exits non-zero, HEAD is detached and we refuse
+   (see Consequences). This is now the *whole* check — a single attachment model
+   with no SHA-comparison fallback. 0014's original gate resolved and compared
+   HEAD-sha vs `--branch`-tip-sha; that path had the same-sha-different-branch
+   hole and, once detached is also refused, was reachable only by legacy exec
+   mocks, so ADR 0016 removed it (the four SHA-based gate tests were replaced by
+   attachment tests). The `else` case — `symbolic-ref` ok but no stdout — cannot
+   occur with real git (the default `exec` captures stdout); it survives only as
+   an inert no-op so the ~15 other preflight tests that mock `exec` as
+   `() => ({ ok: true })` stay unaffected.
 
 2. **Refuse the no-worktree fast-forward** (`fastForwardIntegration`). The bare
    `update-ref` fallback is removed; when no live worktree has the target branch
@@ -71,9 +76,9 @@ Two test-locked template changes, plus the consumer-side skill fix.
   — a mid-run dead-end. Refusing in preflight turns that into a clear boot-time
   error. This makes the two gates consistent (both require an attached run
   branch) and closes the case a code review flagged: detached-*at-tip* passed
-  the SHA check yet stalled the run. The SHA fallback is consequently unreachable
-  in production (real `symbolic-ref` either resolves or fails); it survives only
-  so legacy exec mocks that don't capture stdout stay inert.
+  the SHA check yet stalled the run. With detached now refused, the old SHA
+  comparison had no remaining production role (real `symbolic-ref` either
+  resolves or fails), so it was removed — leaving a single attachment model.
 - `fastForwardIntegration` can no longer silently advance an unowned ref. If a
   future change legitimately needs a bare-ref fast-forward, it must re-introduce
   it deliberately with its own test — the removed test's expectation was flipped,

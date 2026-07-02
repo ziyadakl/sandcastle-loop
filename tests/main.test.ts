@@ -2055,70 +2055,17 @@ describe("sandcastle-loop main.mts — .sandcastle/main.mts dirty-check prefligh
 
 describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
   // Worker worktrees are cut from the launch checkout's CURRENT HEAD, not from
-  // --branch. If the checkout drifted off the feature branch, every worker
-  // builds on a stale base and dependent issues fail (affinity-tracker branch-
-  // base trap). preflight refuses to launch on a confirmed HEAD≠branch-tip
-  // divergence. baseArgs().branch is "feature/work".
+  // --branch, and fastForwardIntegration advances --branch through the worktree
+  // that has it checked out. So the launch checkout must be ATTACHED to --branch,
+  // not merely at the same commit: `git branch <run> <base>` with no checkout
+  // leaves HEAD attached to <base> at the shared tip, which a SHA-equality check
+  // would wave through (the affinity-tracker branch-base trap). The gate is a
+  // single attachment model over `git symbolic-ref --short HEAD` (ADR 0016);
+  // there is no SHA-comparison fallback. baseArgs().branch is "feature/work".
   //
-  // exec mock: canned shas for the two rev-parse calls; everything else (gh,
-  // docker, dirty-check, …) returns ok so only the branch-base check is tested.
-  function execFor(headSha: string, branchSha: string | null) {
-    return (bin: string, a: readonly string[]) => {
-      if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
-        return { ok: true, stdout: `${headSha}\n` };
-      }
-      if (
-        bin === "git" &&
-        a.includes("rev-parse") &&
-        a.some((x) => x.startsWith("refs/heads/"))
-      ) {
-        return branchSha === null
-          ? { ok: false, stderr: "" } // ref doesn't resolve
-          : { ok: true, stdout: `${branchSha}\n` };
-      }
-      return { ok: true };
-    };
-  }
-  const hasBranchError = (errors: readonly string[]) =>
-    errors.some((e) => /launch checkout HEAD/i.test(e));
-
-  it("refuses to launch when launch HEAD != --branch tip", () => {
-    const res = preflight(baseArgs(), {
-      exec: execFor("aaaa1111", "bbbb2222"),
-    });
-    expect(res.ok).toBe(false);
-    expect(hasBranchError(res.errors)).toBe(true);
-  });
-
-  it("passes when launch HEAD == --branch tip", () => {
-    const res = preflight(baseArgs(), {
-      exec: execFor("aaaa1111", "aaaa1111"),
-    });
-    expect(hasBranchError(res.errors)).toBe(false);
-  });
-
-  it("skips the check when the branch ref doesn't resolve (new branch / detached)", () => {
-    const res = preflight(baseArgs(), { exec: execFor("aaaa1111", null) });
-    expect(hasBranchError(res.errors)).toBe(false);
-  });
-
-  it("is inert when exec doesn't capture stdout (legacy mocks → no false positive)", () => {
-    // The other preflight tests mock exec as () => ({ ok: true }) with no
-    // stdout; the branch-base check must be a no-op for them.
-    const res = preflight(baseArgs(), { exec: () => ({ ok: true }) });
-    expect(hasBranchError(res.errors)).toBe(false);
-  });
-
-  // ---- Attachment (symbolic-ref) hardening — 2026-07-02 scheduler incident ----
-  // The SHA-only check has a hole: `git branch <run> <base>` with NO checkout
-  // leaves the launch HEAD ATTACHED to <base> while <base> and <run> share a
-  // tip. The SHAs then match, so the SHA check passes — yet fastForwardIntegration
-  // advances <run> through a worktree the launch checkout doesn't own, so every
-  // merged issue re-bases off the stale <base> and re-does the foundation. Assert
-  // branch ATTACHMENT via `git symbolic-ref`, not just SHA equality.
-  //
-  // Mock: symbolic-ref returns the branch HEAD is attached to (or fails =
-  // detached); both rev-parse calls return the SAME sha (the hole).
+  // Mock: symbolic-ref returns the branch HEAD is attached to, or fails =
+  // detached. Everything else (gh, docker, dirty-check, …) returns ok so only
+  // the branch-base check is exercised.
   function execAttach(attachedBranch: string | null) {
     return (bin: string, a: readonly string[]) => {
       if (bin === "git" && a.includes("symbolic-ref")) {
@@ -2126,24 +2073,13 @@ describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
           ? { ok: false, stderr: "fatal: ref HEAD is not a symbolic ref" }
           : { ok: true, stdout: `${attachedBranch}\n` };
       }
-      if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
-        return { ok: true, stdout: "aaaa1111\n" };
-      }
-      if (
-        bin === "git" &&
-        a.includes("rev-parse") &&
-        a.some((x) => x.startsWith("refs/heads/"))
-      ) {
-        // SAME sha as HEAD → the SHA check is structurally blind here.
-        return { ok: true, stdout: "aaaa1111\n" };
-      }
       return { ok: true };
     };
   }
   const hasAttachError = (errors: readonly string[]) =>
     errors.some((e) => /on branch '.*', not the --branch/i.test(e));
 
-  it("refuses when HEAD is attached to a DIFFERENT branch at the same tip (SHA-blind hole)", () => {
+  it("refuses when HEAD is attached to a DIFFERENT branch (even at the same tip)", () => {
     const res = preflight(baseArgs(), { exec: execAttach("main") });
     expect(res.ok).toBe(false);
     expect(hasAttachError(res.errors)).toBe(true);
@@ -2163,29 +2099,15 @@ describe("sandcastle-loop main.mts — branch-base preflight gate", () => {
     expect(res.errors.some((e) => /detached HEAD/i.test(e))).toBe(true);
   });
 
-  it("stays inert on the legacy no-stdout mock (symbolic-ref ok but empty) → SHA fallback", () => {
-    // Legacy mocks return { ok: true } with no stdout for symbolic-ref. That is
-    // NOT a detached HEAD (ok is true), so the detached refusal must not fire;
-    // control falls to the SHA comparison, which also skips when tips match.
-    const res = preflight(baseArgs(), {
-      exec: (bin, a) => {
-        if (bin === "git" && a.includes("rev-parse") && a.includes("HEAD")) {
-          return { ok: true, stdout: "aaaa1111\n" };
-        }
-        if (
-          bin === "git" &&
-          a.includes("rev-parse") &&
-          a.some((x) => x.startsWith("refs/heads/"))
-        ) {
-          return { ok: true, stdout: "aaaa1111\n" };
-        }
-        // symbolic-ref (and everything else) → ok, no stdout.
-        return { ok: true };
-      },
-    });
-    expect(res.errors.some((e) => /detached HEAD/i.test(e))).toBe(false);
+  it("stays inert for the legacy no-stdout exec mock (the shape ~15 other preflight tests use)", () => {
+    // Real git always resolves symbolic-ref (attached) or fails it (detached); a
+    // bare () => ({ ok: true }) mock returns ok with no stdout, which is neither.
+    // The gate must treat that as an inert no-op — otherwise every other preflight
+    // test that uses this mock shape (DB-URL, sandbox-image, dirty-check blocks)
+    // would trip the attachment or detached refusal and break.
+    const res = preflight(baseArgs(), { exec: () => ({ ok: true }) });
     expect(hasAttachError(res.errors)).toBe(false);
-    expect(hasBranchError(res.errors)).toBe(false);
+    expect(res.errors.some((e) => /detached HEAD/i.test(e))).toBe(false);
   });
 });
 

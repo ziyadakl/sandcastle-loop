@@ -1102,15 +1102,15 @@ export function preflight(args: SandcastleArgs, opts: {
   // same commit. Worker worktrees are cut from the launch checkout's CURRENT
   // HEAD (`git worktree add` branches off HEAD), NOT from --branch, and
   // fastForwardIntegration advances --branch through whichever worktree has it
-  // checked out. A SHA-only check has a hole: `git branch <run> <base>` with no
+  // checked out. A SHA-only check had a hole: `git branch <run> <base>` with no
   // checkout leaves HEAD attached to <base> while <base> and <run> share a tip
   // — the SHAs match, yet every merged issue re-bases off the stale <base> and
   // re-does the foundation (the affinity-tracker branch-base trap, ADR 0014;
-  // recurred on the scheduler repo 2026-07-02). So assert branch ATTACHMENT via
-  // `git symbolic-ref` first — that is authoritative and closes the hole. Only
-  // when HEAD is detached or symbolic-ref stdout wasn't captured (mocked exec)
-  // fall back to the SHA comparison, where a confirmed HEAD-sha ≠ branch-tip-sha
-  // divergence is still fatal and equal/unknown skips.
+  // recurred on the scheduler repo 2026-07-02). So the check is now a single
+  // ATTACHMENT model over `git symbolic-ref --short HEAD`, which real git always
+  // resolves (→ the attached branch) or fails (→ detached). Both cases are
+  // fatal-or-pass here; there is no third "same-sha-different-branch" hole left
+  // to catch, so ADR 0016 removed the old SHA-comparison fallback.
   const headBranchRef = exec("git", [
     "-C",
     args.repoRoot,
@@ -1124,9 +1124,8 @@ export function preflight(args: SandcastleArgs, opts: {
       ? headBranchRef.stdout.trim()
       : "";
   if (attachedBranch !== "") {
-    // symbolic-ref resolved → attachment is authoritative. When HEAD is
-    // attached to --branch the tips are equal by definition, so this subsumes
-    // the SHA fallback below.
+    // symbolic-ref resolved → HEAD is attached to `attachedBranch`. When that is
+    // --branch the tips are equal by definition, so this is the whole check.
     if (attachedBranch !== args.branch) {
       errors.push(
         `launch checkout is on branch '${attachedBranch}', not the --branch ` +
@@ -1145,9 +1144,7 @@ export function preflight(args: SandcastleArgs, opts: {
     // attached to nothing, so --branch cannot advance and fastForwardIntegration
     // refuses every promotion — a mid-run dead-end. Detached *at* the branch tip
     // also re-creates the branch-base trap the instant --branch first moves.
-    // Refuse at boot rather than let the run stall. (The SHA fallback below is
-    // unreachable in production — real symbolic-ref either resolves or fails; it
-    // survives only for legacy exec mocks that don't capture stdout.)
+    // Refuse at boot rather than let the run stall.
     errors.push(
       `launch checkout has a detached HEAD (attached to no branch), but the loop ` +
         `advances --branch '${args.branch}' through the launch worktree — a ` +
@@ -1155,39 +1152,11 @@ export function preflight(args: SandcastleArgs, opts: {
         `detached commit and every promotion would be refused. Run ` +
         `\`git -C ${args.repoRoot} checkout ${args.branch}\` and re-run the loop.`,
     );
-  } else {
-    // headBranchRef.ok but no stdout captured → a legacy exec mock that doesn't
-    // pipe stdout (real exec always captures it). Stay inert and fall back to the
-    // SHA comparison — only a confirmed HEAD-sha ≠ branch-tip-sha divergence is
-    // fatal; equal/unknown skips.
-    const headRev = exec("git", ["-C", args.repoRoot, "rev-parse", "HEAD"]);
-    const branchRev = exec("git", [
-      "-C",
-      args.repoRoot,
-      "rev-parse",
-      "--verify",
-      "--quiet",
-      `refs/heads/${args.branch}`,
-    ]);
-    if (
-      headRev.ok &&
-      branchRev.ok &&
-      headRev.stdout !== undefined &&
-      branchRev.stdout !== undefined &&
-      headRev.stdout.trim() !== "" &&
-      branchRev.stdout.trim() !== "" &&
-      headRev.stdout.trim() !== branchRev.stdout.trim()
-    ) {
-      errors.push(
-        `launch checkout HEAD (${headRev.stdout.trim().slice(0, 12)}) is not on ` +
-          `the --branch tip '${args.branch}' (${branchRev.stdout.trim().slice(0, 12)}). ` +
-          `Worker worktrees are cut from the launch checkout's HEAD, so they ` +
-          `would build on a stale base and dependent issues would fail. Run ` +
-          `\`git -C ${args.repoRoot} checkout ${args.branch}\` (or pass the ` +
-          `--branch you actually intend) and re-run the loop.`,
-      );
-    }
   }
+  // Remaining case — headBranchRef.ok but no stdout — cannot occur with real git
+  // (the default exec captures stdout); it only arises for legacy exec mocks that
+  // don't pipe stdout, which must stay inert. Falling through with no error is
+  // exactly that inert no-op.
 
   return { ok: errors.length === 0, errors };
 }
