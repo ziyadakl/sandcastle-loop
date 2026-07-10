@@ -28,11 +28,13 @@ For each branch in the list above, in order:
       what it says.
    b. **Preserve both intents where possible.** Where the two changes are
       compatible, keep both. Where they genuinely conflict, pick the side
-      matching this iteration's goal and note the trade-off in the commit
-      body. Do NOT invent new behaviour to bridge them.
+      matching this iteration's goal (record the trade-off in the summary
+      commit — see AFTER ALL BRANCHES). Do NOT invent new behaviour to
+      bridge them.
    c. **Guard test files especially.** A "kept both" or "took theirs"
-      resolution that silently drops an assertion is a real bug — verify no
-      test coverage was lost before staging the file.
+      resolution that silently drops an assertion is a real bug. Before
+      staging a test file, run `git diff --staged <file>` and confirm no
+      assertions were removed — only added or relocated.
 <!-- variant:test-runner-merge -->
 3. After resolving conflicts (or if there were none), run
    `npm run typecheck` and `npm run test` (or the project's equivalents,
