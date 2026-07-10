@@ -939,6 +939,29 @@ export function loadDotenv(repoRoot: string): void {
   }
 }
 
+/**
+ * Paths copied into each per-iteration worktree/container (Docker path) alongside
+ * the git checkout. `node_modules` is always copied — it's gitignored but the
+ * in-sandbox build needs it. `pnpm-workspace.yaml` is copied ONLY when present at
+ * the repo root: pnpm 11 stores its `allowBuilds` build-script approval there (the
+ * only place pnpm 11 reads it), and the loop's onSandboxReady `pnpm install` runs
+ * inside the worktree, which receives only tracked files. Without this copy, a
+ * gitignored approval file is invisible in-sandbox and every iteration re-hits
+ * `ERR_PNPM_IGNORED_BUILDS`. The existence guard keeps npm / yarn / pnpm-10
+ * projects (which have no such file) completely unaffected. `fileExists` is
+ * injectable for tests.
+ */
+export function buildCopyToWorktree(
+  repoRoot: string,
+  fileExists: (p: string) => boolean = (p) => existsSync(p),
+): string[] {
+  const paths = ["node_modules"];
+  if (fileExists(path.join(repoRoot, "pnpm-workspace.yaml"))) {
+    paths.push("pnpm-workspace.yaml");
+  }
+  return paths;
+}
+
 // ---------------------------------------------------------------------------
 // Pre-flight
 // ---------------------------------------------------------------------------
@@ -2369,7 +2392,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       ],
     },
   } as const;
-  const copyToWorktree = ["node_modules"];
+  const copyToWorktree = buildCopyToWorktree(args.repoRoot);
 
   // Read git user identity from the host at CLI startup. The container's
   // safe.directory will be set up by sandcastle itself; user.name/user.email
