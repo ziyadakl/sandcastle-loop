@@ -1,7 +1,13 @@
 You are running natively on macOS via the sandcastle `mac-host` profile —
-there is no Docker container. You have direct access to Xcode, `xcodebuild`,
-`xcrun simctl`, the iOS Simulator runtime, Swift Package Manager, and
-CocoaPods. Use them as you would in any normal macOS development context.
+there is no Docker container. You have direct access to whatever macOS-native
+toolchain this project uses: for an iOS / Xcode project that means `xcodebuild`,
+`xcrun simctl`, the iOS Simulator runtime, and CocoaPods; for a macOS-GUI
+Swift Package Manager app (AppKit / SwiftUI, `Package.swift`, no `.xcodeproj`)
+it means the `swift` command-line toolchain (`swift build` / `swift test`) with
+no Xcode or simulator involved. Do not assume Xcode or a simulator is installed
+unless the project is an Xcode project — check for `Package.swift` vs
+`.xcodeproj`/`.xcworkspace` and use the matching tools. See e2e-command.md for
+the verify shape that matches this project.
 
 Working directory is a dedicated git worktree under
 `.sandcastle/worktrees/<branch>` off the main repository. Treat the

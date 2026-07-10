@@ -1,16 +1,28 @@
 # mac-host variant
 
 Runs each sandcastle iteration directly on the macOS host (no container).
-For iOS / Xcode / Swift projects that need access to macOS-only tooling.
+For macOS-native projects that need tooling a Linux container can't provide:
+iOS / Xcode apps, and macOS-GUI Swift Package Manager apps (AppKit / SwiftUI)
+that can't build on Linux Swift.
 
 ## Prerequisites
 
+Always:
+
 - macOS host (Apple Silicon or Intel)
-- Xcode installed and a valid command-line-tools selection
-  (`xcode-select --install` if missing)
+- The Swift command-line tools on PATH (`swift --version` resolves;
+  `xcode-select --install` if missing)
+- The Claude Code CLI on PATH (`claude` resolves to the binary)
+
+For an **iOS / Xcode** target (`.xcodeproj` / `.xcworkspace`) — additionally:
+
+- Full Xcode installed and selected (`xcodebuild -version` succeeds)
 - At least one iOS Simulator runtime downloaded
   (`xcrun simctl list devices available` must return a non-empty list)
-- The Claude Code CLI on PATH (`claude` resolves to the binary)
+
+For a **macOS-GUI SwiftPM** target (`Package.swift`, no `.xcodeproj`) — nothing
+more: no full Xcode and no simulator are needed. The profile's preflight detects
+which case you're in and only checks the tooling that case requires.
 
 ## Activation
 
@@ -22,7 +34,8 @@ For iOS / Xcode / Swift projects that need access to macOS-only tooling.
 
 - No Dockerfile (no container image to build)
 - Variant intro tells the agent it's running natively on macOS
-- e2e-command.md documents the iOS-shaped verify command
+- e2e-command.md documents the verify command shape (iOS `xcodebuild test`
+  or macOS-GUI SwiftPM `swift build && swift test`)
 - Loop reads `--sandbox mac-host` automatically when this profile is active
 
 ## What this variant does NOT change

@@ -8,7 +8,7 @@ The first concrete case is SyncTasks, a Swift/Xcode iPhone app. Without a host-n
 
 ## Goal
 
-Add a new sandcastle profile, `mac-host`, that runs each loop iteration directly on the macOS host with no container. Consumers (SyncTasks today, any future iOS project tomorrow) opt into it via `/sandcastle-profile mac-host`, and the existing loop machinery (`main.mts`, queue, gates, retry ladder, integration branch) runs unchanged on top of it.
+Add a new sandcastle profile, `mac-host`, that runs each loop iteration directly on the macOS host with no container. Consumers opt into it via `/sandcastle-profile mac-host`, and the existing loop machinery (`main.mts`, queue, gates, retry ladder, integration branch) runs unchanged on top of it. It covers two classes of macOS-native project that a Linux container can't build: (a) iOS / Xcode apps (SyncTasks today), and (b) macOS-GUI Swift Package Manager apps — AppKit or AppKit-backed SwiftUI built with `swift build` / `swift test`, no Xcode and no simulator (applock is the first such case). See the "Out of scope" note for why (b) is distinct from a Linux-buildable SwiftPM project.
 
 ## Non-goals
 
@@ -124,5 +124,5 @@ No step changes from today's Docker flow except the substrate where steps 2–4 
 
 - Signed IPA / TestFlight archive builds in the loop.
 - Multiple concurrent iterations on one Mac.
-- Cross-platform mac-host variant that also covers Swift CLI / SwiftPM server projects (those work in the existing Docker profile via Linux Swift; no value-add).
+- Swift CLI / SwiftPM **server** projects — command-line tools and server-side Swift with no macOS-only framework dependency. Those compile and test fine on Linux Swift, so the existing Docker profile handles them with no value-add from mac-host. This is distinct from macOS-GUI SwiftPM apps (AppKit / AppKit-backed SwiftUI), which are **in scope** for mac-host (see Goal): AppKit is macOS-only and has no Linux Swift build, so Docker genuinely can't compile them. The distinguishing test is not "does it use SwiftPM" but "does it depend on a macOS-only framework" — if yes, it needs mac-host regardless of build system.
 - A Linux-host variant for users who want to skip Docker on Linux for other reasons.
