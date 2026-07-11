@@ -1686,6 +1686,72 @@ export function classifyLintCert(
 }
 
 /**
+ * Stable certification token the implementer writes in the commit body when
+ * the project's test suite passes, and the test-gate backstop greps for. A 1:1
+ * mirror of {@link LINT_CERT_TOKEN}: the host never runs tests, it only confirms
+ * this cert is present on a code-bearing diff. Kept in sync with
+ * implement-prompt.md by a prompt-contract rot-guard test.
+ */
+export const TEST_CERT_TOKEN = "SANDCASTLE-TEST: pass";
+const TEST_CERT_RE = /SANDCASTLE-TEST:\s*pass\b/i;
+
+/**
+ * Does a commit-message body carry the test pass-certification the implementer
+ * is required to write (`SANDCASTLE-TEST: pass`)? Case- and spacing-insensitive;
+ * `pass` must be a whole word so `SANDCASTLE-TEST: n/a` (a false "no test
+ * script" claim) does NOT satisfy it. Mirror of `commitMessageHasLintCert`.
+ */
+export function commitMessageHasTestCert(message: string): boolean {
+  return TEST_CERT_RE.test(message);
+}
+
+/**
+ * Does the project at `repoRoot` define a non-empty `test` script in its
+ * package.json? Drives the test-gate's dormancy — a project with no test
+ * script gets a graceful no-op, same philosophy as the lint gate. Fail-quiet:
+ * a missing or malformed package.json reads as "no test script" so a parse
+ * error can never quarantine a slice. Mirror of `hasLintScript`.
+ */
+export function hasTestScript(repoRoot: string): boolean {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> };
+    const test = pkg.scripts?.test;
+    return typeof test === "string" && test.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pure classifier for the test-gate backstop. Given the project's test-script
+ * presence, the pre/post SHAs, and the shipped commit message (`null` when the
+ * message could not be read), decide the gate status. A 1:1 mirror of
+ * `classifyLintCert` — same dormancy matrix, same fail-quiet branch that must
+ * never quarantine on a git hiccup.
+ *   - no `test` script               → "dormant" (project has no test suite)
+ *   - no code diff (empty/equal SHAs) → "dormant"
+ *   - message unreadable (`null`)     → "dormant" (fail-quiet: an infra/git
+ *       hiccup must not quarantine a slice, cf. classifyLintCert)
+ *   - cert present                    → "pass"
+ *   - cert absent                     → "missing" (quarantine for human triage)
+ */
+export function classifyTestCert(
+  hasTest: boolean,
+  preSha: string,
+  postSha: string,
+  message: string | null,
+): { status: "pass" | "missing" | "dormant" } {
+  if (!hasTest) return { status: "dormant" };
+  if (!hasCodeDiff(preSha, postSha)) return { status: "dormant" };
+  if (message === null) return { status: "dormant" };
+  return commitMessageHasTestCert(message)
+    ? { status: "pass" }
+    : { status: "missing" };
+}
+
+/**
  * Resolve a ref to its commit SHA. Returns "" if the ref does not exist
  * (caller decides whether that's an error or just first-iteration setup).
  */
