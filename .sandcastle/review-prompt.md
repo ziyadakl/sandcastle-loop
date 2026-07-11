@@ -379,6 +379,12 @@ Category-specific guidance:
      a falsified certification — a HARD finding, exactly like a fabricated e2e
      cert. This is the check that catches a red test the implementer claimed
      was green (the failure mode that shipped a broken test through review).
+     Escape hatch, narrow: if the suite is genuinely too slow to finish in a
+     single pass (a heavy integration suite that streams no output for many
+     minutes, not a normal unit suite), you may instead re-run only the tests
+     the diff touched and reason about the cert against the changed test files.
+     Do NOT use this as an excuse to skip a fast unit suite — a suite that
+     completes in a couple of minutes must be run in full.
   4. A genuine test failure is HARD — the work cannot ship with a red test or
      one skipped/weakened to hide a failure.
 
