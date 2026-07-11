@@ -131,6 +131,7 @@ interface MockState {
   comments: { issueNum: number; body: string }[];
   migrationsCalls: { repoRoot: string; preSha: string; postSha: string }[];
   lintCertChecks: { repoRoot: string; preSha: string; postSha: string }[];
+  testCertChecks: { repoRoot: string; preSha: string; postSha: string }[];
   logs: string[];
   errors: string[];
 }
@@ -147,6 +148,7 @@ function newState(): MockState {
     comments: [],
     migrationsCalls: [],
     lintCertChecks: [],
+    testCertChecks: [],
     logs: [],
     errors: [],
   };
@@ -195,6 +197,10 @@ function buildDeps(opts: {
    *  "dormant" so existing tests are unaffected (the gate is a no-op).
    *  Lint-gate tests set "pass" or "missing" to exercise it. */
   lintCertStatus?: "pass" | "missing" | "dormant";
+  /** Stub return for the test-gate backstop checkTestCert. Defaults to
+   *  "dormant" so existing tests are unaffected (the gate is a no-op).
+   *  Test-gate tests set "pass" or "missing" to exercise it. */
+  testCertStatus?: "pass" | "missing" | "dormant";
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -294,6 +300,12 @@ function buildDeps(opts: {
       // Lint-gate tests set opts.lintCertStatus to "pass" / "missing".
       state.lintCertChecks.push({ repoRoot, preSha, postSha });
       return { status: opts.lintCertStatus ?? "dormant" };
+    },
+    async checkTestCert(repoRoot, preSha, postSha) {
+      // Default: "dormant" (gate no-op) so existing tests are unaffected.
+      // Test-gate tests set opts.testCertStatus to "pass" / "missing".
+      state.testCertChecks.push({ repoRoot, preSha, postSha });
+      return { status: opts.testCertStatus ?? "dormant" };
     },
     async captureSha(_w) {
       const v = shas[shaIdx % shas.length] ?? "sha-x";
@@ -4380,6 +4392,7 @@ function makeNoopDeps(): Deps {
     applyMigrations: unused,
     validateMigrationJournal: unused,
     checkLintCert: unused,
+    checkTestCert: unused,
     captureSha: unused,
     log: () => undefined,
     logError: () => undefined,
@@ -5466,6 +5479,71 @@ describe("shipAfterMigrations gate ordering: critique + journal gate before migr
       "first-pass-only",
     );
     expect(b.state.lintCertChecks).toHaveLength(1);
+    expect(b.state.migrationsCalls).toHaveLength(1);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(out.status).toBe("ok");
+  });
+
+  it("test cert present (status=pass) → gate runs, then ships normally", async () => {
+    const b = buildDeps({ testCertStatus: "pass" });
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const out = await shipAfterMigrations(
+      shipCtx(b.deps),
+      sandbox,
+      "pre-sha",
+      "post-sha",
+      "STORY_COMPLETE",
+      ["impeccable"],
+      "first-pass-only",
+    );
+    // Gate was consulted with the repoRoot + the shipped SHAs.
+    expect(b.state.testCertChecks).toEqual([
+      { repoRoot: tmp, preSha: "pre-sha", postSha: "post-sha" },
+    ]);
+    // A present cert does not block: migrations apply, issue marks done.
+    expect(b.state.migrationsCalls).toHaveLength(1);
+    expect(b.state.marksDone).toHaveLength(1);
+    expect(out.status).toBe("ok");
+  });
+
+  it("test cert missing (status=missing) on a code diff → throws before migrations/markDone", async () => {
+    const b = buildDeps({ testCertStatus: "missing" });
+    const { sandbox, names } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const err = await catchErr(
+      shipAfterMigrations(
+        shipCtx(b.deps),
+        sandbox,
+        "pre-sha",
+        "post-sha",
+        "STORY_COMPLETE",
+      ),
+    );
+    // Critique ran first; the test gate then fired before the migration leg.
+    expect(names).toEqual([CRITIQUE]);
+    expect((err as Error).message).toMatch(/test-cert-missing/i);
+    expect(b.state.migrationsCalls).toEqual([]);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("test dormant (no test script / status=dormant) → gate is a no-op, ships", async () => {
+    const b = buildDeps({ testCertStatus: "dormant" });
+    const { sandbox } = makeShipSandbox({
+      [CRITIQUE]: { stdout: "all good\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const out = await shipAfterMigrations(
+      shipCtx(b.deps),
+      sandbox,
+      "pre-sha",
+      "post-sha",
+      "STORY_COMPLETE",
+      ["impeccable"],
+      "first-pass-only",
+    );
+    expect(b.state.testCertChecks).toHaveLength(1);
     expect(b.state.migrationsCalls).toHaveLength(1);
     expect(b.state.marksDone).toHaveLength(1);
     expect(out.status).toBe("ok");

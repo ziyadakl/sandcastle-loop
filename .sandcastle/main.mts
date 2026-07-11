@@ -410,6 +410,20 @@ export interface Deps {
     preSha: string,
     postSha: string,
   ): Promise<{ status: "pass" | "missing" | "dormant" }>;
+  /**
+   * Host-side TEST-CERT gate — a 1:1 mirror of `checkLintCert`. The implementer
+   * certifies `SANDCASTLE-TEST: pass` in the commit body once the suite passes;
+   * the reviewer verifies by running it. This host check only confirms the cert
+   * is present on a code-bearing diff and returns "missing" when it isn't —
+   * `shipAfterMigrations` quarantines for human triage. Required like its
+   * sibling gate; the dormant cases are decided inside `classifyTestCert`, not
+   * by an absent method.
+   */
+  checkTestCert(
+    repoRoot: string,
+    preSha: string,
+    postSha: string,
+  ): Promise<{ status: "pass" | "missing" | "dormant" }>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -1686,6 +1700,72 @@ export function classifyLintCert(
 }
 
 /**
+ * Stable certification token the implementer writes in the commit body when
+ * the project's test suite passes, and the test-gate backstop greps for. A 1:1
+ * mirror of {@link LINT_CERT_TOKEN}: the host never runs tests, it only confirms
+ * this cert is present on a code-bearing diff. Kept in sync with
+ * implement-prompt.md by a prompt-contract rot-guard test.
+ */
+export const TEST_CERT_TOKEN = "SANDCASTLE-TEST: pass";
+const TEST_CERT_RE = /SANDCASTLE-TEST:\s*pass\b/i;
+
+/**
+ * Does a commit-message body carry the test pass-certification the implementer
+ * is required to write (`SANDCASTLE-TEST: pass`)? Case- and spacing-insensitive;
+ * `pass` must be a whole word so `SANDCASTLE-TEST: n/a` (a false "no test
+ * script" claim) does NOT satisfy it. Mirror of `commitMessageHasLintCert`.
+ */
+export function commitMessageHasTestCert(message: string): boolean {
+  return TEST_CERT_RE.test(message);
+}
+
+/**
+ * Does the project at `repoRoot` define a non-empty `test` script in its
+ * package.json? Drives the test-gate's dormancy — a project with no test
+ * script gets a graceful no-op, same philosophy as the lint gate. Fail-quiet:
+ * a missing or malformed package.json reads as "no test script" so a parse
+ * error can never quarantine a slice. Mirror of `hasLintScript`.
+ */
+export function hasTestScript(repoRoot: string): boolean {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> };
+    const test = pkg.scripts?.test;
+    return typeof test === "string" && test.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pure classifier for the test-gate backstop. Given the project's test-script
+ * presence, the pre/post SHAs, and the shipped commit message (`null` when the
+ * message could not be read), decide the gate status. A 1:1 mirror of
+ * `classifyLintCert` — same dormancy matrix, same fail-quiet branch that must
+ * never quarantine on a git hiccup.
+ *   - no `test` script               → "dormant" (project has no test suite)
+ *   - no code diff (empty/equal SHAs) → "dormant"
+ *   - message unreadable (`null`)     → "dormant" (fail-quiet: an infra/git
+ *       hiccup must not quarantine a slice, cf. classifyLintCert)
+ *   - cert present                    → "pass"
+ *   - cert absent                     → "missing" (quarantine for human triage)
+ */
+export function classifyTestCert(
+  hasTest: boolean,
+  preSha: string,
+  postSha: string,
+  message: string | null,
+): { status: "pass" | "missing" | "dormant" } {
+  if (!hasTest) return { status: "dormant" };
+  if (!hasCodeDiff(preSha, postSha)) return { status: "dormant" };
+  if (message === null) return { status: "dormant" };
+  return commitMessageHasTestCert(message)
+    ? { status: "pass" }
+    : { status: "missing" };
+}
+
+/**
  * Resolve a ref to its commit SHA. Returns "" if the ref does not exist
  * (caller decides whether that's an error or just first-iteration setup).
  */
@@ -2710,6 +2790,20 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         message = msg.ok ? msg.stdout : null;
       }
       return classifyLintCert(hasLint, preSha, postSha, message);
+    },
+    async checkTestCert(repoRoot, preSha, postSha) {
+      // Pure I/O: gather the two inputs, then delegate every status decision
+      // to the pure `classifyTestCert` (directly unit-tested, including the
+      // fail-quiet git-hiccup branch). An empty postSha can't be `git show`n,
+      // so the message reads as null there — classifyTestCert maps it to
+      // dormant either way. 1:1 mirror of the checkLintCert impl above.
+      const hasTest = hasTestScript(repoRoot);
+      let message: string | null = null;
+      if (postSha !== "") {
+        const msg = runGit(repoRoot, "show", "-s", "--format=%B", postSha);
+        message = msg.ok ? msg.stdout : null;
+      }
+      return classifyTestCert(hasTest, preSha, postSha, message);
     },
     async captureSha(worktreePath) {
       try {
@@ -4246,6 +4340,27 @@ export async function shipAfterMigrations(
         `the project defines a \`lint\` script. The implementer must run lint ` +
         `and certify it passed (see implement-prompt.md), and the reviewer must ` +
         `reject an uncertified or failing lint. Quarantining for human triage.`,
+    );
+  }
+  // Test gate (deterministic host backstop). A 1:1 mirror of the lint gate:
+  // runs right after it and before the journal/migration gates, so a
+  // test-uncertified diff never reaches the dev DB or markDone. Dormant when
+  // the project has no `test` script or there is no code diff. The test RUN
+  // happens in-sandbox (implementer runs+fixes, reviewer verifies); this only
+  // confirms the implementer's `SANDCASTLE-TEST: pass` cert is present.
+  const testCert = await ctx.deps.checkTestCert(
+    ctx.args.repoRoot,
+    preSha,
+    postSha,
+  );
+  if (testCert.status === "missing") {
+    throw new Error(
+      `test-cert-missing: issue #${ctx.issueNumber} commit ${postSha} changed ` +
+        `code but its body lacks the \`${TEST_CERT_TOKEN}\` certification, and ` +
+        `the project defines a \`test\` script. The implementer must run the ` +
+        `test suite and certify it passed (see implement-prompt.md), and the ` +
+        `reviewer must reject an uncertified or failing suite. Quarantining ` +
+        `for human triage.`,
     );
   }
   if (hasCodeDiff(preSha, postSha)) {
