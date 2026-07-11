@@ -2942,6 +2942,73 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
       cleanup();
     }
   });
+
+  // Review follow-up: when the FF SUCCEEDS (code shipped) but the GitHub
+  // promotion (label flip / close) fails for an issue, that issue must NOT be
+  // left in silent `merge` limbo — it is flagged needs-human so a human finishes
+  // the stale GitHub state. Regression for the post-FF partial-promote gap.
+  it("flags needs-human when the FF lands but GitHub promotion fails for an issue", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-promotefail-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      // The FF will land (clean live worktree on feature/work), but the GitHub
+      // promotion reports #71 in `.failed` (a label/close API error).
+      b.deps.promoteStagingToDone = async () => ({ failed: [71] });
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const status = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, ".sandcastle", "status.json"),
+          "utf8",
+        ),
+      ) as SandcastleStatus;
+      const issue71 = status.issues.find((i) => i.number === 71);
+      // Not silently stuck in `merge` limbo, and not falsely counted merged.
+      expect(issue71?.phase).toBe("needs-human");
+      expect(issue71?.attention).toBe(true);
+      expect(status.totals.merged).toBe(0);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
 });
 
 describe("serializeDotenv", () => {

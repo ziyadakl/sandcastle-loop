@@ -427,7 +427,14 @@ export interface RunMainResult {
   exitCode: 0 | 1 | 2 | 75;
   /** Iterations completed (1-indexed; 0 means we exited before the first cycle). */
   iterationsRun: number;
-  /** Counters useful for tests. */
+  /**
+   * Counters useful for tests. NOTE: `shippedIssues` means "reviewer-certified
+   * this run" — NOT "landed on the integration branch". Under staging an issue
+   * is pushed here at ship time but may still strand at the final fast-forward,
+   * so do not treat membership as proof the code shipped. Authoritative
+   * shipped/merged state lives in the status feed (`totals.merged`, per-issue
+   * phase) and the git branch — not this counter.
+   */
   shippedIssues: number[];
   quarantinedIssues: number[];
 }
@@ -5833,7 +5840,21 @@ export async function runMain(
               // we withheld at ship time, for each issue promotion did flip.
               const failedToPromote = new Set(promoteRes.failed);
               for (const n of mergedIssueNums) {
-                if (failedToPromote.has(n)) continue;
+                if (failedToPromote.has(n)) {
+                  // The FF advanced — the CODE shipped — but promoteStagingToDone
+                  // couldn't flip/close this issue on GitHub (a label/close API
+                  // error). Do NOT silently `continue`: that would leave it in
+                  // `merge` limbo (never counted merged, never flagged), while its
+                  // GitHub state is stale (still open / `merged-to-staging`) and a
+                  // human must finish it. Flag it needs-human so the dashboard
+                  // surfaces it instead of reading as normal queued work.
+                  statusStore.setIssuePhase(
+                    n,
+                    "needs-human",
+                    `shipped to ${args.branch} but GitHub promotion (label flip/close) failed — finish it by hand`,
+                  );
+                  continue;
+                }
                 statusStore.recordOutcome(
                   n,
                   deferredOkOutcomes.get(n) ?? { status: "ok" },
