@@ -410,6 +410,20 @@ export interface Deps {
     preSha: string,
     postSha: string,
   ): Promise<{ status: "pass" | "missing" | "dormant" }>;
+  /**
+   * Host-side TEST-CERT gate — a 1:1 mirror of `checkLintCert`. The implementer
+   * certifies `SANDCASTLE-TEST: pass` in the commit body once the suite passes;
+   * the reviewer verifies by running it. This host check only confirms the cert
+   * is present on a code-bearing diff and returns "missing" when it isn't —
+   * `shipAfterMigrations` quarantines for human triage. Required like its
+   * sibling gate; the dormant cases are decided inside `classifyTestCert`, not
+   * by an absent method.
+   */
+  checkTestCert(
+    repoRoot: string,
+    preSha: string,
+    postSha: string,
+  ): Promise<{ status: "pass" | "missing" | "dormant" }>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -2777,6 +2791,20 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       }
       return classifyLintCert(hasLint, preSha, postSha, message);
     },
+    async checkTestCert(repoRoot, preSha, postSha) {
+      // Pure I/O: gather the two inputs, then delegate every status decision
+      // to the pure `classifyTestCert` (directly unit-tested, including the
+      // fail-quiet git-hiccup branch). An empty postSha can't be `git show`n,
+      // so the message reads as null there — classifyTestCert maps it to
+      // dormant either way. 1:1 mirror of the checkLintCert impl above.
+      const hasTest = hasTestScript(repoRoot);
+      let message: string | null = null;
+      if (postSha !== "") {
+        const msg = runGit(repoRoot, "show", "-s", "--format=%B", postSha);
+        message = msg.ok ? msg.stdout : null;
+      }
+      return classifyTestCert(hasTest, preSha, postSha, message);
+    },
     async captureSha(worktreePath) {
       try {
         return execFileSync("git", ["rev-parse", "HEAD"], {
@@ -4312,6 +4340,27 @@ export async function shipAfterMigrations(
         `the project defines a \`lint\` script. The implementer must run lint ` +
         `and certify it passed (see implement-prompt.md), and the reviewer must ` +
         `reject an uncertified or failing lint. Quarantining for human triage.`,
+    );
+  }
+  // Test gate (deterministic host backstop). A 1:1 mirror of the lint gate:
+  // runs right after it and before the journal/migration gates, so a
+  // test-uncertified diff never reaches the dev DB or markDone. Dormant when
+  // the project has no `test` script or there is no code diff. The test RUN
+  // happens in-sandbox (implementer runs+fixes, reviewer verifies); this only
+  // confirms the implementer's `SANDCASTLE-TEST: pass` cert is present.
+  const testCert = await ctx.deps.checkTestCert(
+    ctx.args.repoRoot,
+    preSha,
+    postSha,
+  );
+  if (testCert.status === "missing") {
+    throw new Error(
+      `test-cert-missing: issue #${ctx.issueNumber} commit ${postSha} changed ` +
+        `code but its body lacks the \`${TEST_CERT_TOKEN}\` certification, and ` +
+        `the project defines a \`test\` script. The implementer must run the ` +
+        `test suite and certify it passed (see implement-prompt.md), and the ` +
+        `reviewer must reject an uncertified or failing suite. Quarantining ` +
+        `for human triage.`,
     );
   }
   if (hasCodeDiff(preSha, postSha)) {

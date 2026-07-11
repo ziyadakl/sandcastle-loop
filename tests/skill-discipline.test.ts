@@ -551,6 +551,10 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
       // Skill-discipline gate tests don't exercise the lint gate; stay dormant.
       return { status: "dormant" };
     },
+    async checkTestCert(_repoRoot, _preSha, _postSha) {
+      // Skill-discipline gate tests don't exercise the test gate; stay dormant.
+      return { status: "dormant" };
+    },
     async captureSha(_w) {
       return "sha-x";
     },
