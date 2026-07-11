@@ -2307,6 +2307,54 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
     }
   });
 
+  // A stray uncommitted file in the launch worktree makes `git merge --ff-only`
+  // refuse ("local changes would be overwritten") and nothing cleans it, so it
+  // silently strands EVERY promotion, iteration after iteration, with only a
+  // cryptic git error. fastForwardIntegration must detect the dirty worktree,
+  // name the offending file, refuse WITHOUT advancing the branch, and never
+  // claim a merge. (The launch worktree is never written by the loop itself —
+  // such dirt is pre-existing / out-of-band.)
+  it("refuses (naming the file) when the launch worktree has uncommitted changes", () => {
+    const { repoRoot, gitEnv, cleanup } = initRepoForFastForward();
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repoRoot, env: gitEnv, encoding: "utf8" }).trim();
+
+      git("branch", "feat-x");
+      git("branch", "integration-candidate");
+      git("checkout", "-q", "integration-candidate");
+      writeFileSync(path.join(repoRoot, "staging-file.ts"), "export const S = 1;\n");
+      git("add", "staging-file.ts");
+      git("commit", "-q", "-m", "staging work");
+      const featBefore = git("rev-parse", "refs/heads/feat-x");
+      git("checkout", "-q", "feat-x");
+      // Leave a stray uncommitted change in the launch worktree (a human's WIP,
+      // or an out-of-band write) — the exact condition that stranded promotion.
+      writeFileSync(path.join(repoRoot, "README.md"), "WIP local edit\n");
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const ok = fastForwardIntegration(
+        repoRoot,
+        "feat-x",
+        (s) => logs.push(s),
+        (s) => errors.push(s),
+      );
+
+      expect(ok).toBe(false);
+      // The branch must NOT have advanced — nothing half-applied.
+      expect(git("rev-parse", "refs/heads/feat-x")).toBe(featBefore);
+      // Loud, actionable, and names the offending file.
+      expect(
+        errors.some((e) => /uncommitted changes/i.test(e) && e.includes("README.md")),
+      ).toBe(true);
+      // Must NOT have attempted / claimed a merge.
+      expect(logs.some((l) => l.includes("via worktree merge"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   // Issue 7 (audit 2026-05-30): when an operator commits to integrationBranch
   // mid-iteration, the staging tip is no longer an ancestor of integration —
   // FF refuses and a human merges manually. Three such recoveries hit
@@ -2754,6 +2802,143 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
       ).toBe(true);
     } finally {
       __setStagingWorktreePathForTests("");
+      cleanup();
+    }
+  });
+
+  // Regression for the "merged 47m ago but its code isn't on the branch" lie:
+  // under staging a reviewer-certified issue was counted/shown `merged` at SHIP
+  // time, before the promotion fast-forward. When that FF strands the work, the
+  // dashboard kept claiming `merged`. After the fix, stranded work is NOT
+  // counted merged and is flagged for a human instead.
+  it("does NOT count stranded work as merged when the final FF refuses", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // Same divergence trick as the unhealthy test → the final FF refuses,
+      // stranding #71 on integration-candidate.
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        const handle = await realRun(spec);
+        if (spec.name === "merger") {
+          const wt = mkdtempSync(path.join(tmpdir(), "sc-strand-divert-"));
+          rmSync(wt, { recursive: true, force: true });
+          const git = (cwd: string, ...args: string[]): string =>
+            execFileSync("git", args, {
+              cwd,
+              env: gitEnv,
+              encoding: "utf8",
+            }).trim();
+          git(repoRoot, "worktree", "add", "-q", wt, "feature/work");
+          writeFileSync(path.join(wt, "operator.ts"), "export const OP = 1;\n");
+          git(wt, "add", "operator.ts");
+          git(wt, "commit", "-q", "-m", "operator hotfix — diverges integration");
+          git(repoRoot, "worktree", "remove", "--force", wt);
+        }
+        return handle;
+      };
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const status = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, ".sandcastle", "status.json"),
+          "utf8",
+        ),
+      ) as SandcastleStatus;
+      // The core lie the fix kills: stranded work must not be tallied merged.
+      expect(status.totals.merged).toBe(0);
+      const issue71 = status.issues.find((i) => i.number === 71);
+      expect(issue71?.phase).not.toBe("merged");
+      expect(issue71?.phase).toBe("needs-human");
+      expect(issue71?.attention).toBe(true);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      cleanup();
+    }
+  });
+
+  // The other half of the same fix: when promotion ACTUALLY lands the work, the
+  // deferred merged accounting must still fire — merged is credited after the
+  // FF, not lost. Otherwise the fix would trade a false-positive for a
+  // false-negative.
+  it("counts merged only after the final FF actually promotes", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      // A clean live worktree on the integration branch so the FF can advance
+      // it (mirrors the real launch worktree). Clean ⇒ the dirty-worktree guard
+      // passes and the FF succeeds.
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-strand-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const status = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, ".sandcastle", "status.json"),
+          "utf8",
+        ),
+      ) as SandcastleStatus;
+      expect(status.state).not.toBe("unhealthy");
+      expect(status.totals.merged).toBe(1);
+      expect(
+        status.issues.find((i) => i.number === 71)?.phase,
+      ).toBe("merged");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
       cleanup();
     }
   });

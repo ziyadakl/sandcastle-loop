@@ -2076,6 +2076,41 @@ export function fastForwardIntegration(
   const liveWorktree = parseWorktreeList(listed.stdout).find(
     (w) => w.branch === `refs/heads/${integrationBranch}`,
   );
+  // Guard: both the fast-forward and the divergence `--no-ff` below run
+  // `git merge` INSIDE the launch worktree. git refuses either merge if that
+  // worktree has uncommitted changes the merge would touch ("Your local
+  // changes to the following files would be overwritten by merge") — and
+  // nothing here cleans it, so a single stray file silently strands EVERY
+  // promotion, iteration after iteration, with only a cryptic git error in the
+  // log. The loop is architected never to write the launch worktree itself
+  // (see ensureStagingWorktree — the merger works in the staging worktree), so
+  // such dirt is pre-existing or introduced out-of-band. Convert the recurring
+  // silent strand into one actionable, file-named failure. Do NOT auto-clean:
+  // the file may be a human's uncommitted work, and `reset --hard` here would
+  // destroy it.
+  if (liveWorktree) {
+    const dirty = runGit(liveWorktree.path, "status", "--porcelain");
+    if (dirty.ok && dirty.stdout.trim() !== "") {
+      // Porcelain lines are `XY <path>`, but runGit() has already trimmed the
+      // whole blob — stripping the leading status-column space on the first
+      // line — so a fixed slice would mangle it. Strip the 1–2 char status code
+      // (plus any leading space) off each line instead.
+      const files = dirty.stdout
+        .split("\n")
+        .map((l) => l.replace(/^[ MADRCU?!]{1,2}\s+/, "").trim())
+        .filter((f) => f !== "")
+        .join(", ");
+      logError(
+        `fast-forward: launch worktree ${liveWorktree.path} has uncommitted ` +
+          `changes (${files}) — the merge into ${integrationBranch} would be ` +
+          `refused or would overwrite them, so certified work stays stranded on ` +
+          `${STAGING_BRANCH}. Commit, stash, or discard these in the launch ` +
+          `checkout, then re-run. (The loop never writes the launch worktree ` +
+          `itself, so this change was introduced outside the loop.)`,
+      );
+      return false;
+    }
+  }
   const ancestor = runGit(repoRoot, "merge-base", "--is-ancestor", integrationTip, stagingTip);
   if (!ancestor.ok) {
     // Divergence — try auto --no-ff merge on the live worktree.
@@ -5280,6 +5315,21 @@ export async function runMain(
         ),
       );
 
+      // Under staging, a pipeline "ok" means shipped + reviewer-certified, but
+      // the code is NOT yet on the integration branch: the merger lands it on
+      // `integration-candidate` and the promotion fast-forward (below) is what
+      // actually ships it. Recording it "merged" HERE — at ship time — makes
+      // the dashboard claim work shipped that can still strand at fast-forward
+      // (the "merged 47m ago but not on the branch" lie). So under staging we
+      // show "ok" issues as `merge` (queued for the merger) and DEFER the
+      // terminal merged accounting (phase=merged, totals.merged++, history row)
+      // to the promotion-success path. This map carries each deferred outcome
+      // there so its final marker survives. Non-ok outcomes, and EVERY outcome
+      // under --no-staging (where ship time genuinely IS done), record now.
+      const deferredOkOutcomes = new Map<
+        number,
+        Parameters<typeof statusStore.recordOutcome>[1]
+      >();
       // Account each pipeline's outcome.
       for (let i = 0; i < settled.length; i++) {
         const s = settled[i]!;
@@ -5289,7 +5339,12 @@ export async function runMain(
           // Authoritative terminal state + totals for the viewer. One call here
           // covers all four sub-branches (ok / quarantined / deferred / error);
           // rejected results have no issueNumber so they are skipped below.
-          statusStore.recordOutcome(s.value.issueNumber, s.value.outcome);
+          if (args.stagingEnabled && s.value.outcome.status === "ok") {
+            statusStore.setIssuePhase(s.value.issueNumber, "merge");
+            deferredOkOutcomes.set(s.value.issueNumber, s.value.outcome);
+          } else {
+            statusStore.recordOutcome(s.value.issueNumber, s.value.outcome);
+          }
           if (s.value.outcome.status === "ok") {
             shippedIssues.push(s.value.issueNumber);
             consecutiveFailures = 0;
@@ -5772,6 +5827,18 @@ export async function runMain(
                   `promoteStagingToDone failed for issues: ${promoteRes.failed.join(", ")}`,
                 );
               }
+              // Promotion actually advanced the integration branch — NOW the
+              // deferred "ok" issues are truly shipped. Record the terminal
+              // merged outcome (phase=merged, totals.merged++, history row) that
+              // we withheld at ship time, for each issue promotion did flip.
+              const failedToPromote = new Set(promoteRes.failed);
+              for (const n of mergedIssueNums) {
+                if (failedToPromote.has(n)) continue;
+                statusStore.recordOutcome(
+                  n,
+                  deferredOkOutcomes.get(n) ?? { status: "ok" },
+                );
+              }
             } catch (err) {
               deps.logError(
                 `promoteStagingToDone threw: ${(err as Error).message}`,
@@ -5791,6 +5858,18 @@ export async function runMain(
                 `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
                 `unhealthy (non-zero). Human triage required.`,
             );
+            // These "ok" issues were shown as `merge` (queued) and deliberately
+            // never recorded merged — correct, they're stranded, not shipped.
+            // Surface them as needing a human so the dashboard flags the strand
+            // instead of leaving them in a neutral "queued" limbo that reads
+            // like normal in-progress work.
+            for (const n of mergedIssueNums) {
+              statusStore.setIssuePhase(
+                n,
+                "needs-human",
+                `stranded on ${STAGING_BRANCH} — promotion fast-forward refused`,
+              );
+            }
           }
         } else {
           // Staging failed certification (post-fixer too) OR merger failed
