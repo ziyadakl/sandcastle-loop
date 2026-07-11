@@ -4813,6 +4813,43 @@ async function runIssuePipeline(
   }
 }
 
+/**
+ * Terminal merged-accounting for a promotion whose fast-forward succeeded.
+ *
+ * Under staging, "ok" issues are shown as `merge` (queued) at ship time and
+ * their terminal merged accounting (phase=merged, totals.merged++, history
+ * row) is DEFERRED to the promotion-success path — the point where the
+ * integration branch actually advanced. For each issue the promotion flipped,
+ * record the outcome we withheld at ship time.
+ *
+ * For any issue the FF landed — the CODE shipped — but `promoteStagingToDone`
+ * couldn't flip/close on GitHub (a label/close API error), do NOT silently
+ * skip it: that would leave it in `merge` limbo (never counted merged, never
+ * flagged) while its GitHub state is stale (still open / `merged-to-staging`)
+ * and a human must finish it. Flag it needs-human so the dashboard surfaces it
+ * instead of reading as normal queued work.
+ */
+function finalizeMergedAccounting(
+  statusStore: StatusStore,
+  mergedIssueNums: readonly number[],
+  deferredOkOutcomes: Map<number, Parameters<StatusStore["recordOutcome"]>[1]>,
+  failedPromotions: readonly number[],
+  branch: string,
+): void {
+  const failedToPromote = new Set(failedPromotions);
+  for (const n of mergedIssueNums) {
+    if (failedToPromote.has(n)) {
+      statusStore.setIssuePhase(
+        n,
+        "needs-human",
+        `shipped to ${branch} but GitHub promotion (label flip/close) failed — finish it by hand`,
+      );
+      continue;
+    }
+    statusStore.recordOutcome(n, deferredOkOutcomes.get(n) ?? { status: "ok" });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Outer loop
 // ---------------------------------------------------------------------------
@@ -5836,30 +5873,16 @@ export async function runMain(
               }
               // Promotion actually advanced the integration branch — NOW the
               // deferred "ok" issues are truly shipped. Record the terminal
-              // merged outcome (phase=merged, totals.merged++, history row) that
-              // we withheld at ship time, for each issue promotion did flip.
-              const failedToPromote = new Set(promoteRes.failed);
-              for (const n of mergedIssueNums) {
-                if (failedToPromote.has(n)) {
-                  // The FF advanced — the CODE shipped — but promoteStagingToDone
-                  // couldn't flip/close this issue on GitHub (a label/close API
-                  // error). Do NOT silently `continue`: that would leave it in
-                  // `merge` limbo (never counted merged, never flagged), while its
-                  // GitHub state is stale (still open / `merged-to-staging`) and a
-                  // human must finish it. Flag it needs-human so the dashboard
-                  // surfaces it instead of reading as normal queued work.
-                  statusStore.setIssuePhase(
-                    n,
-                    "needs-human",
-                    `shipped to ${args.branch} but GitHub promotion (label flip/close) failed — finish it by hand`,
-                  );
-                  continue;
-                }
-                statusStore.recordOutcome(
-                  n,
-                  deferredOkOutcomes.get(n) ?? { status: "ok" },
-                );
-              }
+              // merged outcome we withheld at ship time (and flag any the FF
+              // landed but GitHub promotion couldn't finish). See
+              // finalizeMergedAccounting.
+              finalizeMergedAccounting(
+                statusStore,
+                mergedIssueNums,
+                deferredOkOutcomes,
+                promoteRes.failed,
+                args.branch,
+              );
             } catch (err) {
               deps.logError(
                 `promoteStagingToDone threw: ${(err as Error).message}`,
