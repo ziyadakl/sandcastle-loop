@@ -9,6 +9,7 @@ import {
   appendFileSync,
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
 import { backendForModel } from "../providers.js";
 
@@ -227,6 +228,17 @@ async function spawnAgent(
         ? "legacy-positional"
         : "production";
   const claudeBin = opts.claudeBin ?? envBin ?? "claude";
+  // Force a known session id in the production claude path so the
+  // skill-discipline gate can locate the run's session JSONL afterward.
+  // Claude writes the session to `~/.claude/projects/<slug>/<id>.jsonl`, and
+  // the SDK's `findClaudeSessionOnHost` scans every project dir for that
+  // `<id>.jsonl` filename — so passing `--session-id` is the one lever that
+  // survives the host/worktree slug encoding. We stay on plain `--print`
+  // (NOT `--output-format json`) precisely so stdout still streams the verdict
+  // text incrementally: the verdict parser AND the idle timer are untouched.
+  // Only "production" mode gets an id — the test seams (explicit-args /
+  // legacy-positional) keep `sessionId` undefined and behave exactly as before.
+  const sessionId = mode === "production" ? randomUUID() : undefined;
   const claudeArgs =
     mode === "explicit-args"
       ? [...opts.buildArgs!(runSpec)]
@@ -234,6 +246,7 @@ async function spawnAgent(
         ? [promptFullPath]
         : [
             "--print",
+            "--session-id", sessionId!,
             "--model", runSpec.model,
             "--dangerously-skip-permissions",
           ];
@@ -384,7 +397,14 @@ async function spawnAgent(
         safeResolve({ stdout: finalMessage, commits });
         return;
       }
-      safeResolve({ stdout: stdoutBuf, commits });
+      // Thread the forced session id back so the provider adapter can forward
+      // it to the skill-discipline gate (resolveSessionFilePath → by-id scan).
+      // undefined in the test-seam modes, which is fine — iterations stays [].
+      safeResolve({
+        stdout: stdoutBuf,
+        commits,
+        iterations: sessionId !== undefined ? [{ sessionId }] : [],
+      });
     });
   });
 }
