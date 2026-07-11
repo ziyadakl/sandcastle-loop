@@ -230,11 +230,11 @@ export function makeMacHostProvider(
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
             signal: opts.signal,
           });
-          // Always return an iterations array (empty on mac-host until the
-          // mac-host helper populates per-iteration session metadata —
-          // tracked separately) so the consumer's RunHandle.iterations
-          // field is consistently typed across providers.
-          return { stdout: r.stdout, commits: r.commits, iterations: [] };
+          // Forward the per-iteration session metadata the mac-host helper now
+          // captures (a forced `--session-id` per run) so the skill-discipline
+          // gate can resolve the session JSONL and read the invoked skills.
+          // Falls back to [] for the test seams that don't populate it.
+          return { stdout: r.stdout, commits: r.commits, iterations: r.iterations ?? [] };
         },
         close: () => handle.close(),
       };
