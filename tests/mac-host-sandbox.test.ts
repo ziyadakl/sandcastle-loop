@@ -298,6 +298,69 @@ describe("macHostSandbox explicit claudeBin/buildArgs", () => {
     expect(result.stdout).toContain("ARGS:--marker test-run");
     expect(result.stdout).toContain("STDIN:prompt body");
   });
+
+  // Regression for the mac-host skill-discipline gate false-quarantine on the
+  // CLAUDE path (fix 6b3720a/8e77259). The production path MUST force
+  // `--session-id <uuid>` and thread that same id back through
+  // `iterations[].sessionId`, so the gate can locate `<uuid>.jsonl` and read
+  // the run's Skill() invocations. Before this test the production branch was
+  // unreachable by any fake binary (a bin override flipped the run to
+  // legacy-positional mode), so the fix shipped with no automated guard.
+  it("production mode forces --session-id and threads it into iterations", async () => {
+    // Fake claude on the PRODUCTION path: record the --session-id it was handed
+    // so the test can assert the run returns that exact id.
+    const idSink = path.join(repoRoot, "seen-session-id.txt");
+    const fakeBin = path.join(repoRoot, "fake-claude-prod.sh");
+    writeFileSync(
+      fakeBin,
+      [
+        "#!/bin/sh",
+        "sid=''",
+        "while [ $# -gt 0 ]; do",
+        '  if [ "$1" = "--session-id" ]; then sid="$2"; fi',
+        "  shift",
+        "done",
+        `printf "%s" "$sid" > ${JSON.stringify(idSink)}`,
+        "cat >/dev/null", // drain the piped prompt so stdin doesn't block
+        'echo COMPLIANT',
+        "exit 0",
+      ].join("\n") + "\n",
+    );
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(path.join(repoRoot, "p.md"), "do the thing\n");
+
+    // The global setup (tests/setup.ts) forces SANDCASTLE_MAC_HOST_CLAUDE_BIN=
+    // /bin/cat, which pins every test to legacy-positional mode. Clear it so
+    // `mode` resolves to production, then point the production path at the fake
+    // binary via SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN — the env override
+    // that supplies a binary WITHOUT flipping back to legacy (its whole point).
+    const prevBin = process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+    const prevProdBin = process.env.SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN;
+    delete process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+    process.env.SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN = fakeBin;
+    let result;
+    try {
+      const factory = macHostSandbox({ repoRoot, env: {} });
+      result = await factory.run({
+        name: "prod-run",
+        model: "claude-sonnet-4-5",
+        promptFile: "p.md",
+        idleTimeoutSeconds: 30,
+      });
+    } finally {
+      if (prevBin === undefined) delete process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN;
+      else process.env.SANDCASTLE_MAC_HOST_CLAUDE_BIN = prevBin;
+      if (prevProdBin === undefined) delete process.env.SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN;
+      else process.env.SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN = prevProdBin;
+    }
+
+    const forcedId = readFileSync(idSink, "utf8");
+    expect(forcedId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    // The id the gate will search for MUST equal the one claude actually got.
+    expect(result.iterations).toEqual([{ sessionId: forcedId }]);
+  });
 });
 
 describe("worktreePathFor (extracted helper)", () => {

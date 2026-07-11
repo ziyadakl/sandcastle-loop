@@ -164,6 +164,53 @@ function readCommitsSince(wtPath: string, forkSha: string): { sha: string }[] {
  * whose cwd is the real repo root — mirroring docker, which has no top-level
  * hook and must not litter the operator's working tree.
  */
+/**
+ * Build the `iterations` array the provider forwards to the skill-discipline
+ * gate. A present session id yields a single-iteration array the gate resolves
+ * by id; an absent one yields `[]` (the pre-session-id status quo). Shared by
+ * the claude (forced `--session-id`) and codex (recovered `thread_id`) resolve
+ * sites so the shape stays identical across backends.
+ */
+function iterationsFor(
+  sessionId: string | undefined,
+): readonly { readonly sessionId: string }[] {
+  return sessionId !== undefined ? [{ sessionId }] : [];
+}
+
+/**
+ * Recover a codex run's session id from its `--json` stdout stream so the
+ * skill-discipline gate can locate the rollout afterward. Codex has no
+ * `--session-id` lever (unlike claude, which we force), so the id is only ever
+ * exposed as a `{"type":"thread.started","thread_id":"<id>"}` event — the SAME
+ * shape the docker path parses (`parseCodexStreamLine` in the SDK). The rollout
+ * lands at `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`, and
+ * `findCodexSessionOnHost` matches on that trailing `<thread_id>`. Returns
+ * undefined when no such line is present, in which case iterations stays `[]`
+ * and the run behaves exactly as before this capture existed (no regression,
+ * just no gate coverage — the pre-fix status quo).
+ */
+function extractCodexThreadId(jsonlStdout: string): string | undefined {
+  for (const line of jsonlStdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (
+      typeof obj === "object" &&
+      obj !== null &&
+      (obj as { type?: unknown }).type === "thread.started" &&
+      typeof (obj as { thread_id?: unknown }).thread_id === "string"
+    ) {
+      return (obj as { thread_id: string }).thread_id;
+    }
+  }
+  return undefined;
+}
+
 function stageCodexAgentsMdIntoWorktree(wtPath: string): void {
   const src = path.join(wtPath, ".sandcastle", "AGENTS.md");
   const dst = path.join(wtPath, "AGENTS.md");
@@ -227,7 +274,18 @@ async function spawnAgent(
       : opts.claudeBin !== undefined || envBin !== undefined
         ? "legacy-positional"
         : "production";
-  const claudeBin = opts.claudeBin ?? envBin ?? "claude";
+  // In production mode `opts.claudeBin`/`envBin` are undefined by construction
+  // (either would have forced legacy mode above), so the production branch only
+  // ever consults the dedicated test override — keeping production argv intact.
+  // That override is an env var, NOT an options field, mirroring the codex
+  // sibling `SANDCASTLE_MAC_HOST_CODEX_BIN` (which likewise never changes
+  // `mode`): it exists so the production argv — chiefly the forced
+  // `--session-id` and its threading into `iterations` — is reachable by a fake
+  // binary in tests. Defaults to `claude`, so unset = no behavior change.
+  const claudeBin =
+    mode === "production"
+      ? process.env.SANDCASTLE_MAC_HOST_PRODUCTION_CLAUDE_BIN ?? "claude"
+      : opts.claudeBin ?? envBin ?? "claude";
   // Force a known session id in the production claude path so the
   // skill-discipline gate can locate the run's session JSONL afterward.
   // Claude writes the session to `~/.claude/projects/<slug>/<id>.jsonl`, and
@@ -394,7 +452,16 @@ async function spawnAgent(
           return;
         }
         rmSync(path.dirname(codexOutFile), { recursive: true, force: true });
-        safeResolve({ stdout: finalMessage, commits });
+        // Thread the codex session id (recovered from the JSONL stream) back so
+        // the provider forwards it to the skill-discipline gate, exactly as the
+        // claude branch forwards its forced `--session-id`. Without this every
+        // typed codex issue false-quarantines despite invoking its skills.
+        const codexThreadId = extractCodexThreadId(stdoutBuf);
+        safeResolve({
+          stdout: finalMessage,
+          commits,
+          iterations: iterationsFor(codexThreadId),
+        });
         return;
       }
       // Thread the forced session id back so the provider adapter can forward
@@ -403,7 +470,7 @@ async function spawnAgent(
       safeResolve({
         stdout: stdoutBuf,
         commits,
-        iterations: sessionId !== undefined ? [{ sessionId }] : [],
+        iterations: iterationsFor(sessionId),
       });
     });
   });
