@@ -79,7 +79,10 @@ import {
   critiqueErrorReasonCode,
 } from "../.sandcastle/lib/skill-discipline.js";
 import { envForModel } from "../.sandcastle/providers.js";
-import { VerdictParseError } from "../.sandcastle/lib/verdicts/index.js";
+import {
+  VerdictParseError,
+  MarkerNotFoundError,
+} from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
@@ -1052,6 +1055,168 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
       (c) => c.spec.name === "recovery-reviewer",
     );
     expect(recoveryReviewerCalls).toHaveLength(1);
+  });
+});
+
+describe("sandcastle-loop main.mts — pre-merge reviewer / critique no-verdict retry + defer", () => {
+  // Turn-exhaustion returns partial output with no completion marker, so
+  // extractMarker throws MarkerNotFoundError — which is NOT stall-shaped and
+  // NOT a code rejection. The pre-merge reviewer now retries once on the same
+  // model (mirroring the post-merge reviewer); a persistent no-verdict routes
+  // to the `deferred` category (release for a fresh iteration), bounded by
+  // MAX_DEFERRALS before real quarantine. HAS_BLOCKERS still drives the
+  // existing escalation ladder — the retry must not soften real rejections.
+
+  it("reviewer no verdict on attempt 1 + ALL_CLEAR on same-model retry → ships, no quarantine", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "300", title: "no-verdict then clean", branch: "agent/issue-300" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 300 }),
+      commits: [{ sha: "c1" }],
+    });
+    // Attempt 1 ends its turn without a marker (extractMarker throws).
+    b.enqueue("reviewer", {
+      stdout: "Still running the suite; I'll issue the verdict once it finishes.",
+    });
+    // Same-model retry produces a real verdict.
+    b.enqueue("reviewer", { stdout: "ok\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([300]);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.releases).toEqual([]);
+    expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([300]);
+    // Two "reviewer" calls prove the same-model retry actually fired.
+    const reviewerCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "reviewer",
+    );
+    expect(reviewerCalls).toHaveLength(2);
+  });
+
+  it("reviewer no verdict TWICE (attempt 1 + retry) → deferred (released), NOT quarantined", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "301", title: "persistent no verdict", branch: "agent/issue-301" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 301 }),
+      commits: [{ sha: "c1" }],
+    });
+    // Attempt 1 no verdict, same-model retry ALSO no verdict → propagates.
+    b.enqueue("reviewer", { stdout: "still standing by for the suite result" });
+    b.enqueue("reviewer", { stdout: "still standing by — no verdict yet" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([]);
+    // Deferred, not quarantined: the label is released for a fresh iteration.
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.releases.map((r) => r.issueNum)).toEqual([301]);
+    expect(b.state.marksDone).toEqual([]);
+    // Two reviewer calls (attempt + retry), then it gives up and defers.
+    const reviewerCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "reviewer",
+    );
+    expect(reviewerCalls).toHaveLength(2);
+  });
+
+  it("persistent no verdict across iterations → quarantines only after MAX_DEFERRALS (3) deferrals", async () => {
+    const b = buildDeps();
+    // Iterations 1..4 each re-claim #302 (planner re-emits it), the reviewer
+    // never verdicts (attempt + retry both marker-less), so iters 1..3 defer
+    // and iter 4 (defer budget exhausted) quarantines. Iter 5 exits on empty.
+    for (let i = 0; i < 4; i++) {
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "302", title: "always no verdict", branch: "agent/issue-302" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 302 }),
+        commits: [{ sha: `c${i}` }],
+      });
+      b.enqueue("reviewer", { stdout: "no verdict this pass (attempt)" });
+      b.enqueue("reviewer", { stdout: "no verdict this pass (retry)" });
+    }
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 5, stagingEnabled: false, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([]);
+    // Exactly MAX_DEFERRALS (3) releases, then the 4th attempt quarantines.
+    expect(b.state.releases.map((r) => r.issueNum)).toEqual([302, 302, 302]);
+    expect(b.state.quarantines.map((q) => q.issueNum)).toEqual([302]);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("reviewer HAS_BLOCKERS on attempt 1 → escalation ladder, NOT the no-verdict retry", async () => {
+    // Regression guard: a real rejection must NOT be re-dispatched on the same
+    // model as a no-verdict would be. HAS_BLOCKERS escalates the implementer +
+    // reviewer (the "reviewer-retry" leg), so the plain "reviewer" name fires
+    // exactly once and a distinct escalated leg follows.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "303", title: "real blocker", branch: "agent/issue-303" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 303 }),
+      commits: [{ sha: "c1" }],
+    });
+    b.enqueue("reviewer", { stdout: "Real problem here.\n\nHAS_BLOCKERS" });
+    // Escalation ladder: implementer attempt 2 (escalated model, distinct run
+    // name) then the escalated reviewer-retry leg.
+    b.enqueue("implementer-retry", {
+      stdout: implementerStdout({ ghIssue: 303 }),
+      commits: [{ sha: "c2" }],
+    });
+    b.enqueue("reviewer-retry", { stdout: "fixed now\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([303]);
+    expect(b.state.releases).toEqual([]);
+    // The plain reviewer (attempt 1) fires exactly once — no same-model
+    // no-verdict re-dispatch — and the escalated "reviewer-retry" follows.
+    const plainReviewer = b.state.runCalls.filter(
+      (c) => c.spec.name === "reviewer",
+    );
+    const escalatedReviewer = b.state.runCalls.filter(
+      (c) => c.spec.name === "reviewer-retry",
+    );
+    expect(plainReviewer).toHaveLength(1);
+    expect(escalatedReviewer).toHaveLength(1);
   });
 });
 
@@ -4897,15 +5062,24 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
     expect(names).toEqual([A1]); // CRITICAL is structural — never retries
   });
 
-  it("attempt-1 malformed (no marker) → fails closed as critical-fail", async () => {
-    const { sandbox } = makeCritiqueSandbox({
+  it("attempt-1 no marker, retry ALSO no marker → propagates MarkerNotFoundError (defers, never critical)", async () => {
+    // A missing marker is turn-exhaustion, not a rejection: dispatchCritique
+    // retries once; when the retry also emits no marker the error propagates as
+    // MarkerNotFoundError so the pipeline catch DEFERS it. Fail-closing this
+    // into a CRITIQUE_CRITICAL (the old behavior) would quarantine clean code
+    // that merely ran out of turns.
+    const { sandbox, names } = makeCritiqueSandbox({
       [A1]: { stdout: "I forgot to emit a marker line.", commits: [] },
+      [`${A1} (no-verdict-retry)`]: {
+        stdout: "the retry critic also forgot the marker line",
+        commits: [],
+      },
     });
     const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
-    expect(err).toBeInstanceOf(CritiqueCriticalError);
-    const e = err as CritiqueCriticalError;
-    expect(e.retryExhausted).toBe(false);
-    expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-critical-fail");
+    expect(err).toBeInstanceOf(MarkerNotFoundError);
+    expect(err).not.toBeInstanceOf(CritiqueCriticalError);
+    // Exactly one dispatch + one retry — the retry never dispatches a third.
+    expect(names).toEqual([A1, `${A1} (no-verdict-retry)`]);
   });
 
   it("NEEDS_FIXES → retry → CLEAN → ships, returns refreshed postSha", async () => {
@@ -4987,25 +5161,28 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
     expect(names).toEqual([A1, IMPL, A2, IMPL, A3]);
   });
 
-  it("retry attempt-2 malformed marker → quarantines retry-exhausted (not retry-critical)", async () => {
+  it("retry-leg (attempt-2) no verdict → its own no-verdict retry recovers CLEAN → ships", async () => {
+    // The no-verdict retry applies to EVERY dispatch, including a NEEDS_FIXES
+    // ladder retry leg. A2 runs out of turns without a marker; its one-shot
+    // no-verdict retry then grades CLEAN, so the slice ships instead of being
+    // quarantined for a turn-exhaustion that had nothing to do with the code.
     const implJsonl = writeSessionJsonl(tmp, "impl.jsonl", ["impeccable"]);
-    const { sandbox } = makeCritiqueSandbox({
+    const { sandbox, names } = makeCritiqueSandbox({
       [A1]: { stdout: "CRITIQUE_NEEDS_FIXES", commits: [] },
       [IMPL]: {
         stdout: implementerStdout({ ghIssue: ISSUE }),
-        commits: [],
+        commits: [{ sha: "retry-sha" }],
         iterations: [{ sessionFilePath: implJsonl }],
       },
-      [A2]: { stdout: "the retry critic forgot to emit a marker", commits: [] },
+      [A2]: { stdout: "the retry critic ran out of turns", commits: [] },
+      [`${A2} (no-verdict-retry)`]: {
+        stdout: "graded now\n\nCRITIQUE_CLEAN",
+        commits: [],
+      },
     });
-    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
-    expect(err).toBeInstanceOf(CritiqueCriticalError);
-    const e = err as CritiqueCriticalError;
-    expect(e.retryExhausted).toBe(true);
-    expect(e.criticalAfterRetry).toBe(false); // malformed ≠ critical-after-retry
-    expect(critiqueErrorReasonCode(e).reasonCode).toBe(
-      "critique-retry-exhausted",
-    );
+    const r = await runCritique(sandbox, critiqueCtx(), "post-sha");
+    expect(r.postSha).toBe("retry-sha");
+    expect(names).toEqual([A1, IMPL, A2, `${A2} (no-verdict-retry)`]);
   });
 
   it("NEEDS_FIXES with retry disabled → quarantines without dispatching the implementer", async () => {
@@ -5042,6 +5219,43 @@ describe("runCritique dispatch + verdict ladder (ADR 0006)", () => {
       "critique-no-rubric-loaded",
     );
     expect(names).toEqual([]); // preflight quarantines before any dispatch
+  });
+
+  // -------------------------------------------------------------------------
+  // No-verdict (turn-exhaustion) retry ladder. Turn-exhaustion does not throw
+  // in the SDK — the critic returns partial output with no marker on its last
+  // line, so extractMarker throws MarkerNotFoundError. That is NOT a code-level
+  // rejection; the gate simply never produced a verdict. dispatchCritique now
+  // retries the dispatch ONCE on the same model; if the retry still has no
+  // verdict, MarkerNotFoundError propagates (→ deferred at the pipeline catch,
+  // not quarantined). A malformed-but-present marker is unaffected.
+  // -------------------------------------------------------------------------
+  const A1_NV = `${A1} (no-verdict-retry)`;
+
+  it("attempt-1 no verdict → retries dispatch once → CLEAN → returns postSha, no throw", async () => {
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "I ran out of turns before emitting a verdict.", commits: [] },
+      [A1_NV]: { stdout: "now graded\n\nCRITIQUE_CLEAN", commits: [] },
+    });
+    const r = await runCritique(sandbox, critiqueCtx(), "post-sha");
+    expect(r.postSha).toBe("post-sha");
+    // The no-verdict-retry leg fired exactly once, then produced a clean verdict.
+    expect(names).toEqual([A1, A1_NV]);
+  });
+
+  it("attempt-1 no verdict → retry CRITIQUE_CRITICAL → throws first-pass critical (retry recovered a real verdict)", async () => {
+    // The no-verdict retry recovers a genuine verdict; a CRITICAL on the retry
+    // is a real rejection and must still quarantine — the retry softens nothing.
+    const { sandbox, names } = makeCritiqueSandbox({
+      [A1]: { stdout: "ran out of turns", commits: [] },
+      [A1_NV]: { stdout: "## Findings\n\n1. P0\n\nCRITIQUE_CRITICAL", commits: [] },
+    });
+    const err = await catchErr(runCritique(sandbox, critiqueCtx(), "post-sha"));
+    expect(err).toBeInstanceOf(CritiqueCriticalError);
+    const e = err as CritiqueCriticalError;
+    expect(e.retryExhausted).toBe(false);
+    expect(critiqueErrorReasonCode(e).reasonCode).toBe("critique-critical-fail");
+    expect(names).toEqual([A1, A1_NV]);
   });
 });
 
