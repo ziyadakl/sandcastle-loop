@@ -364,6 +364,32 @@ Category-specific guidance:
 
   Cert present + diff consistent with a clean lint = `ok`.
 
+- **Test suite** — only if the project has a `test` script in its
+  `package.json`. If it doesn't, mark this category `n/a (no test script)`.
+
+  1. The implementer was required to run `pnpm test` to a green result and
+     certify it with a `SANDCASTLE-TEST: pass` line in the commit body
+     (visible above). Confirm that token is present.
+  2. If the project has a test script but the commit body lacks
+     `SANDCASTLE-TEST: pass` (or claims `n/a` when a test script clearly
+     exists), that's a HARD finding — emit `HAS_BLOCKERS`.
+  3. Do NOT take the cert on trust. RUN the project's test script yourself
+     (`pnpm test` / `pnpm run test`) to completion and read the result. A
+     `SANDCASTLE-TEST: pass` cert sitting above a suite that actually fails is
+     a falsified certification — a HARD finding, exactly like a fabricated e2e
+     cert. This is the check that catches a red test the implementer claimed
+     was green (the failure mode that shipped a broken test through review).
+     Escape hatch, narrow: if the suite is genuinely too slow to finish in a
+     single pass (a heavy integration suite that streams no output for many
+     minutes, not a normal unit suite), you may instead re-run only the tests
+     the diff touched and reason about the cert against the changed test files.
+     Do NOT use this as an excuse to skip a fast unit suite — a suite that
+     completes in a couple of minutes must be run in full.
+  4. A genuine test failure is HARD — the work cannot ship with a red test or
+     one skipped/weakened to hide a failure.
+
+  Cert present + you re-ran the suite green = `ok`.
+
 ```
 CATEGORY SWEEP:
 - Execution evidence: <ok | n/a (...) | <finding>>
@@ -376,6 +402,7 @@ CATEGORY SWEEP:
 - Skill discipline: <ok | n/a (...) | <finding>>
 - Migration schema qualification: <ok | n/a (...) | <finding>>
 - Lint / code style: <ok | n/a (...) | <finding>>
+- Test suite: <ok | n/a (...) | <finding>>
 SWEEP COMPLETE.
 ```
 

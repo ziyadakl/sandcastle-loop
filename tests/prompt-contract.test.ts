@@ -107,6 +107,30 @@ describe("lint-gate ↔ prompt contract", () => {
     // cert is TRUE. If the sweep line is dropped, lint stops being enforced.
     expect(reviewPrompt).toMatch(/Lint \/ code style/);
   });
+
+  it("the test cert token the host greps for is the one implement-prompt.md tells the implementer to write", () => {
+    // Sibling of the lint-cert drift guard: the shipAfterMigrations backstop
+    // greps the shipped commit body for `SANDCASTLE-TEST: pass` (TEST_CERT_TOKEN).
+    // If the host token and the implementer prompt drift, every test-enabled run
+    // quarantines on a cert the model was never told to emit.
+    expect(mainSource).toContain("SANDCASTLE-TEST: pass");
+    expect(implementPrompt).toContain("SANDCASTLE-TEST: pass");
+  });
+
+  it("recovery-prompt.md also emits the test cert (its commits hit the same host cert gate)", () => {
+    // The test-cert gate greps recovery commits exactly as it does implementer
+    // commits. If recovery-prompt.md drops the cert instruction, every
+    // test-enabled recovered issue false-quarantines.
+    expect(recoveryPrompt).toContain("SANDCASTLE-TEST: pass");
+  });
+
+  it("the reviewer enforces tests via a CATEGORY SWEEP line and must actually run them", () => {
+    // The host backstop only checks cert PRESENCE; the reviewer verifies the
+    // cert is TRUE by re-running the suite. Dropping either the sweep line or the
+    // run-it instruction is what let a red test ship through review (#125).
+    expect(reviewPrompt).toMatch(/Test suite/);
+    expect(reviewPrompt).toMatch(/RUN the project's test script/i);
+  });
 });
 
 describe("reviewer reviews the cumulative branch diff (issue #340)", () => {

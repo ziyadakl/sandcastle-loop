@@ -388,6 +388,41 @@ finding, exactly like a falsified e2e certification. If the project has a lint
 script and you cannot get it to pass, that is a real blocker — HALT per step 8
 rather than committing an uncertified diff.
 
+# TEST — suite gate (run during STEP 5/9, certify in STEP 9/9)
+
+The loop enforces that the change ships a green test suite. After you write or
+adjust tests and before you commit, run the project's `test` script and fix
+**every** failure it reports:
+
+```
+pnpm test    # or `pnpm run test`
+```
+
+A red test is not something to defer — it is a HARD finding. The reviewer re-runs
+the suite and will emit `HAS_BLOCKERS` (bouncing the work back to you) if any test
+fails, and the host quarantines any shipped commit that changed code but lacks the
+test certification below. So get the suite green before you commit; never ship a
+known-red or newly-skipped test.
+
+**Certify in your STEP 9/9 commit body.** Add exactly ONE of these lines to the
+commit message body, followed by a one-line evidence quote:
+
+- `SANDCASTLE-TEST: pass` — you ran the project's test script and it reported zero
+  failures. (This exact token is what the host greps for.)
+- `SANDCASTLE-TEST: n/a` — ONLY if the project genuinely has no `test` script in
+  its `package.json`. (When there's no test script the host gate is dormant anyway,
+  but state it so the reviewer doesn't have to guess.)
+
+Evidence line: paste the runner's summary proving the run was green — e.g. a
+`Tests  120 passed (120)` / `0 failing` summary, or the clean tail of the test
+output.
+
+Do NOT write `SANDCASTLE-TEST: pass` without actually running the suite to a green
+result. The reviewer re-runs the suite and a falsified cert is a HARD finding,
+exactly like a falsified e2e certification. If the project has a test script and you
+cannot get it to pass, that is a real blocker — HALT per step 8 rather than
+committing an uncertified diff.
+
 # STEP 6/9 (E2e) — non-negotiable rules
 
 If the issue spec's Acceptance section contains a playwright command (any
@@ -496,8 +531,9 @@ start it; the loop never manages the dev server.
    it out before writing code.
 
 3. Run the project's verification commands. ALL must pass before you commit —
-   that includes the project's lint script (see the LINT gate section above);
-   `pnpm lint` is part of "ALL", not an optional extra.
+   that includes the project's lint AND test scripts (see the LINT and TEST gate
+   sections above); `pnpm lint` and `pnpm test` are part of "ALL", not optional
+   extras.
    **Prefer narrow scope by default** to keep memory pressure low. A
    whole-repo typecheck in a constrained container can OOM-kill tsc
    silently — the kernel kills the child while the SDK still sees the
