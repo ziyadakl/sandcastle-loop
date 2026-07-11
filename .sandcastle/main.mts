@@ -3850,6 +3850,12 @@ async function runReviewer(
     name?: string;
     skillsInvoked?: readonly string[];
   } = {},
+  // One-shot guard for the no-verdict retry. Turn-exhaustion returns partial
+  // output with no marker on the last line, so extractMarker throws
+  // MarkerNotFoundError — NOT a code-level rejection. Mirror the post-merge
+  // reviewer: retry ONCE on the same model, then let the error propagate (the
+  // runIssuePipeline catch defers it). `false` on the recursive call caps it.
+  retryOnNoVerdict = true,
 ): Promise<{ marker: string; stdout: string }> {
   const primaryModel = model ?? ctx.args.reviewerModel;
   // Only the default reviewer pass gets a rate-limit fallback. The escalated
@@ -3900,8 +3906,25 @@ async function runReviewer(
     `reviewer (issue=${ctx.issueNumber})`,
     "reviewer",
   );
-  const marker = extractMarker(r.stdout, ["ALL_CLEAR", "HAS_BLOCKERS"] as const);
-  return { marker, stdout: r.stdout };
+  try {
+    const marker = extractMarker(
+      r.stdout,
+      ["ALL_CLEAR", "HAS_BLOCKERS"] as const,
+    );
+    return { marker, stdout: r.stdout };
+  } catch (err) {
+    // No verdict (ran out of turns / deferred the verdict without a marker).
+    // Retry ONCE on the same model; a persistent no-verdict propagates so the
+    // pipeline catch can defer (release for a fresh iteration) rather than
+    // quarantine clean code over a turn-exhaustion.
+    if (retryOnNoVerdict && err instanceof MarkerNotFoundError) {
+      ctx.deps.logError(
+        `reviewer (issue=${ctx.issueNumber}) emitted no verdict (${err.message}) — retrying once on same model`,
+      );
+      return runReviewer(sb, ctx, commitSha, promptFile, model, opts, false);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -4060,10 +4083,8 @@ export async function runCritique(
   // One critique dispatch + verdict parse. marker=null means the sub-agent
   // emitted no recognizable marker (malformed) — the caller fails closed
   // per attempt. Collapses the two formerly-duplicated sandbox.run blocks.
-  const dispatchCritique = async (
-    name: string,
-  ): Promise<{ marker: CritiqueVerdict | null; stdout: string }> => {
-    const result = await sandbox.run({
+  const runCritiqueOnce = (name: string): Promise<{ stdout: string }> =>
+    sandbox.run({
       name,
       maxIterations: 1,
       model: ctx.args.critiqueModel,
@@ -4078,12 +4099,35 @@ export async function runCritique(
         REQUIRED_PRINCIPLES: requiredSkills.join(", "),
       },
     });
+  const dispatchCritique = async (
+    name: string,
+  ): Promise<{ marker: CritiqueVerdict | null; stdout: string }> => {
+    const result = await runCritiqueOnce(name);
     try {
       return {
         marker: extractMarker(result.stdout, CRITIQUE_MARKERS),
         stdout: result.stdout,
       };
-    } catch {
+    } catch (err) {
+      // Turn-exhaustion does NOT throw in the SDK — the critic returns partial
+      // output with no marker on its last line, so extractMarker throws
+      // MarkerNotFoundError. That is not a code-level rejection (the gate never
+      // produced a verdict), so retry the dispatch ONCE on the same model. If
+      // the retry STILL emits no verdict, let MarkerNotFoundError propagate: the
+      // runIssuePipeline catch defers it (release for a fresh iteration), rather
+      // than collapsing "no verdict" into a CRITIQUE_CRITICAL quarantine.
+      if (err instanceof MarkerNotFoundError) {
+        ctx.deps.log(
+          `[critique] issue=${ctx.issueNumber} ${name} emitted no verdict (${err.message}) — retrying dispatch once on same model`,
+        );
+        const retry = await runCritiqueOnce(`${name} (no-verdict-retry)`);
+        return {
+          marker: extractMarker(retry.stdout, CRITIQUE_MARKERS),
+          stdout: retry.stdout,
+        };
+      }
+      // Any other parse failure (a present-but-malformed verdict) still fails
+      // closed as marker:null → CRITIQUE_CRITICAL, per the fail-closed policy.
       return { marker: null, stdout: result.stdout };
     }
   };
@@ -4584,8 +4628,15 @@ async function runIssuePipeline(
     // Pattern lives in module-level STALL_RE — see definition for which
     // error messages count.
     const stalled = STALL_RE.test(errMsg);
+    // No-verdict detection: a Haiku gate (pre-merge reviewer or critique) ran
+    // out of turns and its single-shot same-model retry ALSO produced no
+    // marker, so extractMarker threw MarkerNotFoundError. This is neither a
+    // vendor blip nor a code-level rejection — the gate simply never verdicted.
+    // Defer (release for a fresh iteration) with a distinct marker, bounded by
+    // MAX_DEFERRALS; on exhaustion it falls through to real quarantine.
+    const noVerdictVerdict = err instanceof MarkerNotFoundError;
     ctx.deps.log(
-      `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} stalled=${stalled} msg=${JSON.stringify(errMsg)}`,
+      `[isTransientError-audit] issue=${ctx.issueNumber} verdict=${transientVerdict} stalled=${stalled} noVerdict=${noVerdictVerdict} msg=${JSON.stringify(errMsg)}`,
     );
     ctx.deps.logError(
       `[issue=${ctx.issueNumber}] pipeline error: ${errMsg}`,
@@ -4657,6 +4708,18 @@ async function runIssuePipeline(
       // fall through to quarantine on budget exhaustion or release failure
     }
 
+    // Defer a persistent no-verdict (reviewer/critique gate ran out of turns
+    // and its same-model retry also emitted no marker) with a DISTINCT marker
+    // so it never disappears into a generic quarantine. Bounded by the same
+    // MAX_DEFERRALS budget; on exhaustion it falls through to a quarantine
+    // below. A no-verdict is not a code-level halt, so — like the transient /
+    // output-cap paths — it must not consume a recovery pass (guarded below).
+    if (noVerdictVerdict) {
+      const deferred = await tryDefer("no verdict", errMsg, "NO_VERDICT");
+      if (deferred) return deferred;
+      // fall through to quarantine on budget exhaustion or release failure
+    }
+
     // Opt-in single recovery pass with the implementer model. If recovery
     // succeeds, mark done; otherwise fall through to quarantine. Skip recovery
     // entirely on transient errors — they already deferred above (and recovery
@@ -4667,7 +4730,8 @@ async function runIssuePipeline(
       ctx.args.recoveryEnabled &&
       sandbox &&
       !transientVerdict &&
-      !outputCapVerdict
+      !outputCapVerdict &&
+      !noVerdictVerdict
     ) {
       ctx.status.setIssuePhase(ctx.issueNumber, "recovery");
       ctx.deps.log(
@@ -4792,7 +4856,7 @@ async function runIssuePipeline(
     // future un-quarantine + re-claim starts fresh at attempt 1/MAX_DEFERRALS,
     // not partway through the budget.
     deferralCounts.delete(ctx.issueNumber);
-    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}, outputCapVerdict=${outputCapVerdict}): ${errMsg.slice(0, 400)}`;
+    const reason = `[issue=${ctx.issueNumber}] pipeline halted (transientVerdict=${transientVerdict}, outputCapVerdict=${outputCapVerdict}, noVerdictVerdict=${noVerdictVerdict}): ${errMsg.slice(0, 400)}`;
     try {
       await ctx.deps.quarantine(ctx.issueNumber, reason);
       return { status: "quarantined", finalMarker: "HALT", stalled };
