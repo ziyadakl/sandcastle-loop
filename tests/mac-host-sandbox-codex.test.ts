@@ -282,4 +282,50 @@ describe("macHostSandbox codex backend", () => {
     expect(existsSync(path.join(handle.worktreePath, "AGENTS.md"))).toBe(false);
     await handle.close();
   });
+
+  // Regression for the mac-host skill-discipline gate false-quarantine
+  // (sibling of the claude fix in 6b3720a/8e77259). The gate finds a codex
+  // run's rollout via `iterations[].sessionId` (rollout-*-<id>.jsonl). Codex
+  // has no `--session-id` to force, but `codex exec --json` emits its id as a
+  // `{"type":"thread.started","thread_id":"<id>"}` first stream line. The
+  // adapter must capture THAT and return it in `iterations`, or every typed
+  // codex issue is quarantined despite the implementer invoking its skills.
+  it("captures the codex thread_id from the --json stream into iterations[].sessionId", async () => {
+    const THREAD_ID = "0199abcd-1234-7890-abcd-ef0123456789";
+    const fakeBin = path.join(repoRoot, "fake-codex-thread.sh");
+    writeFileSync(
+      fakeBin,
+      [
+        "#!/bin/sh",
+        // First stream line is codex's session announcement — the only place
+        // the rollout id is exposed to a headless caller.
+        `echo '{\"type\":\"thread.started\",\"thread_id\":\"${THREAD_ID}\"}'`,
+        `echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'`,
+        "out=''",
+        "while [ $# -gt 0 ]; do",
+        '  if [ "$1" = "-o" ]; then out="$2"; fi',
+        "  shift",
+        "done",
+        'printf "COMPLIANT" > "$out"',
+        "exit 0",
+      ].join("\n") + "\n",
+    );
+    chmodSync(fakeBin, 0o755);
+    process.env.SANDCASTLE_MAC_HOST_CODEX_BIN = fakeBin;
+
+    const factory = macHostSandbox({ repoRoot, env: {} });
+    const handle = await factory.createSandbox({ branch: "feat/codex-sid" });
+    writeFileSync(path.join(handle.worktreePath, "p.md"), "do the thing");
+    const result = await handle.run({
+      name: "codex-sid",
+      model: "gpt-5-codex",
+      promptFile: "p.md",
+      idleTimeoutSeconds: 30,
+    });
+
+    // Without this the skill-discipline gate gets an empty iterations array,
+    // reads zero Skill() invocations, and false-quarantines the ticket.
+    expect(result.iterations).toEqual([{ sessionId: THREAD_ID }]);
+    await handle.close();
+  });
 });
