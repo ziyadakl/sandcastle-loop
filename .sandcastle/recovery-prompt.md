@@ -140,6 +140,12 @@ missed. Your steps:
   implementer's commits; a recovery commit that changed code on a lint-enabled
   project without it is rejected. Use `SANDCASTLE-LINT: n/a` only when the
   project genuinely has no `lint` script.
+- **Test certification.** If the project has a `test` script, you must have
+  run `pnpm test` to a green result — add a `SANDCASTLE-TEST: pass` line to the
+  commit body, with the runner's zero-failure summary as evidence. The host
+  gate checks for this token exactly as it does the lint cert; a recovery commit
+  that changed code on a test-enabled project without it is rejected. Use
+  `SANDCASTLE-TEST: n/a` only when the project genuinely has no `test` script.
 - Append to progress.txt:
   `echo "[it={{ITERATION}}] #{{ISSUE_NUMBER}} recovered" >> progress.txt`
 - Output `RECOVERY_COMPLETE` on its own line and exit cleanly. **Do NOT
