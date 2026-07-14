@@ -102,6 +102,24 @@ function isExpired(expiresAt: string, nowIso: string): boolean {
 }
 
 /**
+ * The single source of truth for lease expiry classification, so callers (the
+ * loop driver) never re-implement the skew-grace math. `null` ⇒ `"absent"`;
+ * otherwise apply the SAME `now >= expiresAt + LEASE_SKEW_GRACE_SEC` rule as
+ * {@link reclaimIfExpired}: past-deadline ⇒ `"expired"`, else `"live"`.
+ *
+ * A present-but-UNREADABLE ref is NOT representable here (a null lease means
+ * "no ref"); the read path signals that fail-closed by throwing
+ * {@link LeaseReadError}, which consumers treat as `"live"` (occupied).
+ */
+export function classifyLease(
+  lease: LockLease | null,
+  nowIso: string,
+): "absent" | "live" | "expired" {
+  if (lease === null) return "absent";
+  return isExpired(lease.expiresAt, nowIso) ? "expired" : "live";
+}
+
+/**
  * Try to take the lease for `issue`. Resolves the new {@link LockLease} on
  * success, or null if another live host already holds it (contended).
  */
@@ -267,6 +285,69 @@ function parseLease(body: string, refOid: string): LockLease | null {
 }
 
 /**
+ * A git operation that touches the remote lock ref failed for a reason that is
+ * NOT lease contention — an auth/network/config fault (e.g. a missing
+ * `gh auth setup-git`, a DNS failure, a 403). Carries the offending git
+ * `stderr` so the caller can surface the real problem instead of mistaking it
+ * for a phantom rival holding the lease. Mirrors the plain `Error` that
+ * `makeLockCommit` already throws on a commit-tree failure.
+ */
+export class LeaseBackendError extends Error {
+  /** The raw git stderr (may be empty when git said nothing useful). */
+  readonly stderr: string;
+  constructor(stderr: string, message?: string) {
+    super(message ?? `lease backend git failure: ${stderr || "(no stderr)"}`);
+    this.name = "LeaseBackendError";
+    this.stderr = stderr;
+  }
+}
+
+/**
+ * The lock ref EXISTS on the remote but its lock-commit could not be read or
+ * parsed (a transient fetch/log fault, a moved ref, a malformed body). Thrown
+ * fail-closed so a present-but-unreadable ref is NEVER mistaken for an absent
+ * one: consumers treat this as an OCCUPIED (live) lease, never as free.
+ */
+export class LeaseReadError extends Error {
+  /** Issue whose lock ref could not be read. */
+  readonly issue: number;
+  constructor(issue: number, reason: string) {
+    super(`lease ref for issue ${issue} exists but is unreadable: ${reason}`);
+    this.name = "LeaseReadError";
+    this.issue = issue;
+  }
+}
+
+/**
+ * Contention signatures git emits when a push is rejected because a PEER holds
+ * (or just moved) the ref — the normal mutual-exclusion outcome that upstream
+ * reads as `{ ok: false }`. Matched case-insensitively as substrings.
+ */
+const CONTENTION_SIGNATURES: readonly string[] = [
+  "[rejected]",
+  "rejected",
+  "non-fast-forward",
+  "fetch first",
+  "failed to push some refs",
+  "cannot lock ref",
+  "stale info",
+  "updates were rejected",
+  "[remote rejected]",
+];
+
+/**
+ * Classify a FAILED push. `true` ⇒ ordinary lease contention (return
+ * `{ ok: false }`). `false` ⇒ an auth/network/unknown fault the caller must
+ * raise as a {@link LeaseBackendError}. An EMPTY/unrecognized stderr is NOT
+ * contention (fail-closed: never silently treat an unknown failure as
+ * contended).
+ */
+function isContentionFailure(res: GitRunResult): boolean {
+  const text = `${res.stderr}\n${res.stdout}`.toLowerCase();
+  return CONTENTION_SIGNATURES.some((sig) => text.includes(sig));
+}
+
+/**
  * Build a {@link LockBackend} that stores leases as `refs/locks/issue-<N>` on
  * the remote, using local `git commit-tree` for the lock-commit and
  * `git push`/`git ls-remote`/`git push --force-with-lease` for the ref ops.
@@ -317,18 +398,31 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
       // Non-force push of a parentless commit: creates the ref if absent, is
       // rejected as non-fast-forward if the ref already exists (contended).
       const res = await run("push", remote, `${oid}:${lockRef(lease.issue)}`);
-      if (!res.ok) return { ok: false };
+      if (!res.ok) {
+        // Only a contention-shaped rejection means "a peer has this issue";
+        // an auth/network fault must surface, not masquerade as a rival.
+        if (isContentionFailure(res)) return { ok: false };
+        throw new LeaseBackendError(res.stderr);
+      }
       return { ok: true, oid };
     },
 
     async readRef(issue) {
       const oid = await remoteOid(issue);
-      if (!oid) return null;
-      // The lock-commit may live only on the remote; fetch the object in.
+      if (!oid) return null; // ref genuinely absent — nothing here
+      // The ref EXISTS; from here a failure is fail-closed (occupied), never
+      // treated as absent. The lock-commit may live only on the remote; fetch
+      // the object in first.
       await run("fetch", "--quiet", remote, lockRef(issue));
       const body = await run("log", "-1", "--format=%B", oid);
-      if (!body.ok) return null;
-      return parseLease(body.stdout, oid);
+      if (!body.ok) {
+        throw new LeaseReadError(issue, body.stderr || "git log of lock-commit failed");
+      }
+      const lease = parseLease(body.stdout, oid);
+      if (!lease) {
+        throw new LeaseReadError(issue, "lock-commit body was not a parseable lease");
+      }
+      return lease;
     },
 
     async casRef(expectedOid, lease) {
@@ -341,7 +435,12 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
         remote,
         `${oid}:${lockRef(lease.issue)}`,
       );
-      if (!res.ok) return { ok: false };
+      if (!res.ok) {
+        // Same classification as createRef: a stale-lease/non-fast-forward
+        // rejection is contention; anything else is a real backend fault.
+        if (isContentionFailure(res)) return { ok: false };
+        throw new LeaseBackendError(res.stderr);
+      }
       return { ok: true, oid };
     },
 

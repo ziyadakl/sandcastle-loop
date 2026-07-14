@@ -59,6 +59,10 @@ export {
   renewLease,
   releaseLease,
   createGitLockBackend,
+  classifyLease,
+  LeaseBackendError,
+  LeaseReadError,
+  LEASE_SKEW_GRACE_SEC,
 } from "./lock.js";
 export type {
   LockLease,

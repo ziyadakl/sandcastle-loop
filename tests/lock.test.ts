@@ -20,10 +20,14 @@ import {
   renewLease,
   releaseLease,
   createGitLockBackend,
+  classifyLease,
+  LeaseBackendError,
+  LeaseReadError,
   LEASE_SKEW_GRACE_SEC,
   type LockBackend,
   type LockLease,
   type LockDeps,
+  type GitRunner,
   type GitRunResult,
 } from "../src/state/lock.js";
 
@@ -318,5 +322,169 @@ describe("Part 2 — git-backed backend (real bare repo)", () => {
     expect(await backend.readRef(13)).toBeNull();
     const ls = realRunGit(clone, "ls-remote", remote, "refs/locks/issue-13");
     expect(ls.stdout).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 3 — Fix 2 (push-failure classification), Fix 6 (classifyLease),
+//          Fix 7 (readRef fail-closed). Uses a STUB GitRunner to inject
+//          deterministic git failures without touching a real remote.
+// ---------------------------------------------------------------------------
+
+const leaseOf = (
+  issue: number,
+  over: Partial<Omit<LockLease, "refOid">> = {},
+): Omit<LockLease, "refOid"> => ({
+  issue,
+  holder: "host-A",
+  acquiredAt: T0,
+  expiresAt: T0_PLUS_TTL,
+  epoch: 1,
+  ...over,
+});
+
+/**
+ * A configurable stub git runner. Answers the four argv shapes the git backend
+ * emits (commit-tree, ls-remote, fetch, log, push) from canned results so a
+ * test can force an auth/contention/read failure deterministically.
+ */
+function makeStubRunner(opts: {
+  pushResult?: GitRunResult;
+  logResult?: GitRunResult;
+  lsRemoteOid?: string | null;
+  calls?: string[][];
+}): GitRunner {
+  return (_cwd: string, ...args: string[]): GitRunResult => {
+    opts.calls?.push(args);
+    if (args.includes("commit-tree")) {
+      return { ok: true, stdout: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", stderr: "" };
+    }
+    if (args[0] === "ls-remote") {
+      const oid = opts.lsRemoteOid ?? null;
+      return oid
+        ? { ok: true, stdout: `${oid}\trefs/locks/issue`, stderr: "" }
+        : { ok: true, stdout: "", stderr: "" };
+    }
+    if (args[0] === "fetch") return { ok: true, stdout: "", stderr: "" };
+    if (args[0] === "log") return opts.logResult ?? { ok: true, stdout: "{}", stderr: "" };
+    if (args[0] === "push") return opts.pushResult ?? { ok: true, stdout: "", stderr: "" };
+    return { ok: true, stdout: "", stderr: "" };
+  };
+}
+
+const stubBackend = (opts: Parameters<typeof makeStubRunner>[0]): LockBackend =>
+  createGitLockBackend({ git: makeStubRunner(opts), repoRoot: "/nonexistent", remote: "origin" });
+
+describe("Part 3a — Fix 2: push-failure classification (createRef / casRef)", () => {
+  const CONTENTION = "! [rejected]        main -> main (non-fast-forward)\nUpdates were rejected because the remote contains work you do not have";
+  const AUTH = "fatal: Authentication failed for 'https://github.com/acme/repo.git/'";
+
+  it("createRef: a contention-shaped rejection returns { ok: false } (NOT a throw)", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: CONTENTION } });
+    const res = await backend.createRef(leaseOf(5));
+    expect(res.ok).toBe(false);
+  });
+
+  it("createRef: an auth/network-shaped failure throws LeaseBackendError carrying the stderr", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: AUTH } });
+    await expect(backend.createRef(leaseOf(5))).rejects.toBeInstanceOf(LeaseBackendError);
+    const err = await backend.createRef(leaseOf(5)).catch((e) => e);
+    expect(err).toBeInstanceOf(LeaseBackendError);
+    expect((err as LeaseBackendError).stderr).toContain("Authentication failed");
+  });
+
+  it("createRef: an EMPTY/unrecognized stderr on a failed push throws (fail-closed)", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: "" } });
+    await expect(backend.createRef(leaseOf(5))).rejects.toBeInstanceOf(LeaseBackendError);
+  });
+
+  it("casRef: a contention-shaped rejection returns { ok: false } (NOT a throw)", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: CONTENTION } });
+    const res = await backend.casRef("oldoid", leaseOf(5, { epoch: 2 }));
+    expect(res.ok).toBe(false);
+  });
+
+  it("casRef: an auth/network-shaped failure throws LeaseBackendError carrying the stderr", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: AUTH } });
+    const err = await backend.casRef("oldoid", leaseOf(5, { epoch: 2 })).catch((e) => e);
+    expect(err).toBeInstanceOf(LeaseBackendError);
+    expect((err as LeaseBackendError).stderr).toContain("Authentication failed");
+  });
+
+  it("casRef: an EMPTY stderr on a failed push throws (fail-closed)", async () => {
+    const backend = stubBackend({ pushResult: { ok: false, stdout: "", stderr: "" } });
+    await expect(backend.casRef("oldoid", leaseOf(5, { epoch: 2 }))).rejects.toBeInstanceOf(
+      LeaseBackendError,
+    );
+  });
+});
+
+describe("Part 3b — Fix 6: classifyLease (single source of truth for expiry)", () => {
+  const live: LockLease = {
+    issue: 1,
+    holder: "host-A",
+    acquiredAt: T0,
+    expiresAt: T0_PLUS_TTL,
+    epoch: 1,
+    refOid: "oid",
+  };
+
+  it("null lease classifies as absent", () => {
+    expect(classifyLease(null, T0)).toBe("absent");
+  });
+
+  it("a lease whose deadline+grace is in the future classifies as live", () => {
+    expect(classifyLease(live, T0)).toBe("live");
+  });
+
+  it("skew-grace boundary: live one ms before expiresAt+grace, expired exactly at it", () => {
+    const graceMs = LEASE_SKEW_GRACE_SEC * 1000;
+    const expiresMs = Date.parse(T0_PLUS_TTL);
+    const justBefore = new Date(expiresMs + graceMs - 1).toISOString();
+    const exactly = new Date(expiresMs + graceMs).toISOString();
+    expect(classifyLease(live, justBefore)).toBe("live");
+    expect(classifyLease(live, exactly)).toBe("expired");
+  });
+});
+
+describe("Part 3c — Fix 7: readRef fail-closed (present-but-unreadable != absent)", () => {
+  it("genuinely absent ref (ls-remote empty) resolves to null → absent", async () => {
+    const backend = stubBackend({ lsRemoteOid: null });
+    const read = await backend.readRef(9);
+    expect(read).toBeNull();
+    expect(classifyLease(read, T0)).toBe("absent");
+  });
+
+  it("present ref but unreadable body (log fails) throws LeaseReadError (occupied, not absent)", async () => {
+    const backend = stubBackend({
+      lsRemoteOid: "abc123abc123abc123abc123abc123abc123abcd",
+      logResult: { ok: false, stdout: "", stderr: "fatal: bad object abc123" },
+    });
+    await expect(backend.readRef(9)).rejects.toBeInstanceOf(LeaseReadError);
+  });
+
+  it("present ref but unparseable body throws LeaseReadError (fail-closed, not absent)", async () => {
+    const backend = stubBackend({
+      lsRemoteOid: "abc123abc123abc123abc123abc123abc123abcd",
+      logResult: { ok: true, stdout: "not a lock commit at all", stderr: "" },
+    });
+    await expect(backend.readRef(9)).rejects.toBeInstanceOf(LeaseReadError);
+  });
+
+  it("reclaimIfExpired NEVER steals a ref it could not read (no push attempted)", async () => {
+    const calls: string[][] = [];
+    const backend = stubBackend({
+      lsRemoteOid: "abc123abc123abc123abc123abc123abc123abcd",
+      logResult: { ok: false, stdout: "", stderr: "fatal: bad object abc123" },
+      calls,
+    });
+    const deps: LockDeps = {
+      backend,
+      now: () => "2026-07-14T00:20:00.000Z",
+      hostId: "host-B",
+      ttlSec: 900,
+    };
+    await expect(reclaimIfExpired(1, deps)).rejects.toBeInstanceOf(LeaseReadError);
+    expect(calls.some((a) => a[0] === "push")).toBe(false);
   });
 });
