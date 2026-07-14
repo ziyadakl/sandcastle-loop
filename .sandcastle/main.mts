@@ -2173,7 +2173,7 @@ export async function ensureStagingWorktree(
     throw new Error(
       `Launch worktree HEAD is on ${STAGING_BRANCH} (from a previously-buggy run). ` +
         `Run \`git checkout ${baseBranch}\` in the launch worktree and re-run the loop. ` +
-        `See commit <this-fix-sha> for context.`,
+        `See docs/adr/0016-branch-base-attachment-and-no-worktree-refuse.md for context.`,
     );
   }
 

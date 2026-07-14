@@ -1,7 +1,15 @@
 # Design spec — cross-host code sync (Step 2 of two-machine Sandcastle)
 
-**Date:** 2026-07-14 · **Status:** design, not yet built · **Branch:** `feat/cross-host-issue-lease`
-**Feeds:** an implementation plan (writing-plans) and a future `ADR 0020`.
+**Date:** 2026-07-14 · **Status:** BUILT — superseded by `docs/adr/0020-cross-host-code-sync.md` · **Branch:** `feat/cross-host-issue-lease`
+**Feeds:** an implementation plan (writing-plans) and `ADR 0020` (now the authoritative as-built record).
+
+> **Superseded on one point — conflict handling.** This design (lines ~52, 69, 77)
+> proposed marking the *affected files' issues* `needs-human` on a peer-merge
+> conflict. ADR 0020 (the later, authoritative decision) **reversed** that: a
+> lane-merge conflict is between whole lanes, not attributable to one ticket
+> (staging is one commingled branch), so the loop logs LOUD + continues on the
+> un-synced tip and flags **no** specific issue `needs-human`. The code follows
+> ADR 0020. Read the ADR, not this line, for the shipped behavior.
 
 ---
 
