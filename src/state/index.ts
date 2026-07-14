@@ -46,3 +46,21 @@ export type {
 } from "./gh.js";
 
 export { withPrdLock, withSingleInstance } from "./locks.js";
+
+// Cross-host issue lease (ADR 0019) — the real cross-host claim signal.
+export {
+  acquireLease,
+  readLease,
+  reclaimIfExpired,
+  renewLease,
+  releaseLease,
+  createGitLockBackend,
+} from "./lock.js";
+export type {
+  LockLease,
+  LockBackend,
+  LockDeps,
+  GitRunner,
+  GitRunResult,
+  GitLockBackendOpts,
+} from "./lock.js";

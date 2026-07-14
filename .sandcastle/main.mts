@@ -50,7 +50,16 @@ import {
   listOpenIssuesWithBodies,
   LABEL_READY,
   acquireSingleInstanceLock,
+  acquireLease,
+  readLease,
+  reclaimIfExpired,
+  renewLease,
+  releaseLease,
+  createGitLockBackend,
 } from "./lib/state/index.js";
+import type { LockLease, LockDeps } from "./lib/state/index.js";
+import { LEASE_SKEW_GRACE_SEC } from "./lib/state/lock.js";
+import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
@@ -424,6 +433,32 @@ export interface Deps {
     preSha: string,
     postSha: string,
   ): Promise<{ status: "pass" | "missing" | "dormant" }>;
+  /**
+   * Cross-host issue lease (ADR 0019) — acquire the lease for `issueNum` before
+   * working it. When the lease flag is OFF (default) this ALWAYS resolves `true`
+   * with no git — today's behavior. When ON it creates `refs/locks/issue-<N>` on
+   * origin (or reclaims an expired one); resolves `false` when a peer host holds
+   * a live lease (contended), so the orchestrator skips the issue.
+   */
+  acquireIssueLease(issueNum: number): Promise<boolean>;
+  /**
+   * Release the lease for `issueNum` (delete the ref). OFF: no-op. ON:
+   * best-effort ref delete, and only if THIS host still holds the lease — a
+   * release for an unheld issue never touches a peer's ref.
+   */
+  releaseIssueLease(issueNum: number): Promise<void>;
+  /**
+   * Read the lease state for `issueNum` WITHOUT mutating it. OFF: always
+   * `"absent"`. ON: `"absent"` (no ref), `"live"` (a peer holds an unexpired
+   * lease — leave it alone), or `"expired"` (holder is dead/silent — reclaimable).
+   */
+  leaseState(issueNum: number): Promise<"absent" | "live" | "expired">;
+  /**
+   * Heartbeat: renew every lease this host currently holds (CAS-advance the ref,
+   * bumping expiry + epoch). OFF: no-op. ON: a failed renewal CAS means the lease
+   * was reclaimed out from under us — logged LOUDLY as a fence signal.
+   */
+  renewLeases(): Promise<void>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -731,11 +766,23 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     return v;
   })();
 
+  // Cross-host run-branch namespacing (ADR 0019 "Related"). When the lease is
+  // ON and the run branch is AUTO-derived (no explicit --branch), suffix it
+  // with this host's id so two hosts never push the SAME run branch and clobber
+  // each other. An explicit --branch is the operator's word — left untouched.
+  // OFF: the derived branch is unchanged (byte-for-byte legacy behavior).
+  const branch = ((): string => {
+    if (values.branch !== undefined) return values.branch;
+    const derived = detectBranchOr("HEAD");
+    if (!crossHostLeaseEnabled()) return derived;
+    return `${derived}-${resolveHostId()}`;
+  })();
+
   const args: SandcastleArgs = {
     iterations: effectiveIterations,
     issue,
     repoRoot: values["repo-root"] ?? process.cwd(),
-    branch: values.branch ?? detectBranchOr("HEAD"),
+    branch,
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
@@ -862,7 +909,25 @@ const LOGGED_ENV_KEYS = new Set([
   "GLM_API_KEY",
   "ANTHROPIC_API_KEY",
   "GH_TOKEN",
+  // Cross-host issue lease (ADR 0019) config — surfaced so an operator can
+  // see at a glance whether the opt-in lease is on and how it's tuned.
+  "SANDCASTLE_CROSS_HOST_LEASE",
+  "SANDCASTLE_HOST_ID",
+  "SANDCASTLE_LOCK_TTL_SEC",
 ]);
+
+/**
+ * Whether the cross-host issue lease (ADR 0019) is enabled for this run. OFF by
+ * default: with the flag unset every lease dep is a byte-for-byte no-op, so a
+ * single-host consumer never needs the new `git push` auth. Truthy = "1"/"true"
+ * (case-insensitive). `getEnv` is an injectable seam for tests.
+ */
+function crossHostLeaseEnabled(
+  getEnv: (key: string) => string | undefined = (k) => process.env[k],
+): boolean {
+  const v = (getEnv("SANDCASTLE_CROSS_HOST_LEASE") ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
 
 /** Parse a single .env file into process.env. Earlier writers win — we never
  * overwrite an existing value. Silently no-ops if the file doesn't exist.
@@ -2606,6 +2671,25 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     process.stderr.write(`${line}\n`);
     appendRunLog(`${line}\n`);
   };
+  const logErr = (line: string): void => {
+    process.stderr.write(`ERROR: ${line}\n`);
+    appendRunLog(`ERROR: ${line}\n`);
+  };
+
+  // Cross-host issue lease (ADR 0019). Everything below is inert unless the
+  // opt-in flag is set: `leaseEnabled` false ⇒ every lease dep short-circuits
+  // to today's behavior (acquire always wins, release/state/renew no-op) with
+  // no git touched, so single-host consumers need no new push auth. When on,
+  // `leaseRegistry` tracks the leases THIS host currently holds so renew can
+  // heartbeat them and release only ever deletes a ref we actually own.
+  const leaseEnabled = crossHostLeaseEnabled();
+  const leaseRegistry = new Map<number, LockLease>();
+  const lockDeps: LockDeps = {
+    backend: createGitLockBackend({ git: runGit, repoRoot: args.repoRoot }),
+    now: () => new Date().toISOString(),
+    hostId: resolveHostId(),
+    ttlSec: resolveLockTtlSec(),
+  };
 
   // Raw, provider-agnostic sandbox create (pre-clean + provider.createSandbox).
   // The exported `createSandbox` dep routes the FIRST call through the
@@ -2816,11 +2900,67 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         return "";
       }
     },
-    log,
-    logError(line) {
-      process.stderr.write(`ERROR: ${line}\n`);
-      appendRunLog(`ERROR: ${line}\n`);
+    async acquireIssueLease(n) {
+      if (!leaseEnabled) return true;
+      if (args.dryRun) {
+        dryLog("acquireIssueLease", n);
+        return true;
+      }
+      // Create the ref; on a straight contention (ref exists) try to reclaim it
+      // in case the holder died with the lease still pinned (expired). Only a
+      // LIVE peer lease keeps us out.
+      let lease = await acquireLease(n, lockDeps);
+      if (!lease) lease = await reclaimIfExpired(n, lockDeps);
+      if (!lease) return false;
+      leaseRegistry.set(n, lease);
+      return true;
     },
+    async releaseIssueLease(n) {
+      if (!leaseEnabled) return;
+      // Never delete a ref we don't own: a release for an issue we didn't win
+      // (e.g. the rejected-branch cleanup after a contended acquire) must not
+      // yank a peer host's lease.
+      if (!leaseRegistry.has(n)) return;
+      if (args.dryRun) {
+        dryLog("releaseIssueLease", n);
+        leaseRegistry.delete(n);
+        return;
+      }
+      try {
+        await releaseLease(n, lockDeps);
+      } finally {
+        leaseRegistry.delete(n);
+      }
+    },
+    async leaseState(n) {
+      if (!leaseEnabled) return "absent";
+      const lease = await readLease(n, lockDeps);
+      if (!lease) return "absent";
+      // Same expiry rule the lock module reclaims on: now >= expiresAt + grace.
+      const nowMs = Date.parse(lockDeps.now());
+      const deadlineMs = Date.parse(lease.expiresAt) + LEASE_SKEW_GRACE_SEC * 1000;
+      return nowMs >= deadlineMs ? "expired" : "live";
+    },
+    async renewLeases() {
+      if (!leaseEnabled) return;
+      for (const [n, lease] of [...leaseRegistry]) {
+        const renewed = await renewLease(lease, lockDeps);
+        if (renewed) {
+          leaseRegistry.set(n, renewed);
+        } else {
+          // Fencing: a failed renewal CAS means the lease was reclaimed out from
+          // under us. Drop it and shout — the loop should stop pushing work for
+          // an issue another host now owns.
+          leaseRegistry.delete(n);
+          logErr(
+            `[lease] FENCE — renewal CAS failed for issue #${n}: the lease was ` +
+              `reclaimed by another host. This host no longer owns it.`,
+          );
+        }
+      }
+    },
+    log,
+    logError: logErr,
   };
 }
 
@@ -5076,6 +5216,12 @@ export async function runMain(
   let stalledStreak = 0;
   const STALL_STREAK_LIMIT = 3;
 
+  // Cross-host issue lease (ADR 0019). OFF by default — every lease dep is a
+  // no-op and the reconciliation/heartbeat below take their legacy path, so a
+  // single-host consumer sees byte-for-byte today's behavior. Read once here so
+  // startup reconciliation and the renewal heartbeat agree on the same flag.
+  const leaseEnabled = crossHostLeaseEnabled();
+
   // Skill-discipline opt-in: when `SANDCASTLE.md` exists at the repo root,
   // the orchestrator re-validates the planner's picked issues against a
   // host-side label fetch, excluding any that don't carry exactly one
@@ -5194,6 +5340,24 @@ export async function runMain(
       );
       for (const issue of stale) {
         try {
+          // Cross-host lease (ADR 0019): with the lease OFF, keep the legacy
+          // unconditional release — an in-progress label can only be this
+          // single host's own crash-orphan. With the lease ON, an in-progress
+          // issue may belong to a LIVE peer host; releasing it would yank the
+          // peer's active work. So consult the lease and release ONLY when it
+          // is absent or expired; skip a live foreign lease.
+          if (leaseEnabled) {
+            const st = await deps.leaseState(issue.number);
+            if (st === "live") {
+              deps.log(
+                `  skipping #${issue.number}: lease is LIVE — another host is working it; leaving in-progress`,
+              );
+              continue;
+            }
+            deps.log(
+              `  #${issue.number} lease ${st} — safe to release for re-claim`,
+            );
+          }
           await deps.release(
             issue.number,
             `[sandcastle startup-reconcile] orphaned in-progress label from a prior killed run — released for re-claim by the new loop`,
@@ -5228,6 +5392,20 @@ export async function runMain(
   const sigtermHandler = (): void => onSignal("SIGTERM");
   process.on("SIGINT", sigintHandler);
   process.on("SIGTERM", sigtermHandler);
+
+  // Cross-host lease heartbeat (ADR 0019). While the loop runs, renew every
+  // held lease at ~ttl/3 (floored at 30s) so a live host never loses a lease
+  // mid-work; a failed renewal CAS is the fence signal (logged in renewLeases).
+  // Only when the lease is on. `unref` so it never holds the process open, and
+  // it is always cleared in the finally below on every exit path.
+  let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
+  if (leaseEnabled) {
+    const renewMs = Math.max(30_000, (resolveLockTtlSec() * 1000) / 3);
+    leaseHeartbeat = setInterval(() => {
+      void deps.renewLeases();
+    }, renewMs);
+    leaseHeartbeat.unref?.();
+  }
 
   try {
     for (let it = 1; it <= args.iterations; it++) {
@@ -5519,6 +5697,18 @@ export async function runMain(
                 `plan issue id is not a positive integer: ${JSON.stringify(p.id)}`,
               );
             }
+            // Cross-host lease gate (ADR 0019). Acquire the atomic lease BEFORE
+            // the label flip — the label is last-write-wins signage, the ref is
+            // the real arbiter. OFF: acquireIssueLease always wins (no git). ON:
+            // a `false` means a peer host holds a live lease, so we throw and let
+            // the rejected branch below count this as a skip (NOT a crash) and
+            // move on to the other issues. claim never runs for a contended issue.
+            const wonLease = await deps.acquireIssueLease(issueNumber);
+            if (!wonLease) {
+              throw new Error(
+                `lease contended: #${issueNumber} held by another host`,
+              );
+            }
             // Claim first — this is the only place ready-for-agent →
             // in-progress flips. If claim fails we abort the pipeline.
             await deps.claim(issueNumber);
@@ -5571,20 +5761,34 @@ export async function runMain(
           if (s.value.outcome.status === "ok") {
             shippedIssues.push(s.value.issueNumber);
             consecutiveFailures = 0;
+            // Cross-host lease (ADR 0019): under --no-staging, ship time IS
+            // done — hand the lease back now. Under staging the issue is only
+            // queued for the merger and still needs its lease until promotion,
+            // so we deliberately HOLD it here (released in the promotion path).
+            if (!args.stagingEnabled) {
+              await deps.releaseIssueLease(s.value.issueNumber);
+            }
           } else if (s.value.outcome.status === "quarantined") {
             quarantinedIssues.push(s.value.issueNumber);
             consecutiveFailures += 1;
             lastFailingIssue = s.value.issueNumber;
+            // Terminal — the issue is parked for a human; release its lease.
+            await deps.releaseIssueLease(s.value.issueNumber);
           } else if (s.value.outcome.status === "deferred") {
             deferredIssues.push(s.value.issueNumber);
             // Intentionally do NOT touch consecutiveFailures — a transient
             // rate-limit storm must not trip the loop's overall circuit
             // breaker. The issue is already released back to ready-for-agent
             // and will be re-claimed on the next iteration.
+            // Release the lease too so the re-claim (this or another host) can
+            // re-acquire it cleanly rather than wait out the TTL.
+            await deps.releaseIssueLease(s.value.issueNumber);
           } else {
             // "error" — couldn't even quarantine.
             consecutiveFailures += 1;
             lastFailingIssue = s.value.issueNumber;
+            // Terminal for this run — release the lease.
+            await deps.releaseIssueLease(s.value.issueNumber);
           }
         } else {
           // claim or pre-pipeline error.
@@ -5596,6 +5800,13 @@ export async function runMain(
           );
           consecutiveFailures += 1;
           if (Number.isInteger(issueNumber)) lastFailingIssue = issueNumber;
+          // A lease MIGHT be held here (e.g. acquire won but claim/pipeline
+          // threw). releaseIssueLease is a no-op when this host doesn't hold
+          // it — including the contended-acquire throw above — so a blanket
+          // release here can never yank a peer's lease.
+          if (Number.isInteger(issueNumber)) {
+            await deps.releaseIssueLease(issueNumber);
+          }
         }
       }
 
@@ -6062,6 +6273,17 @@ export async function runMain(
                 promoteRes.failed,
                 args.branch,
               );
+              // Cross-host lease (ADR 0019): the staging path HELD each ok
+              // issue's lease past ship time (the accounting loop skipped the
+              // release for staging-ok). Now that promotion has actually landed
+              // the code, hand the lease back — but only for issues that truly
+              // promoted. Issues in `promoteRes.failed` are flagged needs-human
+              // by finalizeMergedAccounting and keep their lease (it expires).
+              for (const n of mergedIssueNums) {
+                if (!promoteRes.failed.includes(n)) {
+                  await deps.releaseIssueLease(n);
+                }
+              }
             } catch (err) {
               deps.logError(
                 `promoteStagingToDone threw: ${(err as Error).message}`,
@@ -6114,6 +6336,9 @@ export async function runMain(
                 `[issue=${n}] staging-failure quarantine threw: ${(err as Error).message}`,
               );
             }
+            // Terminal (parked for a human) — release the lease held past ship
+            // time, mirroring the non-staging quarantine release above.
+            await deps.releaseIssueLease(n);
           }
           lastFailedStagingIteration = it;
         }
@@ -6216,6 +6441,9 @@ export async function runMain(
       quarantinedIssues,
     };
   } finally {
+    // Always stop the lease heartbeat, on every exit path (clean, error,
+    // circuit-breaker return, hot-reload). undefined when the lease is off.
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     process.off("SIGINT", sigintHandler);
     process.off("SIGTERM", sigtermHandler);
     if (releaseLoopLock) {

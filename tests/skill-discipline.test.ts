@@ -528,6 +528,21 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async comment(_n, _body) {
       // unused
     },
+    // Cross-host issue lease (ADR 0019) — the flag is never set in these gate
+    // tests, so production would no-op; the fake mirrors that (acquire always
+    // wins, the rest are inert).
+    async acquireIssueLease(_n) {
+      return true;
+    },
+    async releaseIssueLease(_n) {
+      // unused
+    },
+    async leaseState(_n) {
+      return "absent";
+    },
+    async renewLeases() {
+      // unused
+    },
     async listIssuesByLabel(label) {
       state.listLabelCalls.push(label);
       if (!opts.listIssuesByLabel) return [];

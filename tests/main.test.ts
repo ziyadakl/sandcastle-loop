@@ -134,6 +134,13 @@ interface MockState {
   testCertChecks: { repoRoot: string; preSha: string; postSha: string }[];
   logs: string[];
   errors: string[];
+  // Cross-host issue lease (ADR 0019) — the fake records every lease call so
+  // the orchestration (gate / release points / reconciliation) can be asserted
+  // without a real git backend (which is proven in tests/lock.test.ts).
+  leaseAcquires: number[];
+  leaseReleases: number[];
+  leaseStateCalls: number[];
+  leaseRenews: number;
 }
 
 function newState(): MockState {
@@ -151,6 +158,10 @@ function newState(): MockState {
     testCertChecks: [],
     logs: [],
     errors: [],
+    leaseAcquires: [],
+    leaseReleases: [],
+    leaseStateCalls: [],
+    leaseRenews: 0,
   };
 }
 
@@ -201,6 +212,15 @@ function buildDeps(opts: {
    *  "dormant" so existing tests are unaffected (the gate is a no-op).
    *  Test-gate tests set "pass" or "missing" to exercise it. */
   testCertStatus?: "pass" | "missing" | "dormant";
+  /** Cross-host lease (ADR 0019): default win/lose for acquireIssueLease.
+   *  Defaults to `true` so existing tests (flag OFF) claim as before. */
+  leaseAcquireWins?: boolean;
+  /** Per-issue override for acquireIssueLease; wins over leaseAcquireWins. */
+  leaseAcquireFor?: (issueNum: number) => boolean;
+  /** Default leaseState result. Defaults to "absent" (no ref). */
+  leaseStateValue?: "absent" | "live" | "expired";
+  /** Per-issue override for leaseState; wins over leaseStateValue. */
+  leaseStateFor?: (issueNum: number) => "absent" | "live" | "expired";
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -311,6 +331,22 @@ function buildDeps(opts: {
       const v = shas[shaIdx % shas.length] ?? "sha-x";
       shaIdx += 1;
       return v;
+    },
+    async acquireIssueLease(n) {
+      state.leaseAcquires.push(n);
+      if (opts.leaseAcquireFor) return opts.leaseAcquireFor(n);
+      return opts.leaseAcquireWins ?? true;
+    },
+    async releaseIssueLease(n) {
+      state.leaseReleases.push(n);
+    },
+    async leaseState(n) {
+      state.leaseStateCalls.push(n);
+      if (opts.leaseStateFor) return opts.leaseStateFor(n);
+      return opts.leaseStateValue ?? "absent";
+    },
+    async renewLeases() {
+      state.leaseRenews += 1;
     },
     log(line) {
       state.logs.push(line);
@@ -4394,6 +4430,10 @@ function makeNoopDeps(): Deps {
     checkLintCert: unused,
     checkTestCert: unused,
     captureSha: unused,
+    acquireIssueLease: unused,
+    releaseIssueLease: unused,
+    leaseState: unused,
+    renewLeases: unused,
     log: () => undefined,
     logError: () => undefined,
   };
@@ -5827,5 +5867,355 @@ describe("resolveReviewBase", () => {
       "bbbb2222",
     );
     expect(reviewBase).toBe("bbbb2222~1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-host issue lease orchestration (ADR 0019). Every test drives runMain /
+// parseSandcastleArgs with the fake Deps lease methods (see buildDeps) — the
+// real git backend is proven in tests/lock.test.ts, so nothing here shells to
+// git for a lease. The opt-in flag is set per-test and scrubbed in afterEach so
+// the default-OFF suite above is never contaminated.
+// ---------------------------------------------------------------------------
+describe("cross-host issue lease orchestration (ADR 0019)", () => {
+  const LEASE_ENV_KEYS = [
+    "SANDCASTLE_CROSS_HOST_LEASE",
+    "SANDCASTLE_HOST_ID",
+    "SANDCASTLE_LOCK_TTL_SEC",
+  ];
+  afterEach(() => {
+    for (const k of LEASE_ENV_KEYS) delete process.env[k];
+  });
+
+  // Real bare-ish repo + staging worktree, mirroring the staging-promotion
+  // suite's initStagingRepo. Only the two staging-path lease tests need it.
+  function initStagingRepo(): {
+    repoRoot: string;
+    stagingPath: string;
+    gitEnv: NodeJS.ProcessEnv;
+    cleanup: () => void;
+  } {
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-lease-"));
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+    git(repoRoot, "init", "-q", "-b", "main");
+    git(repoRoot, "config", "user.email", "test@example.com");
+    git(repoRoot, "config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    git(repoRoot, "add", "README.md");
+    git(repoRoot, "commit", "-q", "-m", "init");
+    git(repoRoot, "branch", "feature/work");
+    git(repoRoot, "branch", "integration-candidate");
+    const stagingPath = mkdtempSync(path.join(tmpdir(), "sc-lease-staging-"));
+    rmSync(stagingPath, { recursive: true, force: true });
+    git(repoRoot, "worktree", "add", "-q", stagingPath, "integration-candidate");
+    return {
+      repoRoot,
+      stagingPath,
+      gitEnv,
+      cleanup: () => {
+        rmSync(repoRoot, { recursive: true, force: true });
+        rmSync(stagingPath, { recursive: true, force: true });
+      },
+    };
+  }
+
+  // Hook 1 — claim gate.
+  it("hook 1: flag ON + contended lease → issue skipped, claim never called, sibling proceeds", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    // #71 loses the lease (peer holds it), #72 wins.
+    const b = buildDeps({ leaseAcquireFor: (n) => n === 72 });
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "71", title: "contended", branch: "agent/issue-71" },
+        { id: "72", title: "mine", branch: "agent/issue-72" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 72 }),
+      commits: [{ sha: "c72" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // The contended issue was never claimed; the sibling shipped.
+    expect(b.state.claims).toEqual([72]);
+    expect(result.shippedIssues).toEqual([72]);
+    // Both issues attempted a lease.
+    expect([...b.state.leaseAcquires].sort()).toEqual([71, 72]);
+  });
+
+  // Hook 2 — release points in the accounting loop.
+  it("hook 2: non-staging ok releases the lease", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([71]);
+    expect(b.state.leaseReleases).toContain(71);
+  });
+
+  it("hook 2: quarantine releases the lease", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "300", title: "z", branch: "agent/issue-300" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines.map((q) => q.issueNum)).toEqual([300]);
+    expect(b.state.leaseReleases).toContain(300);
+  });
+
+  it("hook 2: rate-limit deferral releases the lease", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps();
+    const rl = () => new Error('API Error: 429 rate_limit_error');
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "400", title: "rl", branch: "agent/issue-400" }]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("implementer", { stdout: "", throw: rl() });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.quarantines).toEqual([]);
+    expect(b.state.leaseReleases).toContain(400);
+  });
+
+  it("hook 2: staging ok HOLDS the lease (not released at ship time)", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // Divergence trick (mirrors the staging suite): the merger advances
+      // feature/work so the final fast-forward REFUSES → promotion never runs.
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        const handle = await realRun(spec);
+        if (spec.name === "merger") {
+          const wt = mkdtempSync(path.join(tmpdir(), "sc-lease-divert-"));
+          rmSync(wt, { recursive: true, force: true });
+          const git = (cwd: string, ...args: string[]): string =>
+            execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+          git(repoRoot, "worktree", "add", "-q", wt, "feature/work");
+          writeFileSync(path.join(wt, "operator.ts"), "export const OP = 1;\n");
+          git(wt, "add", "operator.ts");
+          git(wt, "commit", "-q", "-m", "diverge");
+          git(repoRoot, "worktree", "remove", "--force", wt);
+        }
+        return handle;
+      };
+
+      const result = await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      // Promotion failed → unhealthy, and #71's lease is HELD (never released
+      // at ship time and promotion never ran).
+      expect(result.exitCode).not.toBe(0);
+      expect(b.state.leaseAcquires).toContain(71);
+      expect(b.state.leaseReleases).not.toContain(71);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      cleanup();
+    }
+  });
+
+  // Hook 3 — promotion release.
+  it("hook 3: staging ok lease is released only after promotion succeeds", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      // Clean live worktree on the integration branch so the FF advances it.
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-lease-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const status = JSON.parse(
+        readFileSync(path.join(repoRoot, ".sandcastle", "status.json"), "utf8"),
+      ) as SandcastleStatus;
+      // Promotion landed → merged counted → lease released.
+      expect(status.totals.merged).toBe(1);
+      expect(b.state.leaseReleases).toContain(71);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync("git", ["worktree", "remove", "--force", launchPath], {
+            cwd: repoRoot,
+            env: gitEnv,
+            stdio: "ignore",
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // Hook 4 — startup reconciliation.
+  it("hook 4: flag ON → live foreign lease NOT released; expired/absent released", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps({
+      leaseStateFor: (n) =>
+        n === 10 ? "live" : n === 11 ? "expired" : "absent",
+    });
+    b.deps.listIssuesByLabel = async (label) =>
+      label === "in-progress"
+        ? [
+            { number: 10, title: "peer-live", labels: ["in-progress"] },
+            { number: 11, title: "expired", labels: ["in-progress"] },
+            { number: 12, title: "absent", labels: ["in-progress"] },
+          ]
+        : [];
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 1 }), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    // leaseState consulted for every in-progress issue.
+    expect([...b.state.leaseStateCalls].sort()).toEqual([10, 11, 12]);
+    // The live foreign lease (#10) is left alone; the rest are released.
+    expect(b.state.releases.map((r) => r.issueNum).sort()).toEqual([11, 12]);
+  });
+
+  it("hook 4: flag OFF → all in-progress released, leaseState never consulted", async () => {
+    const b = buildDeps({ leaseStateFor: () => "live" });
+    b.deps.listIssuesByLabel = async (label) =>
+      label === "in-progress"
+        ? [
+            { number: 10, title: "a", labels: ["in-progress"] },
+            { number: 11, title: "b", labels: ["in-progress"] },
+            { number: 12, title: "c", labels: ["in-progress"] },
+          ]
+        : [];
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 1 }), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    // Legacy path: every in-progress issue released unconditionally.
+    expect(b.state.releases.map((r) => r.issueNum).sort()).toEqual([10, 11, 12]);
+    // The lease was never consulted.
+    expect(b.state.leaseStateCalls).toEqual([]);
+  });
+
+  // Hook 5 — heartbeat.
+  it("hook 5: flag ON → heartbeat set up and torn down without breaking a clean exit", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 1 }), b.deps);
+
+    // A clean exit with the heartbeat active proves setup + teardown don't wedge
+    // the loop; the renew floor (30s) means it never fires during the test.
+    expect(result.exitCode).toBe(0);
+    expect(b.state.leaseRenews).toBe(0);
+  });
+
+  // Hook 6 — per-host run-branch namespacing.
+  it("hook 6: flag ON + auto-derived branch is host-suffixed", () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    process.env.SANDCASTLE_HOST_ID = "myhost";
+    const { args } = parseSandcastleArgs(["--iterations", "1"]);
+    expect(args.branch.endsWith("-myhost")).toBe(true);
+  });
+
+  it("hook 6: explicit --branch is never suffixed", () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    process.env.SANDCASTLE_HOST_ID = "myhost";
+    const { args } = parseSandcastleArgs([
+      "--iterations",
+      "1",
+      "--branch",
+      "feature/x",
+    ]);
+    expect(args.branch).toBe("feature/x");
+  });
+
+  it("hook 6: flag OFF → auto-derived branch is unchanged (no host suffix)", () => {
+    process.env.SANDCASTLE_HOST_ID = "myhost";
+    const { args } = parseSandcastleArgs(["--iterations", "1"]);
+    expect(args.branch.includes("myhost")).toBe(false);
   });
 });
