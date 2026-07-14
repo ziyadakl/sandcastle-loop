@@ -90,8 +90,12 @@ import {
   MarkerNotFoundError,
 } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
-import { LeaseReadError, LeaseBackendError } from "../.sandcastle/lib/state/index.js";
-import type { LockLease, LockBackend } from "../.sandcastle/lib/state/index.js";
+import {
+  LeaseReadError,
+  LeaseBackendError,
+  createLeaseCoordinator,
+} from "../.sandcastle/lib/state/index.js";
+import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
@@ -6399,10 +6403,29 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
   // (return false → routine skip), NOT an uncaught throw that trips the breaker
   // and permanently deadlocks. A LeaseBackendError from acquire STILL
   // propagates (must reach Fix 2's loud fatal halt — never swallowed here).
-  // Drives the REAL acquireIssueLease closure via the buildDefaultDeps DI
-  // backend seam so the actual reclaimIfExpired → readRef path runs.
+  // Drives the REAL acquireIssueLease closure via the createLeaseCoordinator
+  // seam (ADR 0019) so the actual reclaimIfExpired → readRef path runs against
+  // a fake LockBackend — a single collaborator, no full Deps graph needed.
   // ---------------------------------------------------------------------------
   describe("acquireIssueLease — LeaseReadError is OCCUPIED (review Fix 1)", () => {
+    /** Build a lease coordinator over `backend` with the lease flag ON and a
+     *  capture sink for logError (so heartbeat-fence log lines are assertable). */
+    function coordFor(backend: LockBackend, logs: string[] = []) {
+      const lockDeps: LockDeps = {
+        backend,
+        now: () => new Date().toISOString(),
+        hostId: "test-host",
+        ttlSec: 900,
+      };
+      return createLeaseCoordinator({
+        lockDeps,
+        leaseEnabled: true,
+        dryRun: false,
+        logError: (line) => logs.push(line),
+        dryLog: () => {},
+      });
+    }
+
     /** A backend whose createRef is contended and whose readRef throws
      *  LeaseReadError during the reclaim step. */
     function readThrowsBackend(): LockBackend {
@@ -6422,14 +6445,12 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     }
 
     it("returns false (skip) when readRef throws LeaseReadError during reclaim", async () => {
-      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
-      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), readThrowsBackend());
+      const coord = coordFor(readThrowsBackend());
       // Pre-fix: the LeaseReadError escapes → this rejects. Post-fix: false.
-      await expect(deps.acquireIssueLease(71)).resolves.toBe(false);
+      await expect(coord.acquireIssueLease(71)).resolves.toBe(false);
     });
 
     it("still PROPAGATES a LeaseBackendError from acquire (not swallowed)", async () => {
-      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
       const backend: LockBackend = {
         async createRef(): Promise<never> {
           throw new LeaseBackendError(
@@ -6444,23 +6465,20 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
         },
         async deleteRef() {},
       };
-      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), backend);
-      await expect(deps.acquireIssueLease(71)).rejects.toBeInstanceOf(
+      const coord = coordFor(backend);
+      await expect(coord.acquireIssueLease(71)).rejects.toBeInstanceOf(
         LeaseBackendError,
       );
     });
-  });
 
-  // ---------------------------------------------------------------------------
-  // Review Fix 2 — the heartbeat renewLeases loop is best-effort: a THROWN
-  // backend error (LeaseBackendError / timeout) on one entry is logged and
-  // swallowed (loop continues, entry KEPT), never crashing the loop nor
-  // prematurely fencing. Only a clean null-CAS result deletes + FENCE-logs.
-  // Drives the REAL renewLeases closure via the DI backend seam.
-  // ---------------------------------------------------------------------------
-  describe("renewLeases — heartbeat is best-effort on a THROW (review Fix 2)", () => {
-    it("a renewLease THROW is caught+logged, resolves without throwing, keeps the entry", async () => {
-      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    // -------------------------------------------------------------------------
+    // Review Fix 2 — the heartbeat renewLeases loop is best-effort: a THROWN
+    // backend error (LeaseBackendError / timeout) on one entry is logged and
+    // swallowed (loop continues, entry KEPT), never crashing the loop nor
+    // prematurely fencing. Only a clean null-CAS result deletes + FENCE-logs.
+    // Drives the REAL renewLeases closure via the same coordinator seam.
+    // -------------------------------------------------------------------------
+    it("renewLeases: a renewLease THROW is caught+logged, resolves without throwing, keeps the entry", async () => {
       let casCalls = 0;
       const backend: LockBackend = {
         async createRef() {
@@ -6480,25 +6498,21 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
         },
         async deleteRef() {},
       };
-      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), backend);
-      expect(await deps.acquireIssueLease(71)).toBe(true);
+      const logs: string[] = [];
+      const coord = coordFor(backend, logs);
+      expect(await coord.acquireIssueLease(71)).toBe(true);
 
-      const errSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-      try {
-        // Pre-fix: the thrown LeaseBackendError escapes renewLease → renewLeases
-        // rejects. Post-fix: resolves.
-        await expect(deps.renewLeases()).resolves.toBeUndefined();
-        // It logged the transient heartbeat failure.
-        const logged = errSpy.mock.calls.map((c) => String(c[0])).join("");
-        expect(logged).toMatch(/renew/i);
-        expect(logged).toContain("71");
-      } finally {
-        errSpy.mockRestore();
-      }
+      // Pre-fix: the thrown LeaseBackendError escapes renewLease → renewLeases
+      // rejects. Post-fix: resolves.
+      await expect(coord.renewLeases()).resolves.toBeUndefined();
+      // It logged the transient heartbeat failure.
+      const logged = logs.join("");
+      expect(logged).toMatch(/renew/i);
+      expect(logged).toContain("71");
 
       // Entry KEPT (not deleted like the clean-null lost-lease path): the fence
       // probe finds it in the registry and renews it (casRef now succeeds).
-      expect(await deps.fenceIssue?.(71)).toBe(true);
+      expect(await coord.fenceIssue(71)).toBe(true);
     });
   });
 

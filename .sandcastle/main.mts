@@ -50,19 +50,15 @@ import {
   listOpenIssuesWithBodies,
   LABEL_READY,
   acquireSingleInstanceLock,
-  acquireLease,
-  readLease,
-  reclaimIfExpired,
-  renewLease,
-  releaseLease,
   createGitLockBackend,
+  createLeaseCoordinator,
   classifyLease,
   LeaseBackendError,
   LeaseReadError,
   createLaneSync,
   LaneSyncError,
 } from "./lib/state/index.js";
-import type { LockLease, LockDeps, LockBackend, LaneSyncResult } from "./lib/state/index.js";
+import type { LockLease, LockDeps, LaneSyncResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -2752,14 +2748,7 @@ export function createRunLogAppender(opts: {
  * `dryRun` short-circuits claim / quarantine / markDone / comment to log-only
  * operations so a misconfigured first run can't move labels.
  */
-export function buildDefaultDeps(
-  args: SandcastleArgs,
-  // Test-only DI seam (ADR 0019): inject a fake LockBackend so the real
-  // acquireIssueLease / renewLeases closures can be exercised against a
-  // throwing/contended backend without shelling to git. Undefined in
-  // production ⇒ the concrete git-backed backend, so behavior is unchanged.
-  lockBackendOverride?: LockBackend,
-): Deps {
+export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // pnpm install (not npm) — affinity-tracker and similar monorepos use
   // pnpm's workspace:* protocol which npm refuses to parse. The Dockerfile
   // ships `corepack enable` so `pnpm` works without an extra global install.
@@ -2921,18 +2910,25 @@ export function buildDefaultDeps(
   // opt-in flag is set: `leaseEnabled` false ⇒ every lease dep short-circuits
   // to today's behavior (acquire always wins, release/state/renew no-op) with
   // no git touched, so single-host consumers need no new push auth. When on,
-  // `leaseRegistry` tracks the leases THIS host currently holds so renew can
-  // heartbeat them and release only ever deletes a ref we actually own.
+  // the coordinator's registry tracks the leases THIS host currently holds so
+  // renew can heartbeat them and release only ever deletes a ref we actually
+  // own. The five lease methods live in the createLeaseCoordinator factory
+  // (lib/state/lock.ts) — a one-collaborator (`lockDeps`) seam that is unit-
+  // testable against a fake LockBackend without the whole Deps graph.
   const leaseEnabled = crossHostLeaseEnabled();
-  const leaseRegistry = new Map<number, LockLease>();
   const lockDeps: LockDeps = {
-    backend:
-      lockBackendOverride ??
-      createGitLockBackend({ git: runGitLease, repoRoot: args.repoRoot }),
+    backend: createGitLockBackend({ git: runGitLease, repoRoot: args.repoRoot }),
     now: () => new Date().toISOString(),
     hostId: resolveHostId(),
     ttlSec: lockTtlSecOnce(), // Fix 8: single-resolved, memoized (see lockTtlSecOnce)
   };
+  const leaseCoord = createLeaseCoordinator({
+    lockDeps,
+    leaseEnabled,
+    dryRun: args.dryRun,
+    logError: logErr,
+    dryLog,
+  });
 
   // Cross-host LANE SYNC (ADR 0019, Task B). Like the lease, everything here is
   // inert unless the opt-in flag is set: `syncEnabled` false ⇒ syncLanes /
@@ -3156,126 +3152,10 @@ export function buildDefaultDeps(
         return "";
       }
     },
-    async acquireIssueLease(n) {
-      if (!leaseEnabled) return true;
-      if (args.dryRun) {
-        dryLog("acquireIssueLease", n);
-        return true;
-      }
-      // Create the ref; on a straight contention (ref exists) try to reclaim it
-      // in case the holder died with the lease still pinned (expired). Only a
-      // LIVE peer lease keeps us out.
-      let lease: LockLease | null;
-      try {
-        lease = await acquireLease(n, lockDeps);
-        if (!lease) lease = await reclaimIfExpired(n, lockDeps);
-      } catch (err) {
-        // Review Fix 1: reclaimIfExpired reads the ref BEFORE its expiry check,
-        // so a present-but-unreadable ref throws LeaseReadError here. Treat it
-        // as OCCUPIED (return false → the gate throws LeaseContendedError, a
-        // routine SKIP) rather than letting it escape into the accounting
-        // loop's generic failure branch (which would bump consecutiveFailures
-        // and trip the 3-strike breaker — both hosts pick the same tickets, so
-        // it would halt almost immediately) AND leave the ref permanently
-        // unacquirable (the throw precedes the expiry check, so TTL never
-        // reclaims it). Fail-closed: never double-work. Self-heals if the read
-        // is only transiently broken (next iteration may read fine and
-        // reclaim); a genuinely-corrupt ref skips forever — operator escape
-        // hatch is `git push origin :refs/locks/issue-<N>`.
-        // CRITICAL: catch ONLY LeaseReadError. A LeaseBackendError (auth/
-        // network) from acquireLease's createRef MUST still propagate so the
-        // loud fatal halt (exitCode 2) fires — do NOT swallow it here.
-        if (err instanceof LeaseReadError) return false;
-        throw err;
-      }
-      if (!lease) return false;
-      leaseRegistry.set(n, lease);
-      return true;
-    },
-    async releaseIssueLease(n) {
-      if (!leaseEnabled) return;
-      // Never delete a ref we don't own: a release for an issue we didn't win
-      // (e.g. the rejected-branch cleanup after a contended acquire) must not
-      // yank a peer host's lease.
-      if (!leaseRegistry.has(n)) return;
-      if (args.dryRun) {
-        dryLog("releaseIssueLease", n);
-        leaseRegistry.delete(n);
-        return;
-      }
-      try {
-        await releaseLease(n, lockDeps);
-      } finally {
-        leaseRegistry.delete(n);
-      }
-    },
-    async leaseState(n) {
-      if (!leaseEnabled) return "absent";
-      // Fix 6: single-source-of-truth expiry via classifyLease, and fail-close a
-      // present-but-unreadable ref (LeaseReadError) to "live" so a corrupt lock
-      // is never mistaken for a free issue.
-      return resolveLeaseState(() => readLease(n, lockDeps), lockDeps.now());
-    },
-    async fenceIssue(n) {
-      if (!leaseEnabled) return true;
-      if (args.dryRun) {
-        dryLog("fenceIssue", n);
-        return true;
-      }
-      // Fix 3: re-assert the lease inline right before ship. If we don't hold it
-      // in the registry, we cannot ship (never held, or a prior fence dropped
-      // it). Otherwise run the renewal CAS synchronously: a null result means we
-      // LOST the lease to a reclaimer — drop it and refuse the ship.
-      const lease = leaseRegistry.get(n);
-      if (!lease) return false;
-      const renewed = await renewLease(lease, lockDeps);
-      if (!renewed) {
-        leaseRegistry.delete(n);
-        logErr(
-          `[lease] FENCE — inline renewal CAS failed for issue #${n} at ship ` +
-            `time: this host lost the lease to another host. REFUSING to ship.`,
-        );
-        return false;
-      }
-      leaseRegistry.set(n, renewed);
-      return true;
-    },
-    async renewLeases() {
-      if (!leaseEnabled) return;
-      for (const [n, lease] of [...leaseRegistry]) {
-        let renewed: LockLease | null;
-        try {
-          renewed = await renewLease(lease, lockDeps);
-        } catch (err) {
-          // Review Fix 2: the heartbeat is BEST-EFFORT. A THROWN error here
-          // (LeaseBackendError on an auth/network fault, a post-retry timeout,
-          // anything) must NOT crash the loop (this runs as `void
-          // renewLeases()` in a setInterval → an unhandled rejection could take
-          // the whole process down) and must NOT prematurely fence: a transient
-          // heartbeat blip is not proof we lost the lease. Log it and CONTINUE
-          // to the next entry, KEEPING the registry entry. The real ownership
-          // guard is the inline ship-time fence (fenceIssue). Only the clean
-          // null-CAS result below (a genuine reclaim by a peer) deletes + fences.
-          logErr(
-            `[lease] heartbeat renewal for issue #${n} threw (transient — NOT ` +
-              `fencing, entry kept): ${err instanceof Error ? err.message : String(err)}`,
-          );
-          continue;
-        }
-        if (renewed) {
-          leaseRegistry.set(n, renewed);
-        } else {
-          // Fencing: a failed renewal CAS means the lease was reclaimed out from
-          // under us. Drop it and shout — the loop should stop pushing work for
-          // an issue another host now owns.
-          leaseRegistry.delete(n);
-          logErr(
-            `[lease] FENCE — renewal CAS failed for issue #${n}: the lease was ` +
-              `reclaimed by another host. This host no longer owns it.`,
-          );
-        }
-      }
-    },
+    // Cross-host issue lease (ADR 0019): the five lease methods come from the
+    // createLeaseCoordinator factory above (extracted to lib/state/lock.ts).
+    // Spread here so the returned Deps shape is unchanged.
+    ...leaseCoord,
     async syncLanes(branch, launchWorktreePath) {
       // OFF ⇒ byte-for-byte no-op: NO fetch/ls-remote/merge. Same for --dry-run.
       if (!syncEnabled) return { peers: [] };
