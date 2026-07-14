@@ -58,6 +58,9 @@ import {
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
+  runGitLeaseRetrying,
+  resolveLeaseState,
+  type GitRunResult,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
   STAGE_CODEX_AGENTS_MD_COMMAND,
@@ -84,6 +87,8 @@ import {
   MarkerNotFoundError,
 } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
+import { LeaseReadError, LeaseBackendError } from "../.sandcastle/lib/state/index.js";
+import type { LockLease } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
@@ -141,6 +146,7 @@ interface MockState {
   leaseReleases: number[];
   leaseStateCalls: number[];
   leaseRenews: number;
+  leaseFences: number[];
 }
 
 function newState(): MockState {
@@ -162,6 +168,7 @@ function newState(): MockState {
     leaseReleases: [],
     leaseStateCalls: [],
     leaseRenews: 0,
+    leaseFences: [],
   };
 }
 
@@ -221,6 +228,11 @@ function buildDeps(opts: {
   leaseStateValue?: "absent" | "live" | "expired";
   /** Per-issue override for leaseState; wins over leaseStateValue. */
   leaseStateFor?: (issueNum: number) => "absent" | "live" | "expired";
+  /** Cross-host lease (ADR 0019) Fix 3: default fenceIssue result. Defaults to
+   *  `true` (host still holds the lease) so ship proceeds unchanged. */
+  leaseFenceValue?: boolean;
+  /** Per-issue override for fenceIssue; wins over leaseFenceValue. */
+  leaseFenceFor?: (issueNum: number) => boolean;
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -347,6 +359,11 @@ function buildDeps(opts: {
     },
     async renewLeases() {
       state.leaseRenews += 1;
+    },
+    async fenceIssue(n) {
+      state.leaseFences.push(n);
+      if (opts.leaseFenceFor) return opts.leaseFenceFor(n);
+      return opts.leaseFenceValue ?? true;
     },
     log(line) {
       state.logs.push(line);
@@ -6024,7 +6041,7 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     expect(b.state.leaseReleases).toContain(400);
   });
 
-  it("hook 2: staging ok HOLDS the lease (not released at ship time)", async () => {
+  it("hook 2 / Fix 4: staging ok held past ship is RELEASED when the promotion FF is refused (stranded)", async () => {
     process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
     const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
     try {
@@ -6065,11 +6082,14 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
         b.deps,
       );
 
-      // Promotion failed → unhealthy, and #71's lease is HELD (never released
-      // at ship time and promotion never ran).
+      // Promotion FF refused → the work is stranded on integration-candidate
+      // and #71 is flagged needs-human. Fix 4: the lease held past ship time is
+      // now RELEASED in the stranded branch (matching its promote-success and
+      // quarantine siblings) so the ref clears and a peer can reclaim; the issue
+      // stays needs-human so the planner won't re-pick it.
       expect(result.exitCode).not.toBe(0);
       expect(b.state.leaseAcquires).toContain(71);
-      expect(b.state.leaseReleases).not.toContain(71);
+      expect(b.state.leaseReleases).toContain(71);
     } finally {
       __setStagingWorktreePathForTests("");
       cleanup();
@@ -6217,5 +6237,468 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     process.env.SANDCASTLE_HOST_ID = "myhost";
     const { args } = parseSandcastleArgs(["--iterations", "1"]);
     expect(args.branch.includes("myhost")).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 1 — cross-host contention is a SKIP, not a failure.
+  // ---------------------------------------------------------------------------
+  it("Fix 1: all-contended issues → SKIP, breaker NOT tripped (exit 0)", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    // Every acquire loses — the peer host holds every ticket. Three tickets
+    // matches the default consecutiveFailureLimit (3): pre-fix each would bump
+    // consecutiveFailures and trip the breaker (exit 1) on the very first
+    // iteration. Post-fix each is a routine skip.
+    const b = buildDeps({ leaseAcquireWins: false });
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "51", title: "a", branch: "agent/issue-51" },
+        { id: "52", title: "b", branch: "agent/issue-52" },
+        { id: "53", title: "c", branch: "agent/issue-53" },
+      ]),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0); // breaker did NOT trip
+    expect(b.state.claims).toEqual([]); // nothing claimed
+    expect(result.shippedIssues).toEqual([]);
+    // Contention is routine — no circuit-breaker comment posted, and no
+    // "outer pipeline rejected" error was logged for a contended ticket.
+    expect(b.state.comments).toEqual([]);
+    expect(b.state.errors.join("\n")).not.toMatch(/outer pipeline rejected/);
+  });
+
+  it("Fix 1: contended loser skips, winner sibling ships (single iteration)", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    // #61 contended (peer holds it), #62 free.
+    const b = buildDeps({ leaseAcquireFor: (n) => n === 62 });
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "61", title: "contended", branch: "agent/issue-61" },
+        { id: "62", title: "mine", branch: "agent/issue-62" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 62 }),
+      commits: [{ sha: "c62" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.claims).toEqual([62]); // loser never claimed
+    expect(result.shippedIssues).toEqual([62]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 2 — an auth/network LeaseBackendError from acquire halts LOUD + fatal.
+  // ---------------------------------------------------------------------------
+  it("Fix 2: LeaseBackendError from acquire → run halts loudly, not counted as contention", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps();
+    b.deps.acquireIssueLease = async () => {
+      throw new LeaseBackendError(
+        "fatal: could not read Username for 'https://github.com'",
+      );
+    };
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "61", title: "a", branch: "agent/issue-61" },
+      ]),
+    });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).not.toBe(0); // halted, not exit 0
+    const joined = b.state.errors.join("\n");
+    // Loud, remediation-oriented message.
+    expect(joined).toMatch(/auth|setup-git/i);
+    // NOT mistaken for routine contention.
+    expect(joined.toLowerCase()).not.toContain("contended");
+    // The auth fault stops us before we ever claim.
+    expect(b.state.claims).toEqual([]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 3 — inline-CAS fence before the actual ship/promote.
+  // ---------------------------------------------------------------------------
+  it("Fix 3: fence FAILS before non-staging ship → NOT marked done (deferred)", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps({ leaseFenceValue: false });
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "81", title: "x", branch: "agent/issue-81" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 81 }),
+      commits: [{ sha: "c81" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.leaseFences).toContain(81);
+    // Lost the lease at ship time → never marked done, never shipped.
+    expect(b.state.marksDone).toEqual([]);
+    expect(result.shippedIssues).toEqual([]);
+  });
+
+  it("Fix 3: fence SUCCEEDS before non-staging ship → normal ship proceeds", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const b = buildDeps({ leaseFenceValue: true });
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "82", title: "x", branch: "agent/issue-82" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 82 }),
+      commits: [{ sha: "c82" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(b.state.leaseFences).toContain(82);
+    expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([82]);
+    expect(result.shippedIssues).toEqual([82]);
+  });
+
+  it("Fix 3: flag OFF → fence is a no-op and non-staging ship is unchanged", async () => {
+    // No SANDCASTLE_CROSS_HOST_LEASE env; the mock still exposes fenceIssue but
+    // defaults to true, so ship proceeds exactly as before the fence existed.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "83", title: "x", branch: "agent/issue-83" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 83 }),
+      commits: [{ sha: "c83" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.shippedIssues).toEqual([83]);
+    expect(b.state.marksDone.map((m) => m.issueNum)).toEqual([83]);
+  });
+
+  it("Fix 3: fence FAILS before staging promotion → issue excluded, not merged", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      // Clean live worktree on the integration branch so the FF would advance.
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-lease-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      // #71 lost its lease between ship and promote (fence fails); no other
+      // issue is in play.
+      const b = buildDeps({ leaseFenceFor: (n) => n !== 71 });
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const status = JSON.parse(
+        readFileSync(path.join(repoRoot, ".sandcastle", "status.json"), "utf8"),
+      ) as SandcastleStatus;
+      // Fence failed → #71 excluded from promotion → nothing counted merged.
+      expect(b.state.leaseFences).toContain(71);
+      expect(status.totals.merged).toBe(0);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync("git", ["worktree", "remove", "--force", launchPath], {
+            cwd: repoRoot,
+            env: gitEnv,
+            stdio: "ignore",
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Two-loop E2E — disjoint claims + reclaim-on-death over one shared store.
+  // ---------------------------------------------------------------------------
+  interface FakeLease {
+    holder: string;
+    expiresAt: number;
+  }
+  function wireSharedLease(
+    deps: Deps,
+    store: Map<number, FakeLease>,
+    hostId: string,
+    opts: { ttlMs?: number; neverRelease?: boolean } = {},
+  ): void {
+    const ttl = opts.ttlMs ?? 100_000;
+    const holdsLive = (n: number): boolean => {
+      const cur = store.get(n);
+      return !!cur && cur.holder === hostId && cur.expiresAt > Date.now();
+    };
+    deps.acquireIssueLease = async (n) => {
+      const cur = store.get(n);
+      if (cur && cur.expiresAt > Date.now()) return false; // live peer holds it
+      store.set(n, { holder: hostId, expiresAt: Date.now() + ttl }); // fresh/reclaim
+      return true;
+    };
+    deps.leaseState = async (n) => {
+      const cur = store.get(n);
+      if (!cur) return "absent";
+      return cur.expiresAt > Date.now() ? "live" : "expired";
+    };
+    deps.releaseIssueLease = async (n) => {
+      if (opts.neverRelease) return; // stand in for a still-concurrent peer
+      const cur = store.get(n);
+      if (cur && cur.holder === hostId) store.delete(n);
+    };
+    deps.fenceIssue = async (n) => holdsLive(n);
+  }
+
+  it("E2E (a): two loops over one store make DISJOINT claims", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const store = new Map<number, FakeLease>();
+
+    // Host A works [71,72]; releases are no-ops so its leases persist for the
+    // duration, standing in for a still-running concurrent peer.
+    const a = buildDeps();
+    wireSharedLease(a.deps, store, "A", { neverRelease: true });
+    a.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "71", title: "a1", branch: "agent/issue-71" },
+        { id: "72", title: "a2", branch: "agent/issue-72" },
+      ]),
+    });
+    a.enqueue("implementer", { stdout: implementerStdout({ ghIssue: 71 }), commits: [{ sha: "c71" }] });
+    a.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+    a.enqueue("implementer", { stdout: implementerStdout({ ghIssue: 72 }), commits: [{ sha: "c72" }] });
+    a.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+    a.enqueue("merger", { stdout: "merged" });
+    a.enqueue("planner", { stdout: plannerStdout([]) });
+    const ra = await runMain(baseArgs({ iterations: 2, stagingEnabled: false }), a.deps);
+
+    // Host B works [72,73]: 72 is held live by A (contended → skip), 73 is free.
+    const b = buildDeps();
+    wireSharedLease(b.deps, store, "B", { neverRelease: true });
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "72", title: "b1", branch: "agent/issue-72" },
+        { id: "73", title: "b2", branch: "agent/issue-73" },
+      ]),
+    });
+    b.enqueue("implementer", { stdout: implementerStdout({ ghIssue: 73 }), commits: [{ sha: "c73" }] });
+    b.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    const rb = await runMain(baseArgs({ iterations: 2, stagingEnabled: false }), b.deps);
+
+    expect(ra.exitCode).toBe(0);
+    expect(rb.exitCode).toBe(0);
+    // No issue was claimed by BOTH hosts.
+    const aClaims = new Set(a.state.claims);
+    const bClaims = new Set(b.state.claims);
+    const claimOverlap = [...aClaims].filter((n) => bClaims.has(n));
+    expect(claimOverlap).toEqual([]);
+    // No issue was shipped by BOTH hosts.
+    const shipOverlap = ra.shippedIssues.filter((n) => rb.shippedIssues.includes(n));
+    expect(shipOverlap).toEqual([]);
+    // Concretely: A took 71+72, B took only 73.
+    expect([...aClaims].sort()).toEqual([71, 72]);
+    expect([...bClaims].sort()).toEqual([73]);
+  });
+
+  it("E2E (b): loop-1 dies holding a lease → it expires → loop-2 reclaims and ships", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const store = new Map<number, FakeLease>();
+
+    // Loop-1 (host A) acquires #88, then "dies" — stops renewing. Simulate the
+    // lapse by expiring its lease in the shared store.
+    const a = buildDeps();
+    wireSharedLease(a.deps, store, "A", { ttlMs: 50 });
+    expect(await a.deps.acquireIssueLease(88)).toBe(true);
+    store.get(88)!.expiresAt = Date.now() - 1; // lease lapsed after A went silent
+
+    // Loop-2 (host B) targets #88; its lease is expired → B reclaims and ships.
+    const b = buildDeps();
+    wireSharedLease(b.deps, store, "B");
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "88", title: "orphaned", branch: "agent/issue-88" }]),
+    });
+    b.enqueue("implementer", { stdout: implementerStdout({ ghIssue: 88 }), commits: [{ sha: "c88" }] });
+    b.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const rb = await runMain(baseArgs({ iterations: 2, stagingEnabled: false }), b.deps);
+
+    expect(rb.exitCode).toBe(0);
+    // B reclaimed the expired lease and shipped the orphaned issue.
+    expect(rb.shippedIssues).toEqual([88]);
+    expect(b.state.claims).toEqual([88]);
+    // Non-staging ok ships release the lease, so after B's clean ship the ref is
+    // gone — the full reclaim → ship → release cycle completed under host B.
+    expect(store.get(88)).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 5 — bounded git timeout + retry for lease ref ops.
+  // ---------------------------------------------------------------------------
+  describe("runGitLeaseRetrying (Fix 5)", () => {
+    const timeoutRes: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr: "git ls-remote SIGTERM (killed by timeout)",
+    };
+    const okRes: GitRunResult = { ok: true, stdout: "deadbeef", stderr: "" };
+    const contentionRes: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr: "! [rejected] (fetch first)\nfailed to push some refs",
+    };
+    const authRes: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    };
+
+    it("retries once on a timeout then succeeds", () => {
+      let calls = 0;
+      const once = (): GitRunResult => {
+        calls += 1;
+        return calls === 1 ? timeoutRes : okRes;
+      };
+      const res = runGitLeaseRetrying(once, "ls-remote", "origin");
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(2);
+    });
+
+    it("does NOT retry a clean push rejection (contention)", () => {
+      let calls = 0;
+      const once = (): GitRunResult => {
+        calls += 1;
+        return contentionRes;
+      };
+      const res = runGitLeaseRetrying(once, "push");
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(1);
+    });
+
+    it("does NOT retry an auth failure", () => {
+      let calls = 0;
+      const once = (): GitRunResult => {
+        calls += 1;
+        return authRes;
+      };
+      runGitLeaseRetrying(once, "push");
+      expect(calls).toBe(1);
+    });
+
+    it("caps at 2 attempts even if the timeout persists", () => {
+      let calls = 0;
+      const once = (): GitRunResult => {
+        calls += 1;
+        return timeoutRes;
+      };
+      const res = runGitLeaseRetrying(once, "ls-remote");
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 6 — leaseState uses classifyLease + fail-closes a LeaseReadError.
+  // ---------------------------------------------------------------------------
+  describe("resolveLeaseState (Fix 6)", () => {
+    const now = "2026-07-14T00:00:00.000Z";
+    const liveLease: LockLease = {
+      issue: 1,
+      holder: "h",
+      acquiredAt: now,
+      expiresAt: "2026-07-14T00:10:00.000Z",
+      epoch: 1,
+      refOid: "oid",
+    };
+    const expiredLease: LockLease = {
+      ...liveLease,
+      expiresAt: "2026-07-13T00:00:00.000Z",
+    };
+
+    it("returns 'absent' when the read yields null", async () => {
+      expect(await resolveLeaseState(async () => null, now)).toBe("absent");
+    });
+
+    it("returns 'live' for an unexpired lease", async () => {
+      expect(await resolveLeaseState(async () => liveLease, now)).toBe("live");
+    });
+
+    it("returns 'expired' for a past-deadline lease", async () => {
+      expect(await resolveLeaseState(async () => expiredLease, now)).toBe(
+        "expired",
+      );
+    });
+
+    it("treats a LeaseReadError as 'live' (fail-closed = occupied)", async () => {
+      const res = await resolveLeaseState(async () => {
+        throw new LeaseReadError(1, "corrupt lock-commit");
+      }, now);
+      expect(res).toBe("live");
+    });
+
+    it("rethrows a non-LeaseReadError", async () => {
+      await expect(
+        resolveLeaseState(async () => {
+          throw new Error("boom");
+        }, now),
+      ).rejects.toThrow("boom");
+    });
   });
 });
