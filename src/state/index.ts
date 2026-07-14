@@ -68,3 +68,7 @@ export type {
   GitRunResult,
   GitLockBackendOpts,
 } from "./lock.js";
+
+// Cross-host lane sync (ADR 0019) — the code-sharing substrate for two hosts.
+export { createLaneSync, LaneSyncError } from "./lane-sync.js";
+export type { LaneSyncResult, PeerMergeResult, LaneSyncOpts } from "./lane-sync.js";
