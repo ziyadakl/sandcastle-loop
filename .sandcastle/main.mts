@@ -59,8 +59,10 @@ import {
   classifyLease,
   LeaseBackendError,
   LeaseReadError,
+  createLaneSync,
+  LaneSyncError,
 } from "./lib/state/index.js";
-import type { LockLease, LockDeps, LockBackend } from "./lib/state/index.js";
+import type { LockLease, LockDeps, LockBackend, LaneSyncResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -484,6 +486,25 @@ export interface Deps {
    * `buildDefaultDeps` always provides it; this keeps pre-lease Deps stubs valid.
    */
   fenceIssue?(issueNum: number): Promise<boolean>;
+  /**
+   * Cross-host LANE SYNC (ADR 0019, Task B) — pull each peer host's published
+   * lane into `branch` inside `launchWorktreePath` at iteration start. OFF
+   * (flag unset) OR omitted ⇒ a byte-for-byte no-op resolving `{ peers: [] }`
+   * with NO fetch/ls-remote/merge (today's single-host behavior). ON ⇒ fetch +
+   * merge each peer via the bounded lane-sync runner; NEVER throws on a
+   * fetch-fail or merge-conflict (those surface as `skipped`/`conflict` in the
+   * result for the loop to log + continue on the un-synced tip).
+   */
+  syncLanes?(branch: string, launchWorktreePath: string): Promise<LaneSyncResult>;
+  /**
+   * Cross-host LANE SYNC (ADR 0019, Task B) — publish this host's local
+   * `branch` to its lane ref on origin after a fully-successful ship/promote.
+   * OFF OR omitted ⇒ a no-op with NO push. ON ⇒ force-push `branch` to
+   * `refs/sandcastle/lanes/<hostId>`; a push failure (auth/network/backend) is a
+   * REAL fault surfaced as a thrown {@link LaneSyncError} for the caller to log
+   * LOUD (the code did not reach origin — a peer can't see it).
+   */
+  publishLane?(branch: string): Promise<void>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -937,6 +958,10 @@ const LOGGED_ENV_KEYS = new Set([
   // Cross-host issue lease (ADR 0019) config — surfaced so an operator can
   // see at a glance whether the opt-in lease is on and how it's tuned.
   "SANDCASTLE_CROSS_HOST_LEASE",
+  // Cross-host LANE SYNC (ADR 0019, Task B) — code-sharing opt-in. Requires the
+  // lease (see the startup guard in runMain); surfaced so an operator can see
+  // at a glance whether lane sync is on.
+  "SANDCASTLE_CROSS_HOST_SYNC",
   "SANDCASTLE_HOST_ID",
   "SANDCASTLE_LOCK_TTL_SEC",
 ]);
@@ -951,6 +976,22 @@ function crossHostLeaseEnabled(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): boolean {
   const v = (getEnv("SANDCASTLE_CROSS_HOST_LEASE") ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
+/**
+ * Whether cross-host LANE SYNC (ADR 0019, Task B) is enabled for this run. OFF
+ * by default: with the flag unset both lane deps (syncLanes / publishLane) are
+ * byte-for-byte no-ops, so a single-host consumer never fetches/pushes/ls-remotes
+ * a lane ref and needs no new git auth. Truthy = "1"/"true" (case-insensitive),
+ * matching {@link crossHostLeaseEnabled}. Sync REQUIRES the lease — sharing code
+ * without the per-issue lock is unsafe — enforced by a LOUD startup guard in
+ * runMain. `getEnv` is an injectable seam for tests.
+ */
+function crossHostSyncEnabled(
+  getEnv: (key: string) => string | undefined = (k) => process.env[k],
+): boolean {
+  const v = (getEnv("SANDCASTLE_CROSS_HOST_SYNC") ?? "").trim().toLowerCase();
   return v === "1" || v === "true";
 }
 
@@ -2120,33 +2161,20 @@ export async function ensureStagingWorktree(
   // 2. Before creating: check that integration-candidate isn't already
   //    checked out in another worktree (specifically: the launch worktree
   //    from a previously-buggy run). If it is, abort with a recovery hint.
-  const list = runGit(repoRoot, "worktree", "list", "--porcelain");
-  if (list.ok) {
-    // Porcelain format: blocks separated by blank lines, each block has
-    //   worktree <path>
-    //   HEAD <sha>
-    //   branch refs/heads/<name>
-    const blocks = list.stdout.split("\n\n");
-    for (const block of blocks) {
-      const lines = block.split("\n");
-      let wtPath = "";
-      let branchRef = "";
-      for (const ln of lines) {
-        if (ln.startsWith("worktree ")) wtPath = ln.slice("worktree ".length).trim();
-        else if (ln.startsWith("branch ")) branchRef = ln.slice("branch ".length).trim();
-      }
-      if (
-        branchRef === `refs/heads/${STAGING_BRANCH}` &&
-        wtPath !== "" &&
-        path.resolve(wtPath) !== path.resolve(stagingPath)
-      ) {
-        throw new Error(
-          `Launch worktree HEAD is on ${STAGING_BRANCH} (from a previously-buggy run). ` +
-            `Run \`git checkout ${baseBranch}\` in the launch worktree and re-run the loop. ` +
-            `See commit <this-fix-sha> for context.`,
-        );
-      }
-    }
+  // Route through the canonical "who has <branch> checked out" resolver
+  // (findWorktreeForBranch). A list failure yields `undefined` here, matching
+  // the prior `if (list.ok)` skip; git enforces one worktree per branch, so the
+  // first match is the only match.
+  const staleStaging = findWorktreeForBranch(repoRoot, STAGING_BRANCH);
+  if (
+    staleStaging &&
+    path.resolve(staleStaging.path) !== path.resolve(stagingPath)
+  ) {
+    throw new Error(
+      `Launch worktree HEAD is on ${STAGING_BRANCH} (from a previously-buggy run). ` +
+        `Run \`git checkout ${baseBranch}\` in the launch worktree and re-run the loop. ` +
+        `See commit <this-fix-sha> for context.`,
+    );
   }
 
   // 3. If integration-candidate branch doesn't exist locally, create it
@@ -2203,6 +2231,30 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
     if (wtPath !== "") entries.push({ path: wtPath, branch });
   }
   return entries;
+}
+
+/**
+ * Find the linked worktree that has `branch` checked out (attached HEAD ==
+ * `refs/heads/<branch>`), or `undefined` if none does — the single source of
+ * truth for the `parseWorktreeList(...).find(w => w.branch === "refs/heads/X")`
+ * pattern that was duplicated across the loop (staging preflight, worktree-
+ * health cleanup, fast-forward promote) and is now also the launch-worktree
+ * resolver for the cross-host lane-sync hook (ADR 0019, Task B). Lists via the
+ * injectable `git` runner (defaults to {@link runGit}); returns `undefined`
+ * (never throws) on a list failure so callers that resolve a worktree path can
+ * fall back gracefully. Callers that must DISTINGUISH a list failure from a
+ * genuine not-found keep their own explicit `ok`-check.
+ */
+export function findWorktreeForBranch(
+  repoRoot: string,
+  branch: string,
+  git: (repoRoot: string, ...args: string[]) => GitRunResult = runGit,
+): WorktreeEntry | undefined {
+  const listed = git(repoRoot, "worktree", "list", "--porcelain");
+  if (!listed.ok) return undefined;
+  return parseWorktreeList(listed.stdout).find(
+    (w) => w.branch === `refs/heads/${branch}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,14 +2452,16 @@ export function fastForwardIntegration(
     logError(`fast-forward: cannot resolve integration branch '${integrationBranch}'`);
     return false;
   }
+  // Explicit list-ok guard first: THIS site must distinguish a worktree-list
+  // FAILURE (abort the promote) from a genuine not-found (proceed), which
+  // findWorktreeForBranch collapses to `undefined`. Once the list is known-ok,
+  // resolve the match through the canonical helper.
   const listed = runGit(repoRoot, "worktree", "list", "--porcelain");
   if (!listed.ok) {
     logError(`fast-forward: worktree list failed: ${listed.stderr}`);
     return false;
   }
-  const liveWorktree = parseWorktreeList(listed.stdout).find(
-    (w) => w.branch === `refs/heads/${integrationBranch}`,
-  );
+  const liveWorktree = findWorktreeForBranch(repoRoot, integrationBranch);
   // Guard: both the fast-forward and the divergence `--no-ff` below run
   // `git merge` INSIDE the launch worktree. git refuses either merge if that
   // worktree has uncommitted changes the merge would touch ("Your local
@@ -2880,6 +2934,19 @@ export function buildDefaultDeps(
     ttlSec: lockTtlSecOnce(), // Fix 8: single-resolved, memoized (see lockTtlSecOnce)
   };
 
+  // Cross-host LANE SYNC (ADR 0019, Task B). Like the lease, everything here is
+  // inert unless the opt-in flag is set: `syncEnabled` false ⇒ syncLanes /
+  // publishLane below short-circuit with NO git (no fetch/push/ls-remote), so a
+  // single-host consumer is byte-for-byte unchanged. When on, lane git runs
+  // ONLY through the bounded `runGitLease` runner (NEVER bare runGit) so a hung
+  // fetch/push cannot wedge the loop. hostId matches the lease's namespace.
+  const syncEnabled = crossHostSyncEnabled();
+  const laneSync = createLaneSync({
+    git: runGitLease,
+    repoRoot: args.repoRoot,
+    hostId: resolveHostId(),
+  });
+
   // Raw, provider-agnostic sandbox create (pre-clean + provider.createSandbox).
   // The exported `createSandbox` dep routes the FIRST call through the
   // worktree-health lazy repair, then calls this directly thereafter.
@@ -3208,6 +3275,27 @@ export function buildDefaultDeps(
           );
         }
       }
+    },
+    async syncLanes(branch, launchWorktreePath) {
+      // OFF ⇒ byte-for-byte no-op: NO fetch/ls-remote/merge. Same for --dry-run.
+      if (!syncEnabled) return { peers: [] };
+      if (args.dryRun) {
+        dryLog("syncLanes", branch, launchWorktreePath);
+        return { peers: [] };
+      }
+      // Never throws on fetch-fail / conflict — results carry the per-peer
+      // status for the loop to log + continue on the un-synced tip.
+      return laneSync.syncInto(branch, launchWorktreePath);
+    },
+    async publishLane(branch) {
+      // OFF ⇒ no-op with NO push. Same for --dry-run.
+      if (!syncEnabled) return;
+      if (args.dryRun) {
+        dryLog("publishLane", branch);
+        return;
+      }
+      // Throws LaneSyncError on a real push fault — the loop surfaces it LOUD.
+      await laneSync.publish(branch);
     },
     log,
     logError: logErr,
@@ -4822,6 +4910,13 @@ export async function shipAfterMigrations(
     const fenced = await fenceBeforeShip(ctx);
     if (fenced) return fenced;
     await ctx.deps.markDone(ctx.issueNumber, summary);
+    // NOTE (ADR 0019, Task B): the cross-host lane publish is intentionally NOT
+    // here. markDone flips the label, but this iteration's code only reaches
+    // `args.branch` via the Phase-3 batch merger, which runs AFTER every
+    // per-issue pipeline. Publishing here would force-push a STALE launch-branch
+    // tip missing the just-shipped commit. The --no-staging publish lives in
+    // Phase 3, after the merger lands the work (mirrors the staging publish that
+    // runs after fastForwardIntegration).
   }
   deferralCounts.delete(ctx.issueNumber);
   return { status: "ok", finalMarker, postSha, skillsInvoked };
@@ -5508,6 +5603,30 @@ export async function runMain(
   // startup reconciliation and the renewal heartbeat agree on the same flag.
   const leaseEnabled = crossHostLeaseEnabled();
 
+  // Cross-host LANE SYNC (ADR 0019, Task B). Read once here so the iteration-
+  // start sync hook and the ship/promote publish hooks agree on the same flag.
+  // Sharing code across hosts WITHOUT the per-issue lease is unsafe — two hosts
+  // could ship conflicting work for the SAME issue and then blindly merge each
+  // other's lane. So sync REQUIRES the lease: if sync is on but the lease is
+  // off, refuse to start LOUD rather than silently degrade to an unsafe mode.
+  const syncEnabled = crossHostSyncEnabled();
+  if (syncEnabled && !leaseEnabled) {
+    deps.logError(
+      `[startup] SANDCASTLE_CROSS_HOST_SYNC is enabled but ` +
+        `SANDCASTLE_CROSS_HOST_LEASE is NOT. Cross-host lane sync SHARES code ` +
+        `between hosts and is only safe under the per-issue lease (without it, ` +
+        `two hosts can ship conflicting work for the same issue and merge each ` +
+        `other's lanes). Enable SANDCASTLE_CROSS_HOST_LEASE=1 or disable ` +
+        `SANDCASTLE_CROSS_HOST_SYNC. Refusing to start.`,
+    );
+    return {
+      exitCode: 2,
+      iterationsRun: 0,
+      shippedIssues: [],
+      quarantinedIssues: [],
+    };
+  }
+
   // Skill-discipline opt-in: when `SANDCASTLE.md` exists at the repo root,
   // the orchestrator re-validates the planner's picked issues against a
   // host-side label fetch, excluding any that don't carry exactly one
@@ -5733,6 +5852,49 @@ export async function runMain(
           shippedIssues,
           quarantinedIssues,
         };
+      }
+
+      // Cross-host LANE SYNC hook (ADR 0019, Task B). BEFORE the planner (and
+      // necessarily before resetStagingToIntegrationTip resets staging onto the
+      // integration tip): pull each peer host's published lane into this host's
+      // integration branch so this cycle plans + builds on the shared code.
+      // Gated on the opt-in flag ⇒ a single-host consumer never fetches/merges.
+      // NEVER crashes the loop: syncLanes never throws, and we act on each
+      // per-peer status non-fatally (merged → log; skipped → log + continue;
+      // conflict → log LOUD + continue building on the un-synced tip — we do
+      // NOT needs-human any specific issue, since staging is one commingled
+      // branch and the conflict is between whole lanes, not a single ticket).
+      if (syncEnabled) {
+        // Resolve the launch worktree that has the integration branch checked
+        // out (where a merge must run to be visible); fall back to the repo root.
+        const launchWt =
+          findWorktreeForBranch(args.repoRoot, args.branch)?.path ??
+          args.repoRoot;
+        const syncResult: LaneSyncResult = (await deps.syncLanes?.(
+          args.branch,
+          launchWt,
+        )) ?? { peers: [] };
+        for (const peer of syncResult.peers) {
+          if (peer.status === "merged") {
+            deps.log(`[lane] synced peer ${peer.peer} → ${args.branch} (merged)`);
+          } else if (peer.status === "skipped") {
+            deps.log(
+              `[lane] skipped peer ${peer.peer}: ${peer.reason ?? "(no reason)"} — continuing`,
+            );
+          } else {
+            // conflict — LOUD, durable run-log signal; keep building on the
+            // un-synced tip. The launch worktree was left clean by syncInto.
+            deps.logError(
+              `[lane] CONFLICT merging peer ${peer.peer} into ${args.branch}` +
+                `${
+                  peer.conflictedFiles && peer.conflictedFiles.length > 0
+                    ? ` (files: ${peer.conflictedFiles.join(", ")})`
+                    : ""
+                } — NOT merged; this host continues on its own un-synced tip. ` +
+                `A human should reconcile the two lanes.`,
+            );
+          }
+        }
       }
 
       // Run-level activity for the viewer: the cross-issue planning window
@@ -6681,6 +6843,29 @@ export async function runMain(
                 `promoteStagingToDone threw: ${(err as Error).message}`,
               );
             }
+            // Cross-host LANE SYNC publish hook (ADR 0019, Task B). The
+            // fast-forward promoted this host's integration branch to the shared
+            // ship line; publish it to this host's lane ref so a peer can sync
+            // it next cycle. ONLY on the promote-SUCCESS path (never in the
+            // FF-refused `else` below — that work is stranded, not shipped).
+            // Gated on the opt-in flag. A LaneSyncError is a real fault (code
+            // did not reach origin) surfaced LOUD but never crashes the loop.
+            if (syncEnabled) {
+              try {
+                await deps.publishLane?.(args.branch);
+              } catch (err) {
+                if (err instanceof LaneSyncError) {
+                  deps.logError(
+                    `[lane] PUBLISH FAILED for ${args.branch} after promoting ` +
+                      `staging: this host's code did NOT reach origin, so a peer ` +
+                      `host cannot see it. Fix \`gh auth setup-git\` / network ` +
+                      `connectivity. git stderr: ${err.stderr}`,
+                  );
+                } else {
+                  throw err;
+                }
+              }
+            }
             lastFailedStagingIteration = null;
           } else {
             // Fast-forward refused — treat as a staging failure. The merged +
@@ -6739,6 +6924,32 @@ export async function runMain(
             await deps.releaseIssueLease(n);
           }
           lastFailedStagingIteration = it;
+        }
+      } else if (mergerOk) {
+        // Cross-host LANE SYNC publish hook (ADR 0019, Task B), --no-staging leg.
+        // Under --no-staging the batch merger (Phase 3, above) is what lands this
+        // iteration's shipped work on `args.branch` — markDone only flips labels.
+        // So publish the lane HERE, after the merger has advanced the launch
+        // branch, exactly ONCE per iteration (never per-issue). Gated on
+        // `mergerOk` so a failed merger (nothing landed) does not push a stale,
+        // no-op tip — matching the cleanup gate's `!stagingActive ? mergerOk`
+        // logic below. Gated on the opt-in flag. A LaneSyncError is a real fault
+        // (code did not reach origin) surfaced LOUD but never crashes the loop.
+        if (syncEnabled) {
+          try {
+            await deps.publishLane?.(args.branch);
+          } catch (err) {
+            if (err instanceof LaneSyncError) {
+              deps.logError(
+                `[lane] PUBLISH FAILED for ${args.branch} after landing ` +
+                  `--no-staging merge: this host's code did NOT reach origin, so ` +
+                  `a peer host cannot see it. Fix \`gh auth setup-git\` / network ` +
+                  `connectivity. git stderr: ${err.stderr}`,
+              );
+            } else {
+              throw err;
+            }
+          }
         }
       }
 

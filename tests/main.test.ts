@@ -52,6 +52,7 @@ import {
   createRunLogAppender,
   hasCodeDiff,
   parseWorktreeList,
+  findWorktreeForBranch,
   serializeDotenv,
   oauthTokenEnv,
   ghTokenEnv,
@@ -149,6 +150,15 @@ interface MockState {
   leaseStateCalls: number[];
   leaseRenews: number;
   leaseFences: number[];
+  // Cross-host LANE SYNC (ADR 0019, Task B) — record every sync/publish call so
+  // the flag-off invariant (must be EMPTY) and the two-loop E2E can be asserted
+  // without a real git remote (lane-sync.ts is proven in tests/lane-sync.test.ts).
+  syncLanesCalls: { branch: string; launchWorktreePath: string }[];
+  publishLaneCalls: string[];
+  // Ordered event log across mock deps so tests can assert RELATIVE ordering
+  // (e.g. lane publish must fire AFTER the Phase-3 merger lands the work on the
+  // launch branch, not before). Each recorder pushes a marker onto this array.
+  eventOrder: string[];
 }
 
 function newState(): MockState {
@@ -171,6 +181,9 @@ function newState(): MockState {
     leaseStateCalls: [],
     leaseRenews: 0,
     leaseFences: [],
+    syncLanesCalls: [],
+    publishLaneCalls: [],
+    eventOrder: [],
   };
 }
 
@@ -259,6 +272,7 @@ function buildDeps(opts: {
   const deps: Deps = {
     async run(spec: TopLevelRunSpec): Promise<RunHandle> {
       state.runCalls.push({ kind: "top-level", spec });
+      if (spec.name === "merger") state.eventOrder.push("merger");
       const out = popOutcome(spec.name);
       return handleOutcome(spec.name, out);
     },
@@ -366,6 +380,17 @@ function buildDeps(opts: {
       state.leaseFences.push(n);
       if (opts.leaseFenceFor) return opts.leaseFenceFor(n);
       return opts.leaseFenceValue ?? true;
+    },
+    // Cross-host LANE SYNC (ADR 0019, Task B). Default recorders: return an
+    // empty sync (no peers) and a no-op publish. Two-loop E2E tests override
+    // these on `b.deps` to route through a shared in-memory lane store.
+    async syncLanes(branch, launchWorktreePath) {
+      state.syncLanesCalls.push({ branch, launchWorktreePath });
+      return { peers: [] };
+    },
+    async publishLane(branch) {
+      state.publishLaneCalls.push(branch);
+      state.eventOrder.push("publishLane");
     },
     log(line) {
       state.logs.push(line);
@@ -2889,6 +2914,40 @@ describe("sandcastle-loop main.mts — fastForwardIntegration", () => {
 
     it("returns an empty array for empty input", () => {
       expect(parseWorktreeList("")).toEqual([]);
+    });
+  });
+
+  describe("findWorktreeForBranch", () => {
+    const stdout = [
+      "worktree /path/main",
+      "HEAD abc123",
+      "branch refs/heads/main",
+      "",
+      "worktree /path/launch",
+      "HEAD def456",
+      "branch refs/heads/feature/work",
+      "",
+      "worktree /path/detached",
+      "HEAD 789aaa",
+      "detached",
+    ].join("\n");
+
+    it("returns the worktree entry whose branch matches refs/heads/<branch>", () => {
+      const git = (): GitRunResult => ({ ok: true, stdout, stderr: "" });
+      expect(findWorktreeForBranch("/repo", "feature/work", git)).toEqual({
+        path: "/path/launch",
+        branch: "refs/heads/feature/work",
+      });
+    });
+
+    it("returns undefined when no worktree has that branch checked out", () => {
+      const git = (): GitRunResult => ({ ok: true, stdout, stderr: "" });
+      expect(findWorktreeForBranch("/repo", "nope", git)).toBeUndefined();
+    });
+
+    it("returns undefined (never throws) when the worktree list fails", () => {
+      const git = (): GitRunResult => ({ ok: false, stdout: "", stderr: "boom" });
+      expect(findWorktreeForBranch("/repo", "feature/work", git)).toBeUndefined();
     });
   });
 });
@@ -5899,6 +5958,7 @@ describe("resolveReviewBase", () => {
 describe("cross-host issue lease orchestration (ADR 0019)", () => {
   const LEASE_ENV_KEYS = [
     "SANDCASTLE_CROSS_HOST_LEASE",
+    "SANDCASTLE_CROSS_HOST_SYNC",
     "SANDCASTLE_HOST_ID",
     "SANDCASTLE_LOCK_TTL_SEC",
   ];
@@ -6942,6 +7002,193 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
           throw new Error("boom");
         }, now),
       ).rejects.toThrow("boom");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cross-host LANE SYNC (ADR 0019, Task B) — the code-sharing substrate wired
+  // into the loop. Sync REQUIRES the lease; every lane git op is behind the
+  // opt-in flag so a single-host consumer is byte-for-byte unchanged.
+  // ---------------------------------------------------------------------------
+  describe("lane sync wiring (Task B)", () => {
+    it("startup guard: sync ON but lease OFF → refuses to start, no pipeline", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+      // SANDCASTLE_CROSS_HOST_LEASE intentionally unset.
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "1", title: "x", branch: "agent/issue-1" }]),
+      });
+
+      const result = await runMain(
+        baseArgs({ iterations: 2, stagingEnabled: false }),
+        b.deps,
+      );
+
+      expect(result.exitCode).not.toBe(0);
+      // Never ran the pipeline — no claim, no lane calls.
+      expect(b.state.claims).toEqual([]);
+      expect(b.state.syncLanesCalls).toEqual([]);
+      expect(b.state.publishLaneCalls).toEqual([]);
+      // Loud, actionable message naming the missing lease flag.
+      expect(b.state.errors.join("\n")).toMatch(/lease/i);
+    });
+
+    it("flag OFF invariant: sync/publish are complete no-ops (never reached)", async () => {
+      // Neither flag set — today's single-host behavior.
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+
+      const result = await runMain(
+        baseArgs({ iterations: 2, stagingEnabled: false }),
+        b.deps,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.shippedIssues).toEqual([71]);
+      // The invariant: with the flag off, the loop NEVER reaches deps.syncLanes
+      // / deps.publishLane, so no fetch/push/ls-remote is even attempted.
+      expect(b.state.syncLanesCalls).toEqual([]);
+      expect(b.state.publishLaneCalls).toEqual([]);
+    });
+
+    it("flag ON --no-staging: syncs at iteration start, publishes after ship", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+      process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+
+      const result = await runMain(
+        baseArgs({ iterations: 2, stagingEnabled: false }),
+        b.deps,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.shippedIssues).toEqual([71]);
+      // Synced at the start of at least one iteration, on the integration branch.
+      expect(b.state.syncLanesCalls.length).toBeGreaterThan(0);
+      expect(b.state.syncLanesCalls[0]!.branch).toBe("feature/work");
+      // Published the integration branch after the successful markDone ship.
+      expect(b.state.publishLaneCalls).toContain("feature/work");
+      // ORDERING (the real bug): the lane publish must fire AFTER the Phase-3
+      // batch merger lands this iteration's work on `args.branch`. Publishing
+      // before the merger force-pushes a STALE launch-branch tip missing the
+      // just-shipped commit, so a peer syncs code that is silently behind.
+      const mergerIdx = b.state.eventOrder.indexOf("merger");
+      const publishIdx = b.state.eventOrder.indexOf("publishLane");
+      expect(mergerIdx).toBeGreaterThanOrEqual(0);
+      expect(publishIdx).toBeGreaterThanOrEqual(0);
+      expect(publishIdx).toBeGreaterThan(mergerIdx);
+    });
+
+    it("two-loop E2E over a shared lane store: B sees A's shipped work; A dying + a conflict never stall/crash B", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+      process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+
+      // The shared fake origin: hostId → issue numbers published to its lane.
+      const sharedLanes = new Map<string, number[]>();
+
+      // ---- Loop A ships #101 and publishes its lane ----
+      const a = buildDeps();
+      a.enqueue("planner", {
+        stdout: plannerStdout([{ id: "101", title: "A", branch: "agent/issue-101" }]),
+      });
+      a.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 101 }),
+        commits: [{ sha: "a101" }],
+      });
+      a.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+      a.enqueue("merger", { stdout: "merged" });
+      a.enqueue("planner", { stdout: plannerStdout([]) });
+      a.deps.syncLanes = async (branch, launchWorktreePath) => {
+        a.state.syncLanesCalls.push({ branch, launchWorktreePath });
+        return { peers: [] }; // no peers yet
+      };
+      a.deps.publishLane = async (branch) => {
+        a.state.publishLaneCalls.push(branch);
+        sharedLanes.set("hostA", [101]); // A's shipped code is now on the shared origin
+      };
+      const ra = await runMain(
+        baseArgs({ iterations: 2, stagingEnabled: false }),
+        a.deps,
+      );
+      expect(ra.exitCode).toBe(0);
+      expect(ra.shippedIssues).toEqual([101]);
+      expect(sharedLanes.get("hostA")).toEqual([101]);
+
+      // ---- Loop A "dies" here (its run ended). Its #101 remains on the shared
+      //      origin. Loop B now syncs, must SEE #101, ship dependent #102, and
+      //      survive a conflicting peer without stalling or crashing. ----
+      const seenByB: number[] = [];
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "102", title: "B on A", branch: "agent/issue-102" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 102 }),
+        commits: [{ sha: "b102" }],
+      });
+      b.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+      b.deps.syncLanes = async (branch, launchWorktreePath) => {
+        b.state.syncLanesCalls.push({ branch, launchWorktreePath });
+        const peers: {
+          peer: string;
+          status: "merged" | "conflict" | "skipped";
+          reason?: string;
+          conflictedFiles?: readonly string[];
+        }[] = [];
+        for (const [host, shipped] of sharedLanes) {
+          if (host === "hostB") continue;
+          for (const n of shipped) seenByB.push(n);
+          peers.push({ peer: host, status: "merged" });
+        }
+        // A second peer whose merge CONFLICTS — must not crash the loop.
+        peers.push({
+          peer: "hostC",
+          status: "conflict",
+          reason: "merge conflict",
+          conflictedFiles: ["x.ts"],
+        });
+        return { peers };
+      };
+      b.deps.publishLane = async (branch) => {
+        b.state.publishLaneCalls.push(branch);
+        sharedLanes.set("hostB", [102]);
+      };
+      const rb = await runMain(
+        baseArgs({ iterations: 2, stagingEnabled: false }),
+        b.deps,
+      );
+
+      // Conflict did NOT crash; B shipped its dependent issue.
+      expect(rb.exitCode).toBe(0);
+      expect(rb.shippedIssues).toEqual([102]);
+      // B genuinely saw A's shipped work via the lane sync.
+      expect(seenByB).toContain(101);
+      expect(b.state.syncLanesCalls.length).toBeGreaterThan(0);
+      // B published its own lane after shipping.
+      expect(sharedLanes.get("hostB")).toEqual([102]);
+      // The conflict was surfaced LOUD (durable run-log signal), not silent.
+      expect(b.state.errors.join("\n")).toMatch(/conflict/i);
     });
   });
 });
