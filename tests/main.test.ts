@@ -23,7 +23,7 @@
  *  10. parsePlan: malformed input throws.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -60,6 +60,8 @@ import {
   resolveReviewBase,
   runGitLeaseRetrying,
   resolveLeaseState,
+  isTransientLeaseGitFailure,
+  buildDefaultDeps,
   type GitRunResult,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
@@ -88,7 +90,7 @@ import {
 } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
 import { LeaseReadError, LeaseBackendError } from "../.sandcastle/lib/state/index.js";
-import type { LockLease } from "../.sandcastle/lib/state/index.js";
+import type { LockLease, LockBackend } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
@@ -6333,6 +6335,114 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Review Fix 1 — a LeaseReadError on the acquire/reclaim path is OCCUPIED
+  // (return false → routine skip), NOT an uncaught throw that trips the breaker
+  // and permanently deadlocks. A LeaseBackendError from acquire STILL
+  // propagates (must reach Fix 2's loud fatal halt — never swallowed here).
+  // Drives the REAL acquireIssueLease closure via the buildDefaultDeps DI
+  // backend seam so the actual reclaimIfExpired → readRef path runs.
+  // ---------------------------------------------------------------------------
+  describe("acquireIssueLease — LeaseReadError is OCCUPIED (review Fix 1)", () => {
+    /** A backend whose createRef is contended and whose readRef throws
+     *  LeaseReadError during the reclaim step. */
+    function readThrowsBackend(): LockBackend {
+      return {
+        async createRef() {
+          return { ok: false }; // contended → acquireLease returns null
+        },
+        async readRef(issue: number): Promise<never> {
+          // reclaimIfExpired reads BEFORE the expiry check → throws here.
+          throw new LeaseReadError(issue, "unreadable lock-commit");
+        },
+        async casRef() {
+          return { ok: false };
+        },
+        async deleteRef() {},
+      };
+    }
+
+    it("returns false (skip) when readRef throws LeaseReadError during reclaim", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), readThrowsBackend());
+      // Pre-fix: the LeaseReadError escapes → this rejects. Post-fix: false.
+      await expect(deps.acquireIssueLease(71)).resolves.toBe(false);
+    });
+
+    it("still PROPAGATES a LeaseBackendError from acquire (not swallowed)", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+      const backend: LockBackend = {
+        async createRef(): Promise<never> {
+          throw new LeaseBackendError(
+            "fatal: could not read Username for 'https://github.com'",
+          );
+        },
+        async readRef() {
+          return null;
+        },
+        async casRef() {
+          return { ok: false };
+        },
+        async deleteRef() {},
+      };
+      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), backend);
+      await expect(deps.acquireIssueLease(71)).rejects.toBeInstanceOf(
+        LeaseBackendError,
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Review Fix 2 — the heartbeat renewLeases loop is best-effort: a THROWN
+  // backend error (LeaseBackendError / timeout) on one entry is logged and
+  // swallowed (loop continues, entry KEPT), never crashing the loop nor
+  // prematurely fencing. Only a clean null-CAS result deletes + FENCE-logs.
+  // Drives the REAL renewLeases closure via the DI backend seam.
+  // ---------------------------------------------------------------------------
+  describe("renewLeases — heartbeat is best-effort on a THROW (review Fix 2)", () => {
+    it("a renewLease THROW is caught+logged, resolves without throwing, keeps the entry", async () => {
+      process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+      let casCalls = 0;
+      const backend: LockBackend = {
+        async createRef() {
+          return { ok: true, oid: "oid1" }; // acquire wins → registry populated
+        },
+        async readRef() {
+          return null;
+        },
+        async casRef() {
+          casCalls += 1;
+          // First CAS (the heartbeat) throws; later CASes (the fence probe
+          // below) succeed so we can observe the entry survived.
+          if (casCalls === 1) {
+            throw new LeaseBackendError("fatal: unable to access: 503");
+          }
+          return { ok: true, oid: `oid${casCalls}` };
+        },
+        async deleteRef() {},
+      };
+      const deps = buildDefaultDeps(baseArgs({ iterations: 1 }), backend);
+      expect(await deps.acquireIssueLease(71)).toBe(true);
+
+      const errSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+      try {
+        // Pre-fix: the thrown LeaseBackendError escapes renewLease → renewLeases
+        // rejects. Post-fix: resolves.
+        await expect(deps.renewLeases()).resolves.toBeUndefined();
+        // It logged the transient heartbeat failure.
+        const logged = errSpy.mock.calls.map((c) => String(c[0])).join("");
+        expect(logged).toMatch(/renew/i);
+        expect(logged).toContain("71");
+      } finally {
+        errSpy.mockRestore();
+      }
+
+      // Entry KEPT (not deleted like the clean-null lost-lease path): the fence
+      // probe finds it in the registry and renews it (casRef now succeeds).
+      expect(await deps.fenceIssue?.(71)).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Fix 3 — inline-CAS fence before the actual ship/promote.
   // ---------------------------------------------------------------------------
   it("Fix 3: fence FAILS before non-staging ship → NOT marked done (deferred)", async () => {
@@ -6450,6 +6560,74 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       // Fence failed → #71 excluded from promotion → nothing counted merged.
       expect(b.state.leaseFences).toContain(71);
       expect(status.totals.merged).toBe(0);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync("git", ["worktree", "remove", "--force", launchPath], {
+            cwd: repoRoot,
+            env: gitEnv,
+            stdio: "ignore",
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Review Fix 4 — a LeaseBackendError THROWN by the staging promotion fence
+  // must surface the SAME loud fatal as Fix 2 (exitCode 2 + "gh auth setup-git"
+  // remediation), not escape runMain as a raw exit-1 stack trace. A lost-lease
+  // (fenceIssue returns false) stays the existing needs-human exclusion — only
+  // a THROWN backend error triggers the fatal halt.
+  // ---------------------------------------------------------------------------
+  it("Fix 4: LeaseBackendError from the staging promotion fence → loud exit 2 (not raw exit 1)", async () => {
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      // Clean live worktree on the integration branch so the FF advances and we
+      // reach the promotion fence loop.
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-lease-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      // The fence CAS hits an auth/network fault at promotion time.
+      b.deps.fenceIssue = async () => {
+        throw new LeaseBackendError(
+          "fatal: could not read Username for 'https://github.com'",
+        );
+      };
+      b.enqueue("planner", {
+        stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // Pre-fix: the throw escapes runMain → this rejects. Post-fix: exit 2.
+      const result = await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      expect(result.exitCode).toBe(2);
+      const joined = b.state.errors.join("\n");
+      expect(joined).toMatch(/auth|setup-git/i);
+      expect(joined.toLowerCase()).not.toContain("contended");
     } finally {
       __setStagingWorktreePathForTests("");
       if (launchPath) {
@@ -6651,6 +6829,71 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       const res = runGitLeaseRetrying(once, "ls-remote");
       expect(res.ok).toBe(false);
       expect(calls).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 3 (review) — an auth failure whose text ALSO matches a transient
+  // signature ("unable to access") must NOT be retried: the auth signature
+  // vetoes the transient classification.
+  // ---------------------------------------------------------------------------
+  describe("isTransientLeaseGitFailure — auth veto (review Fix 3)", () => {
+    const http403: GitRunResult = {
+      ok: false,
+      stdout: "",
+      // git's real 403 wording: contains the transient substring "unable to
+      // access" AND the auth signal "403".
+      stderr:
+        "fatal: unable to access 'https://github.com/o/r/': The requested URL returned error: 403",
+    };
+    const http401: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr:
+        "fatal: unable to access 'https://github.com/o/r/': The requested URL returned error: 401 Unauthorized",
+    };
+    const permDenied: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr:
+        "fatal: unable to access 'https://github.com/o/r/': Permission denied (publickey)",
+    };
+    const realTimeout: GitRunResult = {
+      ok: false,
+      stdout: "",
+      stderr: "fatal: unable to access 'https://x/': Could not resolve host: x",
+    };
+
+    it("classifies a 403 'unable to access' as NON-transient", () => {
+      expect(isTransientLeaseGitFailure(http403)).toBe(false);
+    });
+
+    it("classifies a 401 'unable to access' as NON-transient", () => {
+      expect(isTransientLeaseGitFailure(http401)).toBe(false);
+    });
+
+    it("classifies a permission-denied 'unable to access' as NON-transient", () => {
+      expect(isTransientLeaseGitFailure(permDenied)).toBe(false);
+    });
+
+    it("still classifies a genuine resolve-host failure as transient", () => {
+      expect(isTransientLeaseGitFailure(realTimeout)).toBe(true);
+    });
+
+    it("a 403 is NOT retried (single attempt); a resolve-host failure IS retried once", () => {
+      let authCalls = 0;
+      runGitLeaseRetrying(() => {
+        authCalls += 1;
+        return http403;
+      }, "push");
+      expect(authCalls).toBe(1);
+
+      let netCalls = 0;
+      runGitLeaseRetrying(() => {
+        netCalls += 1;
+        return realTimeout;
+      }, "push");
+      expect(netCalls).toBe(2);
     });
   });
 

@@ -60,7 +60,7 @@ import {
   LeaseBackendError,
   LeaseReadError,
 } from "./lib/state/index.js";
-import type { LockLease, LockDeps } from "./lib/state/index.js";
+import type { LockLease, LockDeps, LockBackend } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -1735,10 +1735,28 @@ const LEASE_TRANSIENT_SIGNATURES: readonly string[] = [
   "sigkill",
 ];
 
+/**
+ * Auth/permission signatures. A deterministic auth failure is NEVER retried
+ * (the doc above says so). These VETO the transient classification even when a
+ * transient substring also matches — git's HTTP 403/401 wording is
+ * `fatal: unable to access '...': The requested URL returned error: 403`, which
+ * contains the transient "unable to access" but must NOT be retried.
+ */
+const LEASE_AUTH_SIGNATURES: readonly string[] = [
+  "403",
+  "401",
+  "authentication",
+  "could not read username",
+  "permission denied",
+];
+
 /** True when a FAILED lease git result looks transient (timeout/network). */
 export function isTransientLeaseGitFailure(res: GitRunResult): boolean {
   if (res.ok) return false;
   const text = `${res.stderr}\n${res.stdout}`.toLowerCase();
+  // Auth failures are deterministic — an auth signature vetoes any transient
+  // match so a 403 "unable to access" is not pointlessly retried.
+  if (LEASE_AUTH_SIGNATURES.some((sig) => text.includes(sig))) return false;
   return LEASE_TRANSIENT_SIGNATURES.some((sig) => text.includes(sig));
 }
 
@@ -2680,7 +2698,14 @@ export function createRunLogAppender(opts: {
  * `dryRun` short-circuits claim / quarantine / markDone / comment to log-only
  * operations so a misconfigured first run can't move labels.
  */
-export function buildDefaultDeps(args: SandcastleArgs): Deps {
+export function buildDefaultDeps(
+  args: SandcastleArgs,
+  // Test-only DI seam (ADR 0019): inject a fake LockBackend so the real
+  // acquireIssueLease / renewLeases closures can be exercised against a
+  // throwing/contended backend without shelling to git. Undefined in
+  // production ⇒ the concrete git-backed backend, so behavior is unchanged.
+  lockBackendOverride?: LockBackend,
+): Deps {
   // pnpm install (not npm) — affinity-tracker and similar monorepos use
   // pnpm's workspace:* protocol which npm refuses to parse. The Dockerfile
   // ships `corepack enable` so `pnpm` works without an extra global install.
@@ -2847,7 +2872,9 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   const leaseEnabled = crossHostLeaseEnabled();
   const leaseRegistry = new Map<number, LockLease>();
   const lockDeps: LockDeps = {
-    backend: createGitLockBackend({ git: runGitLease, repoRoot: args.repoRoot }),
+    backend:
+      lockBackendOverride ??
+      createGitLockBackend({ git: runGitLease, repoRoot: args.repoRoot }),
     now: () => new Date().toISOString(),
     hostId: resolveHostId(),
     ttlSec: lockTtlSecOnce(), // Fix 8: single-resolved, memoized (see lockTtlSecOnce)
@@ -3071,8 +3098,29 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // Create the ref; on a straight contention (ref exists) try to reclaim it
       // in case the holder died with the lease still pinned (expired). Only a
       // LIVE peer lease keeps us out.
-      let lease = await acquireLease(n, lockDeps);
-      if (!lease) lease = await reclaimIfExpired(n, lockDeps);
+      let lease: LockLease | null;
+      try {
+        lease = await acquireLease(n, lockDeps);
+        if (!lease) lease = await reclaimIfExpired(n, lockDeps);
+      } catch (err) {
+        // Review Fix 1: reclaimIfExpired reads the ref BEFORE its expiry check,
+        // so a present-but-unreadable ref throws LeaseReadError here. Treat it
+        // as OCCUPIED (return false → the gate throws LeaseContendedError, a
+        // routine SKIP) rather than letting it escape into the accounting
+        // loop's generic failure branch (which would bump consecutiveFailures
+        // and trip the 3-strike breaker — both hosts pick the same tickets, so
+        // it would halt almost immediately) AND leave the ref permanently
+        // unacquirable (the throw precedes the expiry check, so TTL never
+        // reclaims it). Fail-closed: never double-work. Self-heals if the read
+        // is only transiently broken (next iteration may read fine and
+        // reclaim); a genuinely-corrupt ref skips forever — operator escape
+        // hatch is `git push origin :refs/locks/issue-<N>`.
+        // CRITICAL: catch ONLY LeaseReadError. A LeaseBackendError (auth/
+        // network) from acquireLease's createRef MUST still propagate so the
+        // loud fatal halt (exitCode 2) fires — do NOT swallow it here.
+        if (err instanceof LeaseReadError) return false;
+        throw err;
+      }
       if (!lease) return false;
       leaseRegistry.set(n, lease);
       return true;
@@ -3128,7 +3176,25 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     async renewLeases() {
       if (!leaseEnabled) return;
       for (const [n, lease] of [...leaseRegistry]) {
-        const renewed = await renewLease(lease, lockDeps);
+        let renewed: LockLease | null;
+        try {
+          renewed = await renewLease(lease, lockDeps);
+        } catch (err) {
+          // Review Fix 2: the heartbeat is BEST-EFFORT. A THROWN error here
+          // (LeaseBackendError on an auth/network fault, a post-retry timeout,
+          // anything) must NOT crash the loop (this runs as `void
+          // renewLeases()` in a setInterval → an unhandled rejection could take
+          // the whole process down) and must NOT prematurely fence: a transient
+          // heartbeat blip is not proof we lost the lease. Log it and CONTINUE
+          // to the next entry, KEEPING the registry entry. The real ownership
+          // guard is the inline ship-time fence (fenceIssue). Only the clean
+          // null-CAS result below (a genuine reclaim by a peer) deletes + fences.
+          logErr(
+            `[lease] heartbeat renewal for issue #${n} threw (transient — NOT ` +
+              `fencing, entry kept): ${err instanceof Error ? err.message : String(err)}`,
+          );
+          continue;
+        }
         if (renewed) {
           leaseRegistry.set(n, renewed);
         } else {
@@ -6518,32 +6584,61 @@ export async function runMain(
             const summary =
               `[sandcastle it=${it}] integration ${args.branch} fast-forwarded; ` +
               `staging certified by post-merge reviewer`;
-            // Fix 3 (ADR 0019): inline-CAS fence immediately before the actual
-            // promote/ship push. A held lease can be lost between ship and
-            // promote (a failed heartbeat CAS); re-assert it synchronously here
-            // so we never promote code whose lease this host no longer owns. Any
-            // issue whose fence fails is EXCLUDED from this round's promotion and
-            // flagged needs-human (rather than shipping code we lost). Flag OFF ⇒
-            // fenceIssue returns true and fencedIssueNums === mergedIssueNums.
-            // TOCTOU: a tiny window remains between this CAS and the push below;
-            // per-host branches make a double-ship a wasted end-of-run merge, not
-            // corruption (see ADR 0019).
+            // Fix 3 (ADR 0019): inline-CAS fence immediately before the
+            // GitHub promotion + lease release. Review Fix 5 — an honest
+            // account of what this fence does and does NOT guard:
+            // `fastForwardIntegration` (above) ALREADY merged staging (every
+            // issue's commingled code) onto this host's integration branch, so
+            // the fence CANNOT un-land code. What it gates is the downstream
+            // GitHub promote (`promoteStagingToDone`) and the lease release: an
+            // issue whose fence fails is EXCLUDED from the promote and flagged
+            // needs-human, keeping its lease (so a peer won't double-promote via
+            // GitHub). Correctness rests on ADR 0019's per-host-suffixed
+            // integration branches: a stray land another host already made is a
+            // wasted end-of-run merge, NOT corruption — and a true pre-FF
+            // per-issue exclusion is impossible (staging is one commingled
+            // branch). Flag OFF ⇒ fenceIssue returns true and
+            // fencedIssueNums === mergedIssueNums.
+            // Review Fix 4: a fence CAS can THROW a LeaseBackendError on an
+            // auth/network fault (not a lost lease). That is systemic — surface
+            // the SAME loud fatal (exitCode 2 + remediation) as the acquire-path
+            // Fix 2 rather than letting it escape runMain as a raw exit-1 stack
+            // trace. A lost-lease (fenceIssue returns false) stays the
+            // needs-human exclusion below — only a THROWN backend error halts.
             const fencedIssueNums: number[] = [];
-            for (const n of mergedIssueNums) {
-              // Omitted fenceIssue ⇒ pass (identical to flag OFF).
-              if ((await deps.fenceIssue?.(n)) ?? true) {
-                fencedIssueNums.push(n);
-              } else {
-                deps.logError(
-                  `[issue=${n}] lease lost before promotion (inline fence failed) — ` +
-                    `NOT shipping this round; flagged needs-human.`,
-                );
-                statusStore.setIssuePhase(
-                  n,
-                  "needs-human",
-                  `lease lost before promotion — another host may own this issue`,
-                );
+            try {
+              for (const n of mergedIssueNums) {
+                // Omitted fenceIssue ⇒ pass (identical to flag OFF).
+                if ((await deps.fenceIssue?.(n)) ?? true) {
+                  fencedIssueNums.push(n);
+                } else {
+                  deps.logError(
+                    `[issue=${n}] lease lost before promotion (inline fence failed) — ` +
+                      `NOT shipping this round; flagged needs-human.`,
+                  );
+                  statusStore.setIssuePhase(
+                    n,
+                    "needs-human",
+                    `lease lost before promotion — another host may own this issue`,
+                  );
+                }
               }
+            } catch (err) {
+              if (err instanceof LeaseBackendError) {
+                deps.logError(
+                  `Halting: cross-host lease backend authentication/network ` +
+                    `failure at staging promotion — the fence ref push cannot ` +
+                    `reach origin. Fix \`gh auth setup-git\` / network ` +
+                    `connectivity and re-run. git stderr: ${err.stderr}`,
+                );
+                return {
+                  exitCode: 2,
+                  iterationsRun,
+                  shippedIssues,
+                  quarantinedIssues,
+                };
+              }
+              throw err;
             }
             try {
               const promoteRes = await deps.promoteStagingToDone(
