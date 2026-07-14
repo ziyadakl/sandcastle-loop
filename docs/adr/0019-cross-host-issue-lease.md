@@ -53,9 +53,21 @@ semantics provide the atomic arbiter that labels cannot. Operations:
 
 4. **Renew (heartbeat) = CAS forward every ~ttl/3.** The holder keeps the lease
    alive by CAS-advancing the ref (old OID → new lock-commit, fresh `expiresAt`)
-   roughly every third of the TTL. **A failed self-renewal CAS means the lease was
-   lost** — reclaimed out from under us — so the host **aborts that issue
-   (fencing)** rather than continuing to push work for a lease it no longer holds.
+   roughly every third of the TTL. A clean **failed self-renewal CAS means the lease
+   was lost** — reclaimed out from under us — so the host drops the registry entry and
+   shouts. The heartbeat is **best-effort**: a *thrown* renewal error (an auth/network
+   blip, a post-retry timeout) is logged and skipped, never fenced-on and never fatal —
+   a transient blip is not proof of a lost lease, and an unhandled rejection in the
+   heartbeat interval could otherwise crash the loop.
+
+   The authoritative fence is an **inline CAS immediately before the ship/promote
+   push** (not a mid-await abort of a running sandbox, which is out of scope): right
+   before it marks an issue done (`--no-staging`) or promotes it (staging), the host
+   re-asserts the lease with a synchronous renew-CAS and **refuses to ship if that CAS
+   fails**. This closes the sleep/wake race a cached "lease-lost" flag would leave open.
+   An irreducible-but-tiny TOCTOU remains between that CAS and the push itself; because
+   run branches are **per-host-suffixed**, a stray double-ship collides only at the
+   end-of-run lane merge — wasted work, never corruption.
 
 5. **Release = delete the ref.** Clean hand-back on normal completion.
 
@@ -87,15 +99,31 @@ Config: `SANDCASTLE_HOST_ID` (default `os.hostname()`) identifies the holder;
   branches at promotion time via `gh`; the lease writes `refs/locks/*` to origin
   directly. **Both hosts need `git push` auth to origin** — a one-time
   `gh auth setup-git` on each. This is a genuine new prerequisite, called out so it
-  is not discovered at first 403.
+  is not discovered at first 403. **A missing/failed push auth fails loud, not silent:**
+  the backend distinguishes a contention rejection (a peer holds the ref) from an
+  auth/network fault by inspecting git stderr — the latter throws and halts the run
+  with `exitCode 2` and a "check `gh auth setup-git`" message, so a forgotten login
+  can never masquerade as a phantom rival holding every lease.
+- **All lease ops currently use `git` (not `gh api`).** Acquire / read / release /
+  renew / reclaim all go through `git` against `origin`, so a single `git push` auth
+  covers everything. (A `gh api` split for the read-only ops is a possible future
+  optimization; it is not implemented.) Reads are **fail-closed**: a lock ref that
+  exists but whose commit can't be read or parsed is treated as *occupied* (live),
+  never as free, so a corrupt ref is never mistaken for an available issue. The
+  operator escape hatch for a genuinely-stuck ref is `git push origin :refs/locks/issue-<N>`.
 - The ref lives under `refs/locks/*`, so it is **invisible to branch and PR lists**
   and **untouched by branch protection** — no noise, no protected-branch friction.
 - Two hosts can now run the same repo without stealing each other's issues; the
   atomic ref-create decides every contested claim, and the heartbeat + expiry-gated
   reclaim recover leases from a host that actually died.
-- **Fencing is real work lost on a lost lease:** a host whose renewal CAS fails
-  aborts its in-flight issue. That is the intended trade — better a re-attempted
-  issue than two hosts double-shipping one.
+- **Fencing is real work lost on a lost lease:** a host whose inline pre-ship CAS
+  fails refuses to ship that issue (it goes back to the queue / `needs-human`). That is
+  the intended trade — better a re-attempted issue than two hosts double-shipping one.
+- **Contention is a routine skip, not a failure.** Because both hosts sort the ready
+  queue identically and target the same top tickets, the loser contends on most of
+  them; a contended acquire is therefore counted as a *skip* that never touches the
+  consecutive-failure circuit breaker (only genuine work failures do), so normal peer
+  coexistence cannot halt a host.
 
 ## Related
 
