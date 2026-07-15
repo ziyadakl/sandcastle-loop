@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { createStatusSync } from "../src/state/status-sync.js";
+import { createStatusSync } from "../.sandcastle/lib/state/status-sync.js";
 import type { GitRunner, GitRunResult } from "../src/state/issue-lease.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 
