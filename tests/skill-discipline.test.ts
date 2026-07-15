@@ -609,6 +609,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     iterations: 1,
     repoRoot: "/repo",
     branch: "feature/work",
+    runId: "feature/work",
     label: "ready-for-agent",
     maxConcurrent: 3,
     imageName: "sandcastle:test",
