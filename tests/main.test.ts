@@ -93,6 +93,8 @@ import {
   LeaseReadError,
   LeaseBackendError,
   createLeaseCoordinator,
+  createGitLockBackend,
+  createLaneSync,
   resolveLeaseState,
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
@@ -7206,6 +7208,303 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       expect(sharedLanes.get("hostB")).toEqual([102]);
       // The conflict was surfaced LOUD (durable run-log signal), not silent.
       expect(b.state.errors.join("\n")).toMatch(/conflict/i);
+    });
+
+    // -----------------------------------------------------------------------
+    // REAL-GIT two-loop E2E (ADR 0019/0020). Closes the one honest coverage
+    // gap: every OTHER runMain-level two-loop test above substitutes an
+    // in-memory Map (`sharedLanes`) / a fake lease store (`wireSharedLease`)
+    // for the lease + lane halves. This one drives TWO `runMain` instances
+    // over ONE real bare git remote with the lease + lane halves of `Deps`
+    // wired to the REAL git-backed factories (createGitLockBackend +
+    // createLeaseCoordinator, createLaneSync) exactly as buildDefaultDeps does
+    // (main.mts ~2907-2932, ~3147-3167) — only the coding-agent half stays
+    // canned (buildDeps). Assertions read REAL refs off the REAL bare remote
+    // via `ls-remote`, and REAL propagated file content in the peer's real
+    // worktree — never an in-memory structure — so breaking the lease/lane
+    // wiring turns this RED.
+    describe("real-git two-loop E2E — runMain against REAL lease + lane refs", () => {
+      /** A real GitRunner over `execFileSync` (mirrors main.mts:1589 & the
+       *  helpers in lane-sync.test.ts / issue-lease.test.ts). */
+      const realRunGit = (cwd: string, ...args: string[]): GitRunResult => {
+        try {
+          const stdout = execFileSync("git", args, {
+            cwd,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          return { ok: true, stdout: stdout.trim(), stderr: "" };
+        } catch (err) {
+          const e = err as Error & {
+            stderr?: Buffer | string;
+            stdout?: Buffer | string;
+          };
+          const stderr =
+            typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? "");
+          const stdout =
+            typeof e.stdout === "string" ? e.stdout : (e.stdout?.toString() ?? "");
+          return {
+            ok: false,
+            stdout: stdout.trim(),
+            stderr: stderr.trim() || e.message,
+          };
+        }
+      };
+      /** git with a committer identity baked in, for seed/host commits. */
+      const gitID = (cwd: string, ...args: string[]): GitRunResult =>
+        realRunGit(cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...args);
+
+      const BRANCH = "feature/work"; // must match baseArgs().branch
+
+      let tmp: string;
+      let remote: string;
+      let hostAClone: string;
+      let hostBClone: string;
+
+      beforeEach(() => {
+        tmp = mkdtempSync(path.join(tmpdir(), "sandcastle-xhost-e2e-"));
+        remote = path.join(tmp, "remote.git");
+        hostAClone = path.join(tmp, "hostA");
+        hostBClone = path.join(tmp, "hostB");
+        realRunGit(tmp, "init", "--bare", remote);
+
+        // Seed the shared integration branch. `.gitignore` masks `.sandcastle/`
+        // so the runtime run-log/status/lock files runMain writes under each
+        // clone never dirty the worktree — otherwise syncInto's dirty-tree guard
+        // would skip every peer merge and real code propagation could not happen.
+        const seed = path.join(tmp, "seed");
+        realRunGit(tmp, "clone", remote, seed);
+        writeFileSync(path.join(seed, ".gitignore"), ".sandcastle/\n");
+        writeFileSync(path.join(seed, "base.txt"), "base\n");
+        gitID(seed, "add", "-A");
+        gitID(seed, "commit", "-m", "base");
+        gitID(seed, "branch", "-M", BRANCH);
+        gitID(seed, "push", "origin", BRANCH);
+
+        // Both hosts clone the shared remote and check out the shared branch, so
+        // each clone's `origin` IS the one bare remote the leases/lanes live on.
+        realRunGit(tmp, "clone", remote, hostAClone);
+        gitID(hostAClone, "checkout", BRANCH);
+        realRunGit(tmp, "clone", remote, hostBClone);
+        gitID(hostBClone, "checkout", BRANCH);
+      });
+
+      afterEach(() => {
+        // Env is scrubbed by the parent describe's afterEach; also scrub here so
+        // this block is self-contained if ever re-homed.
+        delete process.env.SANDCASTLE_CROSS_HOST_LEASE;
+        delete process.env.SANDCASTLE_CROSS_HOST_SYNC;
+        delete process.env.SANDCASTLE_HOST_ID;
+        rmSync(tmp, { recursive: true, force: true });
+      });
+
+      /**
+       * Override ONLY the lease + lane methods on a canned `buildDeps()` result
+       * to delegate to the REAL git-backed factories over `clonePath`, mirroring
+       * buildDefaultDeps' wiring (main.mts ~2907-2932, ~3146-3167). The
+       * coding-agent half (run/createSandbox/claim/markDone/gh) stays canned.
+       * `leaseEnabled: true` here matches the crossHostLeaseEnabled() env flag
+       * the tests set — buildDefaultDeps resolves it the same way.
+       */
+      const wireRealHost = (
+        b: DepsBuilder,
+        clonePath: string,
+        hostId: string,
+      ): {
+        coord: ReturnType<typeof createLeaseCoordinator>;
+      } => {
+        const lockDeps = {
+          backend: createGitLockBackend({ git: realRunGit, repoRoot: clonePath }),
+          now: () => new Date().toISOString(),
+          hostId,
+          ttlSec: 3600, // long TTL: a held lease stays LIVE for the whole test
+        };
+        const coord = createLeaseCoordinator({
+          lockDeps,
+          leaseEnabled: true,
+          dryRun: false,
+          logError: (line) => b.state.errors.push(line),
+          dryLog: () => {},
+        });
+        // The five lease methods, spread exactly as buildDefaultDeps does.
+        Object.assign(b.deps, coord);
+
+        const laneSync = createLaneSync({
+          git: realRunGit,
+          repoRoot: clonePath,
+          hostId,
+        });
+        // syncLanes / publishLane wrappers — same shape as buildDefaultDeps
+        // (flag ON, not --dry-run): syncInto fetch+merges peer lanes through the
+        // launch worktree; publish force-pushes this host's branch tip to its
+        // lane ref. We also record the calls for the existing state assertions.
+        b.deps.syncLanes = async (branch, launchWorktreePath) => {
+          b.state.syncLanesCalls.push({ branch, launchWorktreePath });
+          return laneSync.syncInto(branch, launchWorktreePath);
+        };
+        b.deps.publishLane = async (branch) => {
+          b.state.publishLaneCalls.push(branch);
+          b.state.eventOrder.push("publishLane");
+          await laneSync.publish(branch);
+        };
+        return { coord };
+      };
+
+      it("Test 1 — happy path: A's real committed code propagates to B via real lane refs", async () => {
+        process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+        process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+
+        // hostA has a REAL committed file on its integration branch — this is the
+        // code that must reach hostB. publishLane force-pushes this tip to
+        // refs/sandcastle/lanes/hostA, so there is genuine content to propagate.
+        const A_FILE = "from-hostA.txt";
+        writeFileSync(path.join(hostAClone, A_FILE), "code from host A\n");
+        gitID(hostAClone, "add", A_FILE);
+        gitID(hostAClone, "commit", "-m", "hostA real work");
+        const aTip = realRunGit(hostAClone, "rev-parse", BRANCH).stdout;
+
+        // ---- hostA ships #101, publishes its lane ----
+        process.env.SANDCASTLE_HOST_ID = "hostA";
+        const a = buildDeps();
+        wireRealHost(a, hostAClone, "hostA");
+        a.enqueue("planner", {
+          stdout: plannerStdout([{ id: "101", title: "A", branch: "agent/issue-101" }]),
+        });
+        a.enqueue("implementer", {
+          stdout: implementerStdout({ ghIssue: 101 }),
+          commits: [{ sha: "a101" }],
+        });
+        a.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+        a.enqueue("merger", { stdout: "merged" });
+        a.enqueue("planner", { stdout: plannerStdout([]) });
+
+        const ra = await runMain(
+          baseArgs({ iterations: 2, stagingEnabled: false, repoRoot: hostAClone }),
+          a.deps,
+        );
+        expect(ra.exitCode).toBe(0);
+        expect(ra.shippedIssues).toEqual([101]);
+
+        // REAL ref assertion (NOT a Map): A's lane exists on the bare remote and
+        // points at A's real committed tip.
+        const laneAOnRemote = realRunGit(
+          tmp,
+          "ls-remote",
+          remote,
+          "refs/sandcastle/lanes/hostA",
+        );
+        expect(laneAOnRemote.stdout).toContain("refs/sandcastle/lanes/hostA");
+        expect(laneAOnRemote.stdout).toContain(aTip);
+        // The real publish fired (through the real wiring).
+        expect(a.state.publishLaneCalls).toContain(BRANCH);
+
+        // ---- hostB syncs A's lane, then ships #102 ----
+        process.env.SANDCASTLE_HOST_ID = "hostB";
+        const b = buildDeps();
+        wireRealHost(b, hostBClone, "hostB");
+        b.enqueue("planner", {
+          stdout: plannerStdout([{ id: "102", title: "B on A", branch: "agent/issue-102" }]),
+        });
+        b.enqueue("implementer", {
+          stdout: implementerStdout({ ghIssue: 102 }),
+          commits: [{ sha: "b102" }],
+        });
+        b.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+        b.enqueue("merger", { stdout: "merged" });
+        b.enqueue("planner", { stdout: plannerStdout([]) });
+
+        // Before B runs, A's file is NOT in B's clone.
+        expect(existsSync(path.join(hostBClone, A_FILE))).toBe(false);
+
+        const rb = await runMain(
+          baseArgs({ iterations: 2, stagingEnabled: false, repoRoot: hostBClone }),
+          b.deps,
+        );
+        expect(rb.exitCode).toBe(0);
+        expect(rb.shippedIssues).toEqual([102]);
+
+        // STRONGEST propagation proof: B's REAL launch worktree now contains A's
+        // real committed file — the lane sync genuinely fetched+merged A's tip.
+        expect(existsSync(path.join(hostBClone, A_FILE))).toBe(true);
+        expect(readFileSync(path.join(hostBClone, A_FILE), "utf8")).toBe(
+          "code from host A\n",
+        );
+        // B's sync ran and saw a peer.
+        expect(b.state.syncLanesCalls.length).toBeGreaterThan(0);
+
+        // REAL ref assertion: B's own lane exists on the bare remote after B
+        // ships, and includes A's commit (B published its post-merge tip).
+        const laneBOnRemote = realRunGit(
+          tmp,
+          "ls-remote",
+          remote,
+          "refs/sandcastle/lanes/hostB",
+        );
+        expect(laneBOnRemote.stdout).toContain("refs/sandcastle/lanes/hostB");
+        const bTip = realRunGit(hostBClone, "rev-parse", BRANCH).stdout;
+        expect(laneBOnRemote.stdout).toContain(bTip);
+      });
+
+      it("Test 2 — mutual exclusion: A's live real lock ref makes B fail to acquire #101", async () => {
+        process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+        process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+
+        // hostA acquires the REAL lease for #101 and does NOT release it — stands
+        // in for "A is still working #101". This pushes refs/locks/issue-101 to
+        // the shared bare remote via the real coordinator/backend.
+        process.env.SANDCASTLE_HOST_ID = "hostA";
+        const a = buildDeps();
+        const { coord: coordA } = wireRealHost(a, hostAClone, "hostA");
+        const aWon = await coordA.acquireIssueLease(101);
+        expect(aWon).toBe(true);
+
+        // REAL ref assertion: the lock ref exists on the bare remote.
+        const lockOnRemote = realRunGit(
+          tmp,
+          "ls-remote",
+          remote,
+          "refs/locks/issue-101",
+        );
+        expect(lockOnRemote.stdout).toContain("refs/locks/issue-101");
+        const lockOid = lockOnRemote.stdout.split(/\s+/)[0];
+
+        // ---- hostB's runMain tries the SAME issue #101 → real git ref-exists
+        //      rejection must make the acquire gate throw LeaseContendedError, so
+        //      B skips it and ships nothing. ----
+        process.env.SANDCASTLE_HOST_ID = "hostB";
+        const b = buildDeps();
+        wireRealHost(b, hostBClone, "hostB");
+        b.enqueue("planner", {
+          stdout: plannerStdout([{ id: "101", title: "B wants A's issue", branch: "agent/issue-101" }]),
+        });
+        // No implementer/reviewer/merger enqueued: if B wrongly acquired #101 and
+        // ran the pipeline it would throw "no queued outcome", failing the test
+        // LOUD rather than silently passing.
+        b.enqueue("planner", { stdout: plannerStdout([]) });
+
+        const rb = await runMain(
+          baseArgs({ iterations: 2, stagingEnabled: false, repoRoot: hostBClone }),
+          b.deps,
+        );
+
+        // B did not double-work #101: no claim, nothing shipped, exit clean
+        // (contention is a routine SKIP, not a failure).
+        expect(rb.exitCode).toBe(0);
+        expect(rb.shippedIssues).not.toContain(101);
+        expect(b.state.claims).not.toContain(101);
+        expect(b.state.marksDone).toEqual([]);
+
+        // A's real lock ref SURVIVED B's run (B's registry-guarded release is a
+        // no-op for a ref it never won) — still present, still the same oid.
+        const lockAfter = realRunGit(
+          tmp,
+          "ls-remote",
+          remote,
+          "refs/locks/issue-101",
+        );
+        expect(lockAfter.stdout).toContain("refs/locks/issue-101");
+        expect(lockAfter.stdout.split(/\s+/)[0]).toBe(lockOid);
+      });
     });
   });
 });
