@@ -82,6 +82,14 @@ Reads the same merged local file, so it gets the data for free. v1: ensure it to
 - Component: a multi-host snapshot renders the tagged "In progress" union, merged "Recent", combined totals, per-machine iteration line.
 - Schema: both the new multi-host shape and an old single-host shape parse.
 
+## As-built deviations (Sandcastle side, Step 3 — recorded post-implementation)
+
+Two deliberate departures from the design text above, decided during implementation with rationale:
+
+1. **`status-sync.ts` is SINGLE-COPY, not twinned.** The design (and the twin note below) called for a byte-identical `src/state/status-sync.ts` twin mirroring `lane-sync.ts`. During build this was found to be net-negative: nothing enforces the `src/` ↔ `.sandcastle/lib/` mirror (`tests/gh-cwd.test.ts` deliberately imports the canonical `.sandcastle` copy), `src/` is a dev-only test tree with no consumer/template impact, and the entire status feature (schema, store, `merge.ts`) is already single-copy — the schema's own docstring declares itself single-source-of-truth. A twin would have required a `src/status/schema.ts` re-export shim, creating a second path to the schema and partially undoing that invariant. So `status-sync.ts` lives ONLY at `.sandcastle/lib/state/status-sync.ts`, exported from the canonical barrel, and its test imports the canonical module.
+
+2. **Trigger is once-per-iteration, not the heartbeat timer.** Item 4 said "throttle to the lease heartbeat beat." As built, `syncStatusOnce` fires once per iteration, co-located with the existing per-iteration lane-sync hook (`main.mts`, under `if (syncEnabled)`). Reason: the lease heartbeat is a 30s+ real timer that never fires in a fast run/test, so an iteration-boundary trigger is both deterministic (the E2E can observe it) and timely. Trade-off: no sub-iteration refresh during a single very long iteration — acceptable for observability-only telemetry. A heartbeat-timer piggyback for sub-iteration liveness remains an available fast-follow.
+
 ## Twin discipline reminder
 
 Verified twin layout: `.sandcastle/lib/state/*` has byte-identical `src/state/*` twins; `.sandcastle/lib/status/*` is **single-copy (no `src/status` twin)**. Therefore:

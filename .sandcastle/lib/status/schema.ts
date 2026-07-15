@@ -129,14 +129,21 @@ export const StatusTotalsSchema = z.object({
 });
 export type StatusTotals = z.infer<typeof StatusTotalsSchema>;
 
+/**
+ * The run's iteration counter. Shared by `StatusRunSchema` (the local run) and
+ * `PeerStatusSchema` (a folded peer) so both render the same `current/total`
+ * primitive — one definition, no drift.
+ */
+export const IterationsSchema = z.object({
+  current: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+});
+
 export const StatusRunSchema = z.object({
   branch: z.string(),
   repo: z.string(),
   startedAt: z.string(),
-  iterations: z.object({
-    current: z.number().int().nonnegative(),
-    total: z.number().int().nonnegative(),
-  }),
+  iterations: IterationsSchema,
   maxConcurrent: z.number().int().positive(),
 });
 
@@ -155,9 +162,9 @@ export type RunActivity = "planning" | "merging" | "reviewing" | "cleanup";
  * A single PEER host's live status, as folded into the unified cross-host
  * viewer. This is the shape one host publishes about ITSELF and the shape a
  * viewing host stores about each OTHER host it has learned of. It intentionally
- * REUSES `RunStateSchema`, `StatusTotalsSchema`, and `StatusIssueSchema` (no
- * duplicated shapes), and mirrors the `iterations` object of `StatusRunSchema`
- * — so a peer card renders with the same primitives as the local run. It is a
+ * REUSES `RunStateSchema`, `StatusTotalsSchema`, `StatusIssueSchema`, and
+ * `IterationsSchema` (no duplicated shapes) — so a peer card renders with the
+ * same primitives as the local run. It is a
  * flattened projection of `SandcastleStatus` (host identity + the run's live
  * counters), NOT the whole snapshot: no nested `run`/`history`/`peers`, which
  * keeps peer-folding non-recursive.
@@ -167,10 +174,7 @@ export const PeerStatusSchema = z.object({
   state: RunStateSchema,
   /** Permissive run-level activity label — see `SandcastleStatusSchema.activity`. */
   activity: z.string().optional(),
-  iterations: z.object({
-    current: z.number().int().nonnegative(),
-    total: z.number().int().nonnegative(),
-  }),
+  iterations: IterationsSchema,
   totals: StatusTotalsSchema,
   issues: z.array(StatusIssueSchema),
   /** ISO-8601 of the peer's last write, as seen when this projection was taken. */
