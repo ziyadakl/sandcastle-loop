@@ -414,4 +414,84 @@ describe("StatusStore", () => {
     expect(s.history.filter((e) => e.phase === "deferred")).toHaveLength(s.totals.requeued);
     expect(s.history.filter((e) => e.phase === "merged")).toHaveLength(s.totals.merged);
   });
+
+  // --- cross-host setPeers (Task S5): store is the single writer of the fused file ---
+
+  /** A valid v3 peer snapshot from a different host with one merged history row. */
+  function peerFixture(): SandcastleStatus {
+    const peer: SandcastleStatus = {
+      schemaVersion: STATUS_SCHEMA_VERSION,
+      state: "running",
+      hostId: "host-b",
+      runId: "run-jun4",
+      run: {
+        branch: "sandcastle/run-jun4",
+        repo: "affinity-tracker",
+        startedAt: FIXED_NOW,
+        iterations: { current: 2, total: 50 },
+        maxConcurrent: 2,
+      },
+      totals: { merged: 1, needsHuman: 0, requeued: 0, running: 0 },
+      issues: [],
+      history: [
+        {
+          number: 99,
+          title: "peer-shipped issue",
+          branch: "agent/issue-99",
+          phase: "merged",
+          completedAt: "2026-06-04T11:00:00.000Z",
+          hostId: "host-b",
+        },
+      ],
+      updatedAt: FIXED_NOW,
+    };
+    // Guard the fixture itself is schema-valid, else the test proves nothing.
+    expect(SandcastleStatusSchema.safeParse(peer).success).toBe(true);
+    return peer;
+  }
+
+  it("setPeers folds peers into the WRITTEN file (peers key + merged tagged history) while snapshot() stays own-only", () => {
+    const { store, writes } = makeStore();
+    store.setPlan([{ number: 10, title: "own issue", branch: "agent/issue-10" }]);
+    store.recordOutcome(10, { status: "ok" }); // own merged row
+
+    store.setPeers([peerFixture()]);
+
+    // WRITTEN file is the FUSED view.
+    const written = JSON.parse(writes.at(-1)!.content) as SandcastleStatus;
+    expect(written.peers).toBeDefined();
+    expect(written.peers).toHaveLength(1);
+    expect(written.peers![0]!.hostId).toBe("host-b");
+    // Fused history carries BOTH hosts' rows, each host-tagged.
+    const nums = written.history.map((e) => e.number).sort();
+    expect(nums).toEqual([10, 99]);
+    const own = written.history.find((e) => e.number === 10)!;
+    const peerRow = written.history.find((e) => e.number === 99)!;
+    expect(own.hostId).toBe("host-a"); // own rows tagged with own hostId
+    expect(peerRow.hostId).toBe("host-b");
+
+    // In-memory truth stays OWN-ONLY — snapshot() is what gets PUBLISHED, so it
+    // must never carry a peers key or peer rows (no re-folding of folds).
+    const snap = store.snapshot();
+    expect(snap.peers).toBeUndefined();
+    expect(snap.history.map((e) => e.number)).toEqual([10]);
+  });
+
+  it("with NO peers set the written bytes are byte-identical to the pre-cross-host writer (own-only)", () => {
+    const before = makeStore();
+    before.store.setPlan([{ number: 10, title: "own issue", branch: "agent/issue-10" }]);
+    before.store.recordOutcome(10, { status: "ok" });
+    const beforeBytes = before.writes.at(-1)!.content;
+
+    const after = makeStore();
+    after.store.setPlan([{ number: 10, title: "own issue", branch: "agent/issue-10" }]);
+    after.store.recordOutcome(10, { status: "ok" });
+    // setPeers([]) must not perturb the written bytes at all.
+    after.store.setPeers([]);
+    const afterBytes = after.writes.at(-1)!.content;
+
+    expect(afterBytes).toBe(beforeBytes);
+    // And no `peers` key leaks into the own-only file.
+    expect("peers" in JSON.parse(afterBytes)).toBe(false);
+  });
 });

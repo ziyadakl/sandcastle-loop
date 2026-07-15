@@ -591,6 +591,12 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async publishLane() {
       // no-op
     },
+    async publishStatus() {
+      return { ok: true };
+    },
+    async fetchStatusPeers() {
+      return [];
+    },
   };
 
   return {

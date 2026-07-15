@@ -63,6 +63,7 @@ import {
   runGitLeaseRetrying,
   isTransientLeaseGitFailure,
   buildDefaultDeps,
+  syncStatusOnce,
   type GitRunResult,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
@@ -164,6 +165,11 @@ interface MockState {
   // without a real git remote (lane-sync.ts is proven in tests/lane-sync.test.ts).
   syncLanesCalls: { branch: string; launchWorktreePath: string }[];
   publishLaneCalls: string[];
+  // Cross-host STATUS SYNC (Task S5) — record publish/fetch calls so the
+  // flag-off invariant (must be EMPTY) and the per-iteration trigger can be
+  // asserted without a real git remote (status-sync.ts is proven separately).
+  publishStatusCalls: string[];
+  fetchStatusPeersCalls: string[];
   // Ordered event log across mock deps so tests can assert RELATIVE ordering
   // (e.g. lane publish must fire AFTER the Phase-3 merger lands the work on the
   // launch branch, not before). Each recorder pushes a marker onto this array.
@@ -192,6 +198,8 @@ function newState(): MockState {
     leaseFences: [],
     syncLanesCalls: [],
     publishLaneCalls: [],
+    publishStatusCalls: [],
+    fetchStatusPeersCalls: [],
     eventOrder: [],
   };
 }
@@ -400,6 +408,16 @@ function buildDeps(opts: {
     async publishLane(branch) {
       state.publishLaneCalls.push(branch);
       state.eventOrder.push("publishLane");
+    },
+    // Cross-host STATUS SYNC (Task S5). Default recorders: publish succeeds,
+    // no peers. Tests override on `b.deps` to assert the syncStatusOnce trigger.
+    async publishStatus(snapshotJson) {
+      state.publishStatusCalls.push(snapshotJson);
+      return { ok: true };
+    },
+    async fetchStatusPeers(runId) {
+      state.fetchStatusPeersCalls.push(runId);
+      return [];
     },
     log(line) {
       state.logs.push(line);
@@ -4548,6 +4566,8 @@ function makeNoopDeps(): Deps {
     fenceIssue: unused,
     syncLanes: unused,
     publishLane: unused,
+    publishStatus: unused,
+    fetchStatusPeers: unused,
     log: () => undefined,
     logError: () => undefined,
   };
@@ -7104,6 +7124,11 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       // / deps.publishLane, so no fetch/push/ls-remote is even attempted.
       expect(b.state.syncLanesCalls).toEqual([]);
       expect(b.state.publishLaneCalls).toEqual([]);
+      // Same invariant for STATUS SYNC (Task S5): syncStatusOnce lives under the
+      // same `if (syncEnabled)` gate, so publish/fetch are never reached and the
+      // store never receives peers.
+      expect(b.state.publishStatusCalls).toEqual([]);
+      expect(b.state.fetchStatusPeersCalls).toEqual([]);
     });
 
     it("flag ON --no-staging: syncs at iteration start, publishes after ship", async () => {
@@ -7133,6 +7158,15 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       expect(b.state.syncLanesCalls[0]!.branch).toBe("feature/work");
       // Published the integration branch after the successful markDone ship.
       expect(b.state.publishLaneCalls).toContain("feature/work");
+      // STATUS SYNC (Task S5) fires once per iteration under the same gate:
+      // publish the own snapshot + fetch same-run peers.
+      expect(b.state.publishStatusCalls.length).toBeGreaterThan(0);
+      expect(b.state.fetchStatusPeersCalls.length).toBeGreaterThan(0);
+      // The published payload is a valid own-only snapshot (no peers key).
+      const pub = JSON.parse(b.state.publishStatusCalls[0]!) as SandcastleStatus;
+      expect(pub.hostId).toBeTruthy();
+      expect(pub.runId).toBeTruthy();
+      expect("peers" in pub).toBe(false);
       // ORDERING (the real bug): the lane publish must fire AFTER the Phase-3
       // batch merger lands this iteration's work on `args.branch`. Publishing
       // before the merger force-pushes a STALE launch-branch tip missing the
@@ -7533,5 +7567,140 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
         expect(lockAfter.stdout.split(/\s+/)[0]).toBe(lockOid);
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-host STATUS SYNC — syncStatusOnce (Task S5)
+// ---------------------------------------------------------------------------
+
+describe("syncStatusOnce (cross-host status fold)", () => {
+  function makeSyncStore() {
+    const writes: string[] = [];
+    const store = createStatusStore(
+      {
+        branch: "sandcastle/run-s5",
+        repo: "affinity-tracker",
+        repoRoot: "/tmp/sandcastle-s5",
+        startedAt: "2026-07-14T00:00:00.000Z",
+        iterationsTotal: 10,
+        maxConcurrent: 2,
+        hostId: "host-a",
+        runId: "run-s5",
+      },
+      { writeFn: (_p, c) => writes.push(c), now: () => "2026-07-14T00:00:00.000Z" },
+    );
+    return { store, writes };
+  }
+
+  function peerSnap(): SandcastleStatus {
+    return {
+      schemaVersion: 3,
+      state: "running",
+      hostId: "host-b",
+      runId: "run-s5",
+      run: {
+        branch: "sandcastle/run-s5",
+        repo: "affinity-tracker",
+        startedAt: "2026-07-14T00:00:00.000Z",
+        iterations: { current: 1, total: 10 },
+        maxConcurrent: 2,
+      },
+      totals: { merged: 0, needsHuman: 0, requeued: 0, running: 1 },
+      issues: [],
+      history: [],
+      updatedAt: "2026-07-14T00:00:00.000Z",
+    };
+  }
+
+  it("publishes the OWN snapshot JSON and folds the fetched peers via setPeers", async () => {
+    const { store, writes } = makeSyncStore();
+    const published: string[] = [];
+    const peer = peerSnap();
+    const deps = {
+      async publishStatus(json: string) {
+        published.push(json);
+        return { ok: true };
+      },
+      async fetchStatusPeers(_runId: string) {
+        return [peer];
+      },
+      logError: () => undefined,
+    };
+
+    await syncStatusOnce(store, deps);
+
+    // Published the own-only snapshot (no peers key, host-a identity).
+    expect(published).toHaveLength(1);
+    const pubbed = JSON.parse(published[0]!) as SandcastleStatus;
+    expect(pubbed.hostId).toBe("host-a");
+    expect(pubbed.runId).toBe("run-s5");
+    expect("peers" in pubbed).toBe(false);
+
+    // setPeers ran → the LAST written file carries the peer.
+    const written = JSON.parse(writes.at(-1)!) as SandcastleStatus;
+    expect(written.peers).toHaveLength(1);
+    expect(written.peers![0]!.hostId).toBe("host-b");
+  });
+
+  it("passes the own runId to fetchStatusPeers", async () => {
+    const { store } = makeSyncStore();
+    const runIds: string[] = [];
+    await syncStatusOnce(store, {
+      async publishStatus() {
+        return { ok: true };
+      },
+      async fetchStatusPeers(runId: string) {
+        runIds.push(runId);
+        return [];
+      },
+      logError: () => undefined,
+    });
+    expect(runIds).toEqual(["run-s5"]);
+  });
+
+  it("a failed publish is logged, does NOT throw, and execution still reaches fetch + setPeers", async () => {
+    const { store, writes } = makeSyncStore();
+    const errors: string[] = [];
+    let fetched = false;
+    const peer = peerSnap();
+
+    await expect(
+      syncStatusOnce(store, {
+        async publishStatus() {
+          return { ok: false, error: "push rejected" };
+        },
+        async fetchStatusPeers() {
+          fetched = true;
+          return [peer];
+        },
+        logError: (line: string) => errors.push(line),
+      }),
+    ).resolves.toBeUndefined();
+
+    // Logged the publish failure with the error detail.
+    expect(errors.some((e) => e.includes("publish failed") && e.includes("push rejected"))).toBe(true);
+    // Still fetched peers and folded them despite the publish failure.
+    expect(fetched).toBe(true);
+    const written = JSON.parse(writes.at(-1)!) as SandcastleStatus;
+    expect(written.peers).toHaveLength(1);
+  });
+
+  it("no peers fetched ⇒ setPeers([]) ⇒ written file stays own-only (byte-clean)", async () => {
+    const { store, writes } = makeSyncStore();
+    const beforeLen = writes.length;
+    await syncStatusOnce(store, {
+      async publishStatus() {
+        return { ok: true };
+      },
+      async fetchStatusPeers() {
+        return [];
+      },
+      logError: () => undefined,
+    });
+    // setPeers([]) still commits once, but with NO peers key.
+    expect(writes.length).toBeGreaterThan(beforeLen);
+    const written = JSON.parse(writes.at(-1)!) as SandcastleStatus;
+    expect("peers" in written).toBe(false);
   });
 });

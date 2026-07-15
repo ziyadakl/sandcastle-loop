@@ -27,6 +27,7 @@ import {
   STATUS_SCHEMA_VERSION,
   HEARTBEAT_MS,
 } from "./schema.js";
+import { foldPeers } from "./merge.js";
 
 export interface StatusStoreMeta {
   branch: string;
@@ -95,6 +96,20 @@ export interface StatusStore {
    */
   setActivity(activity: RunActivity | null): void;
   /**
+   * Cross-host STATUS SYNC (Task S5): set the peer snapshots that `commit()`
+   * folds into the WRITTEN file (via `foldPeers`) so a viewer sees one fused,
+   * host-tagged loop. The in-memory `status` (esp. `status.history`) stays
+   * OWN-ONLY truth — folding happens at write time, never mutates `status`, and
+   * `snapshot()` still returns own-only (that is what gets PUBLISHED, so peers
+   * never re-fold each other's folds).
+   *
+   * SYNCHRONOUS (mutate `peerSnapshots` then `commit()`), preserving the
+   * race-safety invariant — do NOT make it async.
+   *
+   * Passing `[]` restores byte-identical own-only writes (single-host / flag-off).
+   */
+  setPeers(peers: SandcastleStatus[]): void;
+  /**
    * Begin emitting periodic keep-alive writes (every `HEARTBEAT_MS`) that
    * re-stamp `updatedAt` so the viewer's staleness gate doesn't false-fire
    * during a long phase that produces no transition. Idempotent; `finish()`
@@ -152,6 +167,10 @@ export function createStatusStore(
 
   let heartbeatHandle: unknown;
 
+  // Peer snapshots folded into the WRITTEN file at commit time. Empty ⇒ the
+  // written bytes are own-only and byte-identical to the pre-cross-host writer.
+  let peerSnapshots: SandcastleStatus[] = [];
+
   const status: SandcastleStatus = {
     schemaVersion: STATUS_SCHEMA_VERSION,
     state: "running",
@@ -176,11 +195,22 @@ export function createStatusStore(
     ).length;
   }
 
-  /** Mutate-then-write. The only place `updatedAt` is stamped and IO happens. */
+  /**
+   * Mutate-then-write. The only place `updatedAt` is stamped and IO happens,
+   * and the ONLY writer of the merged status.json.
+   *
+   * Folds `peerSnapshots` into the serialized view WITHOUT mutating `status`
+   * (own-history stays own-only truth). CRITICAL: when there are no peers,
+   * `out === status` so the written bytes are IDENTICAL to the pre-cross-host
+   * writer — the flag-off / single-host byte-for-byte invariant. Only fold when
+   * peers are present.
+   */
   function commit(): void {
     status.updatedAt = now();
+    const out =
+      peerSnapshots.length > 0 ? foldPeers(status, peerSnapshots) : status;
     try {
-      writeFn(path, `${JSON.stringify(status, null, 2)}\n`);
+      writeFn(path, `${JSON.stringify(out, null, 2)}\n`);
     } catch (err) {
       onError(err);
     }
@@ -278,6 +308,11 @@ export function createStatusStore(
       // `undefined` so JSON.stringify drops the key entirely when cleared —
       // the viewer then sees no activity and falls back to its idle copy.
       status.activity = activity ?? undefined;
+      commit();
+    },
+
+    setPeers(peers: SandcastleStatus[]): void {
+      peerSnapshots = peers;
       commit();
     },
 

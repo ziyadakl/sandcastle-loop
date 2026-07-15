@@ -55,6 +55,7 @@ import {
   LeaseBackendError,
   createLaneSync,
   LaneSyncError,
+  createStatusSync,
 } from "./lib/state/index.js";
 import type { LockDeps, LaneSyncResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
@@ -70,6 +71,7 @@ function lockTtlSecOnce(): number {
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
+import type { SandcastleStatus } from "./lib/status/schema.js";
 import {
   applyMigrationsBetween,
   listMigrationsOnDisk,
@@ -506,6 +508,22 @@ export interface Deps {
    * LOUD (the code did not reach origin — a peer can't see it).
    */
   publishLane(branch: string): Promise<void>;
+  /**
+   * Cross-host STATUS SYNC (Task S5, ADR 0020) — publish THIS host's own status
+   * snapshot (own-only JSON) to its status ref so peers can fold it into a
+   * unified viewer. OFF (flag unset) ⇒ a no-op resolving `{ ok: true }` with NO
+   * git (no commit/push). Same for --dry-run. NEVER throws: status sync is
+   * cosmetic telemetry — a publish fault surfaces as `{ ok: false, error }` for
+   * the caller to log, never as a crash.
+   */
+  publishStatus(snapshotJson: string): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Cross-host STATUS SYNC (Task S5, ADR 0020) — discover every same-`runId`
+   * PEER host's published status snapshot so the caller can fold them into the
+   * local status.json. OFF ⇒ `[]` with NO git. Same for --dry-run. NEVER throws:
+   * any fault at any step skips the bad peer, worst case returning `[]`.
+   */
+  fetchStatusPeers(runId: string): Promise<SandcastleStatus[]>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -2980,6 +2998,17 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     hostId: resolveHostId(),
   });
 
+  // Cross-host STATUS SYNC (ADR 0020, Task S5). Same gating + same BOUNDED
+  // runner as lane-sync: inert unless `syncEnabled`, and status git runs ONLY
+  // through `runGitLease` so a hung push/fetch cannot wedge the loop. Fail-soft
+  // lives inside the module (publish returns {ok:false,error}; fetchPeers skips
+  // bad peers) so no call site can crash the loop on a telemetry glitch.
+  const statusSync = createStatusSync({
+    git: runGitLease,
+    repoRoot: args.repoRoot,
+    hostId: resolveHostId(),
+  });
+
   // Raw, provider-agnostic sandbox create (pre-clean + provider.createSandbox).
   // The exported `createSandbox` dep routes the FIRST call through the
   // worktree-health lazy repair, then calls this directly thereafter.
@@ -3214,9 +3243,60 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // Throws LaneSyncError on a real push fault — the loop surfaces it LOUD.
       await laneSync.publish(branch);
     },
+    async publishStatus(snapshotJson) {
+      // OFF ⇒ no-op success with NO git. Same for --dry-run.
+      if (!syncEnabled) return { ok: true };
+      if (args.dryRun) {
+        dryLog("publishStatus");
+        return { ok: true };
+      }
+      // Fail-soft inside the module: never throws, returns {ok:false,error}.
+      return statusSync.publish(snapshotJson);
+    },
+    async fetchStatusPeers(runId) {
+      // OFF ⇒ no peers with NO git. Same for --dry-run.
+      if (!syncEnabled) return [];
+      if (args.dryRun) {
+        dryLog("fetchStatusPeers", runId);
+        return [];
+      }
+      // Fail-soft inside the module: never throws, worst case returns [].
+      return statusSync.fetchPeers(runId);
+    },
     log,
     logError: logErr,
   };
+}
+
+/**
+ * Cross-host STATUS SYNC — ONE deterministic pass (Task S5, ADR 0020). Called
+ * once per iteration from the `syncEnabled` hook in `runMain` (the 30s
+ * lease-heartbeat timer would never fire in a fast run/test, so the per-loop
+ * call is the deterministic trigger). Publishes THIS host's own snapshot to its
+ * status ref, fetches same-run peers, and folds them into the LOCAL status.json
+ * (via `statusStore.setPeers`) so a viewer sees one fused, host-tagged loop.
+ *
+ * Observability ONLY: every step FAILS SOFT. `deps.publishStatus` /
+ * `deps.fetchStatusPeers` never throw (fail-soft lives inside status-sync.ts),
+ * and a `{ ok: false }` publish is logged then execution STILL reaches the fetch
+ * + fold — a publish glitch must not stop this host from SHOWING its peers.
+ * Never called on the flag-off path.
+ */
+export async function syncStatusOnce(
+  statusStore: StatusStore,
+  deps: Pick<Deps, "publishStatus" | "fetchStatusPeers" | "logError">,
+): Promise<void> {
+  // `snapshot()` is own-only (no `peers` key) — that is what we PUBLISH, so
+  // peers never re-fold each other's folds.
+  const ownSnapshot = statusStore.snapshot();
+  const pub = await deps.publishStatus(JSON.stringify(ownSnapshot));
+  if (!pub.ok) {
+    deps.logError(
+      `[status] publish failed: ${pub.error ?? "(no detail)"} — continuing`,
+    );
+  }
+  const peers = await deps.fetchStatusPeers(ownSnapshot.runId);
+  statusStore.setPeers(peers);
 }
 
 // ---------------------------------------------------------------------------
@@ -5842,6 +5922,15 @@ export async function runMain(
             );
           }
         }
+
+        // Cross-host STATUS SYNC (ADR 0020, Task S5). Co-located with the lane
+        // hook so it fires ONCE PER ITERATION deterministically (the 30s lease
+        // heartbeat would never fire in a fast run/test). Publish this host's
+        // own snapshot, fetch same-run peers, and fold them into the LOCAL
+        // status.json so a viewer sees one fused, host-tagged loop. Observability
+        // only — fails SOFT (never throws, never crashes the loop). NOT on the
+        // flag-off path (this whole block is under `if (syncEnabled)`).
+        await syncStatusOnce(statusStore, deps);
       }
 
       // Run-level activity for the viewer: the cross-issue planning window
