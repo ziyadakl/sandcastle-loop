@@ -119,6 +119,8 @@ const testStatusStore = createStatusStore(
     startedAt: "2026-01-01T00:00:00.000Z",
     iterationsTotal: 1,
     maxConcurrent: 1,
+    hostId: "test-host",
+    runId: "test-run",
   },
   { writeFn: () => {} },
 );

@@ -38,6 +38,18 @@ export interface StatusStoreMeta {
   startedAt: string;
   iterationsTotal: number;
   maxConcurrent: number;
+  /**
+   * Stable identity of THIS host — written into every snapshot (even
+   * single-host) so cross-host viewers can attribute and fold. Derived at the
+   * store's call site (main.mts, Task S2).
+   */
+  hostId: string;
+  /**
+   * Shared-run identity — the same value across every host collaborating on one
+   * logical run, so a viewer groups their snapshots. Also derived at the call
+   * site (Task S2).
+   */
+  runId: string;
 }
 
 /** Minimal plan-issue input — decoupled from main.mts's `PlanIssue`. */
@@ -143,6 +155,8 @@ export function createStatusStore(
   const status: SandcastleStatus = {
     schemaVersion: STATUS_SCHEMA_VERSION,
     state: "running",
+    hostId: meta.hostId,
+    runId: meta.runId,
     run: {
       branch: meta.branch,
       repo: meta.repo,

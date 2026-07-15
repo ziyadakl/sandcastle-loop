@@ -75,6 +75,8 @@ describe("watch recent strip — history-backed rendering", () => {
     const status: SandcastleStatus = {
       schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
+      hostId: "host-a",
+      runId: "run-jun4",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 2, needsHuman: 1 },
       issues: [{ number: 399, title: "planned issue 399", branch: "agent/399", phase: "planned" }],
@@ -105,6 +107,8 @@ describe("watch recent strip — history-backed rendering", () => {
     const status: SandcastleStatus = {
       schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
+      hostId: "host-a",
+      runId: "run-jun4",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 1 },
       issues: [{ number: 320, title: "issue 320 merged", branch: "agent/320", phase: "merged" }],
@@ -130,6 +134,8 @@ describe("watch recent strip — history-backed rendering", () => {
     const status: SandcastleStatus = {
       schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
+      hostId: "host-a",
+      runId: "run-jun4",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 10 },
       issues: [],
@@ -155,6 +161,8 @@ describe("watch recent strip — history-backed rendering", () => {
     const status: SandcastleStatus = {
       schemaVersion: STATUS_SCHEMA_VERSION,
       state: "running",
+      hostId: "host-a",
+      runId: "run-jun4",
       run: BASE_RUN,
       totals: { ...BASE_TOTALS, merged: 1, needsHuman: 1 },
       issues: [],

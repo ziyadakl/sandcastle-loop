@@ -13,10 +13,14 @@ import {
 } from "../.sandcastle/lib/status/store.js";
 import {
   SandcastleStatusSchema,
+  StatusHistoryEntrySchema,
   HEARTBEAT_MS,
   STATUS_SCHEMA_VERSION,
 } from "../.sandcastle/lib/status/schema.js";
-import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
+import type {
+  SandcastleStatus,
+  PeerStatus,
+} from "../.sandcastle/lib/status/schema.js";
 
 const FIXED_NOW = "2026-06-04T12:00:00.000Z";
 
@@ -32,6 +36,8 @@ function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void;
     startedAt: FIXED_NOW,
     iterationsTotal: 50,
     maxConcurrent: 2,
+    hostId: "host-a",
+    runId: "run-jun4",
   };
   const store = createStatusStore(meta, {
     writeFn,
@@ -42,6 +48,65 @@ function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void;
 }
 
 describe("StatusStore", () => {
+  // --- cross-host identity (Task S1) ---
+
+  it("a fresh snapshot carries hostId and runId from meta", () => {
+    const { store, writes } = makeStore();
+    const snap = store.snapshot();
+    expect(snap.hostId).toBe("host-a");
+    expect(snap.runId).toBe("run-jun4");
+    // and they are serialized to disk on the first write
+    store.startIteration(1);
+    const written = JSON.parse(writes.at(-1)!.content);
+    expect(written.hostId).toBe("host-a");
+    expect(written.runId).toBe("run-jun4");
+    // still a valid snapshot with the new required fields present
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
+  it("a snapshot carrying a peers array validates against the schema", () => {
+    const { store } = makeStore();
+    const snap = store.snapshot() as SandcastleStatus;
+    const peer: PeerStatus = {
+      hostId: "host-b",
+      state: "running",
+      activity: "reviewing",
+      iterations: { current: 3, total: 10 },
+      totals: { merged: 2, needsHuman: 0, requeued: 1, running: 1 },
+      issues: [
+        {
+          number: 501,
+          title: "peer issue",
+          branch: "agent/issue-501",
+          phase: "implementer",
+        },
+      ],
+      updatedAt: FIXED_NOW,
+    };
+    const withPeers = { ...snap, peers: [peer] };
+    expect(SandcastleStatusSchema.safeParse(withPeers).success).toBe(true);
+  });
+
+  it("a history entry validates WITH hostId and WITHOUT hostId (backward compat)", () => {
+    const withHost = {
+      number: 1,
+      title: "t",
+      branch: "b",
+      phase: "merged",
+      completedAt: FIXED_NOW,
+      hostId: "host-a",
+    };
+    const withoutHost = {
+      number: 1,
+      title: "t",
+      branch: "b",
+      phase: "merged",
+      completedAt: FIXED_NOW,
+    };
+    expect(StatusHistoryEntrySchema.safeParse(withHost).success).toBe(true);
+    expect(StatusHistoryEntrySchema.safeParse(withoutHost).success).toBe(true);
+  });
+
   it("produces a schema-valid snapshot through a full lifecycle", () => {
     const { store } = makeStore();
     store.startIteration(1);
@@ -132,6 +197,8 @@ describe("StatusStore", () => {
         startedAt: "t0",
         iterationsTotal: 1,
         maxConcurrent: 1,
+        hostId: "host-a",
+        runId: "run-hb",
       },
       {
         writeFn: (_p, c) => writes.push(c),
@@ -301,14 +368,15 @@ describe("StatusStore", () => {
 
   // --- audit issue #4 follow-up: STATUS_SCHEMA_VERSION bump for `unhealthy` ---
 
-  it("STATUS_SCHEMA_VERSION is bumped to 2 (the `unhealthy` run-state is a breaking shape change for old viewers)", () => {
-    // Regression lock: adding the `unhealthy` enum member to RunStateSchema
-    // changes what a valid snapshot looks like. An un-bumped version constant
-    // would let an old (pre-`unhealthy`) viewer pass the raw-version guard in
-    // reducer.ts and then fail safeParse on the unknown enum value, which the
-    // reducer treats as a torn read ("stale") — hiding the very failure state
-    // #4 exists to surface. See `.sandcastle/lib/status/schema.ts`.
-    expect(STATUS_SCHEMA_VERSION).toBe(2);
+  it("STATUS_SCHEMA_VERSION is bumped to 3 (cross-host hostId/runId/peers are a breaking shape change for old viewers)", () => {
+    // Regression lock: adding the always-written `hostId`/`runId` required
+    // fields to SandcastleStatusSchema changes what a valid snapshot looks like.
+    // An un-bumped version constant would let an old viewer pass the raw-version
+    // guard in reducer.ts and then fail safeParse on the missing required
+    // fields, which the reducer treats as a torn read ("stale"). Bumping routes
+    // a version-skewed old viewer to the graceful "outdated" banner instead.
+    // See `.sandcastle/lib/status/schema.ts`.
+    expect(STATUS_SCHEMA_VERSION).toBe(3);
   });
 
   it("a full snapshot with state:'unhealthy' at the current STATUS_SCHEMA_VERSION round-trips through the schema", () => {

@@ -31,8 +31,18 @@ import { z } from "zod";
  * graceful "outdated" banner instead. Both `store.ts` (writer) and
  * `reducer.ts` (reader) import this same constant, so a single bump updates
  * both sides — keep doing that on any future breaking change.
+ *
+ * Bumped 2 → 3 alongside the cross-host unified viewer: `hostId` and `runId`
+ * became always-written REQUIRED fields on `SandcastleStatusSchema`. A required
+ * field is a breaking shape change for the same reason `unhealthy` was — an old
+ * viewer's compiled schema demands nothing new, but a NEWER file that OMITS a
+ * field the old schema requires is impossible (they're always written), while
+ * an old file lacking `hostId`/`runId` fails the new schema's required check.
+ * The raw-version guard in `reducer.ts` catches the skew first and shows
+ * "outdated" instead of a misleading "stale". (`peers` is optional and would be
+ * non-breaking on its own; the bump is driven by the required id fields.)
  */
-export const STATUS_SCHEMA_VERSION = 2;
+export const STATUS_SCHEMA_VERSION = 3;
 
 /**
  * Liveness timing — shared by BOTH sides so they can never drift apart:
@@ -87,6 +97,12 @@ export const StatusHistoryEntrySchema = z.object({
   branch: z.string(),
   phase: IssuePhaseSchema,
   completedAt: z.string(), // ISO-8601
+  /**
+   * Cross-host attribution: which host produced this terminal outcome. OPTIONAL
+   * so pre-cross-host files and single-host writers that don't stamp it stay
+   * valid; a unified viewer folding multiple hosts uses it to badge each row.
+   */
+  hostId: z.string().optional(),
 });
 export type StatusHistoryEntry = z.infer<typeof StatusHistoryEntrySchema>;
 
@@ -135,12 +151,57 @@ export const StatusRunSchema = z.object({
  */
 export type RunActivity = "planning" | "merging" | "reviewing" | "cleanup";
 
+/**
+ * A single PEER host's live status, as folded into the unified cross-host
+ * viewer. This is the shape one host publishes about ITSELF and the shape a
+ * viewing host stores about each OTHER host it has learned of. It intentionally
+ * REUSES `RunStateSchema`, `StatusTotalsSchema`, and `StatusIssueSchema` (no
+ * duplicated shapes), and mirrors the `iterations` object of `StatusRunSchema`
+ * — so a peer card renders with the same primitives as the local run. It is a
+ * flattened projection of `SandcastleStatus` (host identity + the run's live
+ * counters), NOT the whole snapshot: no nested `run`/`history`/`peers`, which
+ * keeps peer-folding non-recursive.
+ */
+export const PeerStatusSchema = z.object({
+  hostId: z.string(),
+  state: RunStateSchema,
+  /** Permissive run-level activity label — see `SandcastleStatusSchema.activity`. */
+  activity: z.string().optional(),
+  iterations: z.object({
+    current: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  }),
+  totals: StatusTotalsSchema,
+  issues: z.array(StatusIssueSchema),
+  /** ISO-8601 of the peer's last write, as seen when this projection was taken. */
+  updatedAt: z.string(),
+});
+export type PeerStatus = z.infer<typeof PeerStatusSchema>;
+
 export const SandcastleStatusSchema = z.object({
   schemaVersion: z.literal(STATUS_SCHEMA_VERSION),
   state: RunStateSchema,
   run: StatusRunSchema,
   totals: StatusTotalsSchema,
   issues: z.array(StatusIssueSchema),
+  /**
+   * Stable identity of the host that produced this snapshot. ALWAYS written,
+   * even single-host (where it's the lone participant). Cross-host viewers key
+   * peer folding on it. Required ⇒ drove the v2→v3 bump.
+   */
+  hostId: z.string(),
+  /**
+   * Shared-run identity: all hosts collaborating on the same logical run write
+   * the same `runId`, so a viewer knows which peers belong together. ALWAYS
+   * written. Required ⇒ drove the v2→v3 bump.
+   */
+  runId: z.string(),
+  /**
+   * Other hosts' folded status, absent/empty in single-host mode. Optional so a
+   * lone writer omits the key entirely and a single-host viewer never renders a
+   * peers rail.
+   */
+  peers: z.array(PeerStatusSchema).optional(),
   /** ISO-8601 of the last write. Its age is the loop's liveness signal. */
   updatedAt: z.string(),
   /**

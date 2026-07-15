@@ -27,6 +27,8 @@ const VALID_NOW = Date.parse(VALID_UPDATED_AT);
 const validStatus: SandcastleStatus = {
   schemaVersion: STATUS_SCHEMA_VERSION,
   state: "running",
+  hostId: "host-a",
+  runId: "run-jun4",
   run: {
     branch: "sandcastle/run-jun4",
     repo: "affinity-tracker",

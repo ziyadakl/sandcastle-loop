@@ -1,6 +1,8 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "state": "running",
+  "hostId": "host-a",
+  "runId": "run-jun4",
   "run": {
     "branch": "sandcastle/run-jun4",
     "repo": "affinity-tracker",
