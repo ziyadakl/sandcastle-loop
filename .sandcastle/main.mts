@@ -129,6 +129,14 @@ export interface SandcastleArgs {
   issue?: number;
   repoRoot: string;
   branch: string;
+  /**
+   * Shared-run identity: the pre-hostId-suffix branch name. All hosts
+   * cooperating on ONE shared queue derive the SAME `runId` (so a cross-host
+   * viewer folds their snapshots), while `branch` stays host-distinct for git
+   * safety. With the lease OFF or an explicit `--branch`, `runId === branch`.
+   * See {@link deriveRunBranchAndId}.
+   */
+  runId: string;
   label: string;
   maxConcurrent: number;
   plannerModel: string;
@@ -810,18 +818,25 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   // with this host's id so two hosts never push the SAME run branch and clobber
   // each other. An explicit --branch is the operator's word — left untouched.
   // OFF: the derived branch is unchanged (byte-for-byte legacy behavior).
-  const branch = ((): string => {
-    if (values.branch !== undefined) return values.branch;
-    const derived = detectBranchOr("HEAD");
-    if (!crossHostLeaseEnabled()) return derived;
-    return `${derived}-${resolveHostId()}`;
-  })();
+  // `derived` is the bare, pre-suffix branch name — the same value whether or
+  // not the lease then host-suffixes `branch` — so it doubles as the shared
+  // `runId`. Computed once (one `detectBranchOr` call at most) and handed to
+  // {@link deriveRunBranchAndId}, which owns the runId/branch rule.
+  const derivedBranch =
+    values.branch ?? detectBranchOr("HEAD");
+  const { branch, runId } = deriveRunBranchAndId(
+    values.branch,
+    derivedBranch,
+    crossHostLeaseEnabled(),
+    resolveHostId(),
+  );
 
   const args: SandcastleArgs = {
     iterations: effectiveIterations,
     issue,
     repoRoot: values["repo-root"] ?? process.cwd(),
     branch,
+    runId,
     label: values.label ?? LABEL_READY,
     maxConcurrent:
       parsePositiveInt(values["max-concurrent"], "--max-concurrent") ?? 3,
@@ -883,6 +898,39 @@ function parsePositiveInt(raw: unknown, flag: string): number | null {
  * Best-effort detection of the current git branch. Returns `fallback` if `git`
  * is unavailable or the repo is in a detached state.
  */
+/**
+ * Derive the run's git `branch` and its shared `runId` from the raw inputs.
+ *
+ * RULE (ADR 0019 / Task S2): hosts cooperating on ONE shared queue must derive
+ * the SAME `runId` so a cross-host viewer folds their snapshots, while each
+ * host's `branch` stays distinct so two hosts never push the same run branch
+ * and clobber each other.
+ *
+ * - explicit `--branch` (`explicitBranch` set): the operator's word — `branch`
+ *   and `runId` are both that value, never suffixed (even with the lease ON).
+ * - auto-derived + lease OFF: `branch === runId === derived` (byte-for-byte
+ *   legacy behavior).
+ * - auto-derived + lease ON: `branch` is host-suffixed (`<derived>-<hostId>`)
+ *   but `runId` is the bare `derived` name shared across hosts.
+ *
+ * Pure and fully injectable (no git / env / os reads) so the rule is unit
+ * tested directly.
+ */
+export function deriveRunBranchAndId(
+  explicitBranch: string | undefined,
+  derived: string,
+  leaseEnabled: boolean,
+  hostId: string,
+): { branch: string; runId: string } {
+  if (explicitBranch !== undefined) {
+    return { branch: explicitBranch, runId: explicitBranch };
+  }
+  return {
+    branch: leaseEnabled ? `${derived}-${hostId}` : derived,
+    runId: derived,
+  };
+}
+
 function detectBranchOr(fallback: string): string {
   try {
     const out = execFileSync(
@@ -912,6 +960,7 @@ function defaultArgs(): SandcastleArgs {
     iterations: 1,
     repoRoot: process.cwd(),
     branch: "HEAD",
+    runId: "HEAD",
     label: LABEL_READY,
     maxConcurrent: 3,
     plannerModel: models.planner.default,
@@ -5615,6 +5664,8 @@ export async function runMain(
       startedAt: new Date().toISOString(),
       iterationsTotal: args.iterations,
       maxConcurrent: args.maxConcurrent,
+      hostId: resolveHostId(),
+      runId: args.runId,
     },
     { onError: (err) => deps.logError(`status write failed: ${(err as Error).message}`) },
   );

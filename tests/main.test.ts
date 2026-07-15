@@ -38,6 +38,7 @@ import {
   parseBlockedBy,
   buildBlockedByNote,
   parseSandcastleArgs,
+  deriveRunBranchAndId,
   preflight,
   loadDotenv,
   isTransientServerError,
@@ -436,6 +437,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     iterations: 1,
     repoRoot: TEST_REPO_ROOT,
     branch: "feature/work",
+    runId: "feature/work",
     label: "ready-for-agent",
     maxConcurrent: 3,
     imageName: "sandcastle:affinity-tracker",
@@ -1436,6 +1438,29 @@ describe("sandcastle-loop main.mts — parseSandcastleArgs", () => {
     expect(r.args.recoveryModel).toBe("claude-opus-4-8");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
+  });
+});
+
+describe("sandcastle-loop main.mts — runId / run-branch derivation", () => {
+  // The cross-host rule: all hosts on ONE shared queue derive the SAME runId
+  // (the pre-hostId-suffix branch name), while run.branch stays host-distinct
+  // for git safety.
+  it("lease ON, auto-derived branch: branch is host-suffixed, runId is the bare derived name", () => {
+    const r = deriveRunBranchAndId(undefined, "nightly", true, "hostA");
+    expect(r.runId).toBe("nightly");
+    expect(r.branch).toBe("nightly-hostA");
+  });
+
+  it("lease OFF, auto-derived branch: runId equals branch equals derived (byte-for-byte legacy)", () => {
+    const r = deriveRunBranchAndId(undefined, "nightly", false, "hostA");
+    expect(r.runId).toBe("nightly");
+    expect(r.branch).toBe("nightly");
+  });
+
+  it("explicit --branch: runId equals branch equals the explicit value, never suffixed even with lease ON", () => {
+    const r = deriveRunBranchAndId("release/1.2", "release/1.2", true, "hostA");
+    expect(r.runId).toBe("release/1.2");
+    expect(r.branch).toBe("release/1.2");
   });
 });
 
