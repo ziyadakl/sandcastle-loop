@@ -962,6 +962,19 @@ const LOGGED_ENV_KEYS = new Set([
 ]);
 
 /**
+ * Read env `key` via `getEnv`, normalize (`?? ""` default, trim, lowercase),
+ * and return whether it reads as a truthy flag ("1"/"true", case-insensitive).
+ * Shared body for the cross-host opt-in flags below.
+ */
+function envFlagEnabled(
+  getEnv: (key: string) => string | undefined,
+  key: string,
+): boolean {
+  const v = (getEnv(key) ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
+/**
  * Whether the cross-host issue lease (ADR 0019) is enabled for this run. OFF by
  * default: with the flag unset every lease dep is a byte-for-byte no-op, so a
  * single-host consumer never needs the new `git push` auth. Truthy = "1"/"true"
@@ -970,8 +983,7 @@ const LOGGED_ENV_KEYS = new Set([
 function crossHostLeaseEnabled(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): boolean {
-  const v = (getEnv("SANDCASTLE_CROSS_HOST_LEASE") ?? "").trim().toLowerCase();
-  return v === "1" || v === "true";
+  return envFlagEnabled(getEnv, "SANDCASTLE_CROSS_HOST_LEASE");
 }
 
 /**
@@ -986,8 +998,7 @@ function crossHostLeaseEnabled(
 function crossHostSyncEnabled(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): boolean {
-  const v = (getEnv("SANDCASTLE_CROSS_HOST_SYNC") ?? "").trim().toLowerCase();
-  return v === "1" || v === "true";
+  return envFlagEnabled(getEnv, "SANDCASTLE_CROSS_HOST_SYNC");
 }
 
 /** Parse a single .env file into process.env. Earlier writers win — we never
@@ -5429,6 +5440,34 @@ function finalizeMergedAccounting(
   }
 }
 
+/**
+ * Publish this host's lane ref (ADR 0019, Task B) after it advanced the launch
+ * branch, logging a LOUD-but-non-fatal message on a real push fault. Callers
+ * gate on the opt-in flag; `context` names the ship path (e.g. "promoting
+ * staging") for the failure message. A {@link LaneSyncError} is swallowed after
+ * logging (code did not reach origin, but the loop keeps running); any other
+ * error rethrows.
+ */
+async function publishLaneOrLog(
+  deps: Deps,
+  branch: string,
+  context: string,
+): Promise<void> {
+  try {
+    await deps.publishLane(branch);
+  } catch (err) {
+    if (err instanceof LaneSyncError) {
+      deps.logError(
+        `[lane] PUBLISH FAILED for ${branch} after ${context}: this host's ` +
+          `code did NOT reach origin, so a peer host cannot see it. Fix ` +
+          `\`gh auth setup-git\` / network connectivity. git stderr: ${err.stderr}`,
+      );
+    } else {
+      throw err;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Outer loop
 // ---------------------------------------------------------------------------
@@ -6730,20 +6769,7 @@ export async function runMain(
             // Gated on the opt-in flag. A LaneSyncError is a real fault (code
             // did not reach origin) surfaced LOUD but never crashes the loop.
             if (syncEnabled) {
-              try {
-                await deps.publishLane(args.branch);
-              } catch (err) {
-                if (err instanceof LaneSyncError) {
-                  deps.logError(
-                    `[lane] PUBLISH FAILED for ${args.branch} after promoting ` +
-                      `staging: this host's code did NOT reach origin, so a peer ` +
-                      `host cannot see it. Fix \`gh auth setup-git\` / network ` +
-                      `connectivity. git stderr: ${err.stderr}`,
-                  );
-                } else {
-                  throw err;
-                }
-              }
+              await publishLaneOrLog(deps, args.branch, "promoting staging");
             }
             lastFailedStagingIteration = null;
           } else {
@@ -6815,20 +6841,11 @@ export async function runMain(
         // logic below. Gated on the opt-in flag. A LaneSyncError is a real fault
         // (code did not reach origin) surfaced LOUD but never crashes the loop.
         if (syncEnabled) {
-          try {
-            await deps.publishLane(args.branch);
-          } catch (err) {
-            if (err instanceof LaneSyncError) {
-              deps.logError(
-                `[lane] PUBLISH FAILED for ${args.branch} after landing ` +
-                  `--no-staging merge: this host's code did NOT reach origin, so ` +
-                  `a peer host cannot see it. Fix \`gh auth setup-git\` / network ` +
-                  `connectivity. git stderr: ${err.stderr}`,
-              );
-            } else {
-              throw err;
-            }
-          }
+          await publishLaneOrLog(
+            deps,
+            args.branch,
+            "landing --no-staging merge",
+          );
         }
       }
 
