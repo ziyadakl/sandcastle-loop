@@ -60,7 +60,6 @@ import {
   priorFindingsResolved,
   resolveReviewBase,
   runGitLeaseRetrying,
-  resolveLeaseState,
   isTransientLeaseGitFailure,
   buildDefaultDeps,
   type GitRunResult,
@@ -94,6 +93,7 @@ import {
   LeaseReadError,
   LeaseBackendError,
   createLeaseCoordinator,
+  resolveLeaseState,
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";

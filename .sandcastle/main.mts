@@ -52,13 +52,11 @@ import {
   acquireSingleInstanceLock,
   createGitLockBackend,
   createLeaseCoordinator,
-  classifyLease,
   LeaseBackendError,
-  LeaseReadError,
   createLaneSync,
   LaneSyncError,
 } from "./lib/state/index.js";
-import type { LockLease, LockDeps, LaneSyncResult } from "./lib/state/index.js";
+import type { LockDeps, LaneSyncResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -1872,26 +1870,6 @@ function runGitLease(repoRoot: string, ...gitArgs: string[]): GitRunResult {
     (...a: string[]) => runGitLeaseOnce(repoRoot, ...a),
     ...gitArgs,
   );
-}
-
-/**
- * Fix 6 (ADR 0019): classify a lease's state from a possibly-throwing read.
- * Delegates the skew-grace expiry math to {@link classifyLease} (single source
- * of truth) and fail-closes a {@link LeaseReadError} — a ref that EXISTS but is
- * unreadable — to `"live"` (occupied), so a present-but-corrupt lock is never
- * mistaken for a free issue. Any other error propagates.
- */
-export async function resolveLeaseState(
-  read: () => Promise<LockLease | null>,
-  nowIso: string,
-): Promise<"absent" | "live" | "expired"> {
-  try {
-    const lease = await read();
-    return classifyLease(lease, nowIso);
-  } catch (err) {
-    if (err instanceof LeaseReadError) return "live";
-    throw err;
-  }
 }
 
 /**

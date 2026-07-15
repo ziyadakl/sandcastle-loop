@@ -120,6 +120,26 @@ export function classifyLease(
 }
 
 /**
+ * Fix 6 (ADR 0019): classify a lease's state from a possibly-throwing read.
+ * Delegates the skew-grace expiry math to {@link classifyLease} (single source
+ * of truth) and fail-closes a {@link LeaseReadError} — a ref that EXISTS but is
+ * unreadable — to `"live"` (occupied), so a present-but-corrupt lock is never
+ * mistaken for a free issue. Any other error propagates.
+ */
+export async function resolveLeaseState(
+  read: () => Promise<LockLease | null>,
+  nowIso: string,
+): Promise<"absent" | "live" | "expired"> {
+  try {
+    const lease = await read();
+    return classifyLease(lease, nowIso);
+  } catch (err) {
+    if (err instanceof LeaseReadError) return "live";
+    throw err;
+  }
+}
+
+/**
  * Try to take the lease for `issue`. Resolves the new {@link LockLease} on
  * success, or null if another live host already holds it (contended).
  */
@@ -559,16 +579,11 @@ export function createLeaseCoordinator(
       if (!leaseEnabled) return "absent";
       // Fix 6: single-source-of-truth expiry via classifyLease, and fail-close a
       // present-but-unreadable ref (LeaseReadError) to "live" so a corrupt lock
-      // is never mistaken for a free issue. Mirrors resolveLeaseState in
-      // main.mts (nowIso captured BEFORE the read, exactly as the caller did).
+      // is never mistaken for a free issue. Delegates to the shared
+      // resolveLeaseState helper in this module (nowIso captured BEFORE the
+      // read, exactly as the caller did).
       const nowIso = lockDeps.now();
-      try {
-        const lease = await readLease(n, lockDeps);
-        return classifyLease(lease, nowIso);
-      } catch (err) {
-        if (err instanceof LeaseReadError) return "live";
-        throw err;
-      }
+      return resolveLeaseState(() => readLease(n, lockDeps), nowIso);
     },
     async fenceIssue(n) {
       if (!leaseEnabled) return true;

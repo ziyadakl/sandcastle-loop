@@ -57,6 +57,7 @@ export {
   createGitLockBackend,
   createLeaseCoordinator,
   classifyLease,
+  resolveLeaseState,
   LeaseBackendError,
   LeaseReadError,
   LEASE_SKEW_GRACE_SEC,
