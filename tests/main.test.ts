@@ -97,6 +97,7 @@ import {
   createLeaseCoordinator,
   createGitLockBackend,
   createLaneSync,
+  createStatusSync,
   resolveLeaseState,
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
@@ -7408,6 +7409,28 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
           b.state.eventOrder.push("publishLane");
           await laneSync.publish(branch);
         };
+
+        // Cross-host STATUS SYNC (Task S6). Wire publishStatus/fetchStatusPeers
+        // to a REAL createStatusSync over this clone, mirroring lane's
+        // publishLane/syncLanes → laneSync wiring exactly (buildDefaultDeps
+        // main.mts ~3006, ~3246-3265). publish bakes this host's own snapshot
+        // JSON into an empty-tree commit and force-pushes it to
+        // refs/sandcastle/status/<hostId> on the bare remote; fetchPeers
+        // discovers same-run peers off that remote. We record the calls, but the
+        // real proof is the on-disk merged hostB/.sandcastle/status.json.
+        const statusSync = createStatusSync({
+          git: realRunGit,
+          repoRoot: clonePath,
+          hostId,
+        });
+        b.deps.publishStatus = async (snapshotJson) => {
+          b.state.publishStatusCalls.push(snapshotJson);
+          return statusSync.publish(snapshotJson);
+        };
+        b.deps.fetchStatusPeers = async (runId) => {
+          b.state.fetchStatusPeersCalls.push(runId);
+          return statusSync.fetchPeers(runId);
+        };
         return { coord };
       };
 
@@ -7565,6 +7588,152 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
         );
         expect(lockAfter.stdout).toContain("refs/locks/issue-101");
         expect(lockAfter.stdout.split(/\s+/)[0]).toBe(lockOid);
+      });
+
+      it("Test 3 — status fusion: B's real merged status.json fuses A's published snapshot (peer + host-tagged history)", async () => {
+        process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+        process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+
+        // Both hosts pass the SAME explicit --branch (= BRANCH) via baseArgs, so
+        // deriveRunBranchAndId returns runId === BRANCH for BOTH (explicit branch
+        // is never host-suffixed). Same runId ⇒ each host's published status
+        // snapshot is same-run ⇒ fetchPeers keeps it and foldPeers fuses it. We
+        // assert this runId-sharing below off the REAL published snapshots.
+
+        // ---- hostA ships #101, publishes its status ref ----
+        // syncStatusOnce fires at the START of each iteration (main.mts ~5933,
+        // before the planner). A's #101 is recorded by iteration 1's merger; A
+        // then PUBLISHES that history at iteration-2 start — so A's published
+        // status ref carries #101 in its history BEFORE B ever fetches.
+        process.env.SANDCASTLE_HOST_ID = "hostA";
+        const a = buildDeps();
+        wireRealHost(a, hostAClone, "hostA");
+        a.enqueue("planner", {
+          stdout: plannerStdout([{ id: "101", title: "A", branch: "agent/issue-101" }]),
+        });
+        a.enqueue("implementer", {
+          stdout: implementerStdout({ ghIssue: 101 }),
+          commits: [{ sha: "a101" }],
+        });
+        a.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+        a.enqueue("merger", { stdout: "merged" });
+        a.enqueue("planner", { stdout: plannerStdout([]) });
+
+        const ra = await runMain(
+          baseArgs({ iterations: 2, stagingEnabled: false, repoRoot: hostAClone }),
+          a.deps,
+        );
+        expect(ra.exitCode).toBe(0);
+        expect(ra.shippedIssues).toEqual([101]);
+
+        // REAL ref assertion (NOT a Map): A's status ref exists on the bare
+        // remote — the real publish force-pushed A's snapshot commit there.
+        const statusAOnRemote = realRunGit(
+          tmp,
+          "ls-remote",
+          remote,
+          "refs/sandcastle/status/hostA",
+        );
+        expect(statusAOnRemote.stdout).toContain("refs/sandcastle/status/hostA");
+        expect(a.state.publishStatusCalls.length).toBeGreaterThan(0);
+
+        // runId-sharing proof: every snapshot A published carries runId === BRANCH.
+        for (const json of a.state.publishStatusCalls) {
+          const snap = JSON.parse(json) as SandcastleStatus;
+          expect(snap.runId).toBe(BRANCH);
+        }
+        // A's LAST published snapshot (iteration-2 start) already carries #101 in
+        // its history — the timing that lets B see A's shipped row.
+        const aLastPublished = JSON.parse(
+          a.state.publishStatusCalls[a.state.publishStatusCalls.length - 1]!,
+        ) as SandcastleStatus;
+        expect(aLastPublished.history.map((h) => h.number)).toContain(101);
+
+        // ---- hostB ships #102, fetches + folds A's status ----
+        process.env.SANDCASTLE_HOST_ID = "hostB";
+        const b = buildDeps();
+        wireRealHost(b, hostBClone, "hostB");
+        b.enqueue("planner", {
+          stdout: plannerStdout([{ id: "102", title: "B", branch: "agent/issue-102" }]),
+        });
+        b.enqueue("implementer", {
+          stdout: implementerStdout({ ghIssue: 102 }),
+          commits: [{ sha: "b102" }],
+        });
+        b.enqueue("reviewer", { stdout: "good\n\nALL_CLEAR" });
+        b.enqueue("merger", { stdout: "merged" });
+        b.enqueue("planner", { stdout: plannerStdout([]) });
+
+        const rb = await runMain(
+          baseArgs({ iterations: 2, stagingEnabled: false, repoRoot: hostBClone }),
+          b.deps,
+        );
+        expect(rb.exitCode).toBe(0);
+        expect(rb.shippedIssues).toEqual([102]);
+        expect(b.state.fetchStatusPeersCalls).toContain(BRANCH);
+
+        // STRONGEST fusion proof: read B's REAL on-disk merged status.json — the
+        // file a cross-host viewer would render — and confirm it fuses A.
+        const bStatus = JSON.parse(
+          readFileSync(path.join(hostBClone, ".sandcastle", "status.json"), "utf8"),
+        ) as SandcastleStatus;
+
+        // B's own identity is present and correct. NOTE: the snapshot `hostId`
+        // field is the resolveHostId()-SANITIZED id (lower-cased), so env
+        // "hostB" → "hostb" here; the status REF suffix stays the raw "hostB"
+        // (asserted above). Production uses resolveHostId() for both, so they
+        // agree there — this describe block wires the raw id to match Tests 1/2.
+        expect(bStatus.hostId).toBe("hostb");
+        expect(bStatus.runId).toBe(BRANCH);
+
+        // (1) peers[] includes hostA with A's totals — B genuinely folded A's
+        //     fetched snapshot (setPeers → foldPeers), not a happy mock.
+        expect(bStatus.peers).toBeDefined();
+        const peerA = bStatus.peers!.find((p) => p.hostId === "hosta");
+        expect(peerA).toBeDefined();
+        expect(peerA!.totals.merged).toBe(1); // A shipped #101
+
+        // (2) history is a genuinely MERGED, host-tagged Recent list: #101 tagged
+        //     hosta (A's shipped issue, folded from A's published snapshot) AND
+        //     #102 tagged hostb (B's own). This is the fused cross-host feed.
+        const rowA = bStatus.history.find((h) => h.number === 101);
+        const rowB = bStatus.history.find((h) => h.number === 102);
+        expect(rowA).toBeDefined();
+        expect(rowA!.hostId).toBe("hosta");
+        expect(rowB).toBeDefined();
+        expect(rowB!.hostId).toBe("hostb");
+
+        // Host A's OWN file is deliberately NOT asserted to fuse both: A ran to
+        // completion BEFORE B ever published its status ref, so A never fetched
+        // B — A only ever saw itself. The third pass below closes that loop.
+
+        // ---- OPTIONAL third pass: A runs ONE more iteration AFTER B, now sees B
+        //      too — fully realizing "each host sees both". A's fresh run fetches
+        //      B's published status ref (which now carries #102) at iteration
+        //      start and folds it. ----
+        process.env.SANDCASTLE_HOST_ID = "hostA";
+        const a2 = buildDeps();
+        wireRealHost(a2, hostAClone, "hostA");
+        a2.enqueue("planner", { stdout: plannerStdout([]) }); // no new work; just sync
+
+        const ra2 = await runMain(
+          baseArgs({ iterations: 1, stagingEnabled: false, repoRoot: hostAClone }),
+          a2.deps,
+        );
+        expect(ra2.exitCode).toBe(0);
+        expect(a2.state.fetchStatusPeersCalls).toContain(BRANCH);
+
+        const aStatus = JSON.parse(
+          readFileSync(path.join(hostAClone, ".sandcastle", "status.json"), "utf8"),
+        ) as SandcastleStatus;
+        expect(aStatus.hostId).toBe("hosta");
+        const aPeerB = aStatus.peers?.find((p) => p.hostId === "hostb");
+        expect(aPeerB).toBeDefined();
+        expect(aPeerB!.totals.merged).toBe(1); // B shipped #102
+        // A's fused history now carries B's #102 (tagged hostb) alongside its own.
+        const aRowB = aStatus.history.find((h) => h.number === 102);
+        expect(aRowB).toBeDefined();
+        expect(aRowB!.hostId).toBe("hostb");
       });
     });
   });
