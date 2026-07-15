@@ -4516,6 +4516,9 @@ function makeNoopDeps(): Deps {
     releaseIssueLease: unused,
     leaseState: unused,
     renewLeases: unused,
+    fenceIssue: unused,
+    syncLanes: unused,
+    publishLane: unused,
     log: () => undefined,
     logError: () => undefined,
   };

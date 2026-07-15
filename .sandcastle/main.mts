@@ -477,30 +477,29 @@ export interface Deps {
    * abort the ship for that issue. This closes the sleep/wake race a cached
    * `leaseLost` flag has (a coalesced heartbeat could fire AFTER the ship).
    *
-   * Optional: an omitted `fenceIssue` is treated identically to the flag being
-   * OFF — the fence passes (`true`) and the ship proceeds unchanged. Production
-   * `buildDefaultDeps` always provides it; this keeps pre-lease Deps stubs valid.
+   * Flag OFF: the fence passes (`true`) and the ship proceeds unchanged.
+   * Production `buildDefaultDeps` always provides it.
    */
-  fenceIssue?(issueNum: number): Promise<boolean>;
+  fenceIssue(issueNum: number): Promise<boolean>;
   /**
    * Cross-host LANE SYNC (ADR 0019, Task B) — pull each peer host's published
    * lane into `branch` inside `launchWorktreePath` at iteration start. OFF
-   * (flag unset) OR omitted ⇒ a byte-for-byte no-op resolving `{ peers: [] }`
+   * (flag unset) ⇒ a byte-for-byte no-op resolving `{ peers: [] }`
    * with NO fetch/ls-remote/merge (today's single-host behavior). ON ⇒ fetch +
    * merge each peer via the bounded lane-sync runner; NEVER throws on a
    * fetch-fail or merge-conflict (those surface as `skipped`/`conflict` in the
    * result for the loop to log + continue on the un-synced tip).
    */
-  syncLanes?(branch: string, launchWorktreePath: string): Promise<LaneSyncResult>;
+  syncLanes(branch: string, launchWorktreePath: string): Promise<LaneSyncResult>;
   /**
    * Cross-host LANE SYNC (ADR 0019, Task B) — publish this host's local
    * `branch` to its lane ref on origin after a fully-successful ship/promote.
-   * OFF OR omitted ⇒ a no-op with NO push. ON ⇒ force-push `branch` to
+   * OFF ⇒ a no-op with NO push. ON ⇒ force-push `branch` to
    * `refs/sandcastle/lanes/<hostId>`; a push failure (auth/network/backend) is a
    * REAL fault surfaced as a thrown {@link LaneSyncError} for the caller to log
    * LOUD (the code did not reach origin — a peer can't see it).
    */
-  publishLane?(branch: string): Promise<void>;
+  publishLane(branch: string): Promise<void>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -4809,8 +4808,8 @@ export async function shipAfterMigrations(
  * bubble up so the issue is neither merged nor marked done this round.
  */
 async function fenceBeforeShip(ctx: PipelineCtx): Promise<IssueOutcome | null> {
-  // An omitted fenceIssue ⇒ pass (identical to flag OFF).
-  if ((await ctx.deps.fenceIssue?.(ctx.issueNumber)) ?? true) return null;
+  // Flag OFF ⇒ fenceIssue returns true (pass), and this is a no-op.
+  if (await ctx.deps.fenceIssue(ctx.issueNumber)) return null;
   const msg =
     `[issue=${ctx.issueNumber}] lease lost at ship time (inline fence failed) — ` +
     `another host owns this issue now; deferring instead of marking done`;
@@ -5750,10 +5749,10 @@ export async function runMain(
         const launchWt =
           findWorktreeForBranch(args.repoRoot, args.branch)?.path ??
           args.repoRoot;
-        const syncResult: LaneSyncResult = (await deps.syncLanes?.(
+        const syncResult: LaneSyncResult = await deps.syncLanes(
           args.branch,
           launchWt,
-        )) ?? { peers: [] };
+        );
         for (const peer of syncResult.peers) {
           if (peer.status === "merged") {
             deps.log(`[lane] synced peer ${peer.peer} → ${args.branch} (merged)`);
@@ -6650,8 +6649,8 @@ export async function runMain(
             const fencedIssueNums: number[] = [];
             try {
               for (const n of mergedIssueNums) {
-                // Omitted fenceIssue ⇒ pass (identical to flag OFF).
-                if ((await deps.fenceIssue?.(n)) ?? true) {
+                // Flag OFF ⇒ fenceIssue returns true (pass).
+                if (await deps.fenceIssue(n)) {
                   fencedIssueNums.push(n);
                 } else {
                   deps.logError(
@@ -6732,7 +6731,7 @@ export async function runMain(
             // did not reach origin) surfaced LOUD but never crashes the loop.
             if (syncEnabled) {
               try {
-                await deps.publishLane?.(args.branch);
+                await deps.publishLane(args.branch);
               } catch (err) {
                 if (err instanceof LaneSyncError) {
                   deps.logError(
@@ -6817,7 +6816,7 @@ export async function runMain(
         // (code did not reach origin) surfaced LOUD but never crashes the loop.
         if (syncEnabled) {
           try {
-            await deps.publishLane?.(args.branch);
+            await deps.publishLane(args.branch);
           } catch (err) {
             if (err instanceof LaneSyncError) {
               deps.logError(

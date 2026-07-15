@@ -579,6 +579,18 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     logError(line) {
       state.errors.push(line);
     },
+    // Cross-host lease/lane deps (ADR 0019/0020): benign no-ops. These gate
+    // tests never enable the sync flag, so the fence always passes and the
+    // lane deps are never reached; matches production flag-OFF behavior.
+    async fenceIssue() {
+      return true;
+    },
+    async syncLanes() {
+      return { peers: [] };
+    },
+    async publishLane() {
+      // no-op
+    },
   };
 
   return {
