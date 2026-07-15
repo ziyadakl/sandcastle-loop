@@ -2,7 +2,7 @@
  * Cross-host LANE SYNC — the code-sharing substrate for a two-machine setup.
  * See docs/adr/0019-cross-host-issue-lease.md (companion to the issue lease).
  *
- * Where the LEASE (lock.ts) answers "who may WORK issue N", lane-sync answers
+ * Where the LEASE (issue-lease.ts) answers "who may WORK issue N", lane-sync answers
  * "how do two hosts SHARE the code they produce". Each host PUBLISHES its local
  * integration branch to `origin` under an invisible ref namespace
  * `refs/sandcastle/lanes/<hostId>` — invisible because it lives outside
@@ -12,15 +12,15 @@
  * branch by fetching + merging inside the launch worktree.
  *
  * The module is pure and dependency-injected: it shells out only through the
- * injected {@link GitRunner} (imported from lock.ts, already the loop's runGit
+ * injected {@link GitRunner} (imported from issue-lease.ts, already the loop's runGit
  * shape), so it is tested entirely offline against a real local bare repo.
  */
 
-import type { GitRunner } from "./lock.js";
+import type { GitRunner } from "./issue-lease.js";
 
 /** Options for a lane-sync handle bound to one repo + one host identity. */
 export interface LaneSyncOpts {
-  /** How this module shells out to git. Imported shape from lock.ts. */
+  /** How this module shells out to git. Imported shape from issue-lease.ts. */
   readonly git: GitRunner;
   /** Repo root the git runner's cwd is bound to. */
   readonly repoRoot: string;

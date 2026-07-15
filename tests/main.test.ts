@@ -148,7 +148,7 @@ interface MockState {
   errors: string[];
   // Cross-host issue lease (ADR 0019) — the fake records every lease call so
   // the orchestration (gate / release points / reconciliation) can be asserted
-  // without a real git backend (which is proven in tests/lock.test.ts).
+  // without a real git backend (which is proven in tests/issue-lease.test.ts).
   leaseAcquires: number[];
   leaseReleases: number[];
   leaseStateCalls: number[];
@@ -5958,7 +5958,7 @@ describe("resolveReviewBase", () => {
 // ---------------------------------------------------------------------------
 // Cross-host issue lease orchestration (ADR 0019). Every test drives runMain /
 // parseSandcastleArgs with the fake Deps lease methods (see buildDeps) — the
-// real git backend is proven in tests/lock.test.ts, so nothing here shells to
+// real git backend is proven in tests/issue-lease.test.ts, so nothing here shells to
 // git for a lease. The opt-in flag is set per-test and scrubbed in afterEach so
 // the default-OFF suite above is never contaminated.
 // ---------------------------------------------------------------------------

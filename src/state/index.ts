@@ -60,7 +60,7 @@ export {
   LeaseBackendError,
   LeaseReadError,
   LEASE_SKEW_GRACE_SEC,
-} from "./lock.js";
+} from "./issue-lease.js";
 export type {
   LockLease,
   LockBackend,
@@ -70,7 +70,7 @@ export type {
   GitRunner,
   GitRunResult,
   GitLockBackendOpts,
-} from "./lock.js";
+} from "./issue-lease.js";
 
 // Cross-host lane sync (ADR 0019) — the code-sharing substrate for two hosts.
 export { createLaneSync, LaneSyncError } from "./lane-sync.js";

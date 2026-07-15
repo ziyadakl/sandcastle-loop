@@ -29,7 +29,7 @@ import {
   type LockDeps,
   type GitRunner,
   type GitRunResult,
-} from "../src/state/lock.js";
+} from "../src/state/issue-lease.js";
 
 // ---------------------------------------------------------------------------
 // In-memory fake backend

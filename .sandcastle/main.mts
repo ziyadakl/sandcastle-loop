@@ -2923,7 +2923,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // the coordinator's registry tracks the leases THIS host currently holds so
   // renew can heartbeat them and release only ever deletes a ref we actually
   // own. The five lease methods live in the createLeaseCoordinator factory
-  // (lib/state/lock.ts) — a one-collaborator (`lockDeps`) seam that is unit-
+  // (lib/state/issue-lease.ts) — a one-collaborator (`lockDeps`) seam that is unit-
   // testable against a fake LockBackend without the whole Deps graph.
   const leaseEnabled = crossHostLeaseEnabled();
   const lockDeps: LockDeps = {
@@ -3163,7 +3163,7 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       }
     },
     // Cross-host issue lease (ADR 0019): the five lease methods come from the
-    // createLeaseCoordinator factory above (extracted to lib/state/lock.ts).
+    // createLeaseCoordinator factory above (extracted to lib/state/issue-lease.ts).
     // Spread here so the returned Deps shape is unchanged.
     ...leaseCoord,
     async syncLanes(branch, launchWorktreePath) {

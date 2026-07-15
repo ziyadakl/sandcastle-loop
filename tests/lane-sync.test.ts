@@ -18,9 +18,9 @@ import {
   type LaneSyncResult,
   type PeerMergeResult,
 } from "../src/state/lane-sync.js";
-import type { GitRunner, GitRunResult } from "../src/state/lock.js";
+import type { GitRunner, GitRunResult } from "../src/state/issue-lease.js";
 
-/** Tiny local git runner mirroring lock.test.ts's realRunGit. */
+/** Tiny local git runner mirroring issue-lease.test.ts's realRunGit. */
 function realRunGit(cwd: string, ...args: string[]): GitRunResult {
   try {
     const stdout = execFileSync("git", args, {
