@@ -233,6 +233,12 @@ export function formatCheckpointStop(results: CheckpointStopResult[]): string {
         return `  #${r.issue}  nothing-to-save`;
       case "error":
         return `  #${r.issue}  error: ${r.detail ?? "(no detail)"}`;
+      default: {
+        // Exhaustive over CheckpointStopResult["outcome"]; a future variant
+        // fails to compile here (mirrors formatHostResult in hosts/result.ts).
+        const _exhaustive: never = r.outcome;
+        return _exhaustive;
+      }
     }
   });
 

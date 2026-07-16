@@ -58,8 +58,15 @@ import {
   createStatusSync,
   wipRef,
   resolveReuseDecision,
+  deleteWipRef,
+  listWipRefIssues,
 } from "./lib/state/index.js";
-import type { LockDeps, LaneSyncResult, PublishResult } from "./lib/state/index.js";
+import type {
+  LockDeps,
+  LaneSyncResult,
+  PublishResult,
+  GitRunner,
+} from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -5531,6 +5538,137 @@ function finalizeMergedAccounting(
 }
 
 /**
+ * The `--limit` gh `issue list` cap used by `listOpenIssuesWithBodies`
+ * (gh.ts). A returned page of exactly this many rows may be truncated, so the
+ * startup WIP prune treats `length >= this` as an INCOMPLETE open set and
+ * refuses to prune (never risk a dropped open issue's live WIP ref).
+ */
+const GH_OPEN_ISSUE_LIST_LIMIT = 100;
+
+/**
+ * ADR 0021 §4 cleanup hook 1 (SHIP-PATH). Once an issue's code has reached the
+ * integration branch it has SHIPPED, so its `refs/sandcastle/wip/issue-<N>`
+ * checkpoint is now stale — left in place it could resurrect merged work the
+ * next time that issue number is reused. Best-effort delete each merged issue's
+ * WIP ref.
+ *
+ * Gated on `syncEnabled`: WIP refs only exist when cross-host sync is ON, so
+ * with the flag OFF this is a no-op that touches NO origin (no push), keeping
+ * the flag-off path byte-for-byte unchanged. Every delete is best-effort — a
+ * fault is logged LOUD-but-non-fatal (mirroring publishLaneOrLog / status sync
+ * swallowing a LaneSyncError) and NEVER crashes the loop, since the code has
+ * already shipped and a lingering ref is a hygiene issue the startup prune (hook
+ * 2) also sweeps.
+ */
+export async function cleanupShippedWipRefs(
+  mergedIssueNums: readonly number[],
+  syncEnabled: boolean,
+  repoRoot: string,
+  git: GitRunner,
+  logError: (msg: string) => void,
+): Promise<void> {
+  if (!syncEnabled) return;
+  for (const n of mergedIssueNums) {
+    try {
+      const res = await deleteWipRef(repoRoot, n, git);
+      if (!res.ok) {
+        logError(
+          `[wip-cleanup] failed to delete WIP ref for shipped issue #${n}: ` +
+            `${res.stderr.trim() || "git push :wip failed"} — a stale ` +
+            `${wipRef(n)} may resurrect merged work on a later reuse; delete ` +
+            `it by hand with \`git push origin :${wipRef(n)}\``,
+        );
+      }
+    } catch (err) {
+      logError(
+        `[wip-cleanup] error deleting WIP ref for shipped issue #${n}: ` +
+          `${(err as Error).message}`,
+      );
+    }
+  }
+}
+
+/**
+ * ADR 0021 §4 cleanup hook 2 (STARTUP PRUNE, safety net). Enumerate the WIP
+ * refs on origin and delete only those whose issue is NO LONGER OPEN
+ * (closed/merged) — a stale ref left by an issue that shipped without the
+ * ship-path hook firing (e.g. the loop was killed post-merge).
+ *
+ * SAFETY INVARIANT: a checkpoint-stopped issue stays OPEN (ready-for-agent or
+ * in-progress) precisely so it can resume from its WIP ref. Deleting a live
+ * issue's WIP ref is data loss. So we prune ONLY issues ABSENT from the current
+ * OPEN-issue set (`openIssueNums`) — every open issue, ready OR in-progress,
+ * incl. a checkpoint-stopped one flipped back to ready, is KEPT. A failed
+ * `ls-remote` yields `[]` (listWipRefIssues) so we never prune on a partial
+ * view of the remote.
+ *
+ * CRITICAL: the open-issue set comes from `gh issue list --limit 100`, which
+ * SILENTLY TRUNCATES when a repo has ≥100 open issues (gh.ts). An open issue
+ * dropped by that cap would look "closed" here and its LIVE WIP ref would be
+ * wrongly pruned — data loss. So the caller passes `openListComplete=false`
+ * whenever the list may be truncated, and we SKIP the entire prune in that
+ * case (Hook 1 still cleans the normal ship path; stale refs merely linger
+ * until the repo drops below the cap). Never trade a possibly-live ref for
+ * hygiene.
+ *
+ * Gated on `syncEnabled`: with the flag OFF this is a no-op touching NO origin
+ * (no ls-remote, no push). Each delete is best-effort and logged non-fatally.
+ */
+export async function pruneStaleWipRefs(
+  syncEnabled: boolean,
+  openIssueNums: readonly number[],
+  openListComplete: boolean,
+  repoRoot: string,
+  git: GitRunner,
+  log: (msg: string) => void,
+  logError: (msg: string) => void,
+): Promise<void> {
+  if (!syncEnabled) return;
+  if (!openListComplete) {
+    logError(
+      `[wip-prune] open-issue list may be truncated (hit the gh --limit cap) — ` +
+        `SKIPPING stale-WIP prune this startup so a live issue's WIP ref is ` +
+        `never deleted on an incomplete open set (hook 1 still cleans the ship path)`,
+    );
+    return;
+  }
+  const open = new Set(openIssueNums);
+  let wipIssues: readonly number[];
+  try {
+    wipIssues = await listWipRefIssues(repoRoot, git);
+  } catch (err) {
+    logError(
+      `[wip-prune] ls-remote of the WIP namespace failed: ${(err as Error).message} ` +
+        `— skipping stale-WIP prune this startup (no refs touched)`,
+    );
+    return;
+  }
+  for (const n of wipIssues) {
+    // SAFETY: an OPEN issue (ready or in-progress, incl. checkpoint-stopped)
+    // MUST keep its WIP ref so it can resume. Prune ONLY closed/merged issues.
+    if (open.has(n)) continue;
+    try {
+      const res = await deleteWipRef(repoRoot, n, git);
+      if (!res.ok) {
+        logError(
+          `[wip-prune] failed to delete stale WIP ref ${wipRef(n)} for ` +
+            `closed/merged issue #${n}: ${res.stderr.trim() || "git push :wip failed"}`,
+        );
+      } else {
+        log(
+          `[wip-prune] deleted stale WIP ref for closed/merged issue #${n}`,
+        );
+      }
+    } catch (err) {
+      logError(
+        `[wip-prune] error deleting stale WIP ref for issue #${n}: ` +
+          `${(err as Error).message}`,
+      );
+    }
+  }
+}
+
+/**
  * Publish this host's lane ref (ADR 0019, Task B) after it advanced the launch
  * branch, logging a LOUD-but-non-fatal message on a real push fault. Callers
  * gate on the opt-in flag; `context` names the ship path (e.g. "promoting
@@ -5791,6 +5929,38 @@ export async function runMain(
     deps.log(
       `startup reconciliation skipped: listIssuesByLabel failed: ${(err as Error).message}`,
     );
+  }
+
+  // ADR 0021 §4 cleanup hook 2 (startup prune, safety net): sweep WIP refs on
+  // origin and delete any whose issue is no longer OPEN (closed/merged) — a
+  // stale checkpoint that the ship-path hook missed (e.g. loop killed
+  // post-merge). Gated on sync (no-op + touches no origin when OFF). SAFETY: an
+  // open issue — ready OR in-progress, incl. a checkpoint-stopped one flipped
+  // back to ready above — MUST keep its WIP ref so it can resume, so we prune
+  // ONLY issues absent from the current open set. Best-effort; a fault is
+  // logged non-fatal.
+  if (crossHostSyncEnabled()) {
+    try {
+      const openIssues = await deps.listOpenIssuesWithBodies();
+      // `listOpenIssuesWithBodies` caps at gh `--limit 100`; a full 100 rows
+      // means the list may be truncated, so treat it as INCOMPLETE and let
+      // pruneStaleWipRefs refuse rather than risk pruning a dropped open
+      // issue's live WIP ref.
+      const openListComplete = openIssues.length < GH_OPEN_ISSUE_LIST_LIMIT;
+      await pruneStaleWipRefs(
+        true,
+        openIssues.map((i) => i.number),
+        openListComplete,
+        args.repoRoot,
+        runGitLease,
+        deps.log,
+        deps.logError,
+      );
+    } catch (err) {
+      deps.logError(
+        `[wip-prune] startup prune skipped: listOpenIssuesWithBodies failed: ${(err as Error).message} — no WIP refs touched`,
+      );
+    }
   }
 
   // Graceful shutdown: register once. We don't abort in-flight gh calls;
@@ -6842,6 +7012,20 @@ export async function runMain(
                 deferredOkOutcomes,
                 promoteRes.failed,
                 args.branch,
+              );
+              // ADR 0021 §4 cleanup hook 1 (ship-path): these issues' code has
+              // reached the integration branch (both the promoted-ok and the
+              // failed-GitHub-promotion cases — the FF landed either way), so
+              // their WIP checkpoint refs are now stale. Best-effort delete
+              // them so no stale ref resurrects merged work on a later reuse.
+              // Gated on sync (WIP refs only exist when it's ON); a fault is
+              // logged non-fatal and the loop keeps running.
+              await cleanupShippedWipRefs(
+                fencedIssueNums,
+                crossHostSyncEnabled(),
+                args.repoRoot,
+                runGitLease,
+                deps.logError,
               );
               // Cross-host lease (ADR 0019): the staging path HELD each ok
               // issue's lease past ship time (the accounting loop skipped the

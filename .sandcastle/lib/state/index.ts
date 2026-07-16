@@ -99,6 +99,7 @@ export {
   pushWipRef,
   wipRefExists,
   deleteWipRef,
+  listWipRefIssues,
 } from "./branch-checkpoint.js";
 
 // Canonical GitRunner adapters (Quality #2 dedup) — the single home for the

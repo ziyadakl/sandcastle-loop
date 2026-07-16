@@ -165,6 +165,29 @@ export async function wipRefExists(
 }
 
 /**
+ * List the issue numbers of every WIP checkpoint ref currently on the remote —
+ * parses `git ls-remote <remote> refs/sandcastle/wip/*` output, keeping only
+ * lines whose ref is issue-shaped (`refs/sandcastle/wip/issue-<N>`) and dropping
+ * malformed/foreign lines. Powers ADR 0021 §4's startup prune (delete WIP refs
+ * for issues no longer open). A failed `ls-remote` (network/auth) returns `[]`
+ * so the prune NEVER over-deletes on an incomplete view of the remote.
+ */
+export async function listWipRefIssues(
+  repoRoot: string,
+  git: GitRunner,
+  remote = "origin",
+): Promise<number[]> {
+  const res = await git(repoRoot, "ls-remote", remote, "refs/sandcastle/wip/*");
+  if (!res.ok) return [];
+  const out: number[] = [];
+  for (const line of res.stdout.split("\n")) {
+    const m = /refs\/sandcastle\/wip\/issue-(\d+)\s*$/.exec(line.trim());
+    if (m) out.push(Number(m[1]));
+  }
+  return out;
+}
+
+/**
  * Best-effort delete of the issue's WIP ref (after a successful resume+ship, so
  * the checkpoint is not later re-applied). Pushes the empty-source delete
  * refspec `:<wipRef>`; returns the raw {@link GitRunResult} and never throws —

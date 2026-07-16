@@ -59,6 +59,8 @@ import {
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
+  cleanupShippedWipRefs,
+  pruneStaleWipRefs,
   runGitLeaseRetrying,
   isTransientLeaseGitFailure,
   buildDefaultDeps,
@@ -6019,6 +6021,106 @@ describe("resolveReviewBase", () => {
       "bbbb2222",
     );
     expect(reviewBase).toBe("bbbb2222~1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0021 §4 WIP-ref cleanup lifecycle — ship-path delete (hook 1) + startup
+// prune (hook 2). Both drive the exported helpers against a recording fake git
+// runner (no child_process). Assert the sync-flag gate (flag OFF touches NO
+// origin), best-effort logging, and — critically — the safety invariant that an
+// OPEN issue's WIP ref is NEVER pruned.
+// ---------------------------------------------------------------------------
+describe("cleanupShippedWipRefs (ADR 0021 §4 hook 1)", () => {
+  type Call = { cwd: string; args: string[] };
+  function makeFakeGit(responder: (args: string[]) => Partial<GitRunResult> = () => ({})) {
+    const calls: Call[] = [];
+    const git = async (cwd: string, ...args: string[]): Promise<GitRunResult> => {
+      calls.push({ cwd, args });
+      return { ok: true, stdout: "", stderr: "", ...responder(args) };
+    };
+    return { git, calls };
+  }
+
+  it("deletes the WIP ref for every merged issue when sync is ON", async () => {
+    const { git, calls } = makeFakeGit();
+    const errs: string[] = [];
+    await cleanupShippedWipRefs([7, 42], true, "/repo", git, (m) => errs.push(m));
+    const deletes = calls
+      .filter((c) => c.args[0] === "push")
+      .map((c) => c.args.find((a) => a.startsWith(":")));
+    expect(deletes).toEqual([
+      ":refs/sandcastle/wip/issue-7",
+      ":refs/sandcastle/wip/issue-42",
+    ]);
+    expect(errs).toEqual([]);
+  });
+
+  it("touches NO origin when sync is OFF (flag-off byte-for-byte)", async () => {
+    const { git, calls } = makeFakeGit();
+    await cleanupShippedWipRefs([7, 42], false, "/repo", git, () => {});
+    expect(calls).toEqual([]);
+  });
+
+  it("logs LOUD-but-non-fatal on a delete fault, never throws", async () => {
+    const { git } = makeFakeGit(() => ({ ok: false, stderr: "remote rejected" }));
+    const errs: string[] = [];
+    await expect(
+      cleanupShippedWipRefs([7], true, "/repo", git, (m) => errs.push(m)),
+    ).resolves.toBeUndefined();
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("#7");
+    expect(errs[0]).toContain("remote rejected");
+  });
+});
+
+describe("pruneStaleWipRefs (ADR 0021 §4 hook 2)", () => {
+  type Call = { cwd: string; args: string[] };
+  function makeFakeGit(responder: (args: string[]) => Partial<GitRunResult> = () => ({})) {
+    const calls: Call[] = [];
+    const git = async (cwd: string, ...args: string[]): Promise<GitRunResult> => {
+      calls.push({ cwd, args });
+      return { ok: true, stdout: "", stderr: "", ...responder(args) };
+    };
+    return { git, calls };
+  }
+  // Two WIP refs on origin: #7 (still OPEN, in-progress) and #42 (closed/merged).
+  const twoWipRefs = (args: string[]): Partial<GitRunResult> =>
+    args[0] === "ls-remote"
+      ? {
+          stdout:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/sandcastle/wip/issue-7\n" +
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/sandcastle/wip/issue-42\n",
+        }
+      : {};
+
+  it("deletes a closed issue's WIP ref but KEEPS an open issue's (safety invariant)", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    // #7 is OPEN (in-progress / checkpoint-stopped), #42 is not.
+    await pruneStaleWipRefs(true, [7], true, "/repo", git, () => {}, () => {});
+    const deletes = calls
+      .filter((c) => c.args[0] === "push")
+      .map((c) => c.args.find((a) => a.startsWith(":")));
+    // ONLY the closed issue #42 is pruned; the live #7 ref is untouched.
+    expect(deletes).toEqual([":refs/sandcastle/wip/issue-42"]);
+    expect(deletes).not.toContain(":refs/sandcastle/wip/issue-7");
+  });
+
+  it("REFUSES to prune when the open list may be truncated (never over-deletes)", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    const errs: string[] = [];
+    // openListComplete=false → skip entirely, even though #42 looks closed.
+    await pruneStaleWipRefs(true, [7], false, "/repo", git, () => {}, (m) => errs.push(m));
+    expect(calls.filter((c) => c.args[0] === "push")).toEqual([]);
+    expect(calls.filter((c) => c.args[0] === "ls-remote")).toEqual([]);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("truncated");
+  });
+
+  it("touches NO origin when sync is OFF", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    await pruneStaleWipRefs(false, [7], true, "/repo", git, () => {}, () => {});
+    expect(calls).toEqual([]);
   });
 });
 

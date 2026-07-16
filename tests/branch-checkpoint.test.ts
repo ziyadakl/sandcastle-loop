@@ -17,6 +17,7 @@ import {
   pushWipRef,
   wipRefExists,
   deleteWipRef,
+  listWipRefIssues,
 } from "../.sandcastle/lib/state/branch-checkpoint.js";
 
 type Call = { cwd: string; args: string[] };
@@ -165,5 +166,42 @@ describe("deleteWipRef", () => {
     const { git } = makeFakeGit(() => ({ ok: false, stderr: "no such ref" }));
     const res = await deleteWipRef("/repo", 7, git);
     expect(res.ok).toBe(false);
+  });
+});
+
+describe("listWipRefIssues", () => {
+  it("parses issue numbers from ls-remote wip lines", async () => {
+    const { git } = makeFakeGit(() => ({
+      stdout:
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/sandcastle/wip/issue-7\n" +
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/sandcastle/wip/issue-42\n",
+    }));
+    expect(await listWipRefIssues("/repo", git)).toEqual([7, 42]);
+  });
+
+  it("queries the wip namespace glob via ls-remote", async () => {
+    const { git, calls } = makeFakeGit(() => ({ stdout: "" }));
+    await listWipRefIssues("/repo", git);
+    const ls = callWith(calls, "ls-remote");
+    expect(ls?.args).toEqual([
+      "ls-remote",
+      "origin",
+      "refs/sandcastle/wip/*",
+    ]);
+  });
+
+  it("ignores non-issue-shaped and malformed lines", async () => {
+    const { git } = makeFakeGit(() => ({
+      stdout:
+        "cccccccccccccccccccccccccccccccccccccccc\trefs/sandcastle/wip/issue-3\n" +
+        "dddddddddddddddddddddddddddddddddddddddd\trefs/sandcastle/status/host-a\n" +
+        "garbage line with no ref\n",
+    }));
+    expect(await listWipRefIssues("/repo", git)).toEqual([3]);
+  });
+
+  it("returns [] on a failed ls-remote (never over-prunes)", async () => {
+    const { git } = makeFakeGit(() => ({ ok: false, stderr: "network down" }));
+    expect(await listWipRefIssues("/repo", git)).toEqual([]);
   });
 });
