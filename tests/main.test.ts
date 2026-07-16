@@ -5906,6 +5906,61 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
     expect(feed.totals.merged).toBe(1);
   });
 
+  it("a SIGTERM graceful stop drains the in-flight issue THEN releases all leases", async () => {
+    // Production graceful stop (sandcastle-stop / stop-all) sends SIGTERM, not
+    // SIGINT — main.mts registers a distinct SIGTERM handler (5977). This test
+    // exercises that signal specifically: the SIGINT sibling above does NOT
+    // cover the SIGTERM registration, so dropping `process.on("SIGTERM", …)`
+    // would regress silently without this. Same drain-then-release contract as
+    // ADR 0021 §4: finish the current issue, break at the next iteration top,
+    // then release every held lease on the way out.
+    //
+    // As with the SIGINT test we fire only the handler runMain newly installs
+    // (not vitest's own baseline SIGTERM listeners), to avoid tripping vitest's
+    // teardown.
+    const sigtermBaseline = process.listeners("SIGTERM");
+    const b = buildDeps({
+      iterationStartHook: (it) => {
+        if (it !== 1) return;
+        for (const l of process.listeners("SIGTERM")) {
+          if (!sigtermBaseline.includes(l)) {
+            (l as (sig: string) => void)("SIGTERM");
+          }
+        }
+      },
+    });
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "88", title: "smoke", branch: "agent/issue-88" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 88 }),
+      commits: [{ sha: "def456" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    // (a) The in-flight iteration was DRAINED, not abandoned: issue 88 shipped
+    // (its full pipeline ran) before the SIGTERM break took effect.
+    expect(result.shippedIssues).toEqual([88]);
+
+    // (b) On a genuine stop the shutdown-gated bulk release fires EXACTLY once
+    // (a single `finally`), so a peer reclaims immediately instead of waiting
+    // the 15-min TTL.
+    expect(b.state.leaseReleaseAllCalls).toBe(1);
+
+    // (c) The run surfaces as the distinct "stopped" terminal state.
+    const feed = readStatusFeed();
+    expect(feed.state).toBe("stopped");
+    expect(feed.issues.find((i) => i.number === 88)?.phase).toBe("merged");
+    expect(feed.totals.merged).toBe(1);
+  });
+
   it("a clean ship records ok→merged and finishes the feed 'done'", async () => {
     const b = buildDeps();
     b.enqueue("planner", {
