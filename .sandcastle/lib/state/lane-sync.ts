@@ -17,6 +17,7 @@
  */
 
 import type { GitRunner } from "./issue-lease.js";
+import { discoverRefPeers } from "./ref-peers.js";
 
 /** Options for a lane-sync handle bound to one repo + one host identity. */
 export interface LaneSyncOpts {
@@ -116,19 +117,7 @@ export function createLaneSync(opts: LaneSyncOpts): {
    * path). Empty list when no peers have published.
    */
   async function discoverPeers(): Promise<string[]> {
-    const res = await run("ls-remote", remote, `${LANE_PREFIX}*`);
-    if (!res.ok) return [];
-    const peers: string[] = [];
-    for (const line of res.stdout.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed === "") continue;
-      const ref = trimmed.split(/\s+/)[1];
-      if (!ref || !ref.startsWith(LANE_PREFIX)) continue;
-      const peer = ref.slice(LANE_PREFIX.length);
-      if (peer === "" || peer === opts.hostId) continue;
-      peers.push(peer);
-    }
-    return peers;
+    return discoverRefPeers(run, remote, LANE_PREFIX, opts.hostId);
   }
 
   /**

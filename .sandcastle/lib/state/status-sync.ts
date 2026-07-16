@@ -24,6 +24,7 @@
  */
 
 import { EMPTY_TREE_OID, type GitRunner } from "./issue-lease.js";
+import { discoverRefPeers } from "./ref-peers.js";
 import { SandcastleStatusSchema, type SandcastleStatus } from "../status/schema.js";
 
 /** Options for a status-sync handle bound to one repo + one host identity. */
@@ -128,19 +129,7 @@ export function createStatusSync(opts: StatusSyncOpts): {
    */
   async function fetchPeers(runId: string): Promise<SandcastleStatus[]> {
     try {
-      const ls = await run("ls-remote", remote, `${STATUS_PREFIX}*`);
-      if (!ls.ok) return [];
-      const peers: string[] = [];
-      for (const line of ls.stdout.split("\n")) {
-        const trimmed = line.trim();
-        if (trimmed === "") continue;
-        const ref = trimmed.split(/\s+/)[1];
-        if (!ref || !ref.startsWith(STATUS_PREFIX)) continue;
-        const peer = ref.slice(STATUS_PREFIX.length);
-        if (peer === "" || peer === opts.hostId) continue;
-        peers.push(peer);
-      }
-
+      const peers = await discoverRefPeers(run, remote, STATUS_PREFIX, opts.hostId);
       const out: SandcastleStatus[] = [];
       for (const peer of peers) {
         const status = await readPeerStatus(peer, runId);
