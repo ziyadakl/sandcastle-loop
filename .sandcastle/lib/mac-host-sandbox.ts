@@ -535,11 +535,19 @@ export function macHostSandbox(
         }
       };
       const issue = issueFromBranch(spec.branch);
+      // Short-circuit on the flag FIRST: when cross-host sync is off we must not
+      // touch origin at all (no ls-remote) — matching the inert-when-off
+      // contract that lease/lane/status sync all honor. wipRefExists (a network
+      // ls-remote) runs ONLY when the flag is on AND the branch is issue-shaped.
+      const syncEnabled = opts.crossHostSync ?? false;
+      const wipExists =
+        syncEnabled &&
+        issue !== null &&
+        (await wipRefExists(repoRoot, issue, gitRunner));
       const decision = reuseOrFresh({
-        syncEnabled: opts.crossHostSync ?? false,
+        syncEnabled,
         branch: spec.branch,
-        wipExists:
-          issue !== null && (await wipRefExists(repoRoot, issue, gitRunner)),
+        wipExists,
       });
       if (decision === "reuse" && issue !== null) {
         execFileSync("git", ["fetch", "origin", wipRef(issue)], {

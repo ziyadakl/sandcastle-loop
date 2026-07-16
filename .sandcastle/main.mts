@@ -3045,12 +3045,18 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     // today's behavior. Cross-host git goes through the BOUNDED `runGitLease`
     // (same convention as lane/status sync) so a hung fetch can't wedge the loop.
     const reuseIssue = issueFromBranch(spec.branch);
+    // Short-circuit on the flag FIRST so the flag-off path touches NO origin
+    // (no ls-remote) — matching the comment above and the inert-when-off
+    // contract of lease/lane/status sync. wipRefExists runs ONLY when sync is on.
+    const reuseSyncEnabled = crossHostSyncEnabled();
+    const reuseWipExists =
+      reuseSyncEnabled &&
+      reuseIssue !== null &&
+      (await wipRefExists(args.repoRoot, reuseIssue, runGitLease));
     const reuseDecision = reuseOrFresh({
-      syncEnabled: crossHostSyncEnabled(),
+      syncEnabled: reuseSyncEnabled,
       branch: spec.branch,
-      wipExists:
-        reuseIssue !== null &&
-        (await wipRefExists(args.repoRoot, reuseIssue, runGitLease)),
+      wipExists: reuseWipExists,
     });
     if (reuseDecision === "reuse" && reuseIssue !== null) {
       runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuseIssue));
