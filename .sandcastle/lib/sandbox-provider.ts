@@ -181,6 +181,13 @@ export function makeDockerProvider(
 
 export interface MacHostProviderConfig {
   readonly repoRoot: string;
+  /**
+   * Cross-host sync opt-in (ADR 0021 §2). Threaded straight to
+   * `MacHostSandboxOptions.crossHostSync` so the per-issue worktree-add can
+   * reuse a WIP checkpoint. Defaults to `false` — flag-off is byte-for-byte
+   * today's force-reset from HEAD.
+   */
+  readonly crossHostSync?: boolean;
 }
 
 export function makeMacHostProvider(
@@ -215,6 +222,7 @@ export function makeMacHostProvider(
       const factory = macHostSandbox({
         repoRoot: config.repoRoot,
         env: spec.sandboxEnv,
+        crossHostSync: config.crossHostSync,
       });
       const handle = await factory.createSandbox({ branch: spec.branch });
       return {
@@ -247,12 +255,21 @@ export function makeMacHostProvider(
 // ---------------------------------------------------------------------------
 
 export function buildSandboxProvider(
-  args: { sandbox: "docker" | "mac-host"; imageName: string; repoRoot: string },
+  args: {
+    sandbox: "docker" | "mac-host";
+    imageName: string;
+    repoRoot: string;
+    /** ADR 0021 §2 branch-reuse opt-in, from `crossHostSyncEnabled()`. */
+    crossHostSync?: boolean;
+  },
   containerEnv: Record<string, string>,
   dockerConfig?: Omit<DockerProviderConfig, "imageName" | "repoRoot">,
 ): SandboxProvider {
   if (args.sandbox === "mac-host") {
-    return makeMacHostProvider({ repoRoot: args.repoRoot }, containerEnv);
+    return makeMacHostProvider(
+      { repoRoot: args.repoRoot, crossHostSync: args.crossHostSync },
+      containerEnv,
+    );
   }
   if (!dockerConfig) {
     throw new Error("docker provider requires dockerConfig");

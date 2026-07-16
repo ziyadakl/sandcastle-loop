@@ -85,3 +85,27 @@ export type { LaneSyncResult, PeerMergeResult, LaneSyncOpts } from "./lane-sync.
 // fuses two hosts' status feeds into one viewer.
 export { createStatusSync } from "./status-sync.js";
 export type { StatusSyncOpts, PublishResult } from "./status-sync.js";
+
+// Branch checkpoint / resume-on-pickup (ADR 0021) — WIP-ref primitives plus the
+// pure sandbox-creation decision (`reuseOrFresh`) both worktree-add sites route
+// through.
+export {
+  wipRef,
+  issueFromBranch,
+  reuseOrFresh,
+  resolveReuseDecision,
+  hasWorktreeChanges,
+  commitWorktreeCheckpoint,
+  pushWipRef,
+  wipRefExists,
+  deleteWipRef,
+  listWipRefIssues,
+} from "./branch-checkpoint.js";
+
+// Canonical GitRunner adapters (Quality #2 dedup) — the single home for the
+// async (execFileAsync) and sync (execFileSync) git shell-out shapes the three
+// former inline `makeGitRunner()` / `gitRunner` adapters hand-rolled.
+export {
+  makeExecFileGitRunner,
+  makeSyncGitRunner,
+} from "./git-runner-adapter.js";

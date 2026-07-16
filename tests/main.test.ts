@@ -59,6 +59,8 @@ import {
   extractCategorySweep,
   priorFindingsResolved,
   resolveReviewBase,
+  cleanupShippedWipRefs,
+  pruneStaleWipRefs,
   runGitLeaseRetrying,
   isTransientLeaseGitFailure,
   buildDefaultDeps,
@@ -162,6 +164,7 @@ interface MockState {
   leaseReleases: number[];
   leaseStateCalls: number[];
   leaseRenews: number;
+  leaseReleaseAllCalls: number;
   leaseFences: number[];
   // Cross-host LANE SYNC (ADR 0019, Task B) — record every sync/publish call so
   // the flag-off invariant (must be EMPTY) and the two-loop E2E can be asserted
@@ -198,6 +201,7 @@ function newState(): MockState {
     leaseReleases: [],
     leaseStateCalls: [],
     leaseRenews: 0,
+    leaseReleaseAllCalls: 0,
     leaseFences: [],
     syncLanesCalls: [],
     publishLaneCalls: [],
@@ -395,6 +399,9 @@ function buildDeps(opts: {
     },
     async renewLeases() {
       state.leaseRenews += 1;
+    },
+    async releaseAllLeases() {
+      state.leaseReleaseAllCalls += 1;
     },
     async fenceIssue(n) {
       state.leaseFences.push(n);
@@ -4566,6 +4573,7 @@ function makeNoopDeps(): Deps {
     releaseIssueLease: unused,
     leaseState: unused,
     renewLeases: unused,
+    releaseAllLeases: unused,
     fenceIssue: unused,
     syncLanes: unused,
     publishLane: unused,
@@ -5884,12 +5892,72 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
     // Iteration 1 completed and shipped before the interrupt took effect.
     expect(result.shippedIssues).toEqual([71]);
 
+    // ADR 0021 §4: a genuine stop (SIGINT here) releases every held lease on the
+    // way out so a peer reclaims immediately instead of waiting the TTL. The
+    // shutdown-gated `deps.releaseAllLeases()` must have fired.
+    expect(b.state.leaseReleaseAllCalls).toBeGreaterThanOrEqual(1);
+
     const feed = readStatusFeed();
     // The interrupt must surface as a distinct terminal state so the viewer
     // shows "stopped", not a false "done — loop finished".
     expect(feed.state).toBe("stopped");
     // The shipped issue's terminal phase is still recorded under the stop.
     expect(feed.issues.find((i) => i.number === 71)?.phase).toBe("merged");
+    expect(feed.totals.merged).toBe(1);
+  });
+
+  it("a SIGTERM graceful stop drains the in-flight issue THEN releases all leases", async () => {
+    // Production graceful stop (sandcastle-stop / stop-all) sends SIGTERM, not
+    // SIGINT — main.mts registers a distinct SIGTERM handler (5977). This test
+    // exercises that signal specifically: the SIGINT sibling above does NOT
+    // cover the SIGTERM registration, so dropping `process.on("SIGTERM", …)`
+    // would regress silently without this. Same drain-then-release contract as
+    // ADR 0021 §4: finish the current issue, break at the next iteration top,
+    // then release every held lease on the way out.
+    //
+    // As with the SIGINT test we fire only the handler runMain newly installs
+    // (not vitest's own baseline SIGTERM listeners), to avoid tripping vitest's
+    // teardown.
+    const sigtermBaseline = process.listeners("SIGTERM");
+    const b = buildDeps({
+      iterationStartHook: (it) => {
+        if (it !== 1) return;
+        for (const l of process.listeners("SIGTERM")) {
+          if (!sigtermBaseline.includes(l)) {
+            (l as (sig: string) => void)("SIGTERM");
+          }
+        }
+      },
+    });
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "88", title: "smoke", branch: "agent/issue-88" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 88 }),
+      commits: [{ sha: "def456" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    // (a) The in-flight iteration was DRAINED, not abandoned: issue 88 shipped
+    // (its full pipeline ran) before the SIGTERM break took effect.
+    expect(result.shippedIssues).toEqual([88]);
+
+    // (b) On a genuine stop the shutdown-gated bulk release fires EXACTLY once
+    // (a single `finally`), so a peer reclaims immediately instead of waiting
+    // the 15-min TTL.
+    expect(b.state.leaseReleaseAllCalls).toBe(1);
+
+    // (c) The run surfaces as the distinct "stopped" terminal state.
+    const feed = readStatusFeed();
+    expect(feed.state).toBe("stopped");
+    expect(feed.issues.find((i) => i.number === 88)?.phase).toBe("merged");
     expect(feed.totals.merged).toBe(1);
   });
 
@@ -5925,6 +5993,10 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
       requeued: 0,
       running: 0,
     });
+    // ADR 0021 §4: a CLEAN finish is not a stop — the shutdown-gated bulk lease
+    // release must NOT fire (guards against dropping the `if (shuttingDown)`
+    // condition, which would hand off work on every normal exit / hot-reload).
+    expect(b.state.leaseReleaseAllCalls).toBe(0);
   });
 
   it("a HAS_BLOCKERS review records quarantined→needs-human with attention", async () => {
@@ -6004,6 +6076,106 @@ describe("resolveReviewBase", () => {
       "bbbb2222",
     );
     expect(reviewBase).toBe("bbbb2222~1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0021 §4 WIP-ref cleanup lifecycle — ship-path delete (hook 1) + startup
+// prune (hook 2). Both drive the exported helpers against a recording fake git
+// runner (no child_process). Assert the sync-flag gate (flag OFF touches NO
+// origin), best-effort logging, and — critically — the safety invariant that an
+// OPEN issue's WIP ref is NEVER pruned.
+// ---------------------------------------------------------------------------
+describe("cleanupShippedWipRefs (ADR 0021 §4 hook 1)", () => {
+  type Call = { cwd: string; args: string[] };
+  function makeFakeGit(responder: (args: string[]) => Partial<GitRunResult> = () => ({})) {
+    const calls: Call[] = [];
+    const git = async (cwd: string, ...args: string[]): Promise<GitRunResult> => {
+      calls.push({ cwd, args });
+      return { ok: true, stdout: "", stderr: "", ...responder(args) };
+    };
+    return { git, calls };
+  }
+
+  it("deletes the WIP ref for every merged issue when sync is ON", async () => {
+    const { git, calls } = makeFakeGit();
+    const errs: string[] = [];
+    await cleanupShippedWipRefs([7, 42], true, "/repo", git, (m) => errs.push(m));
+    const deletes = calls
+      .filter((c) => c.args[0] === "push")
+      .map((c) => c.args.find((a) => a.startsWith(":")));
+    expect(deletes).toEqual([
+      ":refs/sandcastle/wip/issue-7",
+      ":refs/sandcastle/wip/issue-42",
+    ]);
+    expect(errs).toEqual([]);
+  });
+
+  it("touches NO origin when sync is OFF (flag-off byte-for-byte)", async () => {
+    const { git, calls } = makeFakeGit();
+    await cleanupShippedWipRefs([7, 42], false, "/repo", git, () => {});
+    expect(calls).toEqual([]);
+  });
+
+  it("logs LOUD-but-non-fatal on a delete fault, never throws", async () => {
+    const { git } = makeFakeGit(() => ({ ok: false, stderr: "remote rejected" }));
+    const errs: string[] = [];
+    await expect(
+      cleanupShippedWipRefs([7], true, "/repo", git, (m) => errs.push(m)),
+    ).resolves.toBeUndefined();
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("#7");
+    expect(errs[0]).toContain("remote rejected");
+  });
+});
+
+describe("pruneStaleWipRefs (ADR 0021 §4 hook 2)", () => {
+  type Call = { cwd: string; args: string[] };
+  function makeFakeGit(responder: (args: string[]) => Partial<GitRunResult> = () => ({})) {
+    const calls: Call[] = [];
+    const git = async (cwd: string, ...args: string[]): Promise<GitRunResult> => {
+      calls.push({ cwd, args });
+      return { ok: true, stdout: "", stderr: "", ...responder(args) };
+    };
+    return { git, calls };
+  }
+  // Two WIP refs on origin: #7 (still OPEN, in-progress) and #42 (closed/merged).
+  const twoWipRefs = (args: string[]): Partial<GitRunResult> =>
+    args[0] === "ls-remote"
+      ? {
+          stdout:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/sandcastle/wip/issue-7\n" +
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/sandcastle/wip/issue-42\n",
+        }
+      : {};
+
+  it("deletes a closed issue's WIP ref but KEEPS an open issue's (safety invariant)", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    // #7 is OPEN (in-progress / checkpoint-stopped), #42 is not.
+    await pruneStaleWipRefs(true, [7], true, "/repo", git, () => {}, () => {});
+    const deletes = calls
+      .filter((c) => c.args[0] === "push")
+      .map((c) => c.args.find((a) => a.startsWith(":")));
+    // ONLY the closed issue #42 is pruned; the live #7 ref is untouched.
+    expect(deletes).toEqual([":refs/sandcastle/wip/issue-42"]);
+    expect(deletes).not.toContain(":refs/sandcastle/wip/issue-7");
+  });
+
+  it("REFUSES to prune when the open list may be truncated (never over-deletes)", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    const errs: string[] = [];
+    // openListComplete=false → skip entirely, even though #42 looks closed.
+    await pruneStaleWipRefs(true, [7], false, "/repo", git, () => {}, (m) => errs.push(m));
+    expect(calls.filter((c) => c.args[0] === "push")).toEqual([]);
+    expect(calls.filter((c) => c.args[0] === "ls-remote")).toEqual([]);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("truncated");
+  });
+
+  it("touches NO origin when sync is OFF", async () => {
+    const { git, calls } = makeFakeGit(twoWipRefs);
+    await pruneStaleWipRefs(false, [7], true, "/repo", git, () => {}, () => {});
+    expect(calls).toEqual([]);
   });
 });
 

@@ -543,6 +543,9 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async renewLeases() {
       // unused
     },
+    async releaseAllLeases() {
+      // unused
+    },
     async listIssuesByLabel(label) {
       state.listLabelCalls.push(label);
       if (!opts.listIssuesByLabel) return [];

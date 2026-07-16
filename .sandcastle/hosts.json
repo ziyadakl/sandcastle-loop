@@ -1,0 +1,6 @@
+{
+  "hosts": [
+    { "name": "local", "transport": "local", "maxConcurrent": 2 },
+    { "name": "hub", "transport": "hub", "maxConcurrent": 1, "repoPath": "/home/deploy/dev/sandcastle-loop" }
+  ]
+}

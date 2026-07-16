@@ -12,6 +12,11 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
 import { backendForModel } from "../providers.js";
+import {
+  wipRef,
+  resolveReuseDecision,
+  makeSyncGitRunner,
+} from "./state/index.js";
 
 const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
@@ -70,6 +75,16 @@ export interface MacHostSandboxOptions {
    * to `[promptFullPath]` (legacy positional seam) if a binary override is.
    */
   readonly buildArgs?: (spec: MacHostRunSpecBase) => readonly string[];
+  /**
+   * Cross-host sync opt-in (ADR 0021 §2 "branch reuse on pickup"). When true
+   * AND a WIP checkpoint ref exists on origin for an issue-shaped branch, the
+   * per-issue worktree is cut from that checkpoint instead of force-reset from
+   * HEAD. Defaults to `false` (undefined) — with it off the worktree-add path
+   * is byte-for-byte today's unconditional `-B <branch>` from HEAD, so a
+   * single-host consumer never fetches/ls-remotes a WIP ref. Threaded from
+   * `crossHostSyncEnabled()` via the provider factory.
+   */
+  readonly crossHostSync?: boolean;
 }
 
 export interface MacHostCreateSpec {
@@ -485,11 +500,44 @@ export function macHostSandbox(
     async createSandbox(spec) {
       const wtPath = absoluteWorktreePath(repoRoot, spec.branch);
       preCleanWorktree(repoRoot, wtPath);
-      execFileSync(
-        "git",
-        ["worktree", "add", "-B", spec.branch, wtPath],
-        { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
-      );
+      // ADR 0021 §2 branch reuse on pickup. When cross-host sync is on and a WIP
+      // checkpoint exists on origin for this issue, cut the worktree from that
+      // checkpoint tip (fetch + `-B <branch> FETCH_HEAD`) so the implementer
+      // continues the committed partial work. Otherwise — and ALWAYS when the
+      // flag is off — the existing unconditional `-B <branch>` from HEAD runs
+      // byte-for-byte unchanged (no fetch/ls-remote, no new git auth). The ref
+      // name is single-sourced from `wipRef`; existence from A2's `wipRefExists`
+      // via the canonical sync GitRunner adapter over execFileSync.
+      const gitRunner = makeSyncGitRunner();
+      // Decision (reuse vs fresh) is single-sourced in state/branch-checkpoint's
+      // resolveReuseDecision so this path and the docker path cannot diverge. It
+      // preserves the flag-FIRST short-circuit: with sync off (or a non-issue
+      // branch) it issues NO ls-remote/origin git — the inert-when-off contract.
+      // The materialization below stays mac-host-specific (worktree add from
+      // FETCH_HEAD) — only the decision is shared.
+      const r = await resolveReuseDecision({
+        syncEnabled: opts.crossHostSync ?? false,
+        branch: spec.branch,
+        repoRoot,
+        git: gitRunner,
+      });
+      if (r.reuse) {
+        execFileSync("git", ["fetch", "origin", wipRef(r.issue)], {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        execFileSync(
+          "git",
+          ["worktree", "add", "-B", spec.branch, wtPath, "FETCH_HEAD"],
+          { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+        );
+      } else {
+        execFileSync(
+          "git",
+          ["worktree", "add", "-B", spec.branch, wtPath],
+          { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+        );
+      }
       const forkSha = execFileSync(
         "git",
         ["rev-parse", "HEAD"],

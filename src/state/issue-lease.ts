@@ -505,6 +505,7 @@ export interface LeaseCoordinator {
   leaseState(n: number): Promise<"absent" | "live" | "expired">;
   fenceIssue(n: number): Promise<boolean>;
   renewLeases(): Promise<void>;
+  releaseAllLeases(): Promise<void>;
 }
 
 /**
@@ -642,6 +643,35 @@ export function createLeaseCoordinator(
             `[lease] FENCE — renewal CAS failed for issue #${n}: the lease was ` +
               `reclaimed by another host. This host no longer owns it.`,
           );
+        }
+      }
+    },
+    async releaseAllLeases() {
+      if (!leaseEnabled) return;
+      // Snapshot the keys up front: we mutate the registry while iterating, and
+      // a release for an issue we don't hold must never yank a peer's lease
+      // (mirrors releaseIssueLease's ownership guard — only registry keys here).
+      const held = [...leaseRegistry.keys()];
+      if (dryRun) {
+        // Log the intended bulk release and clear WITHOUT touching the remote,
+        // mirroring releaseIssueLease's dry-run branch.
+        dryLog("releaseAllLeases", held);
+        leaseRegistry.clear();
+        return;
+      }
+      // Best-effort: one failing release must NOT abort the rest, and every
+      // registry entry is dropped in a finally regardless (matching
+      // releaseIssueLease's finally) so a corrupt release never re-runs.
+      for (const n of held) {
+        try {
+          await releaseLease(n, lockDeps);
+        } catch (err) {
+          logError(
+            `[lease] releaseAllLeases: delete for issue #${n} failed (continuing, ` +
+              `entry dropped): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } finally {
+          leaseRegistry.delete(n);
         }
       }
     },
