@@ -93,6 +93,7 @@ export {
   wipRef,
   issueFromBranch,
   reuseOrFresh,
+  resolveReuseDecision,
   hasWorktreeChanges,
   commitWorktreeCheckpoint,
   pushWipRef,

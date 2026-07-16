@@ -14,9 +14,7 @@ import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js"
 import { backendForModel } from "../providers.js";
 import {
   wipRef,
-  wipRefExists,
-  reuseOrFresh,
-  issueFromBranch,
+  resolveReuseDecision,
   makeSyncGitRunner,
 } from "./state/index.js";
 
@@ -511,23 +509,20 @@ export function macHostSandbox(
       // name is single-sourced from `wipRef`; existence from A2's `wipRefExists`
       // via the canonical sync GitRunner adapter over execFileSync.
       const gitRunner = makeSyncGitRunner();
-      const issue = issueFromBranch(spec.branch);
-      // Short-circuit on the flag FIRST: when cross-host sync is off we must not
-      // touch origin at all (no ls-remote) — matching the inert-when-off
-      // contract that lease/lane/status sync all honor. wipRefExists (a network
-      // ls-remote) runs ONLY when the flag is on AND the branch is issue-shaped.
-      const syncEnabled = opts.crossHostSync ?? false;
-      const wipExists =
-        syncEnabled &&
-        issue !== null &&
-        (await wipRefExists(repoRoot, issue, gitRunner));
-      const decision = reuseOrFresh({
-        syncEnabled,
+      // Decision (reuse vs fresh) is single-sourced in state/branch-checkpoint's
+      // resolveReuseDecision so this path and the docker path cannot diverge. It
+      // preserves the flag-FIRST short-circuit: with sync off (or a non-issue
+      // branch) it issues NO ls-remote/origin git — the inert-when-off contract.
+      // The materialization below stays mac-host-specific (worktree add from
+      // FETCH_HEAD) — only the decision is shared.
+      const r = await resolveReuseDecision({
+        syncEnabled: opts.crossHostSync ?? false,
         branch: spec.branch,
-        wipExists,
+        repoRoot,
+        git: gitRunner,
       });
-      if (decision === "reuse" && issue !== null) {
-        execFileSync("git", ["fetch", "origin", wipRef(issue)], {
+      if (r.reuse) {
+        execFileSync("git", ["fetch", "origin", wipRef(r.issue)], {
           cwd: repoRoot,
           stdio: ["ignore", "pipe", "pipe"],
         });

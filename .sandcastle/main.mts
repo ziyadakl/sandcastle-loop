@@ -57,9 +57,7 @@ import {
   LaneSyncError,
   createStatusSync,
   wipRef,
-  wipRefExists,
-  reuseOrFresh,
-  issueFromBranch,
+  resolveReuseDecision,
 } from "./lib/state/index.js";
 import type { LockDeps, LaneSyncResult, PublishResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
@@ -3050,22 +3048,21 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     // fetch/ls-remote, no branch write, and the SDK's create is byte-for-byte
     // today's behavior. Cross-host git goes through the BOUNDED `runGitLease`
     // (same convention as lane/status sync) so a hung fetch can't wedge the loop.
-    const reuseIssue = issueFromBranch(spec.branch);
-    // Short-circuit on the flag FIRST so the flag-off path touches NO origin
-    // (no ls-remote) — matching the comment above and the inert-when-off
-    // contract of lease/lane/status sync. wipRefExists runs ONLY when sync is on.
-    const reuseSyncEnabled = crossHostSyncEnabled();
-    const reuseWipExists =
-      reuseSyncEnabled &&
-      reuseIssue !== null &&
-      (await wipRefExists(args.repoRoot, reuseIssue, runGitLease));
-    const reuseDecision = reuseOrFresh({
-      syncEnabled: reuseSyncEnabled,
+    // Decision (reuse vs fresh) is single-sourced in resolveReuseDecision so
+    // this docker path and the mac-host path cannot silently diverge. It keeps
+    // the flag-FIRST short-circuit — with sync off (or a non-issue branch) it
+    // touches NO origin (no ls-remote), the inert-when-off contract. The branch
+    // repoint below stays docker-specific (the SDK does the worktree add); only
+    // the decision is shared. Cross-host git still goes through BOUNDED
+    // runGitLease so a hung fetch can't wedge the loop.
+    const reuse = await resolveReuseDecision({
+      syncEnabled: crossHostSyncEnabled(),
       branch: spec.branch,
-      wipExists: reuseWipExists,
+      repoRoot: args.repoRoot,
+      git: runGitLease,
     });
-    if (reuseDecision === "reuse" && reuseIssue !== null) {
-      runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuseIssue));
+    if (reuse.reuse) {
+      runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuse.issue));
       runGitLease(
         args.repoRoot,
         "branch",

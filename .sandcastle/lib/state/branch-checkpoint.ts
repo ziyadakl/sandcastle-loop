@@ -54,6 +54,43 @@ export function reuseOrFresh(opts: {
 }
 
 /**
+ * Cross-cutting sandbox-creation decision (ADR 0021 §2 "branch reuse on
+ * pickup"), single-sourced for BOTH create paths (mac-host + docker) so the two
+ * cannot silently diverge. Answers: does this issue's worktree pick up a saved
+ * WIP checkpoint (`reuse`, carrying the resolved issue number) or start fresh?
+ *
+ * The flag-off short-circuit is load-bearing and comes FIRST: when
+ * `syncEnabled` is false (or the branch is not issue-shaped) `wipRefExists` is
+ * NEVER called, so no `ls-remote`/origin touch happens — the inert-when-off
+ * contract lease/lane/status sync all honor (a prior bug shipped an ls-remote
+ * on the off path). The discriminated return type-narrows `issue` for callers.
+ *
+ * Callers keep their OWN materialization (mac-host adds the worktree from
+ * `FETCH_HEAD`; docker repoints the branch and lets the SDK add) — only the
+ * decision is shared here.
+ */
+export async function resolveReuseDecision(opts: {
+  syncEnabled: boolean;
+  branch: string;
+  repoRoot: string;
+  git: GitRunner;
+}): Promise<{ reuse: true; issue: number } | { reuse: false }> {
+  const issue = issueFromBranch(opts.branch);
+  const wipExists =
+    opts.syncEnabled &&
+    issue !== null &&
+    (await wipRefExists(opts.repoRoot, issue, opts.git));
+  const decision = reuseOrFresh({
+    syncEnabled: opts.syncEnabled,
+    branch: opts.branch,
+    wipExists,
+  });
+  return decision === "reuse" && issue !== null
+    ? { reuse: true, issue }
+    : { reuse: false };
+}
+
+/**
  * True iff the worktree at `wtPath` has uncommitted changes — i.e. `git status
  * --porcelain` prints at least one non-blank line. The single gate that keeps
  * {@link commitWorktreeCheckpoint} from ever making an empty commit.
