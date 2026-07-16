@@ -23,7 +23,7 @@
  * it is tested entirely offline against a real local bare repo.
  */
 
-import type { GitRunner } from "./issue-lease.js";
+import { EMPTY_TREE_OID, type GitRunner } from "./issue-lease.js";
 import { SandcastleStatusSchema, type SandcastleStatus } from "../status/schema.js";
 
 /** Options for a status-sync handle bound to one repo + one host identity. */
@@ -37,14 +37,6 @@ export interface StatusSyncOpts {
   /** Remote to publish/discover status on (default "origin"). */
   readonly remote?: string;
 }
-
-/**
- * The well-known SHA-1 of git's empty tree. Every status-commit points at it —
- * the snapshot carries no tree content, only its message. Avoids a `hash-object`
- * round trip and is stable across all git installs. (issue-lease.ts defines the
- * same constant privately; it is not exported, so it is re-declared here.)
- */
-const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** Remote ref a given host's published status lives at. */
 function statusRef(hostId: string): string {

@@ -249,7 +249,7 @@ export interface GitLockBackendOpts {
  * a lock carries no content, only its message. Avoids a `hash-object` round
  * trip and is stable across all git installs.
  */
-const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+export const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** Ref name a given issue's lease lives at. */
 function lockRef(issue: number): string {
