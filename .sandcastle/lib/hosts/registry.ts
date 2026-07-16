@@ -20,6 +20,14 @@ export interface HostConfig {
   readonly transport: "local" | (string & {});
   /** Per-host concurrency cap; must be an integer >= 1. */
   readonly maxConcurrent: number;
+  /**
+   * Absolute path to the repo checkout ON that host. REQUIRED for remote hosts
+   * (transport !== "local"): a non-interactive `ssh <alias>` lands in the login
+   * dir, not the checkout, so every remote gate command must `cd` here first
+   * (see {@link buildRemoteCommand} in ./launch.ts). Irrelevant for local hosts,
+   * which use the local process cwd (the repo root) instead — omitted/ignored.
+   */
+  readonly repoPath?: string;
 }
 
 /**
@@ -84,7 +92,7 @@ export function parseHostsConfig(raw: string): HostConfig[] {
       throw new Error(`hosts config entry #${i} must be an object`);
     }
 
-    const { name, transport, maxConcurrent } = entry;
+    const { name, transport, maxConcurrent, repoPath } = entry;
 
     if (typeof name !== "string" || name.trim() === "") {
       throw new Error(
@@ -114,7 +122,29 @@ export function parseHostsConfig(raw: string): HostConfig[] {
       );
     }
 
-    configs.push({ name, transport, maxConcurrent });
+    // repoPath: if present it must be a non-empty string; REQUIRED for remote
+    // hosts (transport !== "local"), optional + ignored for the local host.
+    if (repoPath !== undefined) {
+      if (typeof repoPath !== "string" || repoPath.trim() === "") {
+        throw new Error(
+          `hosts config entry "${name}" has an invalid "repoPath" ` +
+            `(must be a non-empty string if present, got ${JSON.stringify(repoPath)})`,
+        );
+      }
+    }
+    const isRemote = transport !== "local";
+    if (isRemote && (typeof repoPath !== "string" || repoPath.trim() === "")) {
+      throw new Error(
+        `host "${name}" is remote (transport "${transport}") but has no repoPath ` +
+          `— set the absolute path to the repo checkout on that host`,
+      );
+    }
+
+    configs.push(
+      isRemote
+        ? { name, transport, maxConcurrent, repoPath: repoPath as string }
+        : { name, transport, maxConcurrent },
+    );
   });
 
   if (localCount > 1) {

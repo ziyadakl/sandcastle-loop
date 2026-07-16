@@ -5,6 +5,7 @@ import type { HostConfig } from "../.sandcastle/lib/hosts/registry.js";
 import {
   runLaunch,
   buildLaunchCommand,
+  buildRemoteCommand,
   isLaunchMode,
   type LaunchDeps,
   type LaunchSpec,
@@ -267,6 +268,52 @@ describe("runLaunch launch command", () => {
   it("includes --resume in the launch command for a resume action", async () => {
     const cmd = buildLaunchCommand(LOCAL, { ...RUN_SPEC, action: "resume" });
     expect(cmd).toContain("--resume");
+  });
+});
+
+describe("buildRemoteCommand shell quoting", () => {
+  it("cd's to the shell-quoted repoPath then joins the shell-quoted argv", () => {
+    const cmd = buildRemoteCommand("/home/deploy/repo", ["git", "status", "--porcelain"]);
+    expect(cmd).toBe("cd '/home/deploy/repo' && 'git' 'status' '--porcelain'");
+  });
+
+  it("quotes a repoPath containing spaces", () => {
+    const cmd = buildRemoteCommand("/home/dev/my repo", ["true"]);
+    expect(cmd).toBe("cd '/home/dev/my repo' && 'true'");
+  });
+
+  it("escapes embedded single quotes with the '\\'' idiom", () => {
+    const cmd = buildRemoteCommand("/r", ["echo", "it's a test"]);
+    // each ' becomes '\'' — closing the quote, an escaped literal ', reopening
+    expect(cmd).toBe("cd '/r' && 'echo' 'it'\\''s a test'");
+  });
+
+  it("passes double quotes, $, && and newlines through literally inside single quotes", () => {
+    const cmd = buildRemoteCommand("/r", ['echo "a" && b', "$PWD\nfoo"]);
+    expect(cmd).toBe("cd '/r' && 'echo \"a\" && b' '$PWD\nfoo'");
+  });
+
+  it("round-trips a realistic multi-line bash -lc script element", () => {
+    const script = "for pid in $(pgrep -f x); do\n  echo \"$pid\"\ndone";
+    const cmd = buildRemoteCommand("/r", ["bash", "-lc", script]);
+    expect(cmd).toBe(`cd '/r' && 'bash' '-lc' '${script}'`);
+  });
+
+  it("reconstructs the original argv when the string is parsed by a POSIX shell", () => {
+    // Prove shq escaping is correct: feed the quoted-argv tail to `sh -c` with a
+    // printf that emits one line per positional param, and assert we get the
+    // original argv back verbatim (embedded quotes, $, spaces, newlines).
+    const argv = ["bash", "-lc", 'echo PWD=$PWD; printf %s "a b"  c', "it's \"x\"", "a$b&&c"];
+    const quoted = buildRemoteCommand("/tmp", argv).replace(/^cd '\/tmp' && /, "");
+    const res = spawnSync(
+      "sh",
+      ["-c", `printf '%s\\n' ${quoted}`],
+      { encoding: "utf8" },
+    );
+    expect(res.status).toBe(0);
+    // printf emits each positional arg on its own line; the argv had no newline
+    // elements here, so splitting on \n recovers the original argv exactly.
+    expect(res.stdout.split("\n").slice(0, argv.length)).toEqual(argv);
   });
 });
 

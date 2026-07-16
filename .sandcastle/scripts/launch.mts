@@ -20,6 +20,7 @@ import { isLocalHost, loadHostsConfig, type HostConfig } from "../lib/hosts/regi
 import { formatHostResults, type HostResult } from "../lib/hosts/result.js";
 import {
   runLaunch,
+  buildRemoteCommand,
   isLaunchMode,
   LAUNCH_MODES,
   type ExecResult,
@@ -96,18 +97,34 @@ function parseArgs(argv: string[]): Args {
 
 /**
  * The real transport: run `argv` on `host`. Local hosts spawn the argv directly
- * in the repo root; remote hosts go over `ssh <transport> -- <argv>` (the alias
- * is expected to carry the remote checkout path via its ssh config / RemoteCommand,
- * or the caller's login shell lands in it). Never throws — a spawn failure maps
- * to `{ ok: false }` so the gate can classify it.
+ * in the repo root (the process cwd). Remote hosts go over
+ * `ssh <transport> "<cmd>"` where `<cmd>` is a SINGLE shell-command string built
+ * by {@link buildRemoteCommand}: `cd '<host.repoPath>' && <shell-quoted argv>`.
+ * This is required because (a) a non-interactive ssh lands in the login dir, not
+ * the checkout — so we `cd` into `host.repoPath` (from the registry) first — and
+ * (b) `ssh <alias> -- a b c` space-joins the args and the remote shell re-parses
+ * them, which mangles any multi-line argv element; shell-quoting each element
+ * makes it reconstruct argv exactly. Never throws — a spawn/exec failure maps to
+ * `{ ok: false }` so the gate can classify it.
  */
 function makeRealExec(repoRoot: string): LaunchDeps["exec"] {
   return async (host: HostConfig, argv: string[]): Promise<ExecResult> => {
     const local = isLocalHost(host);
-    const [cmd, ...rest] = local ? argv : ["ssh", host.transport, "--", ...argv];
+    let cmd: string;
+    let rest: string[];
+    let cwd: string | undefined;
+    if (local) {
+      cmd = argv[0];
+      rest = argv.slice(1);
+      cwd = repoRoot;
+    } else {
+      cmd = "ssh";
+      rest = [host.transport, buildRemoteCommand(host.repoPath!, argv)];
+      cwd = undefined;
+    }
     try {
       const { stdout, stderr } = await execFileAsync(cmd, rest, {
-        cwd: local ? repoRoot : undefined,
+        cwd,
         maxBuffer: 8 * 1024 * 1024,
       });
       return { ok: true, stdout, stderr };

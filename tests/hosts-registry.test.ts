@@ -15,19 +15,19 @@ describe("parseHostsConfig", () => {
   it("parses a bare array of valid entries", () => {
     const raw = JSON.stringify([
       { name: "local", transport: "local", maxConcurrent: 2 },
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/repo" },
     ]);
     const cfg = parseHostsConfig(raw);
     expect(cfg).toEqual<HostConfig[]>([
       { name: "local", transport: "local", maxConcurrent: 2 },
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/repo" },
     ]);
   });
 
   it("parses the { hosts: [...] } wrapper form to the same result", () => {
     const arr = [
       { name: "local", transport: "local", maxConcurrent: 2 },
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/repo" },
     ];
     const fromArray = parseHostsConfig(JSON.stringify(arr));
     const fromWrapper = parseHostsConfig(JSON.stringify({ hosts: arr }));
@@ -54,8 +54,8 @@ describe("parseHostsConfig", () => {
 
   it("throws naming a duplicate name", () => {
     const raw = JSON.stringify([
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
-      { name: "hub", transport: "hub2", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/a" },
+      { name: "hub", transport: "hub2", maxConcurrent: 1, repoPath: "/srv/b" },
     ]);
     expect(() => parseHostsConfig(raw)).toThrow(/duplicate/i);
   });
@@ -69,14 +69,14 @@ describe("parseHostsConfig", () => {
 
   it("throws when maxConcurrent is 0", () => {
     const raw = JSON.stringify([
-      { name: "hub", transport: "hub", maxConcurrent: 0 },
+      { name: "hub", transport: "hub", maxConcurrent: 0, repoPath: "/srv/a" },
     ]);
     expect(() => parseHostsConfig(raw)).toThrow(/maxConcurrent/i);
   });
 
   it("throws when maxConcurrent is not an integer", () => {
     const raw = JSON.stringify([
-      { name: "hub", transport: "hub", maxConcurrent: 1.5 },
+      { name: "hub", transport: "hub", maxConcurrent: 1.5, repoPath: "/srv/a" },
     ]);
     expect(() => parseHostsConfig(raw)).toThrow(/maxConcurrent/i);
   });
@@ -91,10 +91,47 @@ describe("parseHostsConfig", () => {
 
   it("allows zero local hosts (all remote)", () => {
     const raw = JSON.stringify([
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
-      { name: "hub2", transport: "hub2", maxConcurrent: 3 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/a" },
+      { name: "hub2", transport: "hub2", maxConcurrent: 3, repoPath: "/srv/b" },
     ]);
     expect(() => parseHostsConfig(raw)).not.toThrow();
+  });
+
+  it("requires repoPath for a remote host and names it in the error", () => {
+    const raw = JSON.stringify([
+      { name: "hub", transport: "hub", maxConcurrent: 1 },
+    ]);
+    expect(() => parseHostsConfig(raw)).toThrow(/hub.*repoPath/i);
+  });
+
+  it("rejects a blank repoPath on a remote host", () => {
+    const raw = JSON.stringify([
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "  " },
+    ]);
+    expect(() => parseHostsConfig(raw)).toThrow(/repoPath/i);
+  });
+
+  it("carries repoPath through for a remote host", () => {
+    const raw = JSON.stringify([
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/home/deploy/repo" },
+    ]);
+    expect(parseHostsConfig(raw)).toEqual<HostConfig[]>([
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/home/deploy/repo" },
+    ]);
+  });
+
+  it("does NOT require repoPath for a local host (ignored)", () => {
+    const raw = JSON.stringify([
+      { name: "local", transport: "local", maxConcurrent: 2 },
+    ]);
+    expect(() => parseHostsConfig(raw)).not.toThrow();
+  });
+
+  it("rejects a non-string repoPath", () => {
+    const raw = JSON.stringify([
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: 42 },
+    ]);
+    expect(() => parseHostsConfig(raw)).toThrow(/repoPath/i);
   });
 });
 
@@ -110,11 +147,11 @@ describe("loadHostsConfig", () => {
 
   it("parses the injected file contents when readFile succeeds", () => {
     const raw = JSON.stringify([
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/repo" },
     ]);
     const cfg = loadHostsConfig("/whatever", () => raw);
     expect(cfg).toEqual<HostConfig[]>([
-      { name: "hub", transport: "hub", maxConcurrent: 1 },
+      { name: "hub", transport: "hub", maxConcurrent: 1, repoPath: "/srv/repo" },
     ]);
   });
 });
@@ -130,6 +167,11 @@ describe("seeded .sandcastle/hosts.json", () => {
       transport: "local",
       maxConcurrent: 2,
     });
-    expect(hub).toEqual({ name: "hub", transport: "hub", maxConcurrent: 1 });
+    expect(hub).toEqual({
+      name: "hub",
+      transport: "hub",
+      maxConcurrent: 1,
+      repoPath: "/home/deploy/dev/sandcastle-loop",
+    });
   });
 });

@@ -103,6 +103,30 @@ export function buildLaunchCommand(host: HostConfig, spec: LaunchSpec): string {
 }
 
 /**
+ * POSIX single-quote shell escape: wrap `s` in single quotes, and rewrite each
+ * embedded single quote as `'\''` (close-quote, an escaped literal quote,
+ * reopen-quote). Inside single quotes every other byte — spaces, `$`, `&&`,
+ * double quotes, newlines — is literal, so the result reconstructs `s` exactly
+ * when the remote POSIX shell re-parses it.
+ */
+function shq(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Build the SINGLE shell-command string handed to `ssh <alias> "<cmd>"` for a
+ * remote host: `cd <shq(repoPath)> && <argv.map(shq).join(" ")>`. A
+ * non-interactive `ssh <alias>` lands in the login dir, so we `cd` into the
+ * host's repo checkout first; and because ssh space-joins its args and the
+ * remote shell re-parses them, every argv element is shell-quoted so a
+ * multi-line element (the pgrep script, or a `bash -lc '<script>'` launch)
+ * round-trips instead of being mangled.
+ */
+export function buildRemoteCommand(repoPath: string, argv: readonly string[]): string {
+  return `cd ${shq(repoPath)} && ${argv.map(shq).join(" ")}`;
+}
+
+/**
  * The cwd-filtered pgrep from the sandcastle-stop skill, run ON the host over
  * exec. It is project-scoped: a bare `pgrep .sandcastle/main.mts` matches EVERY
  * repo's loop on the machine, so we keep only pids whose working directory is
