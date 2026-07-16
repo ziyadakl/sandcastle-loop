@@ -72,6 +72,7 @@ import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, 
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
+import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
 import {
   applyMigrationsBetween,
   listMigrationsOnDisk,
@@ -840,11 +841,12 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   // not the lease then host-suffixes `branch` — so it doubles as the shared
   // `runId`. Computed once (one `detectBranchOr` call at most) and handed to
   // {@link deriveRunBranchAndId}, which owns the runId/branch rule.
-  const derivedBranch =
-    values.branch ?? detectBranchOr("HEAD");
+  // `deriveRunBranchAndId` early-returns on an explicit `--branch` and never
+  // reads `derived`, so the `??` short-circuit means `detectBranchOr("HEAD")`
+  // only runs on the auto-derived path (no separate pre-decided intermediate).
   const { branch, runId } = deriveRunBranchAndId(
     values.branch,
-    derivedBranch,
+    values.branch ?? detectBranchOr("HEAD"),
     crossHostLeaseEnabled(),
     resolveHostId(),
   );
@@ -916,39 +918,6 @@ function parsePositiveInt(raw: unknown, flag: string): number | null {
  * Best-effort detection of the current git branch. Returns `fallback` if `git`
  * is unavailable or the repo is in a detached state.
  */
-/**
- * Derive the run's git `branch` and its shared `runId` from the raw inputs.
- *
- * RULE (ADR 0019 / Task S2): hosts cooperating on ONE shared queue must derive
- * the SAME `runId` so a cross-host viewer folds their snapshots, while each
- * host's `branch` stays distinct so two hosts never push the same run branch
- * and clobber each other.
- *
- * - explicit `--branch` (`explicitBranch` set): the operator's word — `branch`
- *   and `runId` are both that value, never suffixed (even with the lease ON).
- * - auto-derived + lease OFF: `branch === runId === derived` (byte-for-byte
- *   legacy behavior).
- * - auto-derived + lease ON: `branch` is host-suffixed (`<derived>-<hostId>`)
- *   but `runId` is the bare `derived` name shared across hosts.
- *
- * Pure and fully injectable (no git / env / os reads) so the rule is unit
- * tested directly.
- */
-export function deriveRunBranchAndId(
-  explicitBranch: string | undefined,
-  derived: string,
-  leaseEnabled: boolean,
-  hostId: string,
-): { branch: string; runId: string } {
-  if (explicitBranch !== undefined) {
-    return { branch: explicitBranch, runId: explicitBranch };
-  }
-  return {
-    branch: leaseEnabled ? `${derived}-${hostId}` : derived,
-    runId: derived,
-  };
-}
-
 function detectBranchOr(fallback: string): string {
   try {
     const out = execFileSync(
@@ -3266,37 +3235,6 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
     log,
     logError: logErr,
   };
-}
-
-/**
- * Cross-host STATUS SYNC — ONE deterministic pass (Task S5, ADR 0020). Called
- * once per iteration from the `syncEnabled` hook in `runMain` (the 30s
- * lease-heartbeat timer would never fire in a fast run/test, so the per-loop
- * call is the deterministic trigger). Publishes THIS host's own snapshot to its
- * status ref, fetches same-run peers, and folds them into the LOCAL status.json
- * (via `statusStore.setPeers`) so a viewer sees one fused, host-tagged loop.
- *
- * Observability ONLY: every step FAILS SOFT. `deps.publishStatus` /
- * `deps.fetchStatusPeers` never throw (fail-soft lives inside status-sync.ts),
- * and a `{ ok: false }` publish is logged then execution STILL reaches the fetch
- * + fold — a publish glitch must not stop this host from SHOWING its peers.
- * Never called on the flag-off path.
- */
-export async function syncStatusOnce(
-  statusStore: StatusStore,
-  deps: Pick<Deps, "publishStatus" | "fetchStatusPeers" | "logError">,
-): Promise<void> {
-  // `snapshot()` is own-only (no `peers` key) — that is what we PUBLISH, so
-  // peers never re-fold each other's folds.
-  const ownSnapshot = statusStore.snapshot();
-  const pub = await deps.publishStatus(JSON.stringify(ownSnapshot));
-  if (!pub.ok) {
-    deps.logError(
-      `[status] publish failed: ${pub.error ?? "(no detail)"} — continuing`,
-    );
-  }
-  const peers = await deps.fetchStatusPeers(ownSnapshot.runId);
-  statusStore.setPeers(peers);
 }
 
 // ---------------------------------------------------------------------------

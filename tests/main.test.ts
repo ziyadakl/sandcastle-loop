@@ -38,7 +38,6 @@ import {
   parseBlockedBy,
   buildBlockedByNote,
   parseSandcastleArgs,
-  deriveRunBranchAndId,
   preflight,
   loadDotenv,
   isTransientServerError,
@@ -63,7 +62,6 @@ import {
   runGitLeaseRetrying,
   isTransientLeaseGitFailure,
   buildDefaultDeps,
-  syncStatusOnce,
   type GitRunResult,
   WRITE_PROJECT_DOTENV_COMMAND,
   REGISTER_CONTEXT7_MCP_COMMAND,
@@ -79,6 +77,10 @@ import {
   type SandboxHandle,
   type PlanIssue,
 } from "../.sandcastle/main.mjs";
+import {
+  deriveRunBranchAndId,
+  syncStatusOnce,
+} from "../.sandcastle/lib/status/run-sync.js";
 import {
   MissingRequiredSkillsError,
   validateRequiredSkillsInvoked,
