@@ -57,7 +57,7 @@ import {
   LaneSyncError,
   createStatusSync,
 } from "./lib/state/index.js";
-import type { LockDeps, LaneSyncResult } from "./lib/state/index.js";
+import type { LockDeps, LaneSyncResult, PublishResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
 // it, so the lease lifetime (lockDeps.ttlSec, in buildDefaultDeps) and the
@@ -517,7 +517,7 @@ export interface Deps {
    * cosmetic telemetry — a publish fault surfaces as `{ ok: false, error }` for
    * the caller to log, never as a crash.
    */
-  publishStatus(snapshotJson: string): Promise<{ ok: boolean; error?: string }>;
+  publishStatus(snapshotJson: string): Promise<PublishResult>;
   /**
    * Cross-host STATUS SYNC (Task S5, ADR 0020) — discover every same-`runId`
    * PEER host's published status snapshot so the caller can fold them into the

@@ -56,8 +56,16 @@ function peerStatusRef(peer: string): string {
 /** Prefix of the status ref namespace, used to parse `ls-remote` output. */
 const STATUS_PREFIX = "refs/sandcastle/status/";
 
+/**
+ * The fail-soft outcome of a status `publish`: `ok` on success, or `ok: false`
+ * with a human-readable `error`. Distinct from issue-lease's `{ ok; oid? }` and
+ * drizzle's `{ ok; msg }` — those carry different payloads and must not be
+ * conflated with this cosmetic-telemetry result.
+ */
+export type PublishResult = { ok: boolean; error?: string };
+
 export function createStatusSync(opts: StatusSyncOpts): {
-  publish(snapshotJson: string): Promise<{ ok: boolean; error?: string }>;
+  publish(snapshotJson: string): Promise<PublishResult>;
   fetchPeers(runId: string): Promise<SandcastleStatus[]>;
 } {
   const remote = opts.remote ?? "origin";
@@ -74,7 +82,7 @@ export function createStatusSync(opts: StatusSyncOpts): {
    */
   async function publish(
     snapshotJson: string,
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<PublishResult> {
     try {
       // -c user.* keeps commit-tree from failing on hosts without a git identity.
       const commit = await run(
