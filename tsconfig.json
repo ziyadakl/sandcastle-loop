@@ -15,5 +15,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*", "tests/**/*", ".sandcastle/**/*.mts", ".sandcastle/**/*.ts", ".sandcastle/**/*.tsx", "bin/**/*.mts"],
-  "exclude": ["archive/**"]
+  "exclude": ["archive/**", ".sandcastle/worktrees/**", ".claude/worktrees/**"]
 }
