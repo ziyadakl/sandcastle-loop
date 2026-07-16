@@ -1,12 +1,18 @@
 import { describe, it, expect } from "vitest";
+import { spawnSync } from "node:child_process";
+import * as path from "node:path";
 import type { HostConfig } from "../.sandcastle/lib/hosts/registry.js";
 import {
   runLaunch,
   buildLaunchCommand,
+  isLaunchMode,
   type LaunchDeps,
   type LaunchSpec,
   type ExecResult,
 } from "../.sandcastle/lib/hosts/launch.js";
+
+const REPO_ROOT = path.resolve(__dirname, "..");
+const RUNNER = path.join(REPO_ROOT, ".sandcastle/scripts/launch.mts");
 
 const LOCAL: HostConfig = { name: "local", transport: "local", maxConcurrent: 2 };
 const REMOTE: HostConfig = { name: "hub", transport: "hub", maxConcurrent: 1 };
@@ -29,6 +35,8 @@ function classify(argv: string[]): string {
   }
   if (a0 === "git" && a1 === "status") return "status";
   if (a0 === "git" && a1 === "fetch") return "fetch";
+  if (a0 === "git" && a1 === "rev-parse") return "rev-parse";
+  if (a0 === "git" && a1 === "checkout") return "checkout";
   if (a0 === "git" && a1 === "merge") return "merge";
   if (a0 === "git" && a1 === "symbolic-ref") return "symbolic-ref";
   if (a0 === "gh" && a1 === "auth") return "gh-auth";
@@ -53,6 +61,8 @@ function makeExec(overrides: Partial<Record<string, ExecResult>> = {}): {
     pgrep: { ok: true, stdout: "", stderr: "" }, // no surviving pid -> not running
     status: { ok: true, stdout: "", stderr: "" }, // clean tree
     fetch: { ok: true, stdout: "", stderr: "" },
+    "rev-parse": { ok: true, stdout: "abc123", stderr: "" }, // local run branch exists
+    checkout: { ok: true, stdout: "", stderr: "" },
     merge: { ok: true, stdout: "Fast-forward", stderr: "" },
     "symbolic-ref": { ok: true, stdout: "sandcastle/theme-20260716", stderr: "" },
     "gh-auth": { ok: true, stdout: "Logged in", stderr: "" },
@@ -117,6 +127,86 @@ describe("runLaunch safety gate", () => {
     expect(res.outcome).toBe("preflight-error");
   });
 
+  it("checks out the run branch when it EXISTS locally, ff-merges onto it, then launches", async () => {
+    // host was sitting on `main`; the run branch exists locally.
+    const { deps, calls } = makeExec();
+    const res = await runLaunch(LOCAL, RUN_SPEC, deps);
+    expect(res.outcome).toBe("launched");
+    // it verified local existence, checked out the run branch, THEN ff-merged
+    expect(keys(calls)).toEqual([
+      "reachable",
+      "pgrep",
+      "status",
+      "fetch",
+      "rev-parse",
+      "checkout",
+      "merge",
+      "symbolic-ref",
+      "gh-auth",
+      "gh-issue",
+      "launch",
+    ]);
+    const checkout = calls.find((c) => c.key === "checkout")!;
+    // a plain checkout of the existing branch — NOT a -b create, NOT a reset
+    expect(checkout.argv).toEqual(["git", "checkout", "sandcastle/theme-20260716"]);
+    const flat = calls.flatMap((c) => c.argv);
+    expect(flat).not.toContain("reset");
+    expect(flat).not.toContain("pull");
+  });
+
+  it("creates the run branch at the fetched tip when it is ABSENT locally, then launches", async () => {
+    const { deps, calls } = makeExec({
+      "rev-parse": { ok: false, stdout: "", stderr: "" }, // branch not present locally
+    });
+    const res = await runLaunch(LOCAL, RUN_SPEC, deps);
+    expect(res.outcome).toBe("launched");
+    // no ff-merge step — the branch is created directly at FETCH_HEAD
+    expect(keys(calls)).toEqual([
+      "reachable",
+      "pgrep",
+      "status",
+      "fetch",
+      "rev-parse",
+      "checkout",
+      "symbolic-ref",
+      "gh-auth",
+      "gh-issue",
+      "launch",
+    ]);
+    const checkout = calls.find((c) => c.key === "checkout")!;
+    expect(checkout.argv).toEqual([
+      "git",
+      "checkout",
+      "-b",
+      "sandcastle/theme-20260716",
+      "FETCH_HEAD",
+    ]);
+    const flat = calls.flatMap((c) => c.argv);
+    expect(flat).not.toContain("reset");
+  });
+
+  it("returns diverged when the local run branch cannot fast-forward, and never launches", async () => {
+    const { deps, calls } = makeExec({
+      merge: { ok: false, stdout: "", stderr: "Not possible to fast-forward" },
+    });
+    const res = await runLaunch(LOCAL, RUN_SPEC, deps);
+    expect(res.outcome).toBe("diverged");
+    expect(keys(calls)).not.toContain("launch");
+    const flat = calls.flatMap((c) => c.argv);
+    expect(flat).not.toContain("reset");
+    expect(flat).not.toContain("pull");
+  });
+
+  it("returns preflight-error when HEAD ends up on the wrong branch after the update", async () => {
+    const { deps } = makeExec({
+      "symbolic-ref": { ok: true, stdout: "main", stderr: "" }, // still on main
+    });
+    const res = await runLaunch(LOCAL, RUN_SPEC, deps);
+    expect(res.outcome).toBe("preflight-error");
+    expect(res.detail).toContain("main");
+    expect(res.detail).toContain("sandcastle/theme-20260716");
+  });
+
   it("returns auth-failed when gh auth status fails, and does not launch", async () => {
     const { deps, calls } = makeExec({ "gh-auth": { ok: false, stdout: "", stderr: "not logged in" } });
     const res = await runLaunch(LOCAL, RUN_SPEC, deps);
@@ -135,6 +225,8 @@ describe("runLaunch launch command", () => {
       "pgrep",
       "status",
       "fetch",
+      "rev-parse",
+      "checkout",
       "merge",
       "symbolic-ref",
       "gh-auth",
@@ -175,6 +267,29 @@ describe("runLaunch launch command", () => {
   it("includes --resume in the launch command for a resume action", async () => {
     const cmd = buildLaunchCommand(LOCAL, { ...RUN_SPEC, action: "resume" });
     expect(cmd).toContain("--resume");
+  });
+});
+
+describe("LaunchMode", () => {
+  it("accepts the four canonical modes and rejects anything else", () => {
+    for (const m of ["claude", "codex", "kimi", "glm"]) {
+      expect(isLaunchMode(m)).toBe(true);
+    }
+    expect(isLaunchMode("bogus")).toBe(false);
+    expect(isLaunchMode("")).toBe(false);
+    expect(isLaunchMode("anthropic")).toBe(false);
+  });
+});
+
+describe("launch.mts runner --mode validation", () => {
+  it("rejects an unknown --mode with a clear error and a non-zero exit", () => {
+    const res = spawnSync("npx", ["tsx", RUNNER, "--branch", "x", "--mode", "bogus"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain("--mode");
+    expect(res.stderr).toContain("bogus");
   });
 });
 

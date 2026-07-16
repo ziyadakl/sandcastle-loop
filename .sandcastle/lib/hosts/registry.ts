@@ -11,10 +11,25 @@ export interface HostConfig {
   /**
    * "local" means this machine; any other value is an ssh alias (e.g. "hub")
    * used to reach a remote host.
+   *
+   * `string & {}` keeps the `"local"` literal alive for autocomplete/intent
+   * without collapsing the whole type to bare `string` (which is what plain
+   * `"local" | string` would widen to). Use {@link isLocalHost} for the
+   * local-vs-ssh decision rather than comparing this field inline.
    */
-  readonly transport: "local" | string;
+  readonly transport: "local" | (string & {});
   /** Per-host concurrency cap; must be an integer >= 1. */
   readonly maxConcurrent: number;
+}
+
+/**
+ * The single canonical local-vs-remote predicate. A host is "local" (this
+ * machine, spawn argv directly) iff its transport is exactly `"local"`; any
+ * other value is an ssh alias reached over `ssh <alias> -- <argv>`. Keeping
+ * this in one place means the launch surface never re-derives the rule inline.
+ */
+export function isLocalHost(host: HostConfig): boolean {
+  return host.transport === "local";
 }
 
 /** Default config used when no hosts file exists: a single local host. */

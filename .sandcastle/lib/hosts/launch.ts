@@ -11,8 +11,25 @@
 // real exec (local spawn vs `ssh <alias> -- <argv>`) lives in the thin
 // ../scripts/launch.mts runner, mirroring the check-upstream.ts / .mts split.
 
-import type { HostConfig } from "./registry.js";
+import { isLocalHost, type HostConfig } from "./registry.js";
 import type { HostOutcome, HostResult } from "./result.js";
+
+/**
+ * The fixed set of agent modes a launch may request. `claude` (the default
+ * Anthropic backend), `codex` (OpenAI backend, ADR 0012), and the two
+ * claude-backend endpoint overrides `kimi` / `glm` (see providers.ts). This is
+ * the launch surface's own axis — the skills ask the user for one of these four
+ * and pass it through as `--mode`; it is deliberately distinct from the
+ * narrower `AgentBackend` (claude|codex) and `ProviderName` (anthropic|kimi|glm)
+ * types, neither of which covers this exact set.
+ */
+export const LAUNCH_MODES = ["claude", "codex", "kimi", "glm"] as const;
+export type LaunchMode = (typeof LAUNCH_MODES)[number];
+
+/** Type guard: is `s` one of the four canonical launch modes? */
+export function isLaunchMode(s: string): s is LaunchMode {
+  return (LAUNCH_MODES as readonly string[]).includes(s);
+}
 
 /** Result of running one argv on a host. Mirrors main.mts runGit's shape. */
 export interface ExecResult {
@@ -33,7 +50,7 @@ export interface LaunchDeps {
 
 export interface LaunchSpec {
   readonly branch: string;
-  readonly mode: string;
+  readonly mode: LaunchMode;
   readonly iterations: number;
   readonly base?: string;
   readonly action: "run" | "resume";
@@ -79,7 +96,7 @@ function wrapperInvocation(host: HostConfig, spec: LaunchSpec): string {
 export function buildLaunchCommand(host: HostConfig, spec: LaunchSpec): string {
   const wrapper = wrapperInvocation(host, spec);
   const log = logPath(host);
-  if (host.transport === "local") {
+  if (isLocalHost(host)) {
     return `nohup ${wrapper} > ${log} 2>&1 </dev/null & disown`;
   }
   return `PATH="$PWD/node_modules/.bin:$PATH" setsid nohup ${wrapper} > ${log} 2>&1 </dev/null &`;
@@ -110,10 +127,20 @@ function skip(host: HostConfig, outcome: HostOutcome, detail?: string): HostResu
  *   1. reachable        — `true`; not ok -> `unreachable`
  *   2. not-running      — cwd-filtered pgrep; a surviving pid -> `already-running`
  *   3. clean tree       — `git status --porcelain`; non-empty -> `dirty-tree`
- *   4. ff-only update   — `git fetch origin <branch>` + `git merge --ff-only
- *                         FETCH_HEAD`; non-ff -> `diverged`. Then re-verify
- *                         attachment via `git symbolic-ref --short HEAD`
- *                         (ADR 0016); detached -> `preflight-error`.
+ *   4. ff-only update   — leave the host checked out ON `<branch>`, fast-
+ *                         forwarded to origin's tip, WITHOUT ever force-resetting
+ *                         (never pull, never reset — ff-only). `git fetch origin
+ *                         <branch>` (fetch fails -> `diverged`); then if the
+ *                         local branch exists (`git rev-parse --verify --quiet
+ *                         refs/heads/<branch>`), `git checkout <branch>` + `git
+ *                         merge --ff-only FETCH_HEAD` (non-ff -> `diverged`); if
+ *                         it is absent locally, `git checkout -b <branch>
+ *                         FETCH_HEAD` (create at the fetched tip — no reset).
+ *                         Then re-verify HEAD is attached AND equals `<branch>`
+ *                         via `git symbolic-ref --short HEAD` (ADR 0016);
+ *                         detached OR wrong branch -> `preflight-error`. Step 3
+ *                         already guaranteed a clean tree, so `git checkout` is
+ *                         safe.
  *   5. auth             — `gh auth status` + `gh issue list -L 1`; either fails
  *                         -> `auth-failed`. No token is EVER forwarded — the
  *                         host uses its own credentials.
@@ -146,16 +173,39 @@ export async function runLaunch(
       return skip(host, "dirty-tree");
     }
 
-    // 4. fast-forward-only update — never pull, never reset
+    // 4. fast-forward-only update — never pull, never reset. Leave the host
+    //    checked out ON spec.branch, fast-forwarded to origin's tip.
     const fetch = await deps.exec(host, ["git", "fetch", "origin", spec.branch]);
     if (!fetch.ok) return skip(host, "diverged", fetch.stderr.trim() || "fetch failed");
-    const merge = await deps.exec(host, ["git", "merge", "--ff-only", "FETCH_HEAD"]);
-    if (!merge.ok) return skip(host, "diverged", merge.stderr.trim() || undefined);
 
-    // re-verify HEAD is still attached to a branch after the update (ADR 0016)
+    const localExists = await deps.exec(host, [
+      "git", "rev-parse", "--verify", "--quiet", `refs/heads/${spec.branch}`,
+    ]);
+    if (localExists.ok) {
+      // Local branch exists: check it out, then ff-only merge origin's tip onto
+      // it. Step 3 guaranteed a clean tree, so the checkout can't lose work.
+      const checkout = await deps.exec(host, ["git", "checkout", spec.branch]);
+      if (!checkout.ok) {
+        return skip(host, "preflight-error", checkout.stderr.trim() || `checkout ${spec.branch} failed`);
+      }
+      const merge = await deps.exec(host, ["git", "merge", "--ff-only", "FETCH_HEAD"]);
+      if (!merge.ok) return skip(host, "diverged", merge.stderr.trim() || undefined);
+    } else {
+      // Absent locally: create the branch at the fetched tip — no reset.
+      const checkout = await deps.exec(host, ["git", "checkout", "-b", spec.branch, "FETCH_HEAD"]);
+      if (!checkout.ok) {
+        return skip(host, "preflight-error", checkout.stderr.trim() || `checkout -b ${spec.branch} failed`);
+      }
+    }
+
+    // re-verify HEAD is attached AND equals spec.branch after the update (ADR 0016)
     const symref = await deps.exec(host, ["git", "symbolic-ref", "--short", "HEAD"]);
-    if (!symref.ok || symref.stdout.trim() === "") {
+    const head = symref.stdout.trim();
+    if (!symref.ok || head === "") {
       return skip(host, "preflight-error", "HEAD is detached after update");
+    }
+    if (head !== spec.branch) {
+      return skip(host, "preflight-error", `HEAD is ${head} after update, expected ${spec.branch}`);
     }
 
     // 5. auth — host uses its OWN gh credentials; never forward a token

@@ -16,12 +16,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { loadHostsConfig, type HostConfig } from "../lib/hosts/registry.js";
+import { isLocalHost, loadHostsConfig, type HostConfig } from "../lib/hosts/registry.js";
 import { formatHostResults, type HostResult } from "../lib/hosts/result.js";
 import {
   runLaunch,
+  isLaunchMode,
+  LAUNCH_MODES,
   type ExecResult,
   type LaunchDeps,
+  type LaunchMode,
   type LaunchSpec,
 } from "../lib/hosts/launch.js";
 import { discoverInflightRun } from "../lib/state/inflight-discovery.js";
@@ -40,7 +43,7 @@ interface Args {
   dryRun: boolean;
   action: "run" | "resume";
   branch?: string;
-  mode: string;
+  mode: LaunchMode;
   iterations: number;
   base?: string;
 }
@@ -72,7 +75,11 @@ function parseArgs(argv: string[]): Args {
         args.branch = next();
         break;
       case "--mode":
-        args.mode = next();
+        {
+          const v = next();
+          if (!isLaunchMode(v)) fail(`--mode must be ${LAUNCH_MODES.join("|")}, got ${v}`);
+          args.mode = v;
+        }
         break;
       case "--iterations":
         args.iterations = Number(next());
@@ -96,11 +103,11 @@ function parseArgs(argv: string[]): Args {
  */
 function makeRealExec(repoRoot: string): LaunchDeps["exec"] {
   return async (host: HostConfig, argv: string[]): Promise<ExecResult> => {
-    const [cmd, ...rest] =
-      host.transport === "local" ? argv : ["ssh", host.transport, "--", ...argv];
+    const local = isLocalHost(host);
+    const [cmd, ...rest] = local ? argv : ["ssh", host.transport, "--", ...argv];
     try {
       const { stdout, stderr } = await execFileAsync(cmd, rest, {
-        cwd: host.transport === "local" ? repoRoot : undefined,
+        cwd: local ? repoRoot : undefined,
         maxBuffer: 8 * 1024 * 1024,
       });
       return { ok: true, stdout, stderr };
