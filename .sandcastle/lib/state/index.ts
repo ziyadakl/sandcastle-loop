@@ -99,3 +99,11 @@ export {
   wipRefExists,
   deleteWipRef,
 } from "./branch-checkpoint.js";
+
+// Canonical GitRunner adapters (Quality #2 dedup) — the single home for the
+// async (execFileAsync) and sync (execFileSync) git shell-out shapes the three
+// former inline `makeGitRunner()` / `gitRunner` adapters hand-rolled.
+export {
+  makeExecFileGitRunner,
+  makeSyncGitRunner,
+} from "./git-runner-adapter.js";

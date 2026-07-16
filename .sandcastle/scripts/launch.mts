@@ -25,7 +25,7 @@ import {
   type LaunchSpec,
 } from "../lib/hosts/launch.js";
 import { discoverInflightRun } from "../lib/state/inflight-discovery.js";
-import type { GitRunner, GitRunResult } from "../lib/state/issue-lease.js";
+import { makeExecFileGitRunner } from "../lib/state/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -111,22 +111,6 @@ function makeRealExec(repoRoot: string): LaunchDeps["exec"] {
   };
 }
 
-/** A GitRunner over the local repo, for resume discovery. */
-function makeGitRunner(): GitRunner {
-  return async (cwd: string, ...gitArgs: string[]): Promise<GitRunResult> => {
-    try {
-      const { stdout, stderr } = await execFileAsync("git", gitArgs, {
-        cwd,
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      return { ok: true, stdout, stderr };
-    } catch (err) {
-      const e = err as { stdout?: string; stderr?: string };
-      return { ok: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
-    }
-  };
-}
-
 async function main(): Promise<void> {
   const repoRoot = process.cwd();
   const args = parseArgs(process.argv.slice(2));
@@ -146,7 +130,7 @@ async function main(): Promise<void> {
   // For resume, pre-fill the branch from the in-flight run discovered on origin.
   let branch = args.branch;
   if (args.action === "resume" && !branch) {
-    const inflight = await discoverInflightRun(makeGitRunner(), repoRoot);
+    const inflight = await discoverInflightRun(makeExecFileGitRunner(), repoRoot);
     if (!inflight) fail("resume: no in-flight run found across hosts (nothing to resume)");
     branch = inflight.branch;
   }

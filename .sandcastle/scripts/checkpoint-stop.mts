@@ -12,16 +12,12 @@
  * mirroring the launch.ts / launch.mts and check-upstream.ts / .mts split.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { resolveHostId } from "../lib/host-id.js";
 import {
   checkpointStop,
   formatCheckpointStop,
 } from "../lib/state/checkpoint-stop.js";
-import type { GitRunner, GitRunResult } from "../lib/state/issue-lease.js";
-
-const execFileAsync = promisify(execFile);
+import { makeExecFileGitRunner } from "../lib/state/index.js";
 
 function fail(msg: string): never {
   console.error(`sandcastle:checkpoint-stop: ${msg}`);
@@ -63,26 +59,10 @@ function parseArgs(argv: string[]): Args {
   return { repoRoot, integrationBranch, remote };
 }
 
-/** The real git backend: shell out, mirroring issue-lease's backend runner. */
-function makeGitRunner(): GitRunner {
-  return async (cwd: string, ...gitArgs: string[]): Promise<GitRunResult> => {
-    try {
-      const { stdout, stderr } = await execFileAsync("git", gitArgs, {
-        cwd,
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      return { ok: true, stdout, stderr };
-    } catch (err) {
-      const e = err as { stdout?: string; stderr?: string };
-      return { ok: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
-    }
-  };
-}
-
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const hostId = resolveHostId();
-  const results = await checkpointStop(makeGitRunner(), {
+  const results = await checkpointStop(makeExecFileGitRunner(), {
     repoRoot: args.repoRoot,
     hostId,
     integrationBranch: args.integrationBranch,

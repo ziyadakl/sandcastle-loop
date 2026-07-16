@@ -12,12 +12,12 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
 import { backendForModel } from "../providers.js";
-import type { GitRunner, GitRunResult } from "./state/index.js";
 import {
   wipRef,
   wipRefExists,
   reuseOrFresh,
   issueFromBranch,
+  makeSyncGitRunner,
 } from "./state/index.js";
 
 const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
@@ -509,31 +509,8 @@ export function macHostSandbox(
       // flag is off — the existing unconditional `-B <branch>` from HEAD runs
       // byte-for-byte unchanged (no fetch/ls-remote, no new git auth). The ref
       // name is single-sourced from `wipRef`; existence from A2's `wipRefExists`
-      // via a GitRunner adapter over this module's execFileSync style.
-      const gitRunner: GitRunner = (cwd, ...gitArgs): GitRunResult => {
-        try {
-          const stdout = execFileSync("git", gitArgs, {
-            cwd,
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-          return { ok: true, stdout: stdout.trim(), stderr: "" };
-        } catch (err) {
-          const e = err as Error & {
-            stderr?: Buffer | string;
-            stdout?: Buffer | string;
-          };
-          const stderr =
-            typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? "");
-          const stdout =
-            typeof e.stdout === "string" ? e.stdout : (e.stdout?.toString() ?? "");
-          return {
-            ok: false,
-            stdout: stdout.trim(),
-            stderr: stderr.trim() || e.message,
-          };
-        }
-      };
+      // via the canonical sync GitRunner adapter over execFileSync.
+      const gitRunner = makeSyncGitRunner();
       const issue = issueFromBranch(spec.branch);
       // Short-circuit on the flag FIRST: when cross-host sync is off we must not
       // touch origin at all (no ls-remote) — matching the inert-when-off
