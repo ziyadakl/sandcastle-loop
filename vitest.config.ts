@@ -7,6 +7,7 @@ export default defineConfig({
       "**/node_modules/**",
       "**/dist/**",
       ".claude/worktrees/**",
+      ".sandcastle/worktrees/**",
       "archive/**",
     ],
   },
