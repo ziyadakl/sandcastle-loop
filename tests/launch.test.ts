@@ -11,6 +11,7 @@ import {
   type LaunchSpec,
   type ExecResult,
 } from "../.sandcastle/lib/hosts/launch.js";
+import { parseSandcastleArgs } from "../.sandcastle/main.mjs";
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RUNNER = path.join(REPO_ROOT, ".sandcastle/scripts/launch.mts");
@@ -243,6 +244,19 @@ describe("runLaunch launch command", () => {
     expect(script).not.toContain("setsid"); // macOS has no setsid
   });
 
+  it("local launch prefixes the node_modules PATH so a non-global tsx resolves", () => {
+    // The local exec runs with cwd = repoRoot (scripts/launch.mts), so
+    // $PWD/node_modules/.bin is where the vendored `tsx` lives. Without the
+    // prefix a bare `tsx` dies "command not found" when it isn't installed
+    // globally — the live-dogfood bug this guards.
+    const cmd = buildLaunchCommand(LOCAL, RUN_SPEC);
+    expect(cmd).toContain('PATH="$PWD/node_modules/.bin:$PATH"');
+    // still the macOS detach form — no setsid
+    expect(cmd).toContain("nohup");
+    expect(cmd).toContain("disown");
+    expect(cmd).not.toContain("setsid");
+  });
+
   it("launches on a remote host: uses setsid + the node_modules PATH prefix and the host's concurrency", async () => {
     const { deps, calls } = makeExec();
     const res = await runLaunch(REMOTE, RUN_SPEC, deps);
@@ -269,6 +283,63 @@ describe("runLaunch launch command", () => {
     const cmd = buildLaunchCommand(LOCAL, { ...RUN_SPEC, action: "resume" });
     expect(cmd).toContain("--resume");
   });
+});
+
+describe("buildLaunchCommand mode → main.mts flag translation", () => {
+  // main.mts's parseSandcastleArgs is strict:true and has NO --mode option, so
+  // the wrapper must emit the flags main.mts actually understands, not --mode.
+  const cases: ReadonlyArray<[LaunchSpec["mode"], string]> = [
+    ["claude", "--backend claude"],
+    ["codex", "--backend codex"],
+    ["kimi", "--provider kimi"],
+    ["glm", "--provider glm"],
+  ];
+
+  for (const [mode, expected] of cases) {
+    it(`emits ${JSON.stringify(expected)} for mode ${mode} and never a --mode flag`, () => {
+      const cmd = buildLaunchCommand(LOCAL, { ...RUN_SPEC, mode });
+      expect(cmd).toContain(expected);
+      expect(cmd).not.toContain("--mode");
+    });
+  }
+});
+
+describe("launcher output ↔ main.mts parser contract", () => {
+  // Integration guard the string-only unit tests can't give: drive the flags
+  // the launcher actually emits through the REAL parseSandcastleArgs. A drift
+  // between the launcher and main.mts's strict option set (e.g. the old --mode)
+  // fails HERE even if every string assertion above still passes.
+
+  /** Pull the wrapper argv out of a built launch command. */
+  function wrapperFlags(cmd: string): string[] {
+    const after = cmd.split("sandcastle-wrapper.sh ")[1];
+    const flags = after.split(" > ")[0].trim();
+    return flags.split(/\s+/);
+  }
+
+  const cases: ReadonlyArray<
+    [LaunchSpec["mode"], "claude" | "codex", string | undefined]
+  > = [
+    ["claude", "claude", undefined],
+    ["codex", "codex", undefined],
+    ["kimi", "claude", "kimi"],
+    ["glm", "claude", "glm"],
+  ];
+
+  for (const [mode, backend, provider] of cases) {
+    it(`mode ${mode} parses into backend=${backend} provider=${provider} without throwing`, () => {
+      const cmd = buildLaunchCommand(LOCAL, { ...RUN_SPEC, mode });
+      const flags = wrapperFlags(cmd);
+      // sanity: the launcher must NOT emit --mode (main.mts would reject it)
+      expect(flags).not.toContain("--mode");
+      let parsed!: ReturnType<typeof parseSandcastleArgs>;
+      expect(() => {
+        parsed = parseSandcastleArgs(flags);
+      }).not.toThrow();
+      expect(parsed.args.backend).toBe(backend);
+      expect(parsed.args.provider).toBe(provider);
+    });
+  }
 });
 
 describe("buildRemoteCommand shell quoting", () => {

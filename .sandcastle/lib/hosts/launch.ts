@@ -19,9 +19,11 @@ import type { HostOutcome, HostResult } from "./result.js";
  * Anthropic backend), `codex` (OpenAI backend, ADR 0012), and the two
  * claude-backend endpoint overrides `kimi` / `glm` (see providers.ts). This is
  * the launch surface's own axis — the skills ask the user for one of these four
- * and pass it through as `--mode`; it is deliberately distinct from the
- * narrower `AgentBackend` (claude|codex) and `ProviderName` (anthropic|kimi|glm)
- * types, neither of which covers this exact set.
+ * and the launcher's `scripts/launch.mts` takes it as `--mode`; `modeFlag`
+ * below then translates it into the `--backend`/`--provider` flags main.mts
+ * actually accepts (main.mts has no `--mode` option). It is deliberately
+ * distinct from the narrower `AgentBackend` (claude|codex) and `ProviderName`
+ * (anthropic|kimi|glm) types, neither of which covers this exact set.
  */
 export const LAUNCH_MODES = ["claude", "codex", "kimi", "glm"] as const;
 export type LaunchMode = (typeof LAUNCH_MODES)[number];
@@ -70,7 +72,7 @@ function logPath(host: HostConfig): string {
 function wrapperInvocation(host: HostConfig, spec: LaunchSpec): string {
   const flags = [
     `--branch ${spec.branch}`,
-    `--mode ${spec.mode}`,
+    modeFlag(spec.mode),
     `--iterations ${spec.iterations}`,
     `--max-concurrent ${host.maxConcurrent}`,
   ];
@@ -80,15 +82,48 @@ function wrapperInvocation(host: HostConfig, spec: LaunchSpec): string {
 }
 
 /**
+ * Translate a {@link LaunchMode} into the flag(s) `main.mts`'s
+ * `parseSandcastleArgs` actually accepts. main.mts is `parseArgs({ strict:true })`
+ * with NO `--mode` option — emitting `--mode <x>` makes the loop die with
+ * "Unknown option '--mode'" (the live-dogfood bug this closes). The four launch
+ * modes map to main.mts's own axes (main.mts:665-791):
+ *   - `claude` / `codex` → the `--backend` agent-backend switch (ADR 0012)
+ *   - `kimi`   / `glm`   → the claude-backend `--provider` endpoint override
+ * The exhaustive `switch` with a `never` default fails to compile if a fifth
+ * LaunchMode is ever added, forcing this map to stay in lock-step.
+ */
+function modeFlag(mode: LaunchMode): string {
+  switch (mode) {
+    case "claude":
+      return "--backend claude";
+    case "codex":
+      return "--backend codex";
+    case "kimi":
+      return "--provider kimi";
+    case "glm":
+      return "--provider glm";
+    default: {
+      const _exhaustive: never = mode;
+      throw new Error(`unhandled launch mode: ${String(_exhaustive)}`);
+    }
+  }
+}
+
+/**
  * Build the exact detached launch command string for `host`. The detach form
  * differs by transport:
  *
  * - local (macOS): `nohup <wrapper> > <log> 2>&1 </dev/null & disown` — NO
  *   `setsid` (it does not exist on macOS and mis-parses into a double launch).
  * - remote (ssh): the remote Linux shell reaps children when ssh closes, so it
- *   MUST `setsid nohup <wrapper> … </dev/null &` to survive the disconnect;
- *   prefixed with `PATH="$PWD/node_modules/.bin:$PATH"` because a
- *   non-interactive ssh shell has a minimal PATH and bare `tsx` won't resolve.
+ *   MUST `setsid nohup <wrapper> … </dev/null &` to survive the disconnect.
+ *
+ * BOTH forms are prefixed with `PATH="$PWD/node_modules/.bin:$PATH"`: a
+ * non-interactive ssh shell has a minimal PATH, and a local shell may lack a
+ * global `tsx` install, so the vendored `node_modules/.bin/tsx` must be on PATH
+ * for the bare `tsx` in the wrapper to resolve. The local exec runs with
+ * cwd = repoRoot (scripts/launch.mts), so `$PWD/node_modules/.bin` is correct
+ * for local too.
  *
  * This is returned verbatim in `HostResult.detail` for `--dry-run`, so it is the
  * single source of truth for both the dry-run preview and the real exec.
@@ -97,7 +132,7 @@ export function buildLaunchCommand(host: HostConfig, spec: LaunchSpec): string {
   const wrapper = wrapperInvocation(host, spec);
   const log = logPath(host);
   if (isLocalHost(host)) {
-    return `nohup ${wrapper} > ${log} 2>&1 </dev/null & disown`;
+    return `PATH="$PWD/node_modules/.bin:$PATH" nohup ${wrapper} > ${log} 2>&1 </dev/null & disown`;
   }
   return `PATH="$PWD/node_modules/.bin:$PATH" setsid nohup ${wrapper} > ${log} 2>&1 </dev/null &`;
 }
