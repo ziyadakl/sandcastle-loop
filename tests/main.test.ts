@@ -162,6 +162,7 @@ interface MockState {
   leaseReleases: number[];
   leaseStateCalls: number[];
   leaseRenews: number;
+  leaseReleaseAllCalls: number;
   leaseFences: number[];
   // Cross-host LANE SYNC (ADR 0019, Task B) — record every sync/publish call so
   // the flag-off invariant (must be EMPTY) and the two-loop E2E can be asserted
@@ -198,6 +199,7 @@ function newState(): MockState {
     leaseReleases: [],
     leaseStateCalls: [],
     leaseRenews: 0,
+    leaseReleaseAllCalls: 0,
     leaseFences: [],
     syncLanesCalls: [],
     publishLaneCalls: [],
@@ -395,6 +397,9 @@ function buildDeps(opts: {
     },
     async renewLeases() {
       state.leaseRenews += 1;
+    },
+    async releaseAllLeases() {
+      state.leaseReleaseAllCalls += 1;
     },
     async fenceIssue(n) {
       state.leaseFences.push(n);
@@ -4566,6 +4571,7 @@ function makeNoopDeps(): Deps {
     releaseIssueLease: unused,
     leaseState: unused,
     renewLeases: unused,
+    releaseAllLeases: unused,
     fenceIssue: unused,
     syncLanes: unused,
     publishLane: unused,
@@ -5884,6 +5890,11 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
     // Iteration 1 completed and shipped before the interrupt took effect.
     expect(result.shippedIssues).toEqual([71]);
 
+    // ADR 0021 §4: a genuine stop (SIGINT here) releases every held lease on the
+    // way out so a peer reclaims immediately instead of waiting the TTL. The
+    // shutdown-gated `deps.releaseAllLeases()` must have fired.
+    expect(b.state.leaseReleaseAllCalls).toBeGreaterThanOrEqual(1);
+
     const feed = readStatusFeed();
     // The interrupt must surface as a distinct terminal state so the viewer
     // shows "stopped", not a false "done — loop finished".
@@ -5925,6 +5936,10 @@ describe("sandcastle-loop main.mts — status.json feed (execution-level)", () =
       requeued: 0,
       running: 0,
     });
+    // ADR 0021 §4: a CLEAN finish is not a stop — the shutdown-gated bulk lease
+    // release must NOT fire (guards against dropping the `if (shuttingDown)`
+    // condition, which would hand off work on every normal exit / hot-reload).
+    expect(b.state.leaseReleaseAllCalls).toBe(0);
   });
 
   it("a HAS_BLOCKERS review records quarantined→needs-human with attention", async () => {

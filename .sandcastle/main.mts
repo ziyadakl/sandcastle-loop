@@ -482,6 +482,12 @@ export interface Deps {
    */
   renewLeases(): Promise<void>;
   /**
+   * Release every lease this host currently holds by deleting its ref, so a peer
+   * can reclaim those issues immediately rather than waiting out the TTL. OFF:
+   * no-op. Called on a genuine stop (SIGINT/SIGTERM) shutdown — ADR 0021 §4.
+   */
+  releaseAllLeases(): Promise<void>;
+  /**
    * Fix 3 (ADR 0019): inline-CAS fence, called SYNCHRONOUSLY immediately before
    * an actual ship/promote push. OFF: always `true`, no git. ON: re-asserts this
    * host's lease for `issueNum` via a live renewal CAS — `true` if we still hold
@@ -7049,6 +7055,23 @@ export async function runMain(
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     process.off("SIGINT", sigintHandler);
     process.off("SIGTERM", sigtermHandler);
+    // On a genuine stop (SIGINT/SIGTERM), release every lease this host still
+    // holds so a peer can reclaim those issues immediately instead of waiting
+    // out the 15-min TTL (ADR 0021 §4). Gated on `shuttingDown` so a hot-reload
+    // (exit 75) or circuit-breaker error return does NOT hand off mid-work —
+    // those restart/return on the SAME host. No-op when the lease is off.
+    // Best-effort: a failed release self-heals via the TTL, so it must never
+    // mask the real exit.
+    if (shuttingDown) {
+      try {
+        await deps.releaseAllLeases();
+      } catch (err) {
+        deps.logError(
+          `releaseAllLeases on shutdown failed: ${(err as Error).message} ` +
+            `(leases will auto-expire via TTL)`,
+        );
+      }
+    }
     if (releaseLoopLock) {
       try {
         await releaseLoopLock();
