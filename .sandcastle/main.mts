@@ -56,6 +56,10 @@ import {
   createLaneSync,
   LaneSyncError,
   createStatusSync,
+  wipRef,
+  wipRefExists,
+  reuseOrFresh,
+  issueFromBranch,
 } from "./lib/state/index.js";
 import type { LockDeps, LaneSyncResult, PublishResult } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
@@ -2878,7 +2882,10 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
   // provider.createSandbox uniformly. Docker-only construction config (hooks,
   // copyToWorktree, completionSignal, copyToWorktreeMs) is baked into the
   // adapter and ignored on the mac-host path.
-  const provider: SandboxProvider = buildSandboxProvider(args, containerEnv, {
+  const provider: SandboxProvider = buildSandboxProvider(
+    { ...args, crossHostSync: crossHostSyncEnabled() },
+    containerEnv,
+    {
     hooks: dockerHooks,
     copyToWorktree,
     copyToWorktreeMs: 600_000,
@@ -2886,7 +2893,8 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       "<promise>COMPLETE</promise>",
       "<promise>HALT</promise>",
     ],
-  });
+    },
+  );
 
   const dryLog = (action: string, ...rest: unknown[]): void => {
     process.stderr.write(
@@ -3025,6 +3033,34 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // `hasUncommittedChanges` runs `git status` inside the now-
       // missing path. The error surfaces — just not through
       // `worktree add`.
+    }
+
+    // ADR 0021 §2 branch reuse on pickup (docker path). When cross-host sync is
+    // on and a WIP checkpoint exists on origin for this issue, fetch it and
+    // point the local per-issue branch at that tip BEFORE the SDK's
+    // `git worktree add <path> <branch>` — which reuses an existing branch's tip
+    // — so the worktree is cut from the committed partial work. When the flag is
+    // off (or no checkpoint, or a non-issue branch) NOTHING new runs: no
+    // fetch/ls-remote, no branch write, and the SDK's create is byte-for-byte
+    // today's behavior. Cross-host git goes through the BOUNDED `runGitLease`
+    // (same convention as lane/status sync) so a hung fetch can't wedge the loop.
+    const reuseIssue = issueFromBranch(spec.branch);
+    const reuseDecision = reuseOrFresh({
+      syncEnabled: crossHostSyncEnabled(),
+      branch: spec.branch,
+      wipExists:
+        reuseIssue !== null &&
+        (await wipRefExists(args.repoRoot, reuseIssue, runGitLease)),
+    });
+    if (reuseDecision === "reuse" && reuseIssue !== null) {
+      runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuseIssue));
+      runGitLease(
+        args.repoRoot,
+        "branch",
+        "-f",
+        spec.branch,
+        "FETCH_HEAD",
+      );
     }
 
     // Work around the SDK bug where createSandbox hardcodes

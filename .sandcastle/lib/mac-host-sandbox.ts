@@ -12,6 +12,13 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
 import { backendForModel } from "../providers.js";
+import type { GitRunner, GitRunResult } from "./state/index.js";
+import {
+  wipRef,
+  wipRefExists,
+  reuseOrFresh,
+  issueFromBranch,
+} from "./state/index.js";
 
 const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
@@ -70,6 +77,16 @@ export interface MacHostSandboxOptions {
    * to `[promptFullPath]` (legacy positional seam) if a binary override is.
    */
   readonly buildArgs?: (spec: MacHostRunSpecBase) => readonly string[];
+  /**
+   * Cross-host sync opt-in (ADR 0021 §2 "branch reuse on pickup"). When true
+   * AND a WIP checkpoint ref exists on origin for an issue-shaped branch, the
+   * per-issue worktree is cut from that checkpoint instead of force-reset from
+   * HEAD. Defaults to `false` (undefined) — with it off the worktree-add path
+   * is byte-for-byte today's unconditional `-B <branch>` from HEAD, so a
+   * single-host consumer never fetches/ls-remotes a WIP ref. Threaded from
+   * `crossHostSyncEnabled()` via the provider factory.
+   */
+  readonly crossHostSync?: boolean;
 }
 
 export interface MacHostCreateSpec {
@@ -485,11 +502,62 @@ export function macHostSandbox(
     async createSandbox(spec) {
       const wtPath = absoluteWorktreePath(repoRoot, spec.branch);
       preCleanWorktree(repoRoot, wtPath);
-      execFileSync(
-        "git",
-        ["worktree", "add", "-B", spec.branch, wtPath],
-        { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
-      );
+      // ADR 0021 §2 branch reuse on pickup. When cross-host sync is on and a WIP
+      // checkpoint exists on origin for this issue, cut the worktree from that
+      // checkpoint tip (fetch + `-B <branch> FETCH_HEAD`) so the implementer
+      // continues the committed partial work. Otherwise — and ALWAYS when the
+      // flag is off — the existing unconditional `-B <branch>` from HEAD runs
+      // byte-for-byte unchanged (no fetch/ls-remote, no new git auth). The ref
+      // name is single-sourced from `wipRef`; existence from A2's `wipRefExists`
+      // via a GitRunner adapter over this module's execFileSync style.
+      const gitRunner: GitRunner = (cwd, ...gitArgs): GitRunResult => {
+        try {
+          const stdout = execFileSync("git", gitArgs, {
+            cwd,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          return { ok: true, stdout: stdout.trim(), stderr: "" };
+        } catch (err) {
+          const e = err as Error & {
+            stderr?: Buffer | string;
+            stdout?: Buffer | string;
+          };
+          const stderr =
+            typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? "");
+          const stdout =
+            typeof e.stdout === "string" ? e.stdout : (e.stdout?.toString() ?? "");
+          return {
+            ok: false,
+            stdout: stdout.trim(),
+            stderr: stderr.trim() || e.message,
+          };
+        }
+      };
+      const issue = issueFromBranch(spec.branch);
+      const decision = reuseOrFresh({
+        syncEnabled: opts.crossHostSync ?? false,
+        branch: spec.branch,
+        wipExists:
+          issue !== null && (await wipRefExists(repoRoot, issue, gitRunner)),
+      });
+      if (decision === "reuse" && issue !== null) {
+        execFileSync("git", ["fetch", "origin", wipRef(issue)], {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        execFileSync(
+          "git",
+          ["worktree", "add", "-B", spec.branch, wtPath, "FETCH_HEAD"],
+          { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+        );
+      } else {
+        execFileSync(
+          "git",
+          ["worktree", "add", "-B", spec.branch, wtPath],
+          { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+        );
+      }
       const forkSha = execFileSync(
         "git",
         ["rev-parse", "HEAD"],

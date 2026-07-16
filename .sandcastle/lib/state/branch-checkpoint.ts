@@ -23,6 +23,37 @@ export function wipRef(issue: number): string {
 }
 
 /**
+ * Extract the issue number from a per-issue sandbox branch of the form
+ * `agent/issue-<N>` (the name minted at main.mts:5895). Returns the parsed
+ * number, or `null` when the branch is not issue-shaped (e.g. a run/integration
+ * branch) — the resume path must fall back to a fresh worktree in that case,
+ * never guess a WIP ref for a branch that has none.
+ */
+export function issueFromBranch(branch: string): number | null {
+  const m = /^agent\/issue-(\d+)$/.exec(branch);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Pure decision for sandbox creation (ADR 0021 §2 "branch reuse on pickup"):
+ * should this issue's worktree be cut from a saved WIP checkpoint (`reuse`) or
+ * force-reset from HEAD as today (`fresh`)?
+ *
+ * Returns `"reuse"` ONLY when cross-host sync is enabled, a WIP ref exists on
+ * origin, AND the branch is issue-shaped. Every other combination — sync off, no
+ * checkpoint, or a non-issue branch — yields `"fresh"`, so the flag-off path is
+ * byte-for-byte today's unconditional `-B` behavior.
+ */
+export function reuseOrFresh(opts: {
+  syncEnabled: boolean;
+  branch: string;
+  wipExists: boolean;
+}): "reuse" | "fresh" {
+  const issueShaped = issueFromBranch(opts.branch) !== null;
+  return opts.syncEnabled && opts.wipExists && issueShaped ? "reuse" : "fresh";
+}
+
+/**
  * True iff the worktree at `wtPath` has uncommitted changes — i.e. `git status
  * --porcelain` prints at least one non-blank line. The single gate that keeps
  * {@link commitWorktreeCheckpoint} from ever making an empty commit.
