@@ -6,7 +6,11 @@
  * host-tagged + deduped + sorted + capped merged history, and input immutability.
  */
 import { describe, it, expect } from "vitest";
-import { foldPeers, MAX_MERGED_HISTORY } from "../.sandcastle/lib/status/merge.js";
+import {
+  foldPeers,
+  sumTotalsAcrossHosts,
+  MAX_MERGED_HISTORY,
+} from "../.sandcastle/lib/status/merge.js";
 import {
   SandcastleStatusSchema,
   STATUS_SCHEMA_VERSION,
@@ -200,5 +204,58 @@ describe("foldPeers", () => {
     expect(own.history).toBe(ownHistoryRef); // same array reference untouched
     expect(own.history).toEqual(ownHistorySnapshot); // contents unchanged
     expect(peer).toEqual(peerSnapshot); // peer object fully unchanged
+  });
+});
+
+describe("sumTotalsAcrossHosts", () => {
+  it("no peers => returns own totals unchanged (same reference)", () => {
+    const own = makeStatus({
+      totals: { merged: 2, needsHuman: 1, requeued: 0, running: 3 },
+    });
+    // foldPeers with no peers leaves top-level totals own-only and omits peers.
+    const folded = foldPeers(own, []);
+    expect(folded.peers).toBeUndefined();
+    expect(sumTotalsAcrossHosts(folded)).toBe(folded.totals);
+  });
+
+  it("field-wise sums own + each peer's totals across every key", () => {
+    const own = makeStatus({
+      hostId: "host-a",
+      totals: { merged: 2, needsHuman: 1, requeued: 0, running: 3 },
+    });
+    const peerA = makeStatus({
+      hostId: "host-b",
+      totals: { merged: 3, needsHuman: 0, requeued: 2, running: 1 },
+    });
+    const peerB = makeStatus({
+      hostId: "host-c",
+      totals: { merged: 5, needsHuman: 4, requeued: 1, running: 0 },
+    });
+
+    const fused = sumTotalsAcrossHosts(foldPeers(own, [peerA, peerB]));
+
+    expect(fused).toEqual({
+      merged: 2 + 3 + 5,
+      needsHuman: 1 + 0 + 4,
+      requeued: 0 + 2 + 1,
+      running: 3 + 1 + 0,
+    });
+  });
+
+  it("does not mutate own totals when peers are present", () => {
+    const own = makeStatus({
+      hostId: "host-a",
+      totals: { merged: 2, needsHuman: 0, requeued: 0, running: 0 },
+    });
+    const peer = makeStatus({
+      hostId: "host-b",
+      totals: { merged: 3, needsHuman: 0, requeued: 0, running: 0 },
+    });
+    const folded = foldPeers(own, [peer]);
+    const ownTotalsSnapshot = { ...folded.totals };
+
+    sumTotalsAcrossHosts(folded);
+
+    expect(folded.totals).toEqual(ownTotalsSnapshot); // top-level totals stays own-only
   });
 });

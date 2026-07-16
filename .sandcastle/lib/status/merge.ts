@@ -12,7 +12,37 @@ import type {
   SandcastleStatus,
   PeerStatus,
   StatusHistoryEntry,
+  StatusTotals,
 } from "./schema.js";
+
+/**
+ * Field-wise sum of the local host's `totals` plus every folded peer's
+ * `totals`, for DISPLAY only.
+ *
+ * `foldPeers` deliberately keeps the top-level `totals` OWN-host-only (a
+ * load-bearing publish invariant: a host must never re-fold a peer's already
+ * folded counts, or two hosts publishing to each other would double-count).
+ * So the fused, whole-run count is not stored anywhere — it is computed here,
+ * at the moment a unified viewer renders. Peers each carry their own `totals`
+ * (`PeerStatus.totals`), so the fused count is own + Σ peers.
+ *
+ * Pure and non-mutating. With no peers it returns `status.totals` UNCHANGED
+ * (same reference), so single-host rendering is byte-identical to pre-fusion.
+ * The summed keys match `StatusTotalsSchema` exactly.
+ */
+export function sumTotalsAcrossHosts(status: SandcastleStatus): StatusTotals {
+  const peers = status.peers;
+  if (!peers || peers.length === 0) return status.totals;
+
+  const sum: StatusTotals = { ...status.totals };
+  for (const peer of peers) {
+    sum.merged += peer.totals.merged;
+    sum.needsHuman += peer.totals.needsHuman;
+    sum.requeued += peer.totals.requeued;
+    sum.running += peer.totals.running;
+  }
+  return sum;
+}
 
 /**
  * Max length of the MERGED cross-host history list. Unlike the per-host

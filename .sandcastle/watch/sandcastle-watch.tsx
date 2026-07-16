@@ -43,6 +43,7 @@ import React, { useEffect, useState } from "react";
 
 import { reduce, type ReadResult, type ViewState } from "./reducer.js";
 import { computeRecentCap } from "./layout.js";
+import { sumTotalsAcrossHosts } from "../lib/status/merge.js";
 import type {
   IssuePhase,
   RunActivity,
@@ -505,7 +506,11 @@ export function Dashboard({
     <Box flexDirection="column" marginTop={1}>
       <Header run={status.run} />
       <Rule />
-      <Counts totals={status.totals} state={status.state} />
+      {/* Cross-host FUSED counts: own + every folded peer. `status.totals` is
+          own-host-only by design (foldPeers keeps it that way); the whole-run
+          count is summed at render time. Single-host returns own totals
+          unchanged, so the flag-off render stays byte-identical. */}
+      <Counts totals={sumTotalsAcrossHosts(status)} state={status.state} />
 
       <Box marginTop={1}>
         <RunningPanel active={active} activity={status.activity} />
