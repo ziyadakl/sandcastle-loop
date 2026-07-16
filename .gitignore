@@ -9,3 +9,8 @@ dist/
 .tsbuildinfo
 prd.json.lock
 .pnpm-store/
+# macOS Finder metadata — never belongs in the repo. Tracked copies were
+# untracked in the same commit that added this rule.
+.DS_Store
+# Local Claude Code tooling/session dir — machine-local, not project state.
+.claude/
