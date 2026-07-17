@@ -23,6 +23,32 @@ export function wipRef(issue: number): string {
 }
 
 /**
+ * Refspec a RESUMING host must fetch the issue's checkpoint with:
+ * `+refs/sandcastle/wip/issue-<N>:refs/sandcastle/wip/issue-<N>`.
+ *
+ * Load-bearing, not a style preference. Fetching to `FETCH_HEAD` alone (what
+ * both resume paths used to do) materializes the work but leaves the LOCAL
+ * mirror ref unwritten — and that mirror is the lease {@link pushWipRef} pushes
+ * against. A host that resumed a peer's checkpoint would then lease against ""
+ * ("must not exist") while origin DID hold the peer's snapshot, so every
+ * checkpoint it ever made was rejected `(stale info)` and its work never left
+ * the machine. Fetching INTO the mirror makes the resume a real point-in-time
+ * observation of origin, which is exactly what the lease wants — see
+ * {@link pushWipRef}'s header for why this is safe and not a blind force.
+ *
+ * Forced (`+`) because the mirror must track origin even when the peer's tip is
+ * not a descendant of a stale local value (e.g. a rebased or re-cut checkpoint);
+ * the mirror is an observation of origin, never work of ours to protect.
+ *
+ * Single-sourced here so the mac-host and docker resume paths cannot diverge —
+ * a fix to one only is a half-fix, and this bug was born of exactly that shape.
+ */
+export function wipMirrorFetchRefspec(issue: number): string {
+  const ref = wipRef(issue);
+  return `+${ref}:${ref}`;
+}
+
+/**
  * Extract the issue number from a per-issue sandbox branch of the form
  * `agent/issue-<N>` (the name minted at main.mts:5895). Returns the parsed
  * number, or `null` when the branch is not issue-shaped (e.g. a run/integration
@@ -65,9 +91,10 @@ export function reuseOrFresh(opts: {
  * contract lease/lane/status sync all honor (a prior bug shipped an ls-remote
  * on the off path). The discriminated return type-narrows `issue` for callers.
  *
- * Callers keep their OWN materialization (mac-host adds the worktree from
- * `FETCH_HEAD`; docker repoints the branch and lets the SDK add) — only the
- * decision is shared here.
+ * Callers keep their OWN materialization (mac-host adds the worktree from the
+ * WIP mirror ref; docker repoints the branch at it and lets the SDK add) — only
+ * the decision, and the {@link wipMirrorFetchRefspec} they both fetch with, are
+ * shared here.
  */
 export async function resolveReuseDecision(opts: {
   syncEnabled: boolean;
@@ -162,9 +189,25 @@ export async function revParse(
  *   - re-reading origin at push time would be pointless — it would just adopt a
  *     peer's value as "expected" and clobber it, exactly what `--force` does.
  *
- * The mirror is advanced ONLY on a successful push, so it always means "what
- * origin held because of us", never an aspiration. Best-effort: returns the raw
- * {@link GitRunResult} and does not throw on `ok=false`.
+ * The mirror is therefore written at exactly two moments, and both are genuine
+ * observations of origin rather than aspirations:
+ *
+ *   - AFTER a successful push here — "what origin holds because of us";
+ *   - at RESUME time, by the fetch refspec `+<wipRef>:<wipRef>` (see
+ *     {@link wipMirrorFetchRefspec}) — "what origin held when we picked this
+ *     work up".
+ *
+ * The second is what makes a RESUMING host able to check its own work back in,
+ * and it is NOT the push-time re-read ruled out above. The difference is
+ * timing, and it is the whole safety argument: at resume we adopt the peer's
+ * tip and then BUILD ON IT, so pushing over it destroys nothing; at push time we
+ * would adopt a value we never saw, let alone built on, and overwrite whatever
+ * arrived while we worked. A resumed mirror still goes stale exactly when it
+ * should — if a THIRD host moves the ref after we resumed, our push is refused
+ * and its work survives.
+ *
+ * Best-effort: returns the raw {@link GitRunResult} and does not throw on
+ * `ok=false`.
  */
 export async function pushWipRef(
   repoRoot: string,

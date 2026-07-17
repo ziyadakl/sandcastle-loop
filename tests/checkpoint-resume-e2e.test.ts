@@ -307,6 +307,141 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
   });
 
   // -------------------------------------------------------------------------
+  // TEST 3b — the FULL cross-host CYCLE: A checkpoints → B resumes → B works →
+  // B RE-checkpoints. TEST 3 stops one step short (B resumes but never pushes
+  // its own checkpoint back), which is exactly where the data loss lived: B's
+  // local WIP mirror was never written by the resume fetch, so `pushWipRef`
+  // leased against "" ("must not exist") while origin DID hold A's snapshot —
+  // `(stale info)` rejection, forever, and B's work never left the machine.
+  //
+  // Asserted on the REAL bare origin (`ls-remote` + `git show` INSIDE the bare
+  // repo): WHEN the work landed, not IF a push was attempted.
+  // -------------------------------------------------------------------------
+  it("host B's RE-checkpoint of resumed work LANDS on origin (2nd stop is not lost)", async () => {
+    const hostA = makeHost("hostA");
+    const hostB = makeHost("hostB");
+    const markerA = "PARTIAL-WORK-MARKER-issue7-aaa111-cycleA";
+    const markerB = "PARTIAL-WORK-MARKER-issue7-bbb222-cycleB";
+
+    // --- Host A: in-flight work → checkpoint → lease released. ---
+    makeInflightWorktree(hostA, 7, markerA);
+    pushLock(hostA, 7);
+    const aResults = await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: hostA,
+      hostId: "host-A",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
+    });
+    expect(aResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
+    const wipAfterA = lsRemote(hostB, "refs/sandcastle/wip/issue-7");
+    expect(wipAfterA).not.toBe("");
+
+    // --- Host B: reclaim the lease and RESUME A's checkpoint (production path).
+    pushLock(hostB, 7);
+    const handle = await macHostSandbox({
+      repoRoot: hostB,
+      crossHostSync: true,
+    }).createSandbox({ branch: "agent/issue-7" });
+    expect(git(handle.worktreePath, "rev-parse", "HEAD")).toBe(wipAfterA);
+
+    // --- Host B: build on A's work, leaving it uncommitted as a real stop would.
+    writeFileSync(path.join(handle.worktreePath, "B_WORK.txt"), markerB);
+
+    // --- Host B: the SECOND `--now` stop checkpoints the resumed work. ---
+    const bResults = await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: hostB,
+      hostId: "host-B",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
+    });
+    const r7 = bResults.find((r) => r.issue === 7) as CheckpointStopResult;
+    expect(r7.outcome).toBe("checkpointed");
+
+    // ORIGIN MOVED off A's snapshot onto B's ...
+    const wipAfterB = lsRemote(hostB, "refs/sandcastle/wip/issue-7");
+    expect(wipAfterB).not.toBe(wipAfterA);
+    // ... and BOTH hosts' work is retrievable straight from the bare origin —
+    // B built on A rather than replacing it.
+    expect(git(remote, "show", `${wipAfterB}:B_WORK.txt`)).toBe(markerB);
+    expect(git(remote, "show", `${wipAfterB}:PARTIAL_WORK.txt`)).toBe(markerA);
+
+    // ... and B released the lease, so a third host may reclaim issue 7.
+    expect(lsRemote(hostB, "refs/locks/issue-7")).toBe("");
+    // Two real clones + a full checkpoint/resume/re-checkpoint cycle of real git
+    // outruns the 5s default when the suite runs in parallel.
+  }, 30_000);
+
+  // SAFETY TWIN for TEST 3b — the resume-time mirror fetch must NOT degrade the
+  // lease into a blind force. B resumes (mirror = A's snapshot), then a THIRD
+  // host C checkpoints on top. B's now-STALE push must be REFUSED and C's work
+  // must survive on origin untouched.
+  it("SAFETY: after a peer moves the WIP ref, a stale host's checkpoint is REFUSED", async () => {
+    const hostA = makeHost("hostA");
+    const hostB = makeHost("hostB");
+    const hostC = makeHost("hostC");
+
+    // --- Host A: checkpoint issue 7. ---
+    makeInflightWorktree(hostA, 7, "MARKER-A-safety");
+    pushLock(hostA, 7);
+    await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: hostA,
+      hostId: "host-A",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
+    });
+
+    // --- Host B: resume A's checkpoint and commit on top (NOT yet pushed). ---
+    const handleB = await macHostSandbox({
+      repoRoot: hostB,
+      crossHostSync: true,
+    }).createSandbox({ branch: "agent/issue-7" });
+    writeFileSync(path.join(handleB.worktreePath, "B_WORK.txt"), "B work\n");
+    git(handleB.worktreePath, "add", "-A");
+    git(handleB.worktreePath, "commit", "-m", "B work");
+
+    // --- Host C: resumes the SAME checkpoint and lands its own first. ---
+    const handleC = await macHostSandbox({
+      repoRoot: hostC,
+      crossHostSync: true,
+    }).createSandbox({ branch: "agent/issue-7" });
+    writeFileSync(path.join(handleC.worktreePath, "C_WORK.txt"), "C work\n");
+    const cResults = await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: hostC,
+      hostId: "host-C",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
+    });
+    expect(cResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
+    const wipAfterC = lsRemote(hostC, "refs/sandcastle/wip/issue-7");
+
+    // --- Host B now pushes against a mirror that origin has moved past. ---
+    const bResults = await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: hostB,
+      hostId: "host-B",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
+    });
+    // REFUSED — not silently accepted (the lease did its job) ...
+    expect(bResults.find((r) => r.issue === 7)?.outcome).toBe("error");
+    // ... and C's work is EXACTLY what origin still holds, byte-for-byte.
+    expect(lsRemote(hostB, "refs/sandcastle/wip/issue-7")).toBe(wipAfterC);
+    expect(git(remote, "show", `${wipAfterC}:C_WORK.txt`)).toBe("C work");
+    // ... and B's rejected work is ABSENT from origin — the refusal was real.
+    expect(() => git(remote, "show", `${wipAfterC}:B_WORK.txt`)).toThrow();
+    // THREE real clones of real git — well past the 5s default under suite load.
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
   // TEST 4 (Workstream 1, 1c) — a --now stop preserves a certified-but-
   // unpromoted staging tip: post-merge fixer commits on `integration-candidate`
   // that no worktree owns are backed up to the durable strand ref on origin.

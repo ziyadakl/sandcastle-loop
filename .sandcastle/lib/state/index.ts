@@ -96,6 +96,7 @@ export type { StatusSyncOpts, PublishResult } from "./status-sync.js";
 // through.
 export {
   wipRef,
+  wipMirrorFetchRefspec,
   issueFromBranch,
   reuseOrFresh,
   resolveReuseDecision,

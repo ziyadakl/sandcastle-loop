@@ -57,6 +57,7 @@ import {
   LaneSyncError,
   createStatusSync,
   wipRef,
+  wipMirrorFetchRefspec,
   resolveReuseDecision,
   deleteWipRef,
   listWipRefIssues,
@@ -3073,13 +3074,25 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       git: runGitLease,
     });
     if (reuse.reuse) {
-      runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuse.issue));
+      // Fetch INTO the local WIP mirror (`+<ref>:<ref>`), not just to
+      // FETCH_HEAD: the mirror is the lease pushWipRef checkpoints against, so a
+      // resumed host that never writes it can never check its own work back in.
+      // Refspec is single-sourced in wipMirrorFetchRefspec (shared with the
+      // mac-host path), whose header carries the argument; the branch is then
+      // repointed at the mirror we just wrote rather than FETCH_HEAD, so the ref
+      // we lease against and the ref we work from are provably the same commit.
+      runGitLease(
+        args.repoRoot,
+        "fetch",
+        "origin",
+        wipMirrorFetchRefspec(reuse.issue),
+      );
       runGitLease(
         args.repoRoot,
         "branch",
         "-f",
         spec.branch,
-        "FETCH_HEAD",
+        wipRef(reuse.issue),
       );
     }
 
