@@ -24,7 +24,7 @@ import type {
 
 const FIXED_NOW = "2026-06-04T12:00:00.000Z";
 
-function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void; onError: (e: unknown) => void }> = {}) {
+function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void; onError: (e: unknown) => void; pid: number }> = {}) {
   const writes: Array<{ path: string; content: string }> = [];
   const writeFn = overrides.writeFn ?? ((path: string, content: string) => {
     writes.push({ path, content });
@@ -43,6 +43,7 @@ function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void;
     writeFn,
     onError: overrides.onError,
     now: () => FIXED_NOW,
+    pid: overrides.pid,
   });
   return { store, writes };
 }
@@ -493,5 +494,107 @@ describe("StatusStore", () => {
     expect(afterBytes).toBe(beforeBytes);
     // And no `peers` key leaks into the own-only file.
     expect("peers" in JSON.parse(afterBytes)).toBe(false);
+  });
+
+  // --- 2b: pid stamped at startup so a same-host reconciler can prove death ---
+
+  it("stamps the injected pid into the snapshot and every written file", () => {
+    const { store, writes } = makeStore({ pid: 4242 });
+    expect(store.snapshot().pid).toBe(4242);
+    store.startIteration(1);
+    expect(JSON.parse(writes.at(-1)!.content).pid).toBe(4242);
+  });
+
+  it("defaults pid to the live process.pid when not injected", () => {
+    const { store } = makeStore();
+    expect(store.snapshot().pid).toBe(process.pid);
+  });
+
+  // --- 2c: graceful-stop telemetry (state:"stopping" + waiting-on) ---
+
+  it("markStopping sets state=stopping and names the in-flight issues it is draining", () => {
+    const { store, writes } = makeStore();
+    store.setPlan([
+      { number: 5, title: "a", branch: "agent/issue-5" },
+      { number: 8, title: "b", branch: "agent/issue-8" },
+    ]);
+    store.setIssuePhase(5, "implementer");
+    store.setIssuePhase(8, "reviewer");
+    store.markStopping();
+    const written = JSON.parse(writes.at(-1)!.content);
+    expect(written.state).toBe("stopping");
+    expect(written.stoppingWaitingOn).toContain("#5");
+    expect(written.stoppingWaitingOn).toContain("#8");
+    expect(written.stoppingWaitingOn).toContain("implementer");
+    expect(written.stoppingWaitingOn).toContain("reviewer");
+    // still a schema-valid snapshot
+    expect(SandcastleStatusSchema.safeParse(store.snapshot()).success).toBe(true);
+  });
+
+  it("markStopping with no active issue but a run-level activity names the activity", () => {
+    const { store } = makeStore();
+    store.setActivity("planning");
+    store.markStopping();
+    expect(store.snapshot().stoppingWaitingOn).toBe("planning");
+    expect(store.snapshot().state).toBe("stopping");
+  });
+
+  it("markStopping does NOT stop the heartbeat (the loop is still draining)", () => {
+    const cleared: unknown[] = [];
+    const store = createStatusStore(
+      {
+        branch: "b", repo: "r", repoRoot: "/tmp/x", startedAt: FIXED_NOW,
+        iterationsTotal: 1, maxConcurrent: 1, hostId: "h", runId: "run",
+      },
+      {
+        writeFn: () => {},
+        now: () => FIXED_NOW,
+        setIntervalFn: () => "HANDLE",
+        clearIntervalFn: (h) => { cleared.push(h); },
+      },
+    );
+    store.startHeartbeat();
+    store.markStopping();
+    expect(cleared).toEqual([]); // heartbeat untouched
+  });
+
+  it("finish overwrites the transient stopping state and clears stoppingWaitingOn", () => {
+    const { store, writes } = makeStore();
+    store.setActivity("planning");
+    store.markStopping();
+    store.finish("stopped");
+    const written = JSON.parse(writes.at(-1)!.content);
+    expect(written.state).toBe("stopped");
+    expect("stoppingWaitingOn" in written).toBe(false);
+  });
+
+  // --- 2b meta-test: a new REQUIRED field without a version bump must FAIL ---
+
+  it("META: the v3 required-field set is exactly the known-required keys (adding a required field without bumping STATUS_SCHEMA_VERSION fails here)", () => {
+    // The minimal object carrying ONLY the fields required at schemaVersion 3.
+    // If someone adds a NEW required field to SandcastleStatusSchema while the
+    // version stays 3, this parse fails and the test goes red — the guard that
+    // stops a silent breaking change (which would blank older viewers).
+    const minimalV3Required = {
+      schemaVersion: STATUS_SCHEMA_VERSION,
+      state: "running",
+      run: {
+        branch: "b",
+        repo: "r",
+        startedAt: FIXED_NOW,
+        iterations: { current: 0, total: 1 },
+        maxConcurrent: 1,
+      },
+      totals: { merged: 0, needsHuman: 0, requeued: 0, running: 0 },
+      issues: [],
+      hostId: "h",
+      runId: "run",
+      updatedAt: FIXED_NOW,
+    };
+    // Pin the guard to the version it was written against: when the schema is
+    // legitimately bumped, this test must be revisited alongside it.
+    expect(STATUS_SCHEMA_VERSION).toBe(3);
+    const parsed = SandcastleStatusSchema.safeParse(minimalV3Required);
+    expect(parsed.success).toBe(true);
   });
 });

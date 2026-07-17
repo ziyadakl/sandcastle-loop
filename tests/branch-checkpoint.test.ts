@@ -5,7 +5,11 @@
  * that records every invocation and returns canned {@link GitRunResult}s — no
  * child_process, no real git. Mirrors the seam proven in issue-lease.ts.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import type {
   GitRunner,
   GitRunResult,
@@ -19,6 +23,7 @@ import {
   deleteWipRef,
   listWipRefIssues,
 } from "../.sandcastle/lib/state/branch-checkpoint.js";
+import { makeExecFileGitRunner } from "../.sandcastle/lib/state/index.js";
 
 type Call = { cwd: string; args: string[] };
 
@@ -102,27 +107,252 @@ describe("commitWorktreeCheckpoint", () => {
 });
 
 describe("pushWipRef", () => {
-  it("force-with-lease pushes HEAD to the WIP ref", async () => {
-    const { git, calls } = makeFakeGit();
+  /**
+   * Fake git for the push path: `rev-parse` of HEAD (in the worktree) yields
+   * `headSha`; `rev-parse` of the local mirror ref yields `mirrorSha` ("" =
+   * absent, i.e. --verify --quiet exits non-zero).
+   */
+  function makePushGit(headSha = "aaaa", mirrorSha = "") {
+    return makeFakeGit((args) => {
+      if (args[0] === "rev-parse") {
+        const rev = args[args.length - 1];
+        const sha = rev === "HEAD" ? headSha : mirrorSha;
+        return sha ? { stdout: `${sha}\n` } : { ok: false, stdout: "" };
+      }
+      return {};
+    });
+  }
+
+  /**
+   * REGRESSION (the bug this replaced): a BARE `--force-with-lease` leases
+   * against the remote-TRACKING ref, which `refs/sandcastle/wip/*` does not
+   * have — so the 2nd push of an issue is rejected "stale info" and origin
+   * silently keeps the OLD tip. The lease MUST carry an explicit expected
+   * value. This is the string-level guard; the real-git suite below proves the
+   * behavior on origin (the old test asserted only `toContain("--force-with-lease")`,
+   * which passed happily while work was being lost).
+   */
+  it("never pushes a BARE --force-with-lease (it has no remote-tracking ref)", async () => {
+    const { git, calls } = makePushGit();
     await pushWipRef("/repo", "/wt", 7, git);
     const push = callWith(calls, "push");
     expect(push).toBeDefined();
-    expect(push?.args).toContain("--force-with-lease");
+    expect(push?.args).not.toContain("--force-with-lease");
+    expect(
+      push?.args.some((a) =>
+        a.startsWith("--force-with-lease=refs/sandcastle/wip/issue-7:"),
+      ),
+    ).toBe(true);
+  });
+
+  it("leases against the EMPTY expected value when this host has no mirror ref", async () => {
+    const { git, calls } = makePushGit("aaaa", "");
+    await pushWipRef("/repo", "/wt", 7, git);
+    expect(callWith(calls, "push")?.args).toContain(
+      "--force-with-lease=refs/sandcastle/wip/issue-7:",
+    );
+  });
+
+  it("leases against this host's PRIOR mirror value on a re-push", async () => {
+    const { git, calls } = makePushGit("bbbb", "aaaa");
+    await pushWipRef("/repo", "/wt", 7, git);
+    expect(callWith(calls, "push")?.args).toContain(
+      "--force-with-lease=refs/sandcastle/wip/issue-7:aaaa",
+    );
+  });
+
+  it("pushes the worktree HEAD to the WIP ref", async () => {
+    const { git, calls } = makePushGit("bbbb", "aaaa");
+    await pushWipRef("/repo", "/wt", 7, git);
+    const push = callWith(calls, "push");
     expect(push?.args).toContain("HEAD:refs/sandcastle/wip/issue-7");
     expect(push?.args).toContain("origin");
+    expect(push?.args.slice(0, 2)).toEqual(["-C", "/wt"]);
   });
 
   it("honors a custom remote", async () => {
-    const { git, calls } = makeFakeGit();
+    const { git, calls } = makePushGit();
     await pushWipRef("/repo", "/wt", 7, git, "backup");
     expect(callWith(calls, "push")?.args).toContain("backup");
   });
 
-  it("returns the GitRunResult without throwing on ok=false", async () => {
-    const { git } = makeFakeGit(() => ({ ok: false, stderr: "boom" }));
+  it("returns the GitRunResult without throwing on a REJECTED push", async () => {
+    const { git } = makeFakeGit((args) => {
+      if (args[0] === "rev-parse") return { stdout: "aaaa\n" };
+      return { ok: false, stderr: "boom" };
+    });
     const res = await pushWipRef("/repo", "/wt", 7, git);
     expect(res.ok).toBe(false);
     expect(res.stderr).toBe("boom");
+  });
+
+  it("does NOT advance the local mirror ref when the push is refused", async () => {
+    const { git, calls } = makeFakeGit((args) => {
+      if (args[0] === "rev-parse") return { stdout: "aaaa\n" };
+      return { ok: false, stderr: "stale info" };
+    });
+    await pushWipRef("/repo", "/wt", 7, git);
+    // Advancing it anyway would make the NEXT push lease against a value origin
+    // never held — a lie about what this host observed.
+    expect(callWith(calls, "update-ref")).toBeUndefined();
+  });
+
+  it("advances the local mirror ref to the pushed sha once the push lands", async () => {
+    const { git, calls } = makeFakeGit((args) =>
+      args[0] === "rev-parse" ? { stdout: "bbbb\n" } : {},
+    );
+    await pushWipRef("/repo", "/wt", 7, git);
+    expect(callWith(calls, "update-ref")?.args).toEqual([
+      "update-ref",
+      "refs/sandcastle/wip/issue-7",
+      "bbbb",
+    ]);
+  });
+
+  it("still pushes (leasing against absent) when the mirror ref does not resolve", async () => {
+    const { git, calls } = makeFakeGit(() => ({ ok: true, stdout: "" }));
+    const res = await pushWipRef("/repo", "/wt", 7, git);
+    expect(res.ok).toBe(true);
+    expect(callWith(calls, "push")?.args).toContain(
+      "--force-with-lease=refs/sandcastle/wip/issue-7:",
+    );
+  });
+});
+
+/**
+ * REAL-GIT tests for {@link pushWipRef} against a REAL local bare origin with
+ * real clones acting as separate hosts (offline, real git semantics — never the
+ * real network). Every assertion reads the ref's SHA off the bare ORIGIN via
+ * `ls-remote`, NEVER a recorded mock call — the mock-level tests above could
+ * (and historically did) stay green while origin silently kept stale work.
+ *
+ * Mirrors the harness in checkpoint-resume-e2e.test.ts (helpers copied locally
+ * so the suites stay independent).
+ */
+describe("pushWipRef (real bare origin + real clones)", () => {
+  const gitRunner = makeExecFileGitRunner();
+  let tmp: string;
+  let remote: string;
+
+  /** Run git synchronously for TEST SETUP/ASSERTIONS (not production code). */
+  function g(cwd: string, ...args: string[]): string {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  }
+
+  /** ls-remote a single ref; returns the SHA it points at, or "" when absent. */
+  function lsRemote(cwd: string, ref: string, rem = "origin"): string {
+    const out = g(cwd, "ls-remote", rem, ref);
+    const first = out.split("\n").find((l) => l.trim().length > 0);
+    return first ? first.split(/\s+/)[0] : "";
+  }
+
+  /** Clone the bare origin into a fresh host directory with a git identity. */
+  function makeHost(name: string): string {
+    const repo = path.join(tmp, name);
+    g(tmp, "clone", remote, repo);
+    g(repo, "config", "user.email", `${name}@t.test`);
+    g(repo, "config", "user.name", name);
+    return repo;
+  }
+
+  /** Commit a distinctive file in `repo`, returning the new HEAD sha. */
+  function commitWork(repo: string, content: string): string {
+    writeFileSync(path.join(repo, "PARTIAL_WORK.txt"), content);
+    g(repo, "add", "-A");
+    g(repo, "commit", "-m", `wip ${content}`);
+    return g(repo, "rev-parse", "HEAD");
+  }
+
+  beforeEach(() => {
+    tmp = mkdtempSync(path.join(tmpdir(), "sandcastle-wip-push-"));
+    remote = path.join(tmp, "remote.git");
+    g(tmp, "init", "--bare", remote);
+    const seed = path.join(tmp, "seed");
+    g(tmp, "clone", remote, seed);
+    g(seed, "config", "user.email", "seed@t.test");
+    g(seed, "config", "user.name", "seed");
+    writeFileSync(path.join(seed, "base.txt"), "base content\n");
+    g(seed, "add", "base.txt");
+    g(seed, "commit", "-m", "base");
+    g(seed, "branch", "-M", "main");
+    g(seed, "push", "-u", "origin", "main");
+    rmSync(seed, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("first push CREATES the WIP ref on origin", async () => {
+    const host = makeHost("host-a");
+    const sha = commitWork(host, "first");
+
+    const res = await pushWipRef(host, host, 7, gitRunner);
+
+    expect(res.ok).toBe(true);
+    expect(lsRemote(host, wipRef(7))).toBe(sha);
+  });
+
+  /**
+   * THE DATA-LOSS REGRESSION (ADR 0021 zero-loss checkpoint/resume).
+   *
+   * stop --now → resume → stop --now again. Under the old bare
+   * `--force-with-lease` the SECOND push was rejected ("stale info") because
+   * the wip namespace has no remote-tracking ref, so origin kept the FIRST
+   * snapshot and the newer work never left the host. This asserts origin holds
+   * the NEW sha.
+   */
+  it("re-push by the SAME host ADVANCES the WIP ref on origin (no silent work loss)", async () => {
+    const host = makeHost("host-a");
+    const first = commitWork(host, "first");
+    const push1 = await pushWipRef(host, host, 7, gitRunner);
+    expect(push1.ok).toBe(true);
+    expect(lsRemote(host, wipRef(7))).toBe(first);
+
+    // Work advances, and the host is stopped again.
+    const second = commitWork(host, "second");
+    expect(second).not.toBe(first);
+    const push2 = await pushWipRef(host, host, 7, gitRunner);
+
+    expect(push2.ok).toBe(true);
+    expect(lsRemote(host, wipRef(7))).toBe(second);
+  });
+
+  it("REFUSES to clobber a WIP ref value this host never observed (peer's work survives)", async () => {
+    const peer = makeHost("peer");
+    const peerSha = commitWork(peer, "peer work");
+    g(peer, "push", "origin", `${peerSha}:${wipRef(7)}`);
+
+    // host-a has never pushed/observed this ref: its lease expects "absent".
+    const host = makeHost("host-a");
+    const mySha = commitWork(host, "my work");
+    const res = await pushWipRef(host, host, 7, gitRunner);
+
+    expect(res.ok).toBe(false);
+    expect(lsRemote(host, wipRef(7))).toBe(peerSha);
+    expect(lsRemote(host, wipRef(7))).not.toBe(mySha);
+  });
+
+  it("REFUSES when a peer overwrote the ref after this host's own push", async () => {
+    const host = makeHost("host-a");
+    const mine = commitWork(host, "mine");
+    expect((await pushWipRef(host, host, 7, gitRunner)).ok).toBe(true);
+
+    // A peer reclaims the expired lease and overwrites the WIP ref.
+    const peer = makeHost("peer");
+    const peerSha = commitWork(peer, "peer reclaimed");
+    g(peer, "push", "--force", "origin", `${peerSha}:${wipRef(7)}`);
+
+    const advanced = commitWork(host, "mine advanced");
+    const res = await pushWipRef(host, host, 7, gitRunner);
+
+    expect(res.ok).toBe(false);
+    expect(lsRemote(host, wipRef(7))).toBe(peerSha);
+    expect(lsRemote(host, wipRef(7))).not.toBe(advanced);
   });
 });
 

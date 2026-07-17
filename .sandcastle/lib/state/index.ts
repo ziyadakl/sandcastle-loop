@@ -81,6 +81,11 @@ export type {
 export { createLaneSync, LaneSyncError } from "./lane-sync.js";
 export type { LaneSyncResult, PeerMergeResult, LaneSyncOpts } from "./lane-sync.js";
 
+// Cross-host CONVERGENCE (Workstream 3) — the operator "bring both machines to
+// one point" command: merges every peer lane onto the run branch and pushes it.
+export { convergeLanes, ConvergeError } from "./converge.js";
+export type { ConvergeOpts, ConvergeResult, LaneConvergeResult } from "./converge.js";
+
 // Cross-host status sync (ADR 0020) — the fail-soft telemetry transport that
 // fuses two hosts' status feeds into one viewer.
 export { createStatusSync } from "./status-sync.js";
@@ -91,6 +96,7 @@ export type { StatusSyncOpts, PublishResult } from "./status-sync.js";
 // through.
 export {
   wipRef,
+  wipMirrorFetchRefspec,
   issueFromBranch,
   reuseOrFresh,
   resolveReuseDecision,
@@ -101,6 +107,38 @@ export {
   deleteWipRef,
   listWipRefIssues,
 } from "./branch-checkpoint.js";
+
+// Strand-backup data-safety primitives (Workstream 1) — pin stranded work to
+// durable refs so a refused promotion never loses it, plus the full policy the
+// loop runs on that refusal. STAGING_BRANCH lives here so state-layer code can
+// name the staging branch without re-hardcoding the literal.
+export {
+  STAGING_BRANCH,
+  strandRef,
+  backupStrand,
+  stagingCommitsAhead,
+  handleStrandedPromotion,
+} from "./strand-backup.js";
+export type {
+  StrandBackupOpts,
+  StrandBackupResult,
+  StrandedPromotionDeps,
+  StrandedPromotionOpts,
+} from "./strand-backup.js";
+
+// Post-kill / --now checkpoint sweep (ADR 0021) — enumerate in-flight worktrees
+// and persist+release each. Exported so the loop's heartbeat can reuse the
+// worktree enumeration.
+export {
+  checkpointStop,
+  listInflightIssueWorktrees,
+  formatCheckpointStop,
+} from "./checkpoint-stop.js";
+export type {
+  InflightWorktree,
+  CheckpointStopResult,
+  CheckpointStopOpts,
+} from "./checkpoint-stop.js";
 
 // Canonical GitRunner adapters (Quality #2 dedup) — the single home for the
 // async (execFileAsync) and sync (execFileSync) git shell-out shapes the three

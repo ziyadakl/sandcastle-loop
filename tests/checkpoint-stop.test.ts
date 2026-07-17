@@ -6,6 +6,17 @@
  * proven in issue-lease.ts / branch-checkpoint.ts.
  */
 import { describe, it, expect } from "vitest";
+import { execFileSync } from "node:child_process";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   GitRunner,
   GitRunResult,
@@ -16,6 +27,7 @@ import {
   formatCheckpointStop,
   type CheckpointStopResult,
 } from "../.sandcastle/lib/state/checkpoint-stop.js";
+import { STATUS_SCHEMA_VERSION } from "../.sandcastle/lib/status/schema.js";
 
 type Call = { cwd: string; args: string[] };
 
@@ -134,6 +146,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -179,6 +194,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -226,6 +244,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -265,6 +286,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     const byIssue = new Map(results.map((r) => [r.issue, r]));
@@ -304,6 +328,8 @@ describe("checkpointStop", () => {
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
       remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     const leaseDel = calls.find((c) =>
@@ -319,6 +345,62 @@ describe("checkpointStop", () => {
     );
     expect(wipPush?.args).toContain("HEAD:refs/sandcastle/wip/issue-42");
   });
+});
+
+describe("checkpoint-stop.mts (post-kill runner) — status reconciliation", () => {
+  it("writes state:'stopped' to status.json as its FINAL step, stopping the running lie", () => {
+    // A hard kill leaves status.json saying `running` forever with no reconciler.
+    // The --now runner must flip it to `stopped` after handling the git refs.
+    const tmp = mkdtempSync(join(tmpdir(), "sc-checkpoint-"));
+    execFileSync("git", ["init", "-q"], { cwd: tmp });
+    execFileSync("git", ["config", "user.email", "t@t.co"], { cwd: tmp });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+    writeFileSync(join(tmp, "f.txt"), "x");
+    execFileSync("git", ["add", "-A"], { cwd: tmp });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: tmp });
+
+    // Seed a status.json still claiming the loop is running (the lie).
+    mkdirSync(join(tmp, ".sandcastle"), { recursive: true });
+    const statusPath = join(tmp, ".sandcastle", "status.json");
+    const runningStatus = {
+      schemaVersion: STATUS_SCHEMA_VERSION,
+      state: "running",
+      hostId: "host-a",
+      runId: "run-x",
+      run: {
+        branch: "sandcastle/theme",
+        repo: "r",
+        startedAt: "2026-06-04T11:30:00.000Z",
+        iterations: { current: 1, total: 5 },
+        maxConcurrent: 1,
+      },
+      totals: { merged: 0, needsHuman: 0, requeued: 0, running: 0 },
+      issues: [],
+      history: [],
+      updatedAt: "2026-06-04T11:31:00.000Z",
+      pid: 999999,
+    };
+    writeFileSync(statusPath, `${JSON.stringify(runningStatus, null, 2)}\n`);
+
+    const script = fileURLToPath(
+      new URL("../.sandcastle/scripts/checkpoint-stop.mts", import.meta.url),
+    );
+    // A git worktree has no node_modules of its own; fall back to the main
+    // checkout's tsx (the same one that runs this vitest).
+    const tsxCandidates = [
+      fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url)),
+      "/Users/ziyadakl/Dev/Sandcastle/node_modules/.bin/tsx",
+    ];
+    const tsx = tsxCandidates.find((p) => existsSync(p)) ?? tsxCandidates[0];
+    execFileSync(
+      tsx,
+      [script, "--repo-root", tmp, "--integration-branch", "master"],
+      { cwd: tmp },
+    );
+
+    const after = JSON.parse(readFileSync(statusPath, "utf8"));
+    expect(after.state).toBe("stopped");
+  }, 30_000);
 });
 
 describe("formatCheckpointStop", () => {

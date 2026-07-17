@@ -14,6 +14,7 @@ import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js"
 import { backendForModel } from "../providers.js";
 import {
   wipRef,
+  wipMirrorFetchRefspec,
   resolveReuseDecision,
   makeSyncGitRunner,
 } from "./state/index.js";
@@ -502,11 +503,11 @@ export function macHostSandbox(
       preCleanWorktree(repoRoot, wtPath);
       // ADR 0021 §2 branch reuse on pickup. When cross-host sync is on and a WIP
       // checkpoint exists on origin for this issue, cut the worktree from that
-      // checkpoint tip (fetch + `-B <branch> FETCH_HEAD`) so the implementer
-      // continues the committed partial work. Otherwise — and ALWAYS when the
-      // flag is off — the existing unconditional `-B <branch>` from HEAD runs
-      // byte-for-byte unchanged (no fetch/ls-remote, no new git auth). The ref
-      // name is single-sourced from `wipRef`; existence from A2's `wipRefExists`
+      // checkpoint tip (fetch into the mirror + `-B <branch> <wipRef>`) so the
+      // implementer continues the committed partial work. Otherwise — and ALWAYS
+      // when the flag is off — the existing unconditional `-B <branch>` from
+      // HEAD runs byte-for-byte unchanged (no fetch/ls-remote, no new git auth).
+      // The ref name is single-sourced from `wipRef`; existence from `wipRefExists`
       // via the canonical sync GitRunner adapter over execFileSync.
       const gitRunner = makeSyncGitRunner();
       // Decision (reuse vs fresh) is single-sourced in state/branch-checkpoint's
@@ -514,7 +515,7 @@ export function macHostSandbox(
       // preserves the flag-FIRST short-circuit: with sync off (or a non-issue
       // branch) it issues NO ls-remote/origin git — the inert-when-off contract.
       // The materialization below stays mac-host-specific (worktree add from
-      // FETCH_HEAD) — only the decision is shared.
+      // the WIP mirror ref) — only the decision and the fetch refspec are shared.
       const r = await resolveReuseDecision({
         syncEnabled: opts.crossHostSync ?? false,
         branch: spec.branch,
@@ -522,13 +523,20 @@ export function macHostSandbox(
         git: gitRunner,
       });
       if (r.reuse) {
-        execFileSync("git", ["fetch", "origin", wipRef(r.issue)], {
+        // Fetch INTO the local WIP mirror (`+<ref>:<ref>`), not just to
+        // FETCH_HEAD: the mirror is the lease pushWipRef checkpoints against, so
+        // a resumed host that never writes it can never check its own work back
+        // in. Refspec is single-sourced in wipMirrorFetchRefspec, whose header
+        // carries the argument; the worktree is then cut from the mirror we just
+        // wrote rather than FETCH_HEAD, so the ref we lease against and the ref
+        // we work from are provably the same commit.
+        execFileSync("git", ["fetch", "origin", wipMirrorFetchRefspec(r.issue)], {
           cwd: repoRoot,
           stdio: ["ignore", "pipe", "pipe"],
         });
         execFileSync(
           "git",
-          ["worktree", "add", "-B", spec.branch, wtPath, "FETCH_HEAD"],
+          ["worktree", "add", "-B", spec.branch, wtPath, wipRef(r.issue)],
           { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
         );
       } else {

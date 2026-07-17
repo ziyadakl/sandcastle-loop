@@ -57,9 +57,12 @@ import {
   LaneSyncError,
   createStatusSync,
   wipRef,
+  wipMirrorFetchRefspec,
   resolveReuseDecision,
   deleteWipRef,
   listWipRefIssues,
+  STAGING_BRANCH,
+  handleStrandedPromotion,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
@@ -1746,8 +1749,10 @@ function buildGitEnv(): Record<string, string> {
 // Staging branch — git helpers
 // ---------------------------------------------------------------------------
 
-/** Persistent staging branch name. Reused across iterations. */
-const STAGING_BRANCH = "integration-candidate";
+// The persistent staging branch name (`STAGING_BRANCH`, reused across
+// iterations) is owned by `lib/state` and imported at the top of this file, so
+// state-layer code that reasons about the strand names it from one place
+// instead of re-hardcoding the literal.
 
 /** `git branch --merged` format flag — emit short refnames (no leading "* "). */
 const GIT_BRANCH_FORMAT_ARG = "--format=%(refname:short)";
@@ -3069,13 +3074,25 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       git: runGitLease,
     });
     if (reuse.reuse) {
-      runGitLease(args.repoRoot, "fetch", "origin", wipRef(reuse.issue));
+      // Fetch INTO the local WIP mirror (`+<ref>:<ref>`), not just to
+      // FETCH_HEAD: the mirror is the lease pushWipRef checkpoints against, so a
+      // resumed host that never writes it can never check its own work back in.
+      // Refspec is single-sourced in wipMirrorFetchRefspec (shared with the
+      // mac-host path), whose header carries the argument; the branch is then
+      // repointed at the mirror we just wrote rather than FETCH_HEAD, so the ref
+      // we lease against and the ref we work from are provably the same commit.
+      runGitLease(
+        args.repoRoot,
+        "fetch",
+        "origin",
+        wipMirrorFetchRefspec(reuse.issue),
+      );
       runGitLease(
         args.repoRoot,
         "branch",
         "-f",
         spec.branch,
-        "FETCH_HEAD",
+        wipRef(reuse.issue),
       );
     }
 
@@ -5972,6 +5989,13 @@ export async function runMain(
     deps.log(
       `received ${sig} — finishing in-flight ops then exiting cleanly`,
     );
+    // ADDITIVE TELEMETRY ONLY (2c): surface "stopping — waiting on <phase> for
+    // #N" so status tooling can distinguish a graceful drain from a healthy run.
+    // This changes NO shutdown control flow — the `shuttingDown` flag set above
+    // and the iteration-boundary break remain the sole abort mechanism; the
+    // agent is NOT interrupted (that abort is deliberately out of scope). The
+    // write is synchronous + non-fatal, like every other status write.
+    statusStore.markStopping();
   };
   const sigintHandler = (): void => onSignal("SIGINT");
   const sigtermHandler = (): void => onSignal("SIGTERM");
@@ -5994,6 +6018,17 @@ export async function runMain(
     // once here. The double-fire is intentional + benign: syncStatusOnce is
     // idempotent (publish → fetch → setPeers).
     const syncOnHeartbeat = crossHostSyncEnabled();
+    // STAGED (Workstream 1b, deliberately NOT wired here): a periodic in-flight
+    // checkpoint would protect an `agent/issue-<N>` worktree against a hard crash
+    // (SIGKILL/OOM) between iterations. The naive implementation — `git add -A` +
+    // `git commit` on the live worktree every heartbeat — RACES the implementer
+    // agent working in that same worktree (shared index.lock; moves the branch
+    // HEAD out from under the agent; can commit a half-written tree). It needs a
+    // non-invasive snapshot (e.g. `git stash create` → push the SHA, never moving
+    // HEAD) with its own concurrency tests before it can run against live work.
+    // The reusable helper (`checkpointInflightWork`) is kept + unit-tested for
+    // that redesign; the FF-refused strand backup (1a) and `--now` staging backup
+    // (1c) — both run when no agent is concurrently active — ship in this pass.
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {
@@ -7081,24 +7116,28 @@ export async function runMain(
                 `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
                 `unhealthy (non-zero). Human triage required.`,
             );
-            // These "ok" issues were shown as `merge` (queued) and deliberately
-            // never recorded merged — correct, they're stranded, not shipped.
-            // Surface them as needing a human so the dashboard flags the strand
-            // instead of leaving them in a neutral "queued" limbo that reads
-            // like normal in-progress work.
-            for (const n of mergedIssueNums) {
-              statusStore.setIssuePhase(
-                n,
-                "needs-human",
-                `stranded on ${STAGING_BRANCH} — promotion fast-forward refused`,
-              );
-              // Fix 4 (ADR 0019): release the lease held past ship time, matching
-              // the promote-success and staging-quarantine siblings. Without this
-              // the heartbeat renews the lease forever and a peer can never
-              // reclaim, defeating the "it expires" contract. The issue stays
-              // needs-human (planner won't re-pick it); only the ref clears.
-              await deps.releaseIssueLease(n);
-            }
+            // WORKSTREAM 1 (1a) — DON'T lose the stranded work. The whole policy
+            // (pin the certified tip to durable refs BEFORE any lease is
+            // released → publish the lane when sync is on → surface each issue to
+            // a human → release its lease) lives in `handleStrandedPromotion`,
+            // unit- and real-git-tested in tests/strand-backup.test.ts. It never
+            // throws: the run's unhealthy exit is decided above, not by it.
+            await handleStrandedPromotion(runGitLease, {
+              log: (line) => deps.log(line),
+              logError: (line) => deps.logError(line),
+              setIssuePhase: (n, phase, detail) =>
+                statusStore.setIssuePhase(n, phase, detail),
+              quarantine: (n, reason) => deps.quarantine(n, reason),
+              releaseIssueLease: (n) => deps.releaseIssueLease(n),
+              publishLane: (branch, context) =>
+                publishLaneOrLog(deps, branch, context),
+            }, {
+              repoRoot: args.repoRoot,
+              stagingBranch: STAGING_BRANCH,
+              integrationBranch: args.branch,
+              issues: mergedIssueNums,
+              syncEnabled: crossHostSyncEnabled(),
+            });
           }
         } else {
           // Staging failed certification (post-fixer too) OR merger failed

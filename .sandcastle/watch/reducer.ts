@@ -14,9 +14,9 @@
 import {
   SandcastleStatusSchema,
   STATUS_SCHEMA_VERSION,
-  STALE_AFTER_MS,
   type SandcastleStatus,
 } from "../lib/status/schema.js";
+import { deriveLiveness } from "../lib/status/liveness.js";
 
 /** Result of attempting to read the status file off disk. */
 export type ReadResult =
@@ -53,20 +53,20 @@ function errMessage(error: unknown): string {
 }
 
 /**
- * The banner a good, non-terminal-or-terminal snapshot implies at `nowMs`.
- * Terminal run states (`done`/`stopped`/`unhealthy`) are AUTHORITATIVE and
- * time-independent; otherwise liveness is inferred from write-age against
- * `STALE_AFTER_MS`. Shared by the dedup short-circuit and the full parse path
- * so they can't drift.
+ * The banner a good snapshot implies at `nowMs`. Delegates the liveness JUDGMENT
+ * to the ONE source of truth (`deriveLiveness`) so the viewer can never drift
+ * from the loop's own rule; this function only MAPS the derived reason onto a
+ * viewer banner. A live loop shows no banner (`null`); every non-live reason has
+ * a matching banner. The viewer is a cross-host reader with no view of any
+ * process lock, so it passes only `now` (pure freshness + terminal authority).
+ * Shared by the dedup short-circuit and the full parse path so they can't drift.
  */
 function liveBanner(status: SandcastleStatus, nowMs: number): Banner {
-  if (status.state === "done") return "done";
-  if (status.state === "stopped") return "stopped";
-  if (status.state === "unhealthy") return "unhealthy";
-  const updatedMs = Date.parse(status.updatedAt);
-  const isStale =
-    Number.isFinite(updatedMs) && nowMs - updatedMs > STALE_AFTER_MS;
-  return isStale ? "stale" : null;
+  const { live, reason } = deriveLiveness(status, { now: nowMs });
+  // "running" is the only live reason and has no banner; excluding it also
+  // narrows `reason` to {stale, stopped, unhealthy, done} — all Banner literals.
+  if (live || reason === "running") return null;
+  return reason;
 }
 
 /**

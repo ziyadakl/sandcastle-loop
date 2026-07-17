@@ -176,6 +176,23 @@ describe("reduce", () => {
     expect(s.banner).toBe("stale");
   });
 
+  it("state=stopping + fresh → live (banner null), not a torn-read stale", () => {
+    // A graceful stop writes state="stopping" telemetry while it finishes the
+    // current issue. That is a non-terminal, still-live state — the reducer must
+    // PARSE it (schema knows "stopping") and route it through deriveLiveness to a
+    // clean live view, NOT reject it as an unknown enum member and flash "stale".
+    const stopping = JSON.stringify({ ...validStatus, state: "stopping" });
+    const s = reduce(EMPTY, ok(stopping), VALID_NOW + 1_000);
+    expect(s.status?.state).toBe("stopping");
+    expect(s.banner).toBeNull();
+  });
+
+  it("state=stopping + old → escalates to stale (a stop that wedged mid-drain)", () => {
+    const stopping = JSON.stringify({ ...validStatus, state: "stopping" });
+    const s = reduce(EMPTY, ok(stopping), VALID_NOW + STALE_AFTER_MS + 1_000);
+    expect(s.banner).toBe("stale");
+  });
+
   it("an IO error after a good read → keeps last-good, banner stale", () => {
     const good = reduce(EMPTY, ok(validRaw), VALID_NOW);
     const io: ReadResult = { ok: false, kind: "ioerror", error: new Error("EIO") };
