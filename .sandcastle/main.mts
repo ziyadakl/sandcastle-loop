@@ -62,8 +62,6 @@ import {
   listWipRefIssues,
   strandRef,
   backupStrand,
-  checkpointInflightWork,
-  listInflightIssueWorktrees,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
@@ -6005,46 +6003,22 @@ export async function runMain(
     // once here. The double-fire is intentional + benign: syncStatusOnce is
     // idempotent (publish → fetch → setPeers).
     const syncOnHeartbeat = crossHostSyncEnabled();
-    // WORKSTREAM 1 (1b) — periodic in-flight checkpoint. A hard crash
-    // (SIGKILL/OOM) between iterations loses whatever the in-flight
-    // `agent/issue-<N>` worktrees produced, because nothing in-process gets to
-    // commit-on-stop. Piggy-back on the heartbeat: commit each dirty worktree and
-    // (sync on) push its WIP ref with --force-with-lease, so resume picks up from
-    // the last heartbeat instead of restarting fresh. Fully best-effort —
-    // enumeration/commit/push faults route to logError and NEVER crash the loop;
-    // clean worktrees are skipped so it stays cheap.
-    const heartbeatHostId = resolveHostId();
-    const checkpointInflightOnHeartbeat = async (): Promise<void> => {
-      try {
-        const worktrees = await listInflightIssueWorktrees(
-          runGitLease,
-          args.repoRoot,
-        );
-        if (worktrees.length === 0) return;
-        const results = await checkpointInflightWork(runGitLease, worktrees, {
-          repoRoot: args.repoRoot,
-          hostId: heartbeatHostId,
-          syncEnabled: syncOnHeartbeat,
-        });
-        for (const r of results) {
-          if (r.outcome === "error") {
-            deps.logError(
-              `[heartbeat-checkpoint] issue #${r.issue}: ${r.detail ?? "(no detail)"}`,
-            );
-          }
-        }
-      } catch (err) {
-        deps.logError(
-          `[heartbeat-checkpoint] sweep threw (non-fatal): ${(err as Error).message}`,
-        );
-      }
-    };
+    // STAGED (Workstream 1b, deliberately NOT wired here): a periodic in-flight
+    // checkpoint would protect an `agent/issue-<N>` worktree against a hard crash
+    // (SIGKILL/OOM) between iterations. The naive implementation — `git add -A` +
+    // `git commit` on the live worktree every heartbeat — RACES the implementer
+    // agent working in that same worktree (shared index.lock; moves the branch
+    // HEAD out from under the agent; can commit a half-written tree). It needs a
+    // non-invasive snapshot (e.g. `git stash create` → push the SHA, never moving
+    // HEAD) with its own concurrency tests before it can run against live work.
+    // The reusable helper (`checkpointInflightWork`) is kept + unit-tested for
+    // that redesign; the FF-refused strand backup (1a) and `--now` staging backup
+    // (1c) — both run when no agent is concurrently active — ship in this pass.
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {
         void syncStatusOnce(statusStore, deps);
       }
-      void checkpointInflightOnHeartbeat();
     }, renewMs);
     leaseHeartbeat.unref?.();
   }
@@ -7182,13 +7156,21 @@ export async function runMain(
               // status phase): the status skill's label-based strand sweep keys
               // off the GH label, so setIssuePhase alone leaves the strand
               // invisible to it. quarantineViaLabel flips the label + comments;
-              // it leaves the issue OPEN for a human.
-              await deps.quarantine(
-                n,
-                `Stranded on ${STAGING_BRANCH}: promotion fast-forward to ${args.branch} ` +
-                  `was refused after certification. Certified work is preserved at ` +
-                  `${strandRef(STAGING_BRANCH)} / ${wipRef(n)}. Human triage required.`,
-              );
+              // it leaves the issue OPEN for a human. Wrapped so a GH-API failure
+              // NEVER skips the lease release below (matches the sibling
+              // quarantine branch) — the release is the contract-critical step.
+              try {
+                await deps.quarantine(
+                  n,
+                  `Stranded on ${STAGING_BRANCH}: promotion fast-forward to ${args.branch} ` +
+                    `was refused after certification. Certified work is preserved at ` +
+                    `${strandRef(STAGING_BRANCH)} / ${wipRef(n)}. Human triage required.`,
+                );
+              } catch (err) {
+                deps.logError(
+                  `[strand] labeling #${n} needs-human failed (non-fatal): ${(err as Error).message}`,
+                );
+              }
               // Fix 4 (ADR 0019): release the lease held past ship time, matching
               // the promote-success and staging-quarantine siblings. Without this
               // the heartbeat renews the lease forever and a peer can never
