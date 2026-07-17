@@ -51,10 +51,10 @@ this way.
 its place, documenting each field and carrying deliberately non-functional
 `REPLACE-ME` values so it can never be mistaken for a working config.
 
-Nothing breaks in its absence: `loadHostsConfig`
-(`.sandcastle/lib/hosts/registry.ts:169-180`) already falls back to a single
-local host when the file cannot be read, so multi-host stays opt-in — the
-fresh-clone state and the flag-off state are the same state.
+Nothing breaks in its absence: `loadHostsConfig` in
+`.sandcastle/lib/hosts/registry.ts` already falls back to a single local host
+when the file cannot be read, so multi-host stays opt-in — the fresh-clone state
+and the flag-off state are the same state.
 
 The registry test previously read the tracked `hosts.json` as a fixture and would
 have failed on a fresh clone. It now reads the example and asserts the example
