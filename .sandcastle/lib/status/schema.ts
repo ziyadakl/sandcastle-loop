@@ -225,12 +225,16 @@ export const SandcastleStatusSchema = z.object({
   updatedAt: z.string(),
   /**
    * OPTIONAL OS process id of the loop that owns this feed (2b). Written once at
-   * startup by `store.ts`. Lets a SAME-HOST reconciler prove the loop is gone
-   * (`process.kill(pid, 0)` throws) and stop trusting a fresh-looking
-   * `updatedAt` a hard kill (`--now` / SIGKILL) left behind. OPTIONAL + additive
-   * ⇒ no `STATUS_SCHEMA_VERSION` bump; pre-2b and cross-host peer projections
-   * simply omit it. `deriveLiveness` never REQUIRES it — a stale `running` is
-   * already non-live whether the pid is present, absent, or dead.
+   * startup by `store.ts` (see `pid` at store.ts:255). NOTHING READS IT TODAY —
+   * this is forward-looking telemetry, not a wired reconciler. A same-host
+   * consumer could use it to prove the loop is gone (`process.kill(pid, 0)`
+   * throws ESRCH) and stop trusting a fresh-looking `updatedAt` that a hard
+   * kill (`--now` / SIGKILL) left behind, but no such consumer exists yet — it
+   * would be meaningless cross-host (a remote pid can't be signaled). OPTIONAL
+   * + additive ⇒ no `STATUS_SCHEMA_VERSION` bump; pre-2b and cross-host peer
+   * projections simply omit it. `deriveLiveness` never reads it — a stale
+   * `running` is already treated as non-live whether the pid is present,
+   * absent, or dead.
    */
   pid: z.number().int().positive().optional(),
   /**

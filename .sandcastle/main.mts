@@ -6026,9 +6026,12 @@ export async function runMain(
     // HEAD out from under the agent; can commit a half-written tree). It needs a
     // non-invasive snapshot (e.g. `git stash create` → push the SHA, never moving
     // HEAD) with its own concurrency tests before it can run against live work.
-    // The reusable helper (`checkpointInflightWork`) is kept + unit-tested for
-    // that redesign; the FF-refused strand backup (1a) and `--now` staging backup
-    // (1c) — both run when no agent is concurrently active — ship in this pass.
+    // The reusable helper (`checkpointInflightWork`) this used to call was
+    // REMOVED (commit a4eab4b) along with the heartbeat wiring — it does not
+    // exist in the tree today. A future non-invasive redesign has to be built
+    // from scratch (git history has the old version); the FF-refused strand
+    // backup (1a) and `--now` staging backup (1c) — both run when no agent is
+    // concurrently active — ship in this pass.
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {
