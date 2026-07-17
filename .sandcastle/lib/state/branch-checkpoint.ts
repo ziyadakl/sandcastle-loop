@@ -123,12 +123,48 @@ export async function commitWorktreeCheckpoint(
 }
 
 /**
- * Push the worktree's HEAD to the issue's WIP ref with `--force-with-lease`.
- * The checkpoint may be re-pushed as work advances, so the push overwrites the
- * prior WIP tip — but only if the remote ref still points where we last saw it
- * (`--force-with-lease`), never a blind force. Modeled on issue-lease.ts's
- * backend push; returns the raw {@link GitRunResult} (does not throw on
- * `ok=false`).
+ * Resolve a rev to a concrete commit SHA, or "" when it does not resolve.
+ *
+ * Exported so the sibling strand-backup module (which already imports this one,
+ * so the dependency direction is clean) can drop its private copy.
+ */
+export async function revParse(
+  git: GitRunner,
+  cwd: string,
+  rev: string,
+): Promise<string> {
+  const res = await git(cwd, "rev-parse", "--verify", "--quiet", rev);
+  return res.ok ? res.stdout.trim() : "";
+}
+
+/**
+ * Push the worktree's HEAD to the issue's WIP ref, leasing against this host's
+ * own last-pushed value — **never a blind force**.
+ *
+ * ADR 0021 §2. The checkpoint is re-pushed every time a host is stopped
+ * mid-issue, so the push must OVERWRITE the prior WIP tip while still refusing
+ * to destroy a PEER's. That means an explicit
+ * `--force-with-lease=<ref>:<expected>`, where `expected` is a genuine
+ * point-in-time observation by this host — the local mirror ref as it stood
+ * before this push, or empty ("must not exist") the first time:
+ *
+ *   - first checkpoint, ref absent on origin → created;
+ *   - re-checkpoint by this host             → advances cleanly;
+ *   - a PEER wrote the ref meanwhile         → REFUSED, its work survives.
+ *
+ * Two details this depends on, both verified against real git (the same two
+ * that shape `backupStrand`, whose approach this mirrors):
+ *   - a *bare* `--force-with-lease` CANNOT be used: it leases against the
+ *     remote-TRACKING ref, and `refs/sandcastle/wip/*` has none — so once the
+ *     ref exists on origin every later push is rejected `(stale info)` and
+ *     origin silently keeps the FIRST snapshot. That was a real data-loss bug:
+ *     stop --now → resume → stop --now again lost the second stop's work.
+ *   - re-reading origin at push time would be pointless — it would just adopt a
+ *     peer's value as "expected" and clobber it, exactly what `--force` does.
+ *
+ * The mirror is advanced ONLY on a successful push, so it always means "what
+ * origin held because of us", never an aspiration. Best-effort: returns the raw
+ * {@link GitRunResult} and does not throw on `ok=false`.
  */
 export async function pushWipRef(
   repoRoot: string,
@@ -137,15 +173,30 @@ export async function pushWipRef(
   git: GitRunner,
   remote = "origin",
 ): Promise<GitRunResult> {
-  return git(
+  const ref = wipRef(issue);
+
+  // This host's PRIOR observation — read BEFORE the push, and "" ("must not
+  // exist") when we have never pushed this ref. This is the lease, and the only
+  // thing standing between a re-push and a peer's work.
+  const expected = await revParse(git, repoRoot, ref);
+
+  const push = await git(
     repoRoot,
     "-C",
     wtPath,
     "push",
-    "--force-with-lease",
+    `--force-with-lease=${ref}:${expected}`,
     remote,
-    `HEAD:${wipRef(issue)}`,
+    `HEAD:${ref}`,
   );
+  if (!push.ok) return push;
+
+  // The push LANDED, so origin now holds this worktree's HEAD: record it as our
+  // observation for the next lease. Best-effort — a mirror we fail to advance
+  // only costs us a (safe) refusal next time, never a clobber.
+  const sha = await revParse(git, wtPath, "HEAD");
+  if (sha) await git(repoRoot, "update-ref", ref, sha);
+  return push;
 }
 
 /**
