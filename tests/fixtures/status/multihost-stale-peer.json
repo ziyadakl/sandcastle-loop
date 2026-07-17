@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 3,
+  "state": "running",
+  "hostId": "srv1360790",
+  "runId": "sandcastle/queue-20260716",
+  "run": {
+    "branch": "sandcastle/queue-20260716",
+    "repo": "affinity-tracker",
+    "startedAt": "2026-07-17T00:50:00.000Z",
+    "iterations": { "current": 3, "total": 50 },
+    "maxConcurrent": 2
+  },
+  "totals": { "merged": 2, "needsHuman": 0, "requeued": 0, "running": 1 },
+  "issues": [
+    {
+      "number": 607,
+      "title": "reconcile lease on restart",
+      "branch": "agent/issue-607",
+      "phase": "implementer",
+      "startedAt": "2026-07-17T00:56:00.000Z"
+    }
+  ],
+  "history": [],
+  "updatedAt": "2026-07-17T01:00:00.000Z",
+  "peers": [
+    {
+      "hostId": "ziyads-macbook-air.local",
+      "state": "running",
+      "iterations": { "current": 1, "total": 50 },
+      "totals": { "merged": 1, "needsHuman": 0, "requeued": 0, "running": 1 },
+      "issues": [
+        {
+          "number": 605,
+          "title": "fix worktree health probe",
+          "branch": "agent/issue-605",
+          "phase": "implementer",
+          "startedAt": "2026-07-17T00:45:00.000Z"
+        }
+      ],
+      "updatedAt": "2026-07-17T00:50:00.000Z"
+    }
+  ]
+}

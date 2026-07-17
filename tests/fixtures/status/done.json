@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 3,
+  "state": "done",
+  "hostId": "srv1360790",
+  "runId": "sandcastle/queue-20260716",
+  "run": {
+    "branch": "sandcastle/queue-20260716",
+    "repo": "affinity-tracker",
+    "startedAt": "2026-07-17T00:50:00.000Z",
+    "iterations": { "current": 5, "total": 5 },
+    "maxConcurrent": 2
+  },
+  "totals": { "merged": 5, "needsHuman": 0, "requeued": 0, "running": 0 },
+  "issues": [],
+  "history": [
+    {
+      "number": 620,
+      "title": "final issue shipped",
+      "branch": "agent/issue-620",
+      "phase": "merged",
+      "completedAt": "2026-07-17T00:59:00.000Z",
+      "hostId": "srv1360790"
+    }
+  ],
+  "updatedAt": "2026-07-17T01:00:00.000Z"
+}

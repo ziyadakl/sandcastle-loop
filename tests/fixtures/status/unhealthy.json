@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 3,
+  "state": "unhealthy",
+  "hostId": "srv1360790",
+  "runId": "sandcastle/queue-20260716",
+  "run": {
+    "branch": "sandcastle/queue-20260716",
+    "repo": "affinity-tracker",
+    "startedAt": "2026-07-17T00:50:00.000Z",
+    "iterations": { "current": 8, "total": 8 },
+    "maxConcurrent": 2
+  },
+  "totals": { "merged": 4, "needsHuman": 0, "requeued": 1, "running": 0 },
+  "issues": [],
+  "history": [
+    {
+      "number": 611,
+      "title": "promotion refused: work stranded on integration-candidate",
+      "branch": "agent/issue-611",
+      "phase": "merged",
+      "completedAt": "2026-07-17T00:59:00.000Z",
+      "hostId": "srv1360790"
+    }
+  ],
+  "updatedAt": "2026-07-17T01:00:00.000Z"
+}

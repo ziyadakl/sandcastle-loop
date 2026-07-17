@@ -1,0 +1,146 @@
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#0b0b0b" />
+<meta name="color-scheme" content="dark" />
+<title>Sandcastle</title>
+<link rel="stylesheet" href="./viewer.css" />
+
+<!--
+  ============================================================================
+  SLOT CONTRACT — this file is a STATIC SKELETON. `./viewer.js` polls
+  status.json, builds a view-model via ./view-model.js (buildViewModel), and
+  populates the elements below by id / data-hook. Do NOT add render logic here.
+  viewer.js owns text content, class toggles, and cloning the <template>s.
+
+  Stable slot ids (all live inside <main class="app">):
+    #run-title          — text: project/run title (header, left)
+    #hosts-strip        — container: one .host-dot per hosts[] entry
+                          (clone #tpl-host-dot; set .is-live / .is-stale,
+                           .host-dot__label text, .host-dot__mark tone)
+    #banner             — the status badge (header, right). Set:
+                            data-kind = no-run|live|stale|done|stopped|unhealthy
+                          Children:
+                            #banner-dot   — live pulse dot (show when live)
+                            #banner-text  — text: banner.text
+                            #banner-activity — text: " · " + banner.activity
+    #meta-iterations    — text: meta.perMachine joined "VPS 1/50 · Mac 1/50"
+    #meta-branch        — text: meta.branch
+    #pills              — container: one .pill per pills[] entry
+                          (clone #tpl-pill; set data-tone gray|success|warning|info,
+                           .pill__count text, .pill__label text)
+    #active-list        — container: one issue row per active[] entry
+                          (clone #tpl-issue-row)
+    #active-empty       — shown when active[] empty ("No active issues.")
+    #recent-list        — container: up to 10 issue rows per recent[] entry
+    #recent-empty       — shown when recent[] empty ("Nothing finished yet.")
+    #recent-overflow    — muted "+N more" line; show when overflowRecent > 0,
+                          set #recent-overflow-count text to N
+
+  Issue-row template (#tpl-issue-row) hooks (data-* / class):
+    .issue-row            — root; add .is-attention for attention/needs-you rows
+    .issue-row__num       — text: "#" + number
+    .issue-row__host      — host badge (clone/populate or hide); text = hostLabel
+    .issue-row__title     — text: title
+    .issue-row__detail    — text: detail (hide when absent)
+    .issue-row__meta      — right cluster
+    .issue-row__age       — text: age (recent rows; hide when absent)
+    .issue-row__phase     — phase badge; text = phaseLabel; set
+                            data-tone success|warning|info|gray as fits phase
+
+  Host-badge template (#tpl-host-badge): .host-badge, text = host label.
+  Host-dot template (#tpl-host-dot): .host-dot (add .is-live | .is-stale),
+    .host-dot__mark (the dot), .host-dot__label (text).
+
+  Empty-state elements start hidden via the [hidden] attribute; viewer.js
+  toggles [hidden]. Lists start empty.
+  ============================================================================
+-->
+
+<main class="app">
+  <div class="noise" aria-hidden="true"></div>
+
+  <!-- 1. Header: title + hosts strip (left) / status banner (right) -->
+  <header class="header">
+    <div class="header__lead">
+      <h1 class="header__title" id="run-title">Sandcastle</h1>
+      <div class="hosts-strip" id="hosts-strip" aria-label="Host liveness"></div>
+    </div>
+    <span class="banner" id="banner" data-kind="no-run">
+      <span class="banner__dot" id="banner-dot" aria-hidden="true">
+        <span class="banner__dot-ping"></span>
+        <span class="banner__dot-core"></span>
+      </span>
+      <span class="banner__text" id="banner-text">No run</span>
+      <span class="banner__activity" id="banner-activity"></span>
+    </span>
+  </header>
+
+  <!-- 2. Meta / totals card -->
+  <section class="card meta">
+    <div class="meta__lines">
+      <div class="meta__iterations" id="meta-iterations">—</div>
+      <div class="meta__branch">
+        <span class="meta__branch-icon" aria-hidden="true">⑂</span>
+        <span id="meta-branch">—</span>
+      </div>
+    </div>
+    <div class="pills" id="pills"></div>
+  </section>
+
+  <!-- 3. Active section -->
+  <section class="section">
+    <h2 class="section__title">Active</h2>
+    <div class="list" id="active-list"></div>
+    <p class="empty" id="active-empty" hidden>No active issues.</p>
+  </section>
+
+  <!-- 4. Separator -->
+  <hr class="rule" />
+
+  <!-- 5. Recent section -->
+  <section class="section">
+    <h2 class="section__title">Recent</h2>
+    <div class="list" id="recent-list"></div>
+    <p class="empty" id="recent-empty" hidden>Nothing finished yet.</p>
+    <p class="overflow" id="recent-overflow" hidden>
+      +<span id="recent-overflow-count">0</span> more
+    </p>
+  </section>
+</main>
+
+<!-- ===================== render templates (cloned by viewer.js) ============ -->
+
+<template id="tpl-issue-row">
+  <div class="issue-row">
+    <span class="issue-row__num">#0</span>
+    <span class="badge badge--outline issue-row__host" hidden>Host</span>
+    <div class="issue-row__body">
+      <div class="issue-row__title">Title</div>
+      <div class="issue-row__detail" hidden>Detail</div>
+    </div>
+    <div class="issue-row__meta">
+      <span class="issue-row__age" hidden>0m</span>
+      <span class="badge issue-row__phase" data-tone="gray">Phase</span>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-pill">
+  <span class="pill" data-tone="gray">
+    <span class="pill__count">0</span>
+    <span class="pill__label">Label</span>
+  </span>
+</template>
+
+<template id="tpl-host-badge">
+  <span class="badge badge--outline host-badge">Host</span>
+</template>
+
+<template id="tpl-host-dot">
+  <span class="host-dot is-stale">
+    <span class="host-dot__mark" aria-hidden="true"></span>
+    <span class="host-dot__label">Host</span>
+  </span>
+</template>
+
+<script type="module" src="./viewer.js"></script>

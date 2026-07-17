@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 3,
+  "state": "running",
+  "hostId": "srv1360790",
+  "runId": "sandcastle/queue-20260716",
+  "run": {
+    "branch": "sandcastle/queue-20260716",
+    "repo": "affinity-tracker",
+    "startedAt": "2026-07-17T00:50:00.000Z",
+    "iterations": { "current": 1, "total": 50 },
+    "maxConcurrent": 2
+  },
+  "totals": { "merged": 2, "needsHuman": 0, "requeued": 0, "running": 1 },
+  "issues": [
+    {
+      "number": 607,
+      "title": "reconcile lease on restart",
+      "branch": "agent/issue-607",
+      "phase": "implementer",
+      "startedAt": "2026-07-17T00:56:00.000Z"
+    }
+  ],
+  "history": [
+    {
+      "number": 601,
+      "title": "seed the cross-host status refs",
+      "branch": "agent/issue-601",
+      "phase": "merged",
+      "completedAt": "2026-07-17T00:53:00.000Z",
+      "hostId": "srv1360790"
+    },
+    {
+      "number": 602,
+      "title": "publish lane refs on origin",
+      "branch": "agent/issue-602",
+      "phase": "merged",
+      "completedAt": "2026-07-17T00:58:00.000Z",
+      "hostId": "srv1360790"
+    }
+  ],
+  "activity": "reviewing",
+  "updatedAt": "2026-07-17T01:00:00.000Z",
+  "peers": [
+    {
+      "hostId": "ziyads-macbook-air.local",
+      "state": "running",
+      "activity": "planning",
+      "iterations": { "current": 1, "total": 50 },
+      "totals": { "merged": 1, "needsHuman": 1, "requeued": 0, "running": 1 },
+      "issues": [
+        {
+          "number": 605,
+          "title": "fix worktree health probe",
+          "branch": "agent/issue-605",
+          "phase": "implementer",
+          "startedAt": "2026-07-17T00:55:00.000Z"
+        },
+        {
+          "number": 606,
+          "title": "quarantine blocked ticket",
+          "branch": "agent/issue-606",
+          "phase": "needs-human",
+          "detail": "HAS_BLOCKERS",
+          "startedAt": "2026-07-17T00:54:00.000Z",
+          "attention": true
+        }
+      ],
+      "updatedAt": "2026-07-17T00:59:50.000Z"
+    }
+  ]
+}
