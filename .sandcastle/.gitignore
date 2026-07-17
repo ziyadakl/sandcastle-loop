@@ -1,6 +1,12 @@
 .env
 logs/
 worktrees/
+# Per-machine multi-host registry. Untracked ON PURPOSE: it holds paths that are
+# correct for ONE machine's checkouts and wrong for every other. While it was
+# tracked it shipped in the template tarball, and /sandcastle-update copied this
+# repo's own `hub` repoPath over each consumer's — silently pointing their remote
+# commands at the wrong repo. Seed a new project from hosts.example.json instead.
+hosts.json
 .restart-remaining
 .loop.lock
 .sandbox-flag

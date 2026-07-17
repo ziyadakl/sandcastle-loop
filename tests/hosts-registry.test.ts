@@ -9,7 +9,10 @@ import {
 } from "../.sandcastle/lib/hosts/registry.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const seedPath = resolve(here, "../.sandcastle/hosts.json");
+// hosts.example.json, NOT hosts.json: the real registry is per-machine and
+// untracked, so it does not exist in a fresh clone and cannot be a fixture.
+// The example is what ships, so the example is what must stay parseable.
+const examplePath = resolve(here, "../.sandcastle/hosts.example.json");
 
 describe("parseHostsConfig", () => {
   it("parses a bare array of valid entries", () => {
@@ -156,22 +159,27 @@ describe("loadHostsConfig", () => {
   });
 });
 
-describe("seeded .sandcastle/hosts.json", () => {
-  it("round-trips to local (2) + hub (1)", () => {
-    const raw = readFileSync(seedPath, "utf8");
-    const cfg = parseHostsConfig(raw);
-    const local = cfg.find((h) => h.transport === "local");
-    const hub = cfg.find((h) => h.name === "hub");
-    expect(local).toEqual({
+describe("shipped .sandcastle/hosts.example.json", () => {
+  it("parses, and offers a local host as the starting point", () => {
+    const cfg = parseHostsConfig(readFileSync(examplePath, "utf8"));
+    expect(cfg.find((h) => h.transport === "local")).toEqual({
       name: "local",
       transport: "local",
       maxConcurrent: 2,
     });
-    expect(hub).toEqual({
-      name: "hub",
-      transport: "hub",
-      maxConcurrent: 1,
-      repoPath: "/home/deploy/dev/sandcastle-loop",
-    });
+  });
+
+  // The regression guard for the bug this file was split to fix. The example
+  // ships to every consumer; a REAL path in it is the exact defect that made
+  // /sandcastle-update overwrite each project's registry with this repo's own
+  // `hub` checkout. Placeholders keep it inert until a human edits it.
+  it("contains only placeholder remote paths — never a real machine's", () => {
+    const cfg = parseHostsConfig(readFileSync(examplePath, "utf8"));
+    const remotes = cfg.filter((h) => h.transport !== "local");
+    expect(remotes.length).toBeGreaterThan(0);
+    for (const r of remotes) {
+      expect(r.repoPath).toMatch(/REPLACE-ME/);
+      expect(r.transport).toMatch(/REPLACE-ME/);
+    }
   });
 });
