@@ -27,33 +27,32 @@ idempotent, and it moves any existing copy into a timestamped backup rather than
 deleting it. Afterwards, `git pull` in this repo is all it takes to update the
 skills on that machine.
 
-## Bringing an EXISTING machine up to date (read before pulling)
+## Bringing an EXISTING machine up to date
 
-A machine that already has a checkout — the VPS — needs both steps, and the
-first one destroys a file if you skip the backup:
+Two commands, no preparation:
 
 ```sh
-cp ~/Dev/Sandcastle/.sandcastle/hosts.json /tmp/hosts.json.bak   # DO THIS FIRST
 git -C ~/Dev/Sandcastle pull
-cp /tmp/hosts.json.bak ~/Dev/Sandcastle/.sandcastle/hosts.json   # restore
 bash ~/Dev/Sandcastle/skills/install.sh
 ```
 
-**Why the backup is not optional.** `hosts.json` used to be tracked. The commit
-that made it per-machine removes it from tracking, so when an existing checkout
-pulls that commit, git DELETES the working file — being gitignored does not
-protect a file git itself is removing, because the ignore rule only applies once
-the file is already untracked. This happened for real on the Mac during the
-merge; it was recovered from a backup. It is a ONE-TIME migration cost per
-machine: once past this commit the file is untracked and pulls leave it alone
-forever.
+Both are needed. The pull updates the files; `install.sh` is what makes a skill
+fix take effect. Until it runs on a machine, that machine's
+`~/.claude/skills/sandcastle-*` are private copies, and pulling changes nothing
+about the skills it actually uses.
 
-Consumer projects (affinity-tracker etc.) are NOT affected — they receive files
+The pull will delete `.sandcastle/hosts.json` on any checkout that predates it
+being made per-machine — it was tracked then, and git removes the working file
+on a tracked→deleted transition (the gitignore rule only protects a file that is
+already untracked, so it cannot save one git is actively removing).
+`install.sh` restores it from history automatically and prints the `repoPath`
+values for you to eyeball. No backup step, because the content is in git history
+either way, so there was never anything a backup could save that history
+couldn't. A migration that depends on a human doing three careful steps in the
+right order is a migration that eventually gets done wrong.
+
+Consumer projects (affinity-tracker etc.) are unaffected — they receive files
 through `/sandcastle-update`, which only copies and never deletes.
-
-**`install.sh` is what makes a skill fix take effect.** Until it runs on a
-machine, that machine's `~/.claude/skills/sandcastle-*` are private copies and a
-`git pull` changes nothing about the skills it actually uses.
 
 ## Why symlinks into `~/.claude/skills` rather than this repo's `.claude/skills`
 
