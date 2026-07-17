@@ -138,6 +138,9 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       hostId: "host-A",
       integrationBranch: "main",
       remote: "origin",
+      // Per-issue sweep only — no staging strand in this fixture.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     // Outcome for issue 7 is "checkpointed" at the canonical WIP ref.
@@ -174,6 +177,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       hostId: "host-A",
       integrationBranch: "origin/main",
       remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     const r9 = results.find((r) => r.issue === 9) as CheckpointStopResult;
@@ -267,6 +272,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       hostId: "host-A",
       integrationBranch: "main",
       remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
     });
     expect(aResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
 
@@ -306,6 +313,7 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
   // -------------------------------------------------------------------------
   it("checkpointStop backs up an integration-candidate tip that is ahead of the integration branch", async () => {
     const host = makeHost("hostS");
+    const SYNC_ON = true;
 
     // A certified fixer commit landed on integration-candidate but was never
     // promoted — the branch is 1 ahead of the integration branch (main).
@@ -323,6 +331,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       hostId: "host-S",
       integrationBranch: "main",
       remote: "origin",
+      stagingBranch: "integration-candidate",
+      syncEnabled: SYNC_ON,
     });
     expect(results).toEqual<CheckpointStopResult[]>([]);
 
@@ -349,6 +359,90 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       hostId: "host-U",
       integrationBranch: "main",
       remote: "origin",
+      stagingBranch: "integration-candidate",
+      syncEnabled: true,
+    });
+
+    expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");
+  });
+
+  // -------------------------------------------------------------------------
+  // TEST 6 (review fix #1) — ADR 0021's inertness contract: the staging/strand
+  // backup is an ORIGIN WRITE, so it must be gated behind the cross-host opt-in.
+  // A single-host `--now` stop with the flag OFF must push NOTHING new to origin
+  // even when there IS a stranded staging tip worth saving locally.
+  //
+  // Asserted on the REAL bare origin (WHEN, not IF) and paired with the flag-ON
+  // twin below, so neither assertion can pass vacuously.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Strand a certified-but-unpromoted fixer commit on `integration-candidate`
+   * (1 ahead of main) exactly as TEST 4 does. Returns the staging tip SHA.
+   */
+  function strandStagingTip(host: string): string {
+    git(host, "checkout", "-B", "integration-candidate", "origin/main");
+    writeFileSync(path.join(host, "fixer.txt"), "post-merge fixer commit\n");
+    git(host, "add", "fixer.txt");
+    git(host, "commit", "-m", "post-merge fixer");
+    const tip = git(host, "rev-parse", "integration-candidate");
+    git(host, "checkout", "main");
+    return tip;
+  }
+
+  it("checkpointStop with sync OFF writes NO strand ref to origin (ADR 0021 inertness)", async () => {
+    const host = makeHost("hostV");
+    const stagingTip = strandStagingTip(host);
+
+    await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: host,
+      hostId: "host-V",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: "integration-candidate",
+      syncEnabled: false,
+    });
+
+    // Nothing new on ORIGIN — the flag-off consumer's push surface is unchanged.
+    expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");
+    // …but the work is NOT lost: the LOCAL strand ref still pins the exact tip,
+    // which is what makes this a gating assertion rather than a "did nothing" one.
+    expect(git(host, "rev-parse", "refs/sandcastle/strand/integration-candidate")).toBe(
+      stagingTip,
+    );
+  });
+
+  it("checkpointStop with sync ON writes the strand ref to origin", async () => {
+    const host = makeHost("hostW");
+    const stagingTip = strandStagingTip(host);
+
+    await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: host,
+      hostId: "host-W",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: "integration-candidate",
+      syncEnabled: true,
+    });
+
+    expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe(
+      stagingTip,
+    );
+  });
+
+  // Control for fix #2: `stagingBranch: null` is the explicit "skip it" intent —
+  // no staging backup at all, even with a stranded tip and sync ON.
+  it("checkpointStop with stagingBranch null skips the staging backup entirely", async () => {
+    const host = makeHost("hostX");
+    strandStagingTip(host);
+
+    await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: host,
+      hostId: "host-X",
+      integrationBranch: "main",
+      remote: "origin",
+      stagingBranch: null,
+      syncEnabled: true,
     });
 
     expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");

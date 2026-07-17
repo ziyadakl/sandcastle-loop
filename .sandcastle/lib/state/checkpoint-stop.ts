@@ -107,10 +107,22 @@ export interface CheckpointStopOpts {
    * WORKSTREAM 1 (1c): the staging branch whose tip is backed up when it is ahead
    * of `integrationBranch` — post-merge fixer commits that landed on staging but
    * were never promoted, which a graceful `--now` stop would otherwise lose.
-   * Defaults to `"integration-candidate"` (the loop's STAGING_BRANCH). Set to ""
-   * to disable the staging backup.
+   * `null` SKIPS the staging backup. Required and explicit: the CALLER states the
+   * intent, so this module never owns the default branch name (that literal is the
+   * loop's STAGING_BRANCH, resolved at the entry point).
    */
-  readonly stagingBranch?: string;
+  readonly stagingBranch: string | null;
+  /**
+   * Whether cross-host sync (ADR 0019/0020) is enabled — mirrors main.mts's
+   * `crossHostSyncEnabled()`, threaded in rather than imported (main.mts is the
+   * consumer of this lib; importing it back would be a cycle).
+   *
+   * ADR 0021's inertness contract: the strand backup is a NEW origin write, so it
+   * is gated behind the existing cross-host opt-in — with the flag off a
+   * single-host consumer pushes nothing new. When false the staging tip is still
+   * pinned by a LOCAL strand ref, so nothing is lost; it just never leaves the box.
+   */
+  readonly syncEnabled: boolean;
 }
 
 /**
@@ -148,8 +160,6 @@ export async function checkpointStop(
   opts: CheckpointStopOpts,
 ): Promise<CheckpointStopResult[]> {
   const remote = opts.remote ?? "origin";
-  const stagingBranch =
-    opts.stagingBranch === undefined ? "integration-candidate" : opts.stagingBranch;
   const worktrees = await listInflightIssueWorktrees(git, opts.repoRoot);
   const results: CheckpointStopResult[] = [];
 
@@ -215,22 +225,29 @@ export async function checkpointStop(
   // WORKSTREAM 1 (1c): after the per-issue sweep, preserve any certified-but-
   // unpromoted staging tip. A graceful `--now` stop can catch post-merge fixer
   // commits sitting on `integration-candidate` ahead of the integration branch
-  // that no worktree owns — back them up to the durable strand ref (local always,
-  // origin too) so they survive the stop. Best-effort: a resolve/push fault is
-  // silent here (the same fail-quiet posture the per-issue sweep uses for a bad
-  // worktree). Set `stagingBranch: ""` to disable.
-  if (stagingBranch) {
+  // that no worktree owns — back them up to the durable strand ref so they
+  // survive the stop. The LOCAL ref is always written (nothing is lost either
+  // way); the ORIGIN push is gated on `syncEnabled` per ADR 0021's inertness
+  // contract, so a flag-off single-host consumer pushes nothing new. Best-effort:
+  // a resolve/push fault is silent here (the same fail-quiet posture the per-issue
+  // sweep uses for a bad worktree). Pass `stagingBranch: null` to skip entirely.
+  //
+  // NOTE: the per-issue `pushWipRef` above is deliberately NOT gated — that is
+  // pre-existing behavior from the original checkpoint sweep, out of scope here.
+  // The gating in this sweep is therefore knowingly asymmetric: only the NEW
+  // staging/strand origin write honors the flag.
+  if (opts.stagingBranch !== null) {
     const ahead = await stagingCommitsAhead(
       git,
       opts.repoRoot,
       opts.integrationBranch,
-      stagingBranch,
+      opts.stagingBranch,
     );
     if (ahead > 0) {
       await backupStrand(git, {
         repoRoot: opts.repoRoot,
-        branch: stagingBranch,
-        syncEnabled: true,
+        branch: opts.stagingBranch,
+        syncEnabled: opts.syncEnabled,
         remote,
       });
     }

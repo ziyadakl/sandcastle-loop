@@ -146,6 +146,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -191,6 +194,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -238,6 +244,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -277,6 +286,9 @@ describe("checkpointStop", () => {
       repoRoot: "/repo",
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
+      // These cases exercise the per-issue sweep only — no staging backup.
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     const byIssue = new Map(results.map((r) => [r.issue, r]));
@@ -316,6 +328,8 @@ describe("checkpointStop", () => {
       hostId: "host-a",
       integrationBranch: "sandcastle/theme",
       remote: "origin",
+      stagingBranch: null,
+      syncEnabled: false,
     });
 
     const leaseDel = calls.find((c) =>
