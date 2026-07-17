@@ -5986,8 +5986,19 @@ export async function runMain(
   let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
   if (leaseEnabled) {
     const renewMs = Math.max(30_000, (lockTtlSecOnce() * 1000) / 3); // Fix 8
+    // Cross-host STATUS SYNC also rides the heartbeat (gated). The per-iteration
+    // call (below) is the deterministic trigger for fast runs, but on a LONG
+    // single iteration it would never re-fire, freezing the fused multi-host
+    // viewer (peers never refresh). Folding sync into the heartbeat keeps peers
+    // live mid-iteration. The flag is a process-stable env flag, so snapshot it
+    // once here. The double-fire is intentional + benign: syncStatusOnce is
+    // idempotent (publish → fetch → setPeers).
+    const syncOnHeartbeat = crossHostSyncEnabled();
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
+      if (syncOnHeartbeat) {
+        void syncStatusOnce(statusStore, deps);
+      }
     }, renewMs);
     leaseHeartbeat.unref?.();
   }
