@@ -60,8 +60,8 @@ import {
   resolveReuseDecision,
   deleteWipRef,
   listWipRefIssues,
-  strandRef,
-  backupStrand,
+  STAGING_BRANCH,
+  handleStrandedPromotion,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
@@ -1748,8 +1748,10 @@ function buildGitEnv(): Record<string, string> {
 // Staging branch — git helpers
 // ---------------------------------------------------------------------------
 
-/** Persistent staging branch name. Reused across iterations. */
-const STAGING_BRANCH = "integration-candidate";
+// The persistent staging branch name (`STAGING_BRANCH`, reused across
+// iterations) is owned by `lib/state` and imported at the top of this file, so
+// state-layer code that reasons about the strand names it from one place
+// instead of re-hardcoding the literal.
 
 /** `git branch --merged` format flag — emit short refnames (no leading "* "). */
 const GIT_BRANCH_FORMAT_ARG = "--format=%(refname:short)";
@@ -7101,83 +7103,28 @@ export async function runMain(
                 `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
                 `unhealthy (non-zero). Human triage required.`,
             );
-            // WORKSTREAM 1 (1a) — DON'T lose the stranded work. BEFORE releasing
-            // the leases, pin the certified `integration-candidate` tip to a
-            // durable ref (`refs/sandcastle/strand/<branch>` + per-issue WIP refs)
-            // so a human — or, when cross-host sync is on, a peer host — can
-            // recover it. Local refs always; the origin push is gated on the sync
-            // flag. Best-effort: a backup fault is logged non-fatal (the strand is
-            // still on `integration-candidate` on disk, and the run already exits
-            // unhealthy for a human).
-            const strandSync = crossHostSyncEnabled();
-            try {
-              const backup = await backupStrand(runGitLease, {
-                repoRoot: args.repoRoot,
-                branch: STAGING_BRANCH,
-                issues: mergedIssueNums,
-                syncEnabled: strandSync,
-              });
-              deps.log(
-                `[strand] backed up ${STAGING_BRANCH} → ${backup.localRefs.join(", ") || "(none)"}` +
-                  (backup.pushedRefs.length
-                    ? ` (origin: ${backup.pushedRefs.join(", ")})`
-                    : ""),
-              );
-              for (const e of backup.errors) {
-                deps.logError(`[strand] backup: ${e}`);
-              }
-            } catch (err) {
-              deps.logError(
-                `[strand] backup of ${STAGING_BRANCH} threw (non-fatal): ${(err as Error).message}`,
-              );
-            }
-            // Also publish the stranded staging tip on this host's lane so a peer
-            // can merge it (today publish only runs on promote-SUCCESS, leaving
-            // this stranded work invisible to peers). Gated on the sync flag.
-            if (strandSync) {
-              await publishLaneOrLog(
-                deps,
-                STAGING_BRANCH,
-                "stranding staging (promotion fast-forward refused)",
-              );
-            }
-            // These "ok" issues were shown as `merge` (queued) and deliberately
-            // never recorded merged — correct, they're stranded, not shipped.
-            // Surface them as needing a human so the dashboard flags the strand
-            // instead of leaving them in a neutral "queued" limbo that reads
-            // like normal in-progress work.
-            for (const n of mergedIssueNums) {
-              statusStore.setIssuePhase(
-                n,
-                "needs-human",
-                `stranded on ${STAGING_BRANCH} — promotion fast-forward refused`,
-              );
-              // Apply the REAL `needs-human` GitHub label (not just the in-memory
-              // status phase): the status skill's label-based strand sweep keys
-              // off the GH label, so setIssuePhase alone leaves the strand
-              // invisible to it. quarantineViaLabel flips the label + comments;
-              // it leaves the issue OPEN for a human. Wrapped so a GH-API failure
-              // NEVER skips the lease release below (matches the sibling
-              // quarantine branch) — the release is the contract-critical step.
-              try {
-                await deps.quarantine(
-                  n,
-                  `Stranded on ${STAGING_BRANCH}: promotion fast-forward to ${args.branch} ` +
-                    `was refused after certification. Certified work is preserved at ` +
-                    `${strandRef(STAGING_BRANCH)} / ${wipRef(n)}. Human triage required.`,
-                );
-              } catch (err) {
-                deps.logError(
-                  `[strand] labeling #${n} needs-human failed (non-fatal): ${(err as Error).message}`,
-                );
-              }
-              // Fix 4 (ADR 0019): release the lease held past ship time, matching
-              // the promote-success and staging-quarantine siblings. Without this
-              // the heartbeat renews the lease forever and a peer can never
-              // reclaim, defeating the "it expires" contract. The issue stays
-              // needs-human (planner won't re-pick it); only the ref clears.
-              await deps.releaseIssueLease(n);
-            }
+            // WORKSTREAM 1 (1a) — DON'T lose the stranded work. The whole policy
+            // (pin the certified tip to durable refs BEFORE any lease is
+            // released → publish the lane when sync is on → surface each issue to
+            // a human → release its lease) lives in `handleStrandedPromotion`,
+            // unit- and real-git-tested in tests/strand-backup.test.ts. It never
+            // throws: the run's unhealthy exit is decided above, not by it.
+            await handleStrandedPromotion(runGitLease, {
+              log: (line) => deps.log(line),
+              logError: (line) => deps.logError(line),
+              setIssuePhase: (n, phase, detail) =>
+                statusStore.setIssuePhase(n, phase, detail),
+              quarantine: (n, reason) => deps.quarantine(n, reason),
+              releaseIssueLease: (n) => deps.releaseIssueLease(n),
+              publishLane: (branch, context) =>
+                publishLaneOrLog(deps, branch, context),
+            }, {
+              repoRoot: args.repoRoot,
+              stagingBranch: STAGING_BRANCH,
+              integrationBranch: args.branch,
+              issues: mergedIssueNums,
+              syncEnabled: crossHostSyncEnabled(),
+            });
           }
         } else {
           // Staging failed certification (post-fixer too) OR merger failed
