@@ -12,7 +12,6 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
-  existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -385,13 +384,12 @@ describe("checkpoint-stop.mts (post-kill runner) — status reconciliation", () 
     const script = fileURLToPath(
       new URL("../.sandcastle/scripts/checkpoint-stop.mts", import.meta.url),
     );
-    // A git worktree has no node_modules of its own; fall back to the main
-    // checkout's tsx (the same one that runs this vitest).
-    const tsxCandidates = [
-      fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url)),
-      "/Users/ziyadakl/Dev/Sandcastle/node_modules/.bin/tsx",
-    ];
-    const tsx = tsxCandidates.find((p) => existsSync(p)) ?? tsxCandidates[0];
+    // Resolve the vendored tsx relative to this test file's own location
+    // (not a hardcoded machine path) so this passes on any checkout — this
+    // Mac, the VPS, or CI.
+    const tsx = fileURLToPath(
+      new URL("../node_modules/.bin/tsx", import.meta.url),
+    );
     execFileSync(
       tsx,
       [script, "--repo-root", tmp, "--integration-branch", "master"],

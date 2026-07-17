@@ -127,8 +127,10 @@ export type {
 } from "./strand-backup.js";
 
 // Post-kill / --now checkpoint sweep (ADR 0021) — enumerate in-flight worktrees
-// and persist+release each. Exported so the loop's heartbeat can reuse the
-// worktree enumeration.
+// and persist+release each. `listInflightIssueWorktrees` has no heartbeat
+// consumer (that wiring was removed, commit a4eab4b) — it's re-exported as
+// part of this module's public surface, matching every sibling group in this
+// barrel, and is consumed today by checkpoint-stop.ts:163 and by tests.
 export {
   checkpointStop,
   listInflightIssueWorktrees,
