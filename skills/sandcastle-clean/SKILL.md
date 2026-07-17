@@ -24,24 +24,34 @@ This is a WHAT question (which target), not a HOW question, and the operation is
 - **Single machine (default):** clean this repo on this machine.
 - **All machines (`--all`) / one remote (`--host <name>`):** read `.sandcastle/hosts.json` and clean each target host over its transport.
 
-The per-host procedure is IDENTICAL on both paths. The only differences are where the commands run and that each host gets its own pre-flight.
+The per-host **pre-flight and deletion mechanics** are identical on both paths — same checks, same order, same refusals; only the place they run differs, and each host gets its own pre-flight. **Confirmation is the one real difference:** single-machine confirms before each destructive step; all-machines surveys every host first and confirms ONCE against the combined proposal (see All-machines mechanics). Don't collapse that into "identical" — a per-step prompt × N hosts is the treadmill that path exists to avoid.
 
 ---
 
 ## Pre-flight — PER TARGET HOST, never once globally
 
-1. **Loop running ON THAT HOST?** Run the cwd-filtered pgrep **on the host being cleaned** — locally for this machine, over `ssh <transport> --` for a remote. If it returns a PID, **refuse for that host only** and tell the user to `/sandcastle-stop` (that host) first. Other hosts still proceed.
+1. **Loop running ON THAT HOST? Fail CLOSED — refuse on ANY sign of life.** Gather all three signals **on the host being cleaned** — locally for this machine, over `ssh <transport> --` for a remote (`cd <repoPath>` first). **Refuse for that host** if ANY of them says a loop may be alive, and tell the user to `/sandcastle-stop` (that host) first. Other hosts still proceed.
 
-   ```
-   for pid in $(pgrep -f '\.sandcastle/main\.mts (--iterations|--issue|--max-concurrent|--repo-root|--branch)'); do
-     cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p')
-     [ "$cwd" = "$PWD" ] && echo "$pid"
-   done
-   ```
+   - **a. cwd-filtered pgrep returns a PID:**
+     ```
+     for pid in $(pgrep -f '\.sandcastle/main\.mts (--iterations|--issue|--max-concurrent|--repo-root|--branch)'); do
+       cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p')
+       [ "$cwd" = "$PWD" ] && echo "$pid"
+     done
+     ```
+     (If the loop was launched with `--repo-root <other>`, compare against that path instead of `$PWD` — otherwise no process ever matches the filter, the gate passes on silence, and you delete a live loop's worktrees.)
+   - **b. `<repoRoot>/.sandcastle/status.json` has `state: "running"` AND a fresh `updatedAt`** — within ~4 minutes (2× the 120s status heartbeat, plus margin), per `/sandcastle-status` step 1's rule.
+   - **c. `<repoRoot>/.sandcastle/.loop.lock` is held** — it's held while a loop runs and auto-expires ~60s after the holder dies, so a held lock means a loop was alive within the last minute.
 
-   **This check MUST run on the target, and this is the whole reason the all-machines path is delicate.** A local pgrep cannot see the VPS's loop. Removing a worktree out from under a *running* loop destroys work in progress that no WIP ref has captured yet. Never let this machine's quiet pgrep authorize a remote deletion.
+   **Refuse on unreadable or ambiguous evidence too** — an unparseable `status.json`, an `lsof` you can't run, a lock whose state you can't determine. "I couldn't tell" is not "not running".
 
-   The check is also **project-scoped by cwd on purpose**: every sandcastle loop on a machine shares an identical command line, so a bare `pgrep` surfaces *other* repos' loops and would refuse for the wrong reason. For a remote host, `ssh` lands in the login dir — `cd <repoPath>` first (from that host's registry entry) so `$PWD` is the checkout.
+   **This is deliberately stricter than both sibling skills. Do not "simplify" it back to pgrep-only.** `/sandcastle-stop` gates on pgrep alone and says so on purpose — for it, "Signalling an already-dead PID is a harmless no-op." Clean has no such luxury: **it deletes worktrees.** `/sandcastle-status` step 1 spells out why pgrep can't carry a destructive gate — it "is unreliable in *both* directions: it false-negatives (can't see the sandboxed process) and false-positives (matches your own grep/watcher command text)", which is why it mandates `status.json` freshness as canonical with `.loop.lock` as the cross-check. Here the two costs are wildly asymmetric: a false "nothing is running" **destroys work in progress that no WIP ref has captured yet**; a false "something is running" costs a skipped clean the user can re-run in ten seconds. Take the union and accept the false refusals.
+
+   **A `running` state with a stale `updatedAt` is a hard death, not a live loop** (status step 1) — so signal (b) requires *both* `running` and freshness. Don't let a frozen status file block cleaning forever: that's exactly the wreckage clean exists to remove. Tell the user what you see — "status says `running` but frozen at <updatedAt>, and no process/lock — that's a crash, not a live loop" — and let them decide. A held `.loop.lock` alongside a stale status is also a hard death (the lock outlives its holder by ~60s), but it's fresh enough to be ambiguous, so wait it out rather than guessing.
+
+   **These checks MUST run on the target, and that's the whole reason the all-machines path is delicate.** A local pgrep — or a local `status.json` — cannot see the VPS's loop. Never let this machine's quiet evidence authorize a remote deletion.
+
+   The pgrep is **project-scoped by cwd on purpose**: every sandcastle loop on a machine shares an identical command line, so a bare `pgrep` surfaces *other* repos' loops and would refuse for the wrong reason. For a remote host, `ssh` lands in the login dir — `cd <repoPath>` first (from that host's registry entry) so `$PWD` is the checkout and so `.sandcastle/status.json` and `.sandcastle/.loop.lock` resolve to that host's repo, not the login dir.
 
 2. **Confirm the target is a sandcastle project.** `.sandcastle/` must exist at that host's repo root. If not, skip that host with a reason.
 
@@ -49,7 +59,7 @@ The per-host procedure is IDENTICAL on both paths. The only differences are wher
 
 ## What to clean — per host
 
-In order, with user confirmation before each destructive step:
+In order. **Where the confirmation lands depends on the path:** single-machine asks before each destructive step below; all-machines folds every host's findings into ONE combined proposal and asks once (see All-machines mechanics). The steps, checks and refusals are the same either way — only the prompt boundary moves. Nothing destructive happens without an OK on *some* path.
 
 1. **Sub-worktrees** at `.sandcastle/worktrees/agent-issue-*/`.
    - Run `git worktree prune` first to clear any dangling registrations (`.git/worktrees/agent-issue-*/`) from sub-worktree directories that were manually deleted in the past. Without this, subsequent `git worktree remove` calls fail with confusing errors.
@@ -69,7 +79,7 @@ In order, with user confirmation before each destructive step:
 
 2. **Old log files** at `.sandcastle/logs/*.log` older than 7 days. Just `rm` them.
 
-3. **Backup folders** named `.sandcastle.old-*`, `.sandcastle.broken-*`, `.sandcastle.bak-*` in the project root. These are from past failed inits. Confirm with user before removing each.
+3. **Backup folders** named `.sandcastle.old-*`, `.sandcastle.broken-*`, `.sandcastle.bak-*` in the project root. These are from past failed inits. Confirm before removing each (single-machine) or list them in the combined proposal (all-machines) — never remove one unlisted.
 
 4. **Stale `agent/issue-*` branches.** After removing worktrees, the branches may still exist as refs. For each:
    - Try `git branch -d <branch>` (the safe variant). Git refuses unless the branch is merged into the currently-checked-out branch — that's the safety net.
@@ -77,13 +87,13 @@ In order, with user confirmation before each destructive step:
      - `squash-decoupled` — likely landed via a squash-merged human PR to `main`, so the original commits are no longer ancestors.
      - `worktree-locked` — a worktree still has the branch checked out elsewhere.
      - `unknown-refuse` — anything else.
-   - Do NOT escalate to `git branch -D` automatically. Require explicit user confirmation per refused branch. Show them the reason and the candidate launch branches checked; let them decide.
+   - Do NOT escalate to `git branch -D` automatically. Require explicit user confirmation per refused branch. Show them the reason and the candidate launch branches checked; let them decide. This one is per-branch on **both** paths and it does not violate the all-machines "confirm once" rule: `-D` is a decision the user makes *after* the report, against a reviewed list — not a prompt that blocks the sweep.
 
 ## All-machines mechanics
 
 - **Fan the ssh calls out concurrently, not serially** — the read-only survey (pre-flight + what's cleanable) is safe to parallelize, and a serial sweep across hosts is needlessly slow.
 - **Survey first, then confirm, then delete.** Gather the full picture across all hosts, show the user one combined proposal, and only act on OK. Do NOT prompt per-host mid-sweep — that's a confirmation treadmill, and the user can't see the whole cost while answering the first one.
-- **One host's failure never aborts the others.** Collect per-host outcomes (`cleaned` / `skipped: loop running` / `skipped: unreachable` / `skipped: not a sandcastle project`) and report them all.
+- **One host's failure never aborts the others.** Collect per-host outcomes (`cleaned` / `skipped: loop running` / `skipped: liveness unclear` / `skipped: unreachable` / `skipped: not a sandcastle project`) and report them all. `liveness unclear` is a real, expected outcome of the fail-closed pre-flight — report it as its own thing, not folded into `loop running`, so the user can see it's an evidence problem they can re-run past, not a busy machine.
 - Branch and worktree deletions are **local to each host** — cleaning the VPS never deletes anything on origin, and never touches another host's disk.
 
 ## Output to user

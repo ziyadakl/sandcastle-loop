@@ -10,6 +10,25 @@ This repo and its tooling. Distinct from `@ai-hero/sandcastle`, the upstream npm
 **`.sandcastle/`** (with the leading dot):
 The per-project folder that is copied into each target project. Contains `main.mts` (orchestrator), prompt files, `Dockerfile`, and (in this repo's variant) a `lib/` subfolder with hardening helpers.
 
+**`skills/`** (no leading dot):
+The nine `/sandcastle-*` skills, version-controlled here and symlinked into
+`~/.claude/skills/` by `skills/install.sh`. **User-level, not project-level** —
+they are invoked from *target projects* (`/sandcastle-update` runs inside
+affinity-tracker), so this repo's `.claude/skills/` would be the one scope where
+they're never needed. Distinct from `.sandcastle/`: that folder is *copied* into
+targets; `skills/` is *linked* into the user's home and copied nowhere. A `git
+pull` alone does not update a machine's skills — `install.sh` must run there.
+See ADR 0022.
+
+**Host registry** (`.sandcastle/hosts.json`) vs. **shipped example**
+(`.sandcastle/hosts.example.json`):
+The registry lists the hosts the loop may dispatch to (ADR 0019/0020). It is
+**per-machine and untracked** — its `repoPath`s are right for one machine's
+checkouts and wrong for every other, so tracking it shipped this repo's paths
+into consumers. The *example* is what ships: same shape, `REPLACE-ME` values that
+are non-functional on purpose. Absent registry ⇒ single local host, so multi-host
+is opt-in. See ADR 0022.
+
 **Mother repo**:
 This repository — `~/Dev/Sandcastle/`. The development workshop. Not a runtime. Hosts the canonical `.sandcastle/` folder that gets copied out plus the test suite that validates it.
 _Avoid_: deployed repo, runtime repo

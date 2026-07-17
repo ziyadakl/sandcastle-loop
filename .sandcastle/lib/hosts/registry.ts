@@ -1,8 +1,12 @@
 // Multi-host control (workstream B1) — host registry config parser.
 //
-// Parses the multi-host registry config (intended file: `.sandcastle/hosts.json`,
-// seeded with the local Mac + the "hub" VPS). Other workstreams import the
-// `HostConfig` shape from here, so it must not drift.
+// Parses the multi-host registry config. The real file, `.sandcastle/hosts.json`,
+// is PER-MACHINE and untracked — it holds repoPaths correct for one machine only,
+// so there is no seed in the repo; `.sandcastle/hosts.example.json` is what ships
+// (REPLACE-ME values, non-functional on purpose). `loadHostsConfig` falls back to
+// a single local host when the file is absent, so multi-host stays opt-in. See ADR
+// 0022. Other workstreams import the `HostConfig` shape from here, so it must not
+// drift.
 
 /** A single host the loop may dispatch work to. */
 export interface HostConfig {

@@ -182,4 +182,17 @@ describe("shipped .sandcastle/hosts.example.json", () => {
       expect(r.transport).toMatch(/REPLACE-ME/);
     }
   });
+
+  // The example carries a top-level `_comment` array documenting the fields.
+  // That only parses because parseHostsConfig ignores unknown keys — lock that
+  // tolerance so a future stricter schema fails HERE in CI, not in a user's
+  // shipped example file.
+  it("tolerates the documentation `_comment` key riding in the payload", () => {
+    const withComment = JSON.stringify({
+      _comment: ["docs that must not break parsing"],
+      hosts: [{ name: "local", transport: "local", maxConcurrent: 2 }],
+    });
+    expect(() => parseHostsConfig(withComment)).not.toThrow();
+    expect(readFileSync(examplePath, "utf8")).toContain("_comment");
+  });
 });
