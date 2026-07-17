@@ -5,17 +5,21 @@
  * each one is persisted to so a human or a peer host can recover it:
  *
  *   1a. A final promotion whose fast-forward is REFUSED strands merged +
- *       post-merge-certified code on `integration-candidate`. {@link backupStrand}
+ *       post-merge-certified code on {@link STAGING_BRANCH}. {@link backupStrand}
  *       pins that tip to a local `refs/sandcastle/strand/<branch>` (and per-issue
  *       `refs/sandcastle/wip/issue-<N>`) — ALWAYS locally, and to origin too when
  *       cross-host sync is on so a peer can pull it.
- *   1b. A hard crash (SIGKILL/OOM) between iterations loses whatever an in-flight
- *       `agent/issue-<N>` worktree had produced. {@link checkpointInflightWork},
- *       run on the lease heartbeat, commits each dirty worktree and (sync on)
- *       pushes its WIP ref, so resume picks up the last heartbeat's state.
+ *       {@link handleStrandedPromotion} is the whole policy the loop runs on that
+ *       refusal (back up → publish → surface to a human → release the leases).
  *   1c. A graceful `--now` stop with a certified-but-unpromoted staging tip loses
  *       post-merge fixer commits. {@link stagingCommitsAhead} + {@link backupStrand}
  *       back that tip up to the same strand scheme.
+ *
+ * (1b — a heartbeat checkpoint of live in-flight worktrees — is deliberately
+ * absent: committing a worktree an implementer agent is concurrently writing
+ * races it. See the STAGED note in main.mts's heartbeat; that redesign needs a
+ * non-invasive snapshot (`git stash create`), not the helper this module used to
+ * carry.)
  *
  * Like the rest of the state layer this touches git ONLY through an injected
  * {@link GitRunner} (the seam issue-lease.ts defines), so the whole module is
@@ -24,14 +28,15 @@
  * thrown — a backup that can't complete must never crash the loop it protects.
  */
 import type { GitRunner } from "./issue-lease.js";
-import {
-  wipRef,
-  commitWorktreeCheckpoint,
-  pushWipRef,
-} from "./branch-checkpoint.js";
-// Type-only import (erased at runtime) — keeps this module free of a runtime
-// cycle with checkpoint-stop.ts, which imports the backup helpers below.
-import type { InflightWorktree } from "./checkpoint-stop.js";
+import { wipRef } from "./branch-checkpoint.js";
+
+/**
+ * Persistent staging branch name — the branch the merger lands certified work on
+ * before the final fast-forward promotion. Owned here (rather than in main.mts)
+ * so state-layer code that reasons about the strand can name it instead of
+ * re-hardcoding the literal; main.mts imports it from the barrel.
+ */
+export const STAGING_BRANCH = "integration-candidate";
 
 /** Durable ref a stranded branch's tip is pinned to (mirrors wipRef/laneRef). */
 export function strandRef(branch: string): string {
@@ -83,6 +88,23 @@ async function revParse(
  * commit even if the branch later moves. Local `update-ref` always runs; the
  * origin push runs only when `syncEnabled`. Best-effort: any failure is recorded
  * in `errors`, never thrown.
+ *
+ * ADR 0021 §1 — **never a blind force**. Each push carries an explicit
+ * `--force-with-lease=<ref>:<expected>` whose expected value is *this host's
+ * LOCAL ref as it stood before this backup* — i.e. what we last pushed there, or
+ * empty ("must not exist") the first time. That makes the lease a real
+ * point-in-time observation:
+ *
+ *   - first strand, ref absent on origin  → created;
+ *   - re-strand by this host              → advances cleanly;
+ *   - a PEER stranded the branch meanwhile → REFUSED, so its work survives.
+ *
+ * Two details this depends on, both verified against real git:
+ *   - a *bare* `--force-with-lease` cannot be used: `refs/sandcastle/*` has no
+ *     remote-tracking ref, so the lease has nothing to compare against and the
+ *     push fails outright once the ref exists on origin;
+ *   - re-reading origin at push time would be pointless — it would just adopt a
+ *     peer's value as "expected" and clobber it, exactly what `--force` did.
  */
 export async function backupStrand(
   git: GitRunner,
@@ -104,6 +126,13 @@ export async function backupStrand(
     ...(opts.issues ?? []).map((n) => wipRef(n)),
   ];
 
+  // Snapshot each ref's PRIOR local value first — it becomes the push lease.
+  // Must happen before the update-ref below overwrites it.
+  const expected = new Map<string, string>();
+  for (const ref of refs) {
+    expected.set(ref, await revParse(git, opts.repoRoot, ref));
+  }
+
   for (const ref of refs) {
     const up = await git(opts.repoRoot, "update-ref", ref, sha);
     if (up.ok) localRefs.push(ref);
@@ -112,11 +141,20 @@ export async function backupStrand(
 
   if (opts.syncEnabled) {
     for (const ref of localRefs) {
-      // `--force` is safe: a strand ref is a best-effort snapshot with a single
-      // writing host, and a per-issue WIP ref is namespaced to its issue.
-      const push = await git(opts.repoRoot, "push", "--force", remote, `${sha}:${ref}`);
+      const push = await git(
+        opts.repoRoot,
+        "push",
+        `--force-with-lease=${ref}:${expected.get(ref) ?? ""}`,
+        remote,
+        `${sha}:${ref}`,
+      );
       if (push.ok) pushedRefs.push(ref);
-      else errors.push(`push ${ref} failed: ${push.stderr.trim() || "(no stderr)"}`);
+      else {
+        errors.push(
+          `push ${ref} failed (refusing to clobber a peer's ref): ` +
+            `${push.stderr.trim() || "(no stderr)"}`,
+        );
+      }
     }
   }
 
@@ -146,72 +184,120 @@ export async function stagingCommitsAhead(
   return Number.isFinite(n) ? n : 0;
 }
 
-/** Options for {@link checkpointInflightWork}. */
-export interface InflightCheckpointOpts {
-  readonly repoRoot: string;
-  readonly hostId: string;
-  /** Push the WIP ref to origin only when true (the sync flag). */
-  readonly syncEnabled: boolean;
-  readonly remote?: string;
+/**
+ * The loop-side effects {@link handleStrandedPromotion} needs, injected so the
+ * policy is testable without a loop. Mirrors the matching members of main.mts's
+ * `Deps` (plus the status store's `setIssuePhase` and main.mts's
+ * `publishLaneOrLog`, which already swallows a LaneSyncError).
+ */
+export interface StrandedPromotionDeps {
+  log: (line: string) => void;
+  logError: (line: string) => void;
+  /** Status-store phase write (in-memory dashboard state). */
+  setIssuePhase: (issue: number, phase: "needs-human", detail: string) => void;
+  /** Apply the REAL `needs-human` GitHub label. MAY THROW (GH API). */
+  quarantine: (issue: number, reason: string) => Promise<void>;
+  releaseIssueLease: (issue: number) => Promise<void>;
+  /** Publish this host's lane ref; `context` names the path for error text. */
+  publishLane: (branch: string, context: string) => Promise<void>;
 }
 
-/** Per-issue outcome of a heartbeat in-flight checkpoint. */
-export interface InflightCheckpointResult {
-  readonly issue: number;
-  /** `checkpointed` — dirt was committed (and pushed when sync on). `clean` —
-   *  nothing changed, no ref touched. `error` — a non-fatal git failure. */
-  readonly outcome: "checkpointed" | "clean" | "error";
-  readonly detail?: string;
+/** Options for {@link handleStrandedPromotion}. */
+export interface StrandedPromotionOpts {
+  readonly repoRoot: string;
+  /** Branch the certified work is stranded on (normally {@link STAGING_BRANCH}). */
+  readonly stagingBranch: string;
+  /** Branch the fast-forward promotion was REFUSED against (the ship line). */
+  readonly integrationBranch: string;
+  /** Issues that merged to staging and are now stranded. */
+  readonly issues: readonly number[];
+  /** Cross-host sync opt-in: gates every origin write. */
+  readonly syncEnabled: boolean;
 }
 
 /**
- * Heartbeat checkpoint (1b): for each in-flight `agent/issue-<N>` worktree,
- * commit any dirty state and — when sync is on — push its WIP ref with
- * `--force-with-lease`, so a hard crash resumes from the last heartbeat rather
- * than restarting fresh. Clean worktrees are left untouched. Every worktree is
- * independent: one bad worktree records an `error` and the sweep continues.
- * NEVER throws — callers route failures to a non-fatal log.
+ * WORKSTREAM 1 (1a) — the whole policy for a REFUSED final promotion.
+ *
+ * The merged + post-merge-reviewer-certified work is stranded on
+ * `stagingBranch` and the integration branch was NOT advanced. DON'T lose it:
+ *
+ *   1. Pin the certified tip to durable refs (strand + per-issue WIP) — BEFORE
+ *      any lease is released, because once the lease is gone a peer may reclaim
+ *      the issue and the work must already be recoverable. Local refs always;
+ *      the origin push is gated on `syncEnabled`.
+ *   2. When sync is on, publish the stranded tip on this host's lane so a peer
+ *      can merge it (the normal publish only runs on promote-SUCCESS, which
+ *      would leave this work invisible to peers).
+ *   3. Per stranded issue: mark it `needs-human` in the status store AND apply
+ *      the real GitHub label (the status skill's strand sweep keys off the
+ *      label, so the phase alone leaves the strand invisible to it), then
+ *      release the lease.
+ *
+ * NEVER throws. Backup faults are logged non-fatal (the strand is still on
+ * `stagingBranch` on disk and the run already exits unhealthy for a human), and
+ * a `quarantine` fault can never skip the lease release below it — that release
+ * is the contract-critical step (ADR 0019 Fix-4): without it the heartbeat
+ * renews the lease forever and no peer can ever reclaim the issue.
+ *
+ * The caller keeps ownership of run-level health (`promotionFailed` /
+ * `lastFailedStagingIteration`) — this function deliberately does not touch it.
  */
-export async function checkpointInflightWork(
+export async function handleStrandedPromotion(
   git: GitRunner,
-  worktrees: readonly InflightWorktree[],
-  opts: InflightCheckpointOpts,
-): Promise<InflightCheckpointResult[]> {
-  const remote = opts.remote ?? "origin";
-  const results: InflightCheckpointResult[] = [];
+  deps: StrandedPromotionDeps,
+  opts: StrandedPromotionOpts,
+): Promise<void> {
+  const { stagingBranch, integrationBranch, issues, syncEnabled } = opts;
 
-  for (const wt of worktrees) {
-    try {
-      const committed = await commitWorktreeCheckpoint(
-        wt.path,
-        wt.issue,
-        opts.hostId,
-        git,
-      );
-      if (!committed) {
-        results.push({ issue: wt.issue, outcome: "clean" });
-        continue;
-      }
-      if (opts.syncEnabled) {
-        const push = await pushWipRef(opts.repoRoot, wt.path, wt.issue, git, remote);
-        if (!push.ok) {
-          results.push({
-            issue: wt.issue,
-            outcome: "error",
-            detail: push.stderr.trim() || "wip push failed",
-          });
-          continue;
-        }
-      }
-      results.push({ issue: wt.issue, outcome: "checkpointed" });
-    } catch (err) {
-      results.push({
-        issue: wt.issue,
-        outcome: "error",
-        detail: err instanceof Error ? err.message : String(err),
-      });
+  try {
+    const backup = await backupStrand(git, {
+      repoRoot: opts.repoRoot,
+      branch: stagingBranch,
+      issues,
+      syncEnabled,
+    });
+    deps.log(
+      `[strand] backed up ${stagingBranch} → ${backup.localRefs.join(", ") || "(none)"}` +
+        (backup.pushedRefs.length ? ` (origin: ${backup.pushedRefs.join(", ")})` : ""),
+    );
+    for (const e of backup.errors) {
+      deps.logError(`[strand] backup: ${e}`);
     }
+  } catch (err) {
+    deps.logError(
+      `[strand] backup of ${stagingBranch} threw (non-fatal): ${(err as Error).message}`,
+    );
   }
 
-  return results;
+  if (syncEnabled) {
+    await deps.publishLane(
+      stagingBranch,
+      "stranding staging (promotion fast-forward refused)",
+    );
+  }
+
+  // These "ok" issues were shown as `merge` (queued) and deliberately never
+  // recorded merged — correct, they're stranded, not shipped. Surface them as
+  // needing a human so the dashboard flags the strand instead of leaving them in
+  // a neutral "queued" limbo that reads like normal in-progress work.
+  for (const n of issues) {
+    deps.setIssuePhase(
+      n,
+      "needs-human",
+      `stranded on ${stagingBranch} — promotion fast-forward refused`,
+    );
+    try {
+      await deps.quarantine(
+        n,
+        `Stranded on ${stagingBranch}: promotion fast-forward to ${integrationBranch} ` +
+          `was refused after certification. Certified work is preserved at ` +
+          `${strandRef(stagingBranch)} / ${wipRef(n)}. Human triage required.`,
+      );
+    } catch (err) {
+      deps.logError(
+        `[strand] labeling #${n} needs-human failed (non-fatal): ${(err as Error).message}`,
+      );
+    }
+    await deps.releaseIssueLease(n);
+  }
 }

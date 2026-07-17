@@ -107,19 +107,22 @@ export {
   listWipRefIssues,
 } from "./branch-checkpoint.js";
 
-// Strand-backup data-safety primitives (Workstream 1) — pin stranded /
-// in-flight work to durable refs so a crash or refused promotion never loses it.
+// Strand-backup data-safety primitives (Workstream 1) — pin stranded work to
+// durable refs so a refused promotion never loses it, plus the full policy the
+// loop runs on that refusal. STAGING_BRANCH lives here so state-layer code can
+// name the staging branch without re-hardcoding the literal.
 export {
+  STAGING_BRANCH,
   strandRef,
   backupStrand,
   stagingCommitsAhead,
-  checkpointInflightWork,
+  handleStrandedPromotion,
 } from "./strand-backup.js";
 export type {
   StrandBackupOpts,
   StrandBackupResult,
-  InflightCheckpointOpts,
-  InflightCheckpointResult,
+  StrandedPromotionDeps,
+  StrandedPromotionOpts,
 } from "./strand-backup.js";
 
 // Post-kill / --now checkpoint sweep (ADR 0021) — enumerate in-flight worktrees
