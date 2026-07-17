@@ -62,36 +62,27 @@ echo "linked $linked, already-ok $skipped, backed up $backed_up"
 [ "$backed_up" -gt 0 ] && echo "previous copies kept at: $BACKUP"
 echo "skills now track: $REPO_SKILLS"
 
-# --- one-time migration: put hosts.json back if the pull deleted it ----------
+# --- hosts.json: report only, WRITE NOTHING ----------------------------------
 #
-# hosts.json was tracked until it was made per-machine. An existing checkout
-# that pulls that commit has git DELETE the working file: the gitignore rule
-# only protects a file that is ALREADY untracked, so it cannot save one git is
-# removing in a tracked->deleted transition.
-#
-# The content is always still in history, so recovering it needs no backup and
-# no human. Restore it here rather than asking anyone to remember a ritual — a
-# migration that depends on someone doing three careful steps in order is a
-# migration that eventually gets done wrong.
+# The per-machine registry (.sandcastle/hosts.json) is untracked. An existing
+# checkout that pulled the commit making it per-machine had git delete the
+# working file (a tracked->deleted transition; the gitignore rule only protects
+# an already-untracked file). This block used to auto-restore it from history —
+# and that was a real bug: its only signal was "file absent", which a FRESH
+# CLONE also satisfies, so a brand-new machine got another machine's repoPath
+# written back while being told "the pull had deleted it". Absent-because-pulled
+# and absent-because-new are indistinguishable on disk, so no gate can tell them
+# apart. Print guidance and let the human — who alone knows which case they are
+# in — run the one command. (Full rationale: docs/adr/0022.)
 REPO_ROOT="$(cd "$REPO_SKILLS/.." && pwd)"
-HOSTS="$REPO_ROOT/.sandcastle/hosts.json"
-
-if [ -f "$HOSTS" ]; then
+if [ -f "$REPO_ROOT/.sandcastle/hosts.json" ]; then
   echo "hosts.json: present, left alone"
-elif ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "hosts.json: absent (not a git checkout) — copy hosts.example.json if you want multi-host"
 else
-  # The last commit touching the path is the one that deleted it; its parent
-  # still holds the content.
-  del="$(git -C "$REPO_ROOT" rev-list -1 HEAD -- .sandcastle/hosts.json 2>/dev/null || true)"
-  if [ -n "$del" ] && git -C "$REPO_ROOT" cat-file -e "$del^:.sandcastle/hosts.json" 2>/dev/null; then
-    git -C "$REPO_ROOT" show "$del^:.sandcastle/hosts.json" > "$HOSTS"
-    echo "hosts.json: RESTORED from history ($del^) — the pull had deleted it"
-    echo "            check the repoPath values still match this machine:"
-    sed -n 's/.*"repoPath": "\([^"]*\)".*/              \1/p' "$HOSTS"
-  else
-    echo "hosts.json: absent, nothing in history to restore — copy hosts.example.json if you want multi-host"
-  fi
+  echo "hosts.json: absent (fine unless you run multi-host)."
+  echo "  had a registry on this machine before updating? restore it:"
+  echo "    git show \"\$(git -C \"$REPO_ROOT\" rev-list -1 HEAD -- .sandcastle/hosts.json)^:.sandcastle/hosts.json\" > \"$REPO_ROOT/.sandcastle/hosts.json\""
+  echo "  new machine? seed from the example and set your repoPaths:"
+  echo "    cp \"$REPO_ROOT/.sandcastle/hosts.example.json\" \"$REPO_ROOT/.sandcastle/hosts.json\""
 fi
 
 exit 0

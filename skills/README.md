@@ -44,12 +44,21 @@ about the skills it actually uses.
 The pull will delete `.sandcastle/hosts.json` on any checkout that predates it
 being made per-machine — it was tracked then, and git removes the working file
 on a tracked→deleted transition (the gitignore rule only protects a file that is
-already untracked, so it cannot save one git is actively removing).
-`install.sh` restores it from history automatically and prints the `repoPath`
-values for you to eyeball. No backup step, because the content is in git history
-either way, so there was never anything a backup could save that history
-couldn't. A migration that depends on a human doing three careful steps in the
-right order is a migration that eventually gets done wrong.
+already untracked, so it cannot save one git is actively removing). This is a
+one-time cost per machine; past that commit the file is untracked and pulls
+leave it alone.
+
+`install.sh` does NOT write it back — it can't safely, because an absent file
+looks identical whether the pull just deleted it or this is a brand-new machine
+that never had one, and auto-restoring the former's content onto the latter is
+how another machine's `repoPath` ends up here (see ADR 0022). Instead it prints
+the one command to run, and you pick — you're the only one who knows which case
+you're in:
+
+- **Had a registry here before updating?** Run the `git show …hosts.json` line it
+  prints to restore it from history, then check the `repoPath` values.
+- **New machine?** `cp .sandcastle/hosts.example.json .sandcastle/hosts.json` and
+  set your own paths. Skip entirely if you don't run multi-host.
 
 Consumer projects (affinity-tracker etc.) are unaffected — they receive files
 through `/sandcastle-update`, which only copies and never deletes.
