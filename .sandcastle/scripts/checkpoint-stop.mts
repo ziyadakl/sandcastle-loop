@@ -12,12 +12,14 @@
  * mirroring the launch.ts / launch.mts and check-upstream.ts / .mts split.
  */
 
+import { join } from "node:path";
 import { resolveHostId } from "../lib/host-id.js";
 import {
   checkpointStop,
   formatCheckpointStop,
 } from "../lib/state/checkpoint-stop.js";
 import { makeExecFileGitRunner } from "../lib/state/index.js";
+import { markStatusStopped } from "../lib/status/store.js";
 
 function fail(msg: string): never {
   console.error(`sandcastle:checkpoint-stop: ${msg}`);
@@ -69,6 +71,11 @@ async function main(): Promise<void> {
     remote: args.remote,
   });
   console.log(formatCheckpointStop(results));
+
+  // FINAL step: the killed loop can no longer call finish(), so status.json is
+  // still lying `running`. Reconcile it to `stopped` now that the refs are safe.
+  // Best-effort — a missing/torn file is a no-op and never fails the stop.
+  markStatusStopped({ path: join(args.repoRoot, ".sandcastle", "status.json") });
 }
 
 main().catch((err) => {
