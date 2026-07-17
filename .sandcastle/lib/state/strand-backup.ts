@@ -28,7 +28,9 @@
  * thrown — a backup that can't complete must never crash the loop it protects.
  */
 import type { GitRunner } from "./issue-lease.js";
-import { wipRef } from "./branch-checkpoint.js";
+// `revParse` is the canonical copy in branch-checkpoint.ts — imported rather
+// than duplicated so the two modules can never drift on ref resolution.
+import { wipRef, revParse } from "./branch-checkpoint.js";
 
 /**
  * Persistent staging branch name — the branch the merger lands certified work on
@@ -70,16 +72,6 @@ export interface StrandBackupResult {
   readonly pushedRefs: string[];
   /** Non-fatal failures, each a short human string. */
   readonly errors: string[];
-}
-
-/** Resolve a rev to a concrete commit SHA, or "" when it does not resolve. */
-async function revParse(
-  git: GitRunner,
-  repoRoot: string,
-  rev: string,
-): Promise<string> {
-  const res = await git(repoRoot, "rev-parse", "--verify", "--quiet", rev);
-  return res.ok ? res.stdout.trim() : "";
 }
 
 /**
