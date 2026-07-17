@@ -61,4 +61,37 @@ echo "---"
 echo "linked $linked, already-ok $skipped, backed up $backed_up"
 [ "$backed_up" -gt 0 ] && echo "previous copies kept at: $BACKUP"
 echo "skills now track: $REPO_SKILLS"
+
+# --- one-time migration: put hosts.json back if the pull deleted it ----------
+#
+# hosts.json was tracked until it was made per-machine. An existing checkout
+# that pulls that commit has git DELETE the working file: the gitignore rule
+# only protects a file that is ALREADY untracked, so it cannot save one git is
+# removing in a tracked->deleted transition.
+#
+# The content is always still in history, so recovering it needs no backup and
+# no human. Restore it here rather than asking anyone to remember a ritual — a
+# migration that depends on someone doing three careful steps in order is a
+# migration that eventually gets done wrong.
+REPO_ROOT="$(cd "$REPO_SKILLS/.." && pwd)"
+HOSTS="$REPO_ROOT/.sandcastle/hosts.json"
+
+if [ -f "$HOSTS" ]; then
+  echo "hosts.json: present, left alone"
+elif ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "hosts.json: absent (not a git checkout) — copy hosts.example.json if you want multi-host"
+else
+  # The last commit touching the path is the one that deleted it; its parent
+  # still holds the content.
+  del="$(git -C "$REPO_ROOT" rev-list -1 HEAD -- .sandcastle/hosts.json 2>/dev/null || true)"
+  if [ -n "$del" ] && git -C "$REPO_ROOT" cat-file -e "$del^:.sandcastle/hosts.json" 2>/dev/null; then
+    git -C "$REPO_ROOT" show "$del^:.sandcastle/hosts.json" > "$HOSTS"
+    echo "hosts.json: RESTORED from history ($del^) — the pull had deleted it"
+    echo "            check the repoPath values still match this machine:"
+    sed -n 's/.*"repoPath": "\([^"]*\)".*/              \1/p' "$HOSTS"
+  else
+    echo "hosts.json: absent, nothing in history to restore — copy hosts.example.json if you want multi-host"
+  fi
+fi
+
 exit 0
