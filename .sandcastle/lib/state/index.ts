@@ -83,7 +83,7 @@ export type { LaneSyncResult, PeerMergeResult, LaneSyncOpts } from "./lane-sync.
 
 // Cross-host CONVERGENCE (Workstream 3) — the operator "bring both machines to
 // one point" command: merges every peer lane onto the run branch and pushes it.
-export { convergeLanes } from "./converge.js";
+export { convergeLanes, ConvergeError } from "./converge.js";
 export type { ConvergeOpts, ConvergeResult, LaneConvergeResult } from "./converge.js";
 
 // Cross-host status sync (ADR 0020) — the fail-soft telemetry transport that
