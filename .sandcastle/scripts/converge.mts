@@ -70,7 +70,19 @@ function formatConverge(result: ConvergeResult): string {
     lines.push(`  ${result.conflicts.length} conflict marker(s) written:`);
     for (const ref of result.conflicts) lines.push(`    ${ref}`);
   }
+  for (const lane of unrecordedConflicts(result)) {
+    lines.push(`  !! ${lane.host}: ${lane.reason ?? "conflict marker NOT recorded"}`);
+  }
   return lines.join("\n");
+}
+
+/**
+ * Conflicting lanes whose durable marker could NOT be written/pushed. These are
+ * LOUD: the divergence exists but nothing on the remote records it, so the run
+ * must not exit 0 and let a human believe the machines are reconciled.
+ */
+function unrecordedConflicts(result: ConvergeResult) {
+  return result.perLane.filter((l) => l.result === "conflict" && !l.markerRef);
 }
 
 async function main(): Promise<void> {
@@ -83,6 +95,16 @@ async function main(): Promise<void> {
     remote: args.remote,
   });
   console.log(formatConverge(result));
+  // A push fault throws (caught below → exit 1). An UNRECORDED conflict marker
+  // returns normally but is equally a failure to converge visibly → exit 1 too,
+  // so no caller mistakes an unrecorded divergence for a clean run.
+  const unrecorded = unrecordedConflicts(result);
+  if (unrecorded.length > 0) {
+    fail(
+      `${unrecorded.length} conflict(s) could NOT be durably recorded — ` +
+        `the divergence is NOT captured on the remote; reconcile by hand`,
+    );
+  }
 }
 
 main().catch((err) => {
