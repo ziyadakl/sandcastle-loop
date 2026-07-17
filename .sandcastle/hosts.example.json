@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "EXAMPLE multi-host registry. Copy to .sandcastle/hosts.json and edit — the",
+    "REPLACE-ME values are deliberately non-functional so this file can never be",
+    "mistaken for a working config.",
+    "",
+    "  name          Label for the host, your choice (e.g. \"hub\", \"vps\").",
+    "  transport     \"local\" = this machine. Anything else is an ssh alias, and",
+    "                must be one `ssh <alias>` already resolves (see ~/.ssh/config).",
+    "  maxConcurrent Issues that host may work at once. Integer >= 1.",
+    "  repoPath      REQUIRED for remote hosts: absolute path to THIS repo's",
+    "                checkout ON THAT HOST. Every remote command cds here first,",
+    "                so a wrong value silently points the run at the wrong repo.",
+    "                Not used for the local host.",
+    "",
+    "At most one host may have transport \"local\"."
+  ],
+  "hosts": [
+    { "name": "local", "transport": "local", "maxConcurrent": 2 },
+    {
+      "name": "REPLACE-ME-host-label",
+      "transport": "REPLACE-ME-ssh-alias",
+      "maxConcurrent": 1,
+      "repoPath": "/REPLACE-ME/absolute/path/to/this/repo/on/that/host"
+    }
+  ]
+}

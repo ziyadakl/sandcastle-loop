@@ -1,0 +1,93 @@
+<subagent-prompt>
+<task>
+Audit a sandcastle session transcript. Two modes — pick the right one based on the focus-area input:
+
+- **PROPOSAL mode** (use when focus-area is a specific change, e.g. "add /simplify to the loop", "make X work for other projects"): Output a focused proposal addressing exactly that ask. Don't pad with unrelated issues or discipline lessons.
+- **FULL AUDIT mode** (use when focus-area is "none — survey all issues"): Identify every sandcastle issue (what broke / how caused / how fixed / prevention) and every assistant diagnostic mistake in the transcript.
+
+If unsure, prefer PROPOSAL — the user can always re-run with no argument for a full audit.
+</task>
+
+<inputs>
+  <export-file>{{absolute path to $EXPORT}}</export-file>
+  <audit-output-file>{{absolute path to $AUDIT}}</audit-output-file>
+  <hostname>{{output of `hostname`}}</hostname>
+  <working-directory>{{absolute pwd}}</working-directory>
+  <is-sandcastle-template-repo>{{yes or no — yes only if this is the sandcastle-loop template itself, not a downstream project using it}}</is-sandcastle-template-repo>
+  <focus-area>{{user's argument, or "none — survey all issues"}}</focus-area>
+</inputs>
+
+<rules>
+  <rule id="read-export-first">Read the export file fully before making any claim. Do not rely on summarized impressions.</rule>
+  <rule id="no-content-copying">Reference PRDs, plans, ADRs, issues, commits, audit files by path or URL only. Never copy their content into the audit.</rule>
+</rules>
+
+<verification-discipline>
+  Every claim in the audit must carry one of four tags.
+
+  <tag name="ASSERTED">Someone said it in the transcript. No evidence checked.</tag>
+  <tag name="VERIFIED-IN-TRANSCRIPT">Transcript itself contains the evidence — commit hash + log output, file content quoted, error message reproduced. Include the quote inline.</tag>
+  <tag name="VERIFIED-IN-GIT">`git log` / `git show` on the local repo confirms the claim. Must include the command, the absolute path it ran in, and `git rev-parse HEAD` at that path.</tag>
+  <tag name="VERIFIED-IN-CODE">Grep or read of the file confirms current state. Must use an absolute path. Banned: relative paths in verification commands — they caused a past audit to falsely declare "fix not in code" because cwd had shifted.</tag>
+
+  <pre-grep-checklist>
+    Before any code-derived finding, run and record in the audit:
+    - `pwd`
+    - `git rev-parse HEAD`
+    - absolute path of the file you intend to check
+  </pre-grep-checklist>
+
+  <important>
+    Distinguish "fix landed in git history" (VERIFIED-IN-GIT) from "fix is on disk right now" (VERIFIED-IN-CODE). These are different claims. A local checkout may be behind upstream (VPS without recent /sandcastle-update). VERIFIED-IN-GIT pass + VERIFIED-IN-CODE fail = "you need to update," not "fix doesn't exist."
+  </important>
+</verification-discipline>
+
+<required-output-structure>
+  Always include the Header and References sections. Pick the rest based on mode.
+
+  <section name="Header" required="always">
+    Host, working directory, is-sandcastle-template-repo, focus-area, mode (PROPOSAL or FULL AUDIT), export-file path, audit-file path, timestamp, transcript-mode (TRANSCRIPT or RECONSTRUCTED — read from the export's first line, which is `MODE: TRANSCRIPT` or `MODE: RECONSTRUCTED`).
+  </section>
+
+  <section name="Proposal" mode="PROPOSAL">
+    Address the focus-area directly. Three short sub-sections:
+    - **The change** — what to add/modify in the sandcastle template (file paths + brief description of edit).
+    - **Why** — the one-paragraph justification (cite the transcript turn that motivated it).
+    - **Rollout** — which files need the change (active prompt + variants? main.mts? a skill?), what tests/verification apply, and what the user should run to propagate (usually `/sandcastle-update` in other projects after the template ships).
+    Keep it tight — a focused proposal beats a sprawling audit. Skip Sandcastle Issues and Assistant Mistakes unless they directly bear on the proposal.
+  </section>
+
+  <section name="Sandcastle Issues" mode="FULL AUDIT">
+    For each issue (one sub-section per issue):
+    - What broke (symptom the user saw)
+    - How sandcastle caused it (which loop behaviour, file, or assumption)
+    - How it was fixed in-session (commands run, files changed)
+    - Prevention (what should change in the template to stop recurrence)
+    Each fact tagged per verification-discipline.
+  </section>
+
+  <section name="Assistant Mistakes" mode="FULL AUDIT">
+    For each diagnostic mistake (one sub-section per):
+    - What was asserted
+    - What disproved it (with evidence quote)
+    - Discipline-fix (the rule that would have caught it, e.g. "run `git diff HEAD` before concluding")
+
+    <filter when="is-sandcastle-template-repo=no">
+      Include a mistake ONLY if its discipline-fix would be encoded in the sandcastle template, the sandcastle skills, or sandcastle prompts. Exclude mistakes whose fix lives in the user's CLAUDE.md, general session discipline, or unrelated tooling — those belong in a different audit. Examples to EXCLUDE: "should have run /clear between unrelated tasks", "didn't check existing PRD before creating new one", "surface-level UI review", "used technical jargon despite user preferences". Examples to INCLUDE: "implementer claimed e2e ran when it didn't" (template can add stricter cert check), "/sandcastle-update said 'no changes' with no SHA evidence" (skill can require SHA in output), "loop crashed on missing image" (preflight can catch).
+      If after filtering there are zero in-scope mistakes, write "(none — assistant mistakes this session are outside sandcastle's scope)" and move on. Do NOT pad with general-session items.
+    </filter>
+  </section>
+
+  <section name="Recommended Next Session" required="always">
+    What to investigate or implement next. Which skills to invoke (e.g. `diagnose`, `tdd`, `grill-with-docs`, `sandcastle-update`). Which sandcastle-repo files to read first. In PROPOSAL mode this often collapses to "implement the proposal above in the template repo and push."
+  </section>
+
+  <section name="References" required="always">
+    Paths and URLs only. PRDs, plans, ADRs, issues, commits, audit files. Never copy content.
+  </section>
+</required-output-structure>
+
+<return-value>
+  Write the full audit to the audit-output-file. Return to the main agent a 2–4 sentence plain-English summary of the top issue and recommended fix.
+</return-value>
+</subagent-prompt>
