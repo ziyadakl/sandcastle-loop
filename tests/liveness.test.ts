@@ -6,12 +6,10 @@
  * `watch/reducer.ts` and in prose in a skill: a `state:"running"` snapshot whose
  * `updatedAt` is older than `STALE_AFTER_MS` is NOT live (the loop was hard-killed
  * and never got to flip `state`). Terminal states are authoritative and
- * time-independent. `lockHeld:false` is a same-host proxy for "the process that
- * owned this feed is gone" (the single-instance lock released on death, or a
- * `process.kill(pid,0)` probe failed) — it can only DOWNGRADE liveness, never
- * upgrade a stale feed back to live.
+ * time-independent; every other state — including one from a writer NEWER than
+ * this build — degrades to freshness rather than blanking out.
  *
- * Table-driven: every state × freshness × lock/pid combination.
+ * Table-driven: every state (terminal / non-terminal / unknown) × freshness.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -68,7 +66,9 @@ describe("deriveLiveness", () => {
     });
   }
 
-  // --- pid presence does not change the stale rule (2b) ---
+  // --- pid is NOT part of LivenessInput, but IS part of the status schema, so
+  // the reducer hands whole snapshots that carry it. These lock that the extra
+  // field is simply ignored and can never resurrect a dead feed (2b). ---
   it("stale running WITH a pid is still not live (a written pid can't resurrect a dead feed)", () => {
     expect(
       deriveLiveness(status({ state: "running", updatedAt: STALE, pid: 4242 }), {
@@ -85,40 +85,21 @@ describe("deriveLiveness", () => {
     });
   });
 
-  // --- lockHeld: same-host death proxy, DOWNGRADE-ONLY ---
-  it("fresh running but lockHeld:false → not live (loop is provably gone before the stale window)", () => {
+  // --- UNKNOWN states degrade to freshness — the "no version gate" lesson ---
+  // `LivenessInput.state` is deliberately `string`, not the `RunState` union, and
+  // the `default:` branch treats an unrecognised state as non-terminal. A newer
+  // writer emitting a state this build has never heard of must still render as a
+  // live-or-stale run. A strict enum that rejected it is exactly what once blanked
+  // the viewer behind an "out of date" screen. These lock that in.
+  it("an UNKNOWN/newer state + fresh write → live (never hard-fails on a future writer)", () => {
     expect(
-      deriveLiveness(status({ state: "running", updatedAt: FRESH }), {
-        now: NOW,
-        lockHeld: false,
-      }),
-    ).toEqual<Liveness>({ live: false, reason: "stale" });
-  });
-  it("fresh running with lockHeld:true → live", () => {
-    expect(
-      deriveLiveness(status({ state: "running", updatedAt: FRESH }), {
-        now: NOW,
-        lockHeld: true,
-      }),
+      deriveLiveness(status({ state: "draining-v9", updatedAt: FRESH }), { now: NOW }),
     ).toEqual<Liveness>({ live: true, reason: "running" });
   });
-  it("lockHeld:true CANNOT rescue a stale feed (a wedged process that stopped heartbeating is not live)", () => {
+  it("an UNKNOWN/newer state + stale write → not live, reason \"stale\" (freshness still applies)", () => {
     expect(
-      deriveLiveness(status({ state: "running", updatedAt: STALE }), {
-        now: NOW,
-        lockHeld: true,
-      }),
+      deriveLiveness(status({ state: "draining-v9", updatedAt: STALE }), { now: NOW }),
     ).toEqual<Liveness>({ live: false, reason: "stale" });
-  });
-  it("lockHeld:false forces non-live even on a terminal-looking... no — terminal wins over lock", () => {
-    // A done run legitimately stops holding the lock; that must still read "done",
-    // not "stale". Terminal authority is checked before the lock signal.
-    expect(
-      deriveLiveness(status({ state: "done", updatedAt: FRESH }), {
-        now: NOW,
-        lockHeld: false,
-      }),
-    ).toEqual<Liveness>({ live: false, reason: "done" });
   });
 
   // --- degenerate updatedAt mirrors reducer semantics (non-finite ⇒ not stale) ---
