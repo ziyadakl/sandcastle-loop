@@ -61,13 +61,16 @@ export interface ConvergeOpts {
 export interface LaneConvergeResult {
   /** Peer hostId this result is for (or the self hostId for the `noop` sentinel). */
   readonly host: string;
-  /**
+   /**
    * `merged` — the peer's lane is now in the run branch (clean merge or
-   * already-up-to-date). `conflict` — the merge conflicted; it was aborted (the
-   * branch is left clean) and a durable marker ref captures both tips. `skip` —
-   * a non-fatal precondition failed (fetch error / dirty worktree) and this peer
-   * was passed over. `noop` — the single sentinel entry returned when NO peer
-   * lanes exist, so there was nothing to converge.
+   * already-up-to-date). `conflict` — the merge left REAL conflicted paths in
+   * the index (a genuine divergence); it was aborted (the branch is left clean)
+   * and a durable marker ref captures both tips. A merge that failed WITHOUT
+   * conflicted paths is never this — it raises {@link ConvergeError}, because
+   * reporting it here would tell the operator the machines diverged when they
+   * have not. `skip` — a non-fatal precondition failed (fetch error / dirty
+   * worktree) and this peer was passed over. `noop` — the single sentinel entry
+   * returned when NO peer lanes exist, so there was nothing to converge.
    */
   readonly result: "merged" | "conflict" | "skip" | "noop";
   /** The peer lane tip that was merged/attempted (absent for `noop`). */
@@ -143,8 +146,19 @@ export async function convergeLanes(
   // Dirty-tree guard BEFORE any checkout: checking out over uncommitted work
   // would refuse or clobber it. Refuse LOUD instead — the operator's tree is
   // theirs, and convergence is never worth risking it.
+  // A status that FAILS is an UNKNOWN tree, never an assumed-clean one: skipping
+  // the guard on a failed check is how converge ends up merging into a dirty tree
+  // and then misreporting the resulting merge failure as a peer divergence.
   const dirtyBefore = await run("status", "--porcelain");
-  if (dirtyBefore.ok && dirtyBefore.stdout.trim() !== "") {
+  if (!dirtyBefore.ok) {
+    throw new ConvergeError(
+      dirtyBefore.stderr,
+      `converge could not determine whether ${repoRoot} is clean ` +
+        `(git status failed: ${dirtyBefore.stderr || "(no stderr)"}) — refusing to ` +
+        `check out over an unknown tree`,
+    );
+  }
+  if (dirtyBefore.stdout.trim() !== "") {
     throw new ConvergeError(
       "",
       `converge refused: ${repoRoot} has uncommitted changes — ` +
@@ -185,6 +199,43 @@ async function currentRef(
 }
 
 /**
+ * Did a FAILED merge leave real conflicted paths — i.e. is this an actual
+ * divergence between the two machines, or some other fault wearing a merge
+ * failure's clothes?
+ *
+ * The signal is `git ls-files -u` (unmerged index entries), chosen over the two
+ * alternatives because it is the only one that is both authoritative and stable:
+ *   - The EXIT CODE cannot discriminate at all. A dirty-tree merge refusal
+ *     ("local changes would be overwritten") exits 1 — exactly like a genuine
+ *     conflict. Unrelated histories exits 128, but that gap is not a contract.
+ *   - `CONFLICT (...)` in STDERR is human-facing prose: locale-dependent and
+ *     free to be reworded by any git version. Parsing it is a guess.
+ *   - `git ls-files -u` is PLUMBING over the index — the authoritative record of
+ *     conflict state that `git merge` itself writes. It is locale-independent,
+ *     needs no worktree traversal, and reports conflicts that are not
+ *     content-shaped (modify/delete, add/add) which a worktree diff can miss.
+ *
+ * A FAILING `ls-files` is itself unknown state, not a "no": it raises rather
+ * than let an unanswered question decide whether to push a durable marker.
+ */
+async function hasConflictedPaths(
+  run: (...args: string[]) => ReturnType<GitRunner>,
+  peer: string,
+  mergeStderr: string,
+): Promise<boolean> {
+  const unmerged = await run("ls-files", "-u");
+  if (!unmerged.ok) {
+    throw new ConvergeError(
+      unmerged.stderr,
+      `converge could not determine whether the failed merge of peer lane ${peer} ` +
+        `conflicted (git ls-files -u failed: ${unmerged.stderr || "(no stderr)"}); ` +
+        `refusing to guess. The merge failed with: ${mergeStderr || "(no stderr)"}`,
+    );
+  }
+  return unmerged.stdout.trim() !== "";
+}
+
+/**
  * Merge every peer lane onto the ALREADY-checked-out run branch and push. Split
  * out so {@link convergeLanes} owns the checkout/restore lifecycle and this owns
  * the reconciliation, with no `finally` nesting between them.
@@ -210,9 +261,20 @@ async function convergeOnBranch(
     const peerTip = peerTipRes.ok ? peerTipRes.stdout.trim() : undefined;
 
     // 2. Dirty-tree guard (mirrors lane-sync): never merge into a checkout with
-    //    uncommitted changes — the merge would be refused or clobber them.
+    //    uncommitted changes — the merge would be refused or clobber them. A
+    //    dirty tree is a non-fatal skip; a status that FAILS is NOT — it is an
+    //    unknown tree, and merging into one manufactures the false conflict this
+    //    guard exists to prevent, so it fails LOUD instead.
     const dirty = await run("status", "--porcelain");
-    if (dirty.ok && dirty.stdout.trim() !== "") {
+    if (!dirty.ok) {
+      throw new ConvergeError(
+        dirty.stderr,
+        `converge could not determine whether the checkout is clean before merging ` +
+          `peer lane ${peer} (git status failed: ${dirty.stderr || "(no stderr)"}) — ` +
+          `refusing to merge into an unknown tree`,
+      );
+    }
+    if (dirty.stdout.trim() !== "") {
       perLane.push({ host: peer, result: "skip", tip: peerTip });
       continue;
     }
@@ -222,6 +284,22 @@ async function convergeOnBranch(
     if (merged.ok) {
       perLane.push({ host: peer, result: "merged", tip: peerTip });
       continue;
+    }
+
+    // 4. The merge FAILED — but a failure is not evidence of a divergence. Ask
+    //    the INDEX whether real conflicted paths exist before calling it one.
+    //    This MUST precede the `merge --abort` below, which clears the stages.
+    if (!(await hasConflictedPaths(run, peer, merged.stderr))) {
+      // Not a conflict: some other fault (unrelated histories, dirty tree, bad
+      // config, missing ref). Leave no half-merge behind, then fail LOUD naming
+      // the REAL cause — never a marker asserting the machines diverged.
+      await run("merge", "--abort");
+      throw new ConvergeError(
+        merged.stderr,
+        `converge could not merge peer lane ${peer} onto ${branch} — this is NOT ` +
+          `a divergence between the machines, the merge itself failed: ` +
+          `${merged.stderr || "(no stderr)"}`,
+      );
     }
 
     // Conflict: capture both tips in a DURABLE marker BEFORE aborting so the
