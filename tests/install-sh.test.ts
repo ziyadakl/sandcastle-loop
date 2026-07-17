@@ -135,4 +135,23 @@ describe("skills/install.sh", () => {
     expect(backups.length).toBe(1);
     expect(readFileSync(join(dest, backups[0], "sandcastle-run/keepme.txt"), "utf8")).toBe("precious");
   }, 20000);
+
+  // Run from a dir that is NOT a git checkout: the git-history restore line
+  // would error if pasted, so it must be suppressed — but the always-valid `cp`
+  // guidance must still print, and the script must not crash under `set -e`.
+  it("in a non-git dir, prints cp guidance and NOT the git-history line", () => {
+    const nogit = join(tmp, "nogit");
+    mkdirSync(join(nogit, "skills", "sandcastle-run"), { recursive: true });
+    writeFileSync(join(nogit, "skills", "sandcastle-run", "SKILL.md"), "# run\n");
+    writeFileSync(join(nogit, "skills", "install.sh"), readFileSync(REAL_INSTALL_SH, "utf8"));
+
+    const r = spawnSync("bash", [join(nogit, "skills/install.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_SKILLS_DIR: join(tmp, "nogit-dest") },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/hosts\.example\.json/); // cp path still offered
+    expect(r.stdout).not.toMatch(/git show/); // history line suppressed
+    expect(existsSync(join(nogit, ".sandcastle/hosts.json"))).toBe(false);
+  }, 20000);
 });

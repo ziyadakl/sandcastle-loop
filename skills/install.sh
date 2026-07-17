@@ -79,9 +79,14 @@ if [ -f "$REPO_ROOT/.sandcastle/hosts.json" ]; then
   echo "hosts.json: present, left alone"
 else
   echo "hosts.json: absent (fine unless you run multi-host)."
-  echo "  had a registry on this machine before updating? restore it:"
-  echo "    git show \"\$(git -C \"$REPO_ROOT\" rev-list -1 HEAD -- .sandcastle/hosts.json)^:.sandcastle/hosts.json\" > \"$REPO_ROOT/.sandcastle/hosts.json\""
-  echo "  new machine? seed from the example and set your repoPaths:"
+  # The git-history restore only makes sense inside a real checkout — outside
+  # one, `git show` would error if pasted, so don't print it there. The `cp`
+  # path below is always valid, so a non-git dir still gets a usable command.
+  if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "  had a registry on this machine before updating? restore it:"
+    echo "    git show \"\$(git -C \"$REPO_ROOT\" rev-list -1 HEAD -- .sandcastle/hosts.json)^:.sandcastle/hosts.json\" > \"$REPO_ROOT/.sandcastle/hosts.json\""
+  fi
+  echo "  new machine (or not a git checkout)? seed from the example and set your repoPaths:"
   echo "    cp \"$REPO_ROOT/.sandcastle/hosts.example.json\" \"$REPO_ROOT/.sandcastle/hosts.json\""
 fi
 
