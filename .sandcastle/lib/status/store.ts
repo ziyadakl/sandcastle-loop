@@ -17,7 +17,7 @@
  * overnight run.
  */
 
-import { writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { writeFileSync, renameSync, unlinkSync, readFileSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import {
   type SandcastleStatus,
@@ -80,6 +80,12 @@ export interface StatusStoreOpts {
   /** Injectable timers for deterministic heartbeat tests. Default globals. */
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
+  /**
+   * OS process id to stamp into the snapshot (2b). Defaults to the live
+   * `process.pid`; injectable so tests are deterministic. A same-host reconciler
+   * reads it back to prove a hard-killed loop is gone.
+   */
+  pid?: number;
 }
 
 export interface StatusStore {
@@ -95,6 +101,17 @@ export interface StatusStore {
    * every other mutator.
    */
   setActivity(activity: RunActivity | null): void;
+  /**
+   * Graceful-stop TELEMETRY (2c). On SIGTERM/SIGINT the loop calls this the
+   * instant the signal lands: it flips `state` to the transient `"stopping"` and
+   * records `stoppingWaitingOn` — a human label of the in-flight work being
+   * drained (active issue phases, else the run-level activity) — so status
+   * tooling can show "stopping — waiting on implementer for #5". PURELY
+   * ADDITIVE: it changes no control flow and does NOT stop the heartbeat (the
+   * loop is still draining at the iteration boundary). `finish()` later
+   * overwrites the transient state with the real terminal reason.
+   */
+  markStopping(): void;
   /**
    * Cross-host STATUS SYNC (Task S5): set the peer snapshots that `commit()`
    * folds into the WRITTEN file (via `foldPeers`) so a viewer sees one fused,
@@ -141,6 +158,53 @@ function atomicWrite(target: string, content: string): void {
   }
 }
 
+/**
+ * OUT-OF-BAND status reconciler for the post-kill `--now` path (2b). After a hard
+ * kill the loop process is GONE — there is no live StatusStore to call `finish()`
+ * — so `status.json` keeps lying `state:"running"` forever. The
+ * `checkpoint-stop.mts` runner calls this as its FINAL step to flip the feed to
+ * `stopped` once the git refs are handled.
+ *
+ * Surgical + best-effort: it reads the existing snapshot, overwrites ONLY the
+ * liveness-bearing fields (`state`, `updatedAt`) and clears the now-meaningless
+ * transient labels (`activity`, `stoppingWaitingOn`), preserving everything else
+ * (history, totals, ids). If the file is absent or unparseable there is nothing
+ * to un-lie about, so it no-ops and returns `false` — NEVER throws (a stop must
+ * not fail because a glance surface hiccuped). Returns `true` iff it rewrote.
+ */
+export function markStatusStopped(opts: {
+  path: string;
+  now?: () => string;
+  readFn?: (path: string) => string;
+  writeFn?: WriteFn;
+  onError?: (err: unknown) => void;
+}): boolean {
+  const now = opts.now ?? ((): string => new Date().toISOString());
+  const readFn = opts.readFn ?? ((p): string => readFileSync(p, "utf8"));
+  const writeFn = opts.writeFn ?? atomicWrite;
+  const onError = opts.onError ?? ((): void => {});
+  let obj: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(readFn(opts.path)) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return false;
+    obj = parsed as Record<string, unknown>;
+  } catch {
+    // Absent or torn/unparseable — nothing to reconcile. Best-effort no-op.
+    return false;
+  }
+  obj.state = "stopped";
+  obj.updatedAt = now();
+  delete obj.activity;
+  delete obj.stoppingWaitingOn;
+  try {
+    writeFn(opts.path, `${JSON.stringify(obj, null, 2)}\n`);
+    return true;
+  } catch (err) {
+    onError(err);
+    return false;
+  }
+}
+
 /** Phases that count an issue as actively in flight (drives totals.running). */
 const ACTIVE_PHASES: ReadonlySet<IssuePhase> = new Set<IssuePhase>([
   "implementer",
@@ -164,6 +228,7 @@ export function createStatusStore(
   const clearIntervalFn =
     opts.clearIntervalFn ??
     ((h): void => clearInterval(h as ReturnType<typeof setInterval>));
+  const pid = opts.pid ?? process.pid;
 
   let heartbeatHandle: unknown;
 
@@ -187,6 +252,7 @@ export function createStatusStore(
     issues: [],
     history: [],
     updatedAt: now(),
+    pid,
   };
 
   function recomputeRunning(): void {
@@ -316,9 +382,31 @@ export function createStatusStore(
       commit();
     },
 
+    markStopping(): void {
+      // Describe what the graceful stop is draining, most-specific first:
+      // active per-issue phases, else the run-level activity, else nothing.
+      const active = status.issues.filter((i) => ACTIVE_PHASES.has(i.phase));
+      let waitingOn: string | undefined;
+      if (active.length > 0) {
+        waitingOn = active
+          .map((i) => `${i.phase} for #${i.number}`)
+          .join(", ");
+      } else if (status.activity !== undefined) {
+        waitingOn = status.activity;
+      }
+      status.state = "stopping";
+      // `undefined` (not "") so JSON.stringify drops the key when nothing is in
+      // flight, matching the schema's optional contract.
+      status.stoppingWaitingOn = waitingOn;
+      // Deliberately do NOT stopHeartbeat(): the loop is still alive and
+      // draining, so the feed must keep re-stamping until finish().
+      commit();
+    },
+
     finish(reason: "done" | "stopped" | "restarting" | "unhealthy"): void {
       status.state = reason;
       status.activity = undefined; // run over — no stale activity on the feed
+      status.stoppingWaitingOn = undefined; // transient telemetry cleared on exit
       stopHeartbeat(); // the run is over — stop the keep-alive
       recomputeRunning();
       commit();

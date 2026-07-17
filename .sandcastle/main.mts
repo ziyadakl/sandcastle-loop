@@ -5972,6 +5972,13 @@ export async function runMain(
     deps.log(
       `received ${sig} — finishing in-flight ops then exiting cleanly`,
     );
+    // ADDITIVE TELEMETRY ONLY (2c): surface "stopping — waiting on <phase> for
+    // #N" so status tooling can distinguish a graceful drain from a healthy run.
+    // This changes NO shutdown control flow — the `shuttingDown` flag set above
+    // and the iteration-boundary break remain the sole abort mechanism; the
+    // agent is NOT interrupted (that abort is deliberately out of scope). The
+    // write is synchronous + non-fatal, like every other status write.
+    statusStore.markStopping();
   };
   const sigintHandler = (): void => onSignal("SIGINT");
   const sigtermHandler = (): void => onSignal("SIGTERM");

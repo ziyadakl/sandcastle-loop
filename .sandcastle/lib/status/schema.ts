@@ -81,6 +81,20 @@ export type IssuePhase = z.infer<typeof IssuePhaseSchema>;
  * a terminal FAILURE state: the run finished but left merged+reviewed work
  * stranded on `integration-candidate` because the final fast-forward promotion
  * refused — the loop must NOT report this as `done`/success (audit issue #4).
+ * `stopping` is TRANSIENT telemetry (not terminal): a graceful stop
+ * (SIGTERM/SIGINT) sets it the instant the signal lands so tooling can show
+ * "stopping — waiting on <phase> for #N" while the loop drains its in-flight
+ * work at the iteration boundary. `finish()` overwrites it with the real
+ * terminal reason (`stopped`/`done`/…). Like `stopping` is non-terminal,
+ * `deriveLiveness`/the viewer treat it as still-live-and-freshness-gated.
+ *
+ * NOTE ON NO VERSION BUMP: adding `stopping` here is deliberately NOT paired
+ * with a `STATUS_SCHEMA_VERSION` bump. The project has moved OFF the strict
+ * version gate for the lite viewer (which owns its own staleness and never
+ * blank-screens on an unknown value); bumping would risk blanking older viewers
+ * for a purely additive, non-terminal telemetry label. A new writer that emits
+ * `stopping` will simply be rendered as live by any viewer new enough to know
+ * the member, and the state is transient anyway.
  */
 export const RunStateSchema = z.enum([
   "running",
@@ -88,6 +102,7 @@ export const RunStateSchema = z.enum([
   "stopped",
   "restarting",
   "unhealthy",
+  "stopping",
 ]);
 export type RunState = z.infer<typeof RunStateSchema>;
 
@@ -208,6 +223,23 @@ export const SandcastleStatusSchema = z.object({
   peers: z.array(PeerStatusSchema).optional(),
   /** ISO-8601 of the last write. Its age is the loop's liveness signal. */
   updatedAt: z.string(),
+  /**
+   * OPTIONAL OS process id of the loop that owns this feed (2b). Written once at
+   * startup by `store.ts`. Lets a SAME-HOST reconciler prove the loop is gone
+   * (`process.kill(pid, 0)` throws) and stop trusting a fresh-looking
+   * `updatedAt` a hard kill (`--now` / SIGKILL) left behind. OPTIONAL + additive
+   * ⇒ no `STATUS_SCHEMA_VERSION` bump; pre-2b and cross-host peer projections
+   * simply omit it. `deriveLiveness` never REQUIRES it — a stale `running` is
+   * already non-live whether the pid is present, absent, or dead.
+   */
+  pid: z.number().int().positive().optional(),
+  /**
+   * OPTIONAL human label of what a graceful stop is currently draining, e.g.
+   * "implementer for #5, reviewer for #8" or "planning" (2c telemetry). Written
+   * alongside `state:"stopping"` and cleared by `finish()`. Purely additive ⇒ no
+   * version bump; absent whenever the run is not stopping.
+   */
+  stoppingWaitingOn: z.string().optional(),
   /**
    * Optional run-level activity label (see `RunActivity`). PERMISSIVE on read:
    * a `z.string()`, NOT a `z.enum`. An enum would reject any value it doesn't
