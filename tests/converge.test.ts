@@ -287,6 +287,115 @@ describe("convergeLanes (real bare origin + real host clones)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // (h) A merge that fails for a NON-conflict reason (unrelated histories) is
+  //     NOT a divergence between the machines. It must fail LOUD naming the real
+  //     cause, and must NEVER push a conflict marker claiming the hosts diverged.
+  // -------------------------------------------------------------------------
+  it("throws naming the real cause on a NON-conflict merge failure and pushes NO conflict marker", async () => {
+    // host-A's lane shares NO commit with the run branch (orphan history), so
+    // real git refuses the merge with "unrelated histories" — a merge failure
+    // that is emphatically not a content conflict.
+    const hostA = makeHost("host-A");
+    git(hostA, "checkout", "--orphan", "alien");
+    git(hostA, "rm", "-rf", ".");
+    writeFileSync(path.join(hostA, "alien.txt"), "unrelated history\n");
+    git(hostA, "add", "-A");
+    git(hostA, "commit", "-m", "alien root commit");
+    git(hostA, "push", "--force", "origin", "alien:refs/sandcastle/lanes/host-A");
+
+    const originTipBefore = git(converger, "ls-remote", "origin", `refs/heads/${BRANCH}`);
+
+    // (c) The error names the REAL cause, not a fabricated divergence.
+    await expect(
+      convergeLanes(makeExecFileGitRunner(), {
+        repoRoot: converger,
+        branch: BRANCH,
+        hostId: "converger",
+        remote: "origin",
+      }),
+    ).rejects.toThrow(/unrelated histories/i);
+
+    // (b) WHEN it is not a conflict: origin genuinely carries NO marker ref. A
+    // pushed marker here would be a durable LIE about the two machines.
+    expect(git(converger, "ls-remote", "origin", "refs/sandcastle/conflict/*")).toBe("");
+    // Nothing was fabricated locally either.
+    expect(git(converger, "for-each-ref", "--format=%(refname)", "refs/sandcastle/conflict/")).toBe(
+      "",
+    );
+    // The run branch on origin is untouched — no half-convergence landed.
+    expect(git(converger, "ls-remote", "origin", `refs/heads/${BRANCH}`)).toBe(originTipBefore);
+    // The converger's tree is left clean — no half-merge stranded behind.
+    expect(git(converger, "status", "--porcelain")).toBe("");
+    expect(existsSync(path.join(converger, ".git", "MERGE_HEAD"))).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // (i) A `git status` that FAILS is an UNKNOWN tree, not a clean one. Both the
+  //     pre-checkout guard and the per-lane guard must refuse rather than treat
+  //     the failed check as a pass (proceeding is how a false conflict is made).
+  // -------------------------------------------------------------------------
+  it("refuses when the pre-checkout dirty check itself FAILS, rather than assuming clean", async () => {
+    const hostA = makeHost("host-A");
+    commitAndPublishLane(hostA, "host-A", "issueA.txt", "issue A work\n");
+
+    // Fault ONLY the FIRST status — the pre-checkout guard — at the production
+    // GitRunner seam, leaving the per-lane guard real. Faulting every status
+    // would let the PER-LANE guard throw and the test would pass even with this
+    // guard broken; isolating the first call is what makes it real evidence.
+    const real = makeExecFileGitRunner();
+    let statusCalls = 0;
+    const faultyStatus: GitRunner = (cwd, ...args) => {
+      if (args[0] === "status" && ++statusCalls === 1) {
+        return { ok: false, stdout: "", stderr: "fatal: unable to read index" };
+      }
+      return real(cwd, ...args);
+    };
+
+    await expect(
+      convergeLanes(faultyStatus, {
+        repoRoot: converger,
+        branch: BRANCH,
+        hostId: "converger",
+        remote: "origin",
+      }),
+    ).rejects.toThrow(ConvergeError);
+
+    // It refused BEFORE converging: origin's run branch never got host-A's work.
+    const verify = path.join(tmp, "verify-unknown-tree");
+    git(tmp, "clone", "--branch", BRANCH, remote, verify);
+    expect(existsSync(path.join(verify, "issueA.txt"))).toBe(false);
+    // And no marker was invented for a peer that never conflicted.
+    expect(git(converger, "ls-remote", "origin", "refs/sandcastle/conflict/*")).toBe("");
+  });
+
+  it("refuses when the PER-LANE dirty check fails, and invents no conflict marker", async () => {
+    const hostA = makeHost("host-A");
+    commitAndPublishLane(hostA, "host-A", "issueA.txt", "issue A work\n");
+
+    // Let the FIRST status (the pre-checkout guard) through as real, then fault
+    // the per-lane guard — isolating the second skip-on-failure site.
+    const real = makeExecFileGitRunner();
+    let statusCalls = 0;
+    const faultySecondStatus: GitRunner = (cwd, ...args) => {
+      if (args[0] === "status" && ++statusCalls > 1) {
+        return { ok: false, stdout: "", stderr: "fatal: unable to read index" };
+      }
+      return real(cwd, ...args);
+    };
+
+    await expect(
+      convergeLanes(faultySecondStatus, {
+        repoRoot: converger,
+        branch: BRANCH,
+        hostId: "converger",
+        remote: "origin",
+      }),
+    ).rejects.toThrow(ConvergeError);
+
+    expect(git(converger, "ls-remote", "origin", "refs/sandcastle/conflict/*")).toBe("");
+  });
+
+  // -------------------------------------------------------------------------
   // (c) No peers → noop.
   // -------------------------------------------------------------------------
   it("reports noop when no peer lanes exist", async () => {
