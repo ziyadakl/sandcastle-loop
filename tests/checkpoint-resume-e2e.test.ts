@@ -298,4 +298,59 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
 
     await handle.close();
   });
+
+  // -------------------------------------------------------------------------
+  // TEST 4 (Workstream 1, 1c) — a --now stop preserves a certified-but-
+  // unpromoted staging tip: post-merge fixer commits on `integration-candidate`
+  // that no worktree owns are backed up to the durable strand ref on origin.
+  // -------------------------------------------------------------------------
+  it("checkpointStop backs up an integration-candidate tip that is ahead of the integration branch", async () => {
+    const host = makeHost("hostS");
+
+    // A certified fixer commit landed on integration-candidate but was never
+    // promoted — the branch is 1 ahead of the integration branch (main).
+    git(host, "checkout", "-B", "integration-candidate", "origin/main");
+    writeFileSync(path.join(host, "fixer.txt"), "post-merge fixer commit\n");
+    git(host, "add", "fixer.txt");
+    git(host, "commit", "-m", "post-merge fixer");
+    const stagingTip = git(host, "rev-parse", "integration-candidate");
+    // leave the branch as a pure ref (mirrors the real staging worktree layout)
+    git(host, "checkout", "main");
+
+    // No in-flight issue worktrees — this is a pure staging strand.
+    const results = await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: host,
+      hostId: "host-S",
+      integrationBranch: "main",
+      remote: "origin",
+    });
+    expect(results).toEqual<CheckpointStopResult[]>([]);
+
+    // The stranded staging tip is preserved on origin at the strand ref, so a
+    // peer/human can recover the post-merge fixer commit after the stop.
+    expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe(
+      stagingTip,
+    );
+    // …and it is NOT lost even though no worktree carried it.
+    const peer = makeHost("hostT");
+    git(peer, "fetch", "origin", "refs/sandcastle/strand/integration-candidate:refs/local/strand");
+    expect(git(peer, "show", "refs/local/strand:fixer.txt")).toContain(
+      "post-merge fixer commit",
+    );
+  });
+
+  // Control: staging NOT ahead of integration → no strand ref written.
+  it("checkpointStop writes NO strand ref when integration-candidate is level with the integration branch", async () => {
+    const host = makeHost("hostU");
+    git(host, "branch", "integration-candidate", "origin/main");
+
+    await checkpointStop(makeExecFileGitRunner(), {
+      repoRoot: host,
+      hostId: "host-U",
+      integrationBranch: "main",
+      remote: "origin",
+    });
+
+    expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");
+  });
 });

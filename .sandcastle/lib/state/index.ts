@@ -102,6 +102,35 @@ export {
   listWipRefIssues,
 } from "./branch-checkpoint.js";
 
+// Strand-backup data-safety primitives (Workstream 1) — pin stranded /
+// in-flight work to durable refs so a crash or refused promotion never loses it.
+export {
+  strandRef,
+  backupStrand,
+  stagingCommitsAhead,
+  checkpointInflightWork,
+} from "./strand-backup.js";
+export type {
+  StrandBackupOpts,
+  StrandBackupResult,
+  InflightCheckpointOpts,
+  InflightCheckpointResult,
+} from "./strand-backup.js";
+
+// Post-kill / --now checkpoint sweep (ADR 0021) — enumerate in-flight worktrees
+// and persist+release each. Exported so the loop's heartbeat can reuse the
+// worktree enumeration.
+export {
+  checkpointStop,
+  listInflightIssueWorktrees,
+  formatCheckpointStop,
+} from "./checkpoint-stop.js";
+export type {
+  InflightWorktree,
+  CheckpointStopResult,
+  CheckpointStopOpts,
+} from "./checkpoint-stop.js";
+
 // Canonical GitRunner adapters (Quality #2 dedup) — the single home for the
 // async (execFileAsync) and sync (execFileSync) git shell-out shapes the three
 // former inline `makeGitRunner()` / `gitRunner` adapters hand-rolled.

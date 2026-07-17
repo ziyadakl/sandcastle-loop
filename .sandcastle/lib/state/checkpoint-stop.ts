@@ -32,6 +32,7 @@ import {
   pushWipRef,
   issueFromBranch,
 } from "./branch-checkpoint.js";
+import { backupStrand, stagingCommitsAhead } from "./strand-backup.js";
 
 /** One in-flight per-issue worktree still on disk after the loop was killed. */
 export interface InflightWorktree {
@@ -102,6 +103,14 @@ export interface CheckpointStopOpts {
   /** Branch in-flight commits are measured "ahead" of (the run/integration ref). */
   readonly integrationBranch: string;
   readonly remote?: string;
+  /**
+   * WORKSTREAM 1 (1c): the staging branch whose tip is backed up when it is ahead
+   * of `integrationBranch` — post-merge fixer commits that landed on staging but
+   * were never promoted, which a graceful `--now` stop would otherwise lose.
+   * Defaults to `"integration-candidate"` (the loop's STAGING_BRANCH). Set to ""
+   * to disable the staging backup.
+   */
+  readonly stagingBranch?: string;
 }
 
 /**
@@ -139,6 +148,8 @@ export async function checkpointStop(
   opts: CheckpointStopOpts,
 ): Promise<CheckpointStopResult[]> {
   const remote = opts.remote ?? "origin";
+  const stagingBranch =
+    opts.stagingBranch === undefined ? "integration-candidate" : opts.stagingBranch;
   const worktrees = await listInflightIssueWorktrees(git, opts.repoRoot);
   const results: CheckpointStopResult[] = [];
 
@@ -197,6 +208,30 @@ export async function checkpointStop(
         issue: wt.issue,
         outcome: "error",
         detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // WORKSTREAM 1 (1c): after the per-issue sweep, preserve any certified-but-
+  // unpromoted staging tip. A graceful `--now` stop can catch post-merge fixer
+  // commits sitting on `integration-candidate` ahead of the integration branch
+  // that no worktree owns — back them up to the durable strand ref (local always,
+  // origin too) so they survive the stop. Best-effort: a resolve/push fault is
+  // silent here (the same fail-quiet posture the per-issue sweep uses for a bad
+  // worktree). Set `stagingBranch: ""` to disable.
+  if (stagingBranch) {
+    const ahead = await stagingCommitsAhead(
+      git,
+      opts.repoRoot,
+      opts.integrationBranch,
+      stagingBranch,
+    );
+    if (ahead > 0) {
+      await backupStrand(git, {
+        repoRoot: opts.repoRoot,
+        branch: stagingBranch,
+        syncEnabled: true,
+        remote,
       });
     }
   }

@@ -60,6 +60,10 @@ import {
   resolveReuseDecision,
   deleteWipRef,
   listWipRefIssues,
+  strandRef,
+  backupStrand,
+  checkpointInflightWork,
+  listInflightIssueWorktrees,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
@@ -5994,11 +5998,46 @@ export async function runMain(
     // once here. The double-fire is intentional + benign: syncStatusOnce is
     // idempotent (publish → fetch → setPeers).
     const syncOnHeartbeat = crossHostSyncEnabled();
+    // WORKSTREAM 1 (1b) — periodic in-flight checkpoint. A hard crash
+    // (SIGKILL/OOM) between iterations loses whatever the in-flight
+    // `agent/issue-<N>` worktrees produced, because nothing in-process gets to
+    // commit-on-stop. Piggy-back on the heartbeat: commit each dirty worktree and
+    // (sync on) push its WIP ref with --force-with-lease, so resume picks up from
+    // the last heartbeat instead of restarting fresh. Fully best-effort —
+    // enumeration/commit/push faults route to logError and NEVER crash the loop;
+    // clean worktrees are skipped so it stays cheap.
+    const heartbeatHostId = resolveHostId();
+    const checkpointInflightOnHeartbeat = async (): Promise<void> => {
+      try {
+        const worktrees = await listInflightIssueWorktrees(
+          runGitLease,
+          args.repoRoot,
+        );
+        if (worktrees.length === 0) return;
+        const results = await checkpointInflightWork(runGitLease, worktrees, {
+          repoRoot: args.repoRoot,
+          hostId: heartbeatHostId,
+          syncEnabled: syncOnHeartbeat,
+        });
+        for (const r of results) {
+          if (r.outcome === "error") {
+            deps.logError(
+              `[heartbeat-checkpoint] issue #${r.issue}: ${r.detail ?? "(no detail)"}`,
+            );
+          }
+        }
+      } catch (err) {
+        deps.logError(
+          `[heartbeat-checkpoint] sweep threw (non-fatal): ${(err as Error).message}`,
+        );
+      }
+    };
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {
         void syncStatusOnce(statusStore, deps);
       }
+      void checkpointInflightOnHeartbeat();
     }, renewMs);
     leaseHeartbeat.unref?.();
   }
@@ -7081,6 +7120,46 @@ export async function runMain(
                 `certified work is stranded on ${STAGING_BRANCH}; run will exit ` +
                 `unhealthy (non-zero). Human triage required.`,
             );
+            // WORKSTREAM 1 (1a) — DON'T lose the stranded work. BEFORE releasing
+            // the leases, pin the certified `integration-candidate` tip to a
+            // durable ref (`refs/sandcastle/strand/<branch>` + per-issue WIP refs)
+            // so a human — or, when cross-host sync is on, a peer host — can
+            // recover it. Local refs always; the origin push is gated on the sync
+            // flag. Best-effort: a backup fault is logged non-fatal (the strand is
+            // still on `integration-candidate` on disk, and the run already exits
+            // unhealthy for a human).
+            const strandSync = crossHostSyncEnabled();
+            try {
+              const backup = await backupStrand(runGitLease, {
+                repoRoot: args.repoRoot,
+                branch: STAGING_BRANCH,
+                issues: mergedIssueNums,
+                syncEnabled: strandSync,
+              });
+              deps.log(
+                `[strand] backed up ${STAGING_BRANCH} → ${backup.localRefs.join(", ") || "(none)"}` +
+                  (backup.pushedRefs.length
+                    ? ` (origin: ${backup.pushedRefs.join(", ")})`
+                    : ""),
+              );
+              for (const e of backup.errors) {
+                deps.logError(`[strand] backup: ${e}`);
+              }
+            } catch (err) {
+              deps.logError(
+                `[strand] backup of ${STAGING_BRANCH} threw (non-fatal): ${(err as Error).message}`,
+              );
+            }
+            // Also publish the stranded staging tip on this host's lane so a peer
+            // can merge it (today publish only runs on promote-SUCCESS, leaving
+            // this stranded work invisible to peers). Gated on the sync flag.
+            if (strandSync) {
+              await publishLaneOrLog(
+                deps,
+                STAGING_BRANCH,
+                "stranding staging (promotion fast-forward refused)",
+              );
+            }
             // These "ok" issues were shown as `merge` (queued) and deliberately
             // never recorded merged — correct, they're stranded, not shipped.
             // Surface them as needing a human so the dashboard flags the strand
@@ -7091,6 +7170,17 @@ export async function runMain(
                 n,
                 "needs-human",
                 `stranded on ${STAGING_BRANCH} — promotion fast-forward refused`,
+              );
+              // Apply the REAL `needs-human` GitHub label (not just the in-memory
+              // status phase): the status skill's label-based strand sweep keys
+              // off the GH label, so setIssuePhase alone leaves the strand
+              // invisible to it. quarantineViaLabel flips the label + comments;
+              // it leaves the issue OPEN for a human.
+              await deps.quarantine(
+                n,
+                `Stranded on ${STAGING_BRANCH}: promotion fast-forward to ${args.branch} ` +
+                  `was refused after certification. Certified work is preserved at ` +
+                  `${strandRef(STAGING_BRANCH)} / ${wipRef(n)}. Human triage required.`,
               );
               // Fix 4 (ADR 0019): release the lease held past ship time, matching
               // the promote-success and staging-quarantine siblings. Without this
