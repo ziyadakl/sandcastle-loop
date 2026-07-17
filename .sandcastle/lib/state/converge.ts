@@ -25,7 +25,25 @@
  */
 
 import { EMPTY_TREE_OID, type GitRunner } from "./issue-lease.js";
+import { LANE_PREFIX, laneRef, peerRef } from "./lane-sync.js";
 import { discoverRefPeers } from "./ref-peers.js";
+
+/**
+ * A convergence git operation the CALLER must surface LOUD: a genuine fault
+ * (auth/network/non-fast-forward/dirty tree), NOT an ordinary merge-conflict
+ * outcome (conflicts are reported per-lane with a durable marker instead).
+ * Mirrors {@link LaneSyncError} and ADR 0020's fail-loud-on-write posture:
+ * convergence either LANDS on the remote or says so — never silently.
+ */
+export class ConvergeError extends Error {
+  /** The raw git stderr (may be empty when git said nothing useful). */
+  readonly stderr: string;
+  constructor(stderr: string, message?: string) {
+    super(message ?? `converge git failure: ${stderr || "(no stderr)"}`);
+    this.name = "ConvergeError";
+    this.stderr = stderr;
+  }
+}
 
 /** Options for a single convergence, bound to one repo + one host identity. */
 export interface ConvergeOpts {
@@ -54,35 +72,44 @@ export interface LaneConvergeResult {
   readonly result: "merged" | "conflict" | "skip" | "noop";
   /** The peer lane tip that was merged/attempted (absent for `noop`). */
   readonly tip?: string;
+  /**
+   * For `conflict`: the marker ref, present ONLY when the marker was genuinely
+   * created AND pushed to the remote. Its ABSENCE on a `conflict` lane means the
+   * divergence could not be durably recorded — a LOUD problem the caller must
+   * surface (see {@link ConvergeResult.conflicts}).
+   */
+  readonly markerRef?: string;
+  /** For `skip`/`conflict`: a short human reason. */
+  readonly reason?: string;
 }
 
 /** The aggregate result of one {@link convergeLanes} run. */
 export interface ConvergeResult {
   /** Per-peer outcomes (or a single `noop` entry when there are no peers). */
   readonly perLane: LaneConvergeResult[];
-  /** The run branch tip after convergence (== the tip pushed to the remote). */
+  /**
+   * The run branch tip after convergence. Only ever returned once the push to
+   * the remote SUCCEEDED — a rejected push throws {@link ConvergeError} rather
+   * than return a tip that would imply convergence landed when it did not.
+   */
   readonly branchTip: string;
-  /** Marker ref names written for each conflicting peer (empty when none). */
+  /**
+   * Marker ref names for conflicting peers whose marker was genuinely written
+   * AND pushed. A conflict whose marker could NOT be recorded is deliberately
+   * absent here (it appears as a `conflict` lane with no `markerRef`), so this
+   * list never over-claims durable records that do not exist on the remote.
+   */
   readonly conflicts: string[];
 }
 
-/** Remote ref a given host's published lane lives at. */
-function laneRef(hostId: string): string {
-  return `refs/sandcastle/lanes/${hostId}`;
-}
-
-/** Local mirror ref a fetched peer lane is written to (mirrors lane-sync). */
-function peerRef(peer: string): string {
-  return `refs/sandcastle/peers/${peer}`;
-}
-
-/** Durable ref recording a converge conflict between this host and a peer. */
+/**
+ * Durable ref recording a converge conflict between this host and a peer.
+ * (`laneRef` / `peerRef` / `LANE_PREFIX` are imported from lane-sync.ts — the
+ * lane namespace has exactly ONE definition, which the two modules share.)
+ */
 function conflictRef(hostId: string, peer: string): string {
   return `refs/sandcastle/conflict/${hostId}-${peer}`;
 }
-
-/** Prefix of the lane ref namespace, used to parse `ls-remote` output. */
-const LANE_PREFIX = "refs/sandcastle/lanes/";
 
 /**
  * Reconcile every peer lane onto the run branch and push the result. See the
@@ -109,9 +136,65 @@ export async function convergeLanes(
     };
   }
 
-  // Operate ON the run branch in the converger's checkout.
-  await run("checkout", branch);
+  // Remember where the OPERATOR was so we can put them back — this is their
+  // working checkout, not ours to leave parked on the run branch.
+  const originalRef = await currentRef(run);
 
+  // Dirty-tree guard BEFORE any checkout: checking out over uncommitted work
+  // would refuse or clobber it. Refuse LOUD instead — the operator's tree is
+  // theirs, and convergence is never worth risking it.
+  const dirtyBefore = await run("status", "--porcelain");
+  if (dirtyBefore.ok && dirtyBefore.stdout.trim() !== "") {
+    throw new ConvergeError(
+      "",
+      `converge refused: ${repoRoot} has uncommitted changes — ` +
+        `commit or stash them before converging (never checkout over a dirty tree)`,
+    );
+  }
+
+  // Operate ON the run branch in the converger's checkout. A FAILED checkout
+  // would leave every merge below landing on the WRONG branch → fail LOUD.
+  const checkedOut = await run("checkout", branch);
+  if (!checkedOut.ok) {
+    throw new ConvergeError(
+      checkedOut.stderr,
+      `converge could not check out run branch ${branch}: ` +
+        `${checkedOut.stderr || "(no stderr)"}`,
+    );
+  }
+
+  try {
+    return await convergeOnBranch(run, { branch, hostId, remote }, peers);
+  } finally {
+    // Restore the operator's branch on EVERY exit path — success AND the push
+    // fault thrown inside. (The guards ABOVE throw before we ever moved, so they
+    // need no restore.) Best-effort: a restore failure must never mask the real
+    // fault by replacing it with a checkout error.
+    if (originalRef && originalRef !== branch) await run("checkout", originalRef);
+  }
+}
+
+/** The current branch name, or the raw SHA when HEAD is detached. */
+async function currentRef(
+  run: (...args: string[]) => ReturnType<GitRunner>,
+): Promise<string> {
+  const symbolic = await run("symbolic-ref", "--short", "HEAD");
+  if (symbolic.ok && symbolic.stdout.trim() !== "") return symbolic.stdout.trim();
+  const detached = await run("rev-parse", "HEAD");
+  return detached.ok ? detached.stdout.trim() : "";
+}
+
+/**
+ * Merge every peer lane onto the ALREADY-checked-out run branch and push. Split
+ * out so {@link convergeLanes} owns the checkout/restore lifecycle and this owns
+ * the reconciliation, with no `finally` nesting between them.
+ */
+async function convergeOnBranch(
+  run: (...args: string[]) => ReturnType<GitRunner>,
+  opts: { branch: string; hostId: string; remote: string },
+  peers: string[],
+): Promise<ConvergeResult> {
+  const { branch, hostId, remote } = opts;
   const perLane: LaneConvergeResult[] = [];
   const conflicts: string[] = [];
 
@@ -151,30 +234,64 @@ export async function convergeLanes(
     await run("merge", "--abort");
 
     const markerRef = conflictRef(hostId, peer);
-    if (branchTip && peerTip) {
-      const marker = await run(
-        "commit-tree",
-        EMPTY_TREE_OID,
-        "-p",
-        branchTip,
-        "-p",
-        peerTip,
-        "-m",
-        `converge conflict: ${hostId} <-> ${peer} (branch=${branchTip} peer=${peerTip})`,
+    // Record the marker ref ONLY once it genuinely exists on the remote. Each
+    // step below can fail; claiming an unwritten marker would be precisely the
+    // silent divergence the marker exists to prevent.
+    const failed = (reason: string): void => {
+      perLane.push({ host: peer, result: "conflict", tip: peerTip, reason });
+    };
+    if (!branchTip || !peerTip) {
+      failed(
+        `conflict marker NOT recorded: could not resolve ` +
+          `${!branchTip ? "the branch tip" : "the peer tip"}`,
       );
-      if (marker.ok) {
-        const markerSha = marker.stdout.trim();
-        await run("update-ref", markerRef, markerSha);
-        await run("push", remote, `${markerSha}:${markerRef}`);
-      }
+      continue;
+    }
+    const marker = await run(
+      "commit-tree",
+      EMPTY_TREE_OID,
+      "-p",
+      branchTip,
+      "-p",
+      peerTip,
+      "-m",
+      `converge conflict: ${hostId} <-> ${peer} (branch=${branchTip} peer=${peerTip})`,
+    );
+    if (!marker.ok) {
+      failed(`conflict marker NOT recorded: commit-tree failed: ${marker.stderr || "(no stderr)"}`);
+      continue;
+    }
+    const markerSha = marker.stdout.trim();
+    const updated = await run("update-ref", markerRef, markerSha);
+    if (!updated.ok) {
+      failed(`conflict marker NOT recorded: update-ref failed: ${updated.stderr || "(no stderr)"}`);
+      continue;
+    }
+    const pushedMarker = await run("push", remote, `${markerSha}:${markerRef}`);
+    if (!pushedMarker.ok) {
+      failed(
+        `conflict marker NOT recorded on ${remote}: push failed: ` +
+          `${pushedMarker.stderr || "(no stderr)"}`,
+      );
+      continue;
     }
     conflicts.push(markerRef);
-    perLane.push({ host: peer, result: "conflict", tip: peerTip });
+    perLane.push({ host: peer, result: "conflict", tip: peerTip, markerRef });
   }
 
   // Push the converged run branch back to the remote (idempotent when no clean
-  // merge advanced it).
-  await run("push", remote, `${branch}:refs/heads/${branch}`);
+  // merge advanced it). This is the whole POINT of the command: if it does not
+  // land, the machines did NOT converge. A rejection here (non-fast-forward,
+  // auth, network) is a real fault → fail LOUD rather than report a local tip
+  // that would imply convergence landed (ADR 0020 fail-loud-on-write).
+  const pushed = await run("push", remote, `${branch}:refs/heads/${branch}`);
+  if (!pushed.ok) {
+    throw new ConvergeError(
+      pushed.stderr,
+      `converge could NOT push run branch ${branch} to ${remote} — the machines ` +
+        `did not converge: ${pushed.stderr || "(no stderr)"}`,
+    );
+  }
 
   const finalTipRes = await run("rev-parse", branch);
   const branchTip = finalTipRes.ok ? finalTipRes.stdout.trim() : "";

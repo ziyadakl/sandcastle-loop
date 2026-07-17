@@ -70,8 +70,12 @@ export class LaneSyncError extends Error {
   }
 }
 
-/** Remote ref a given host's published lane lives at. */
-function laneRef(hostId: string): string {
+/**
+ * Remote ref a given host's published lane lives at. CANONICAL — exported so
+ * every cross-host module (e.g. converge.ts) computes lane refs from this one
+ * definition; a second copy that drifts would silently split the namespace.
+ */
+export function laneRef(hostId: string): string {
   return `refs/sandcastle/lanes/${hostId}`;
 }
 
@@ -81,13 +85,19 @@ function laneRef(hostId: string): string {
  * relying on FETCH_HEAD — FETCH_HEAD is per-worktree, so a fetch run in the
  * repo root would be invisible to a `merge` run inside a separate launch
  * worktree. Merging a stable local ref by name sidesteps that entirely.
+ *
+ * CANONICAL — exported for the same reason as {@link laneRef}.
  */
-function peerRef(peer: string): string {
+export function peerRef(peer: string): string {
   return `refs/sandcastle/peers/${peer}`;
 }
 
-/** Prefix of the lane ref namespace, used to parse `ls-remote` output. */
-const LANE_PREFIX = "refs/sandcastle/lanes/";
+/**
+ * Prefix of the lane ref namespace, used to parse `ls-remote` output.
+ * CANONICAL — exported so peer DISCOVERY and lane-ref CONSTRUCTION can never
+ * disagree about the namespace.
+ */
+export const LANE_PREFIX = "refs/sandcastle/lanes/";
 
 export function createLaneSync(opts: LaneSyncOpts): {
   publish(branch: string): Promise<void>;

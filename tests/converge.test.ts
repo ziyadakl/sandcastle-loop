@@ -21,8 +21,9 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { convergeLanes } from "../.sandcastle/lib/state/converge.js";
+import { convergeLanes, ConvergeError } from "../.sandcastle/lib/state/converge.js";
 import { makeExecFileGitRunner } from "../.sandcastle/lib/state/index.js";
+import type { GitRunner } from "../.sandcastle/lib/state/issue-lease.js";
 
 const BRANCH = "main";
 
@@ -154,6 +155,135 @@ describe("convergeLanes (real bare origin + real host clones)", () => {
     // The converger branch is left CLEAN — no half-merge, no MERGE_HEAD.
     expect(git(converger, "status", "--porcelain")).toBe("");
     expect(existsSync(path.join(converger, ".git", "MERGE_HEAD"))).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // (d) The FINAL push is REJECTED (non-fast-forward) → LOUD failure, and the
+  //     caller never receives a branchTip implying convergence landed.
+  // -------------------------------------------------------------------------
+  it("throws ConvergeError when the final push is rejected and does NOT report a converged tip", async () => {
+    const hostA = makeHost("host-A");
+    commitAndPublishLane(hostA, "host-A", "issueA.txt", "issue A work\n");
+
+    // Advance origin's run branch from ANOTHER clone, so the converger's local
+    // main no longer contains origin's tip → its final push is a real non-FF
+    // REJECTION from real git (not a simulated return value).
+    const intruder = makeHost("intruder");
+    writeFileSync(path.join(intruder, "intruder.txt"), "landed first\n");
+    git(intruder, "add", "-A");
+    git(intruder, "commit", "-m", "intruder lands first");
+    git(intruder, "push", "origin", BRANCH);
+    const originTipBefore = git(intruder, "rev-parse", "HEAD");
+
+    await expect(
+      convergeLanes(makeExecFileGitRunner(), {
+        repoRoot: converger,
+        branch: BRANCH,
+        hostId: "converger",
+        remote: "origin",
+      }),
+    ).rejects.toThrow(ConvergeError);
+
+    // WHEN the push is rejected: origin's run branch is UNCHANGED — the
+    // convergence provably did not land, so nothing may claim it did.
+    expect(git(converger, "ls-remote", "origin", `refs/heads/${BRANCH}`)).toContain(
+      originTipBefore,
+    );
+    const verify = path.join(tmp, "verify-rejected");
+    git(tmp, "clone", "--branch", BRANCH, remote, verify);
+    expect(existsSync(path.join(verify, "issueA.txt"))).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // (e) A conflict marker that could NOT be pushed must never be claimed in
+  //     `conflicts` — that would be exactly the silent divergence the marker
+  //     exists to prevent.
+  // -------------------------------------------------------------------------
+  it("does NOT claim a conflict ref when the marker push fails, and reports the failure", async () => {
+    const hostA = makeHost("host-A");
+    const hostB = makeHost("host-B");
+    commitAndPublishLane(hostA, "host-A", "base.txt", "A changed base\n");
+    commitAndPublishLane(hostB, "host-B", "base.txt", "B changed base\n");
+
+    // Real git for EVERYTHING except the one marker push we fault-inject at the
+    // production GitRunner seam — the rest of the path stays real.
+    const real = makeExecFileGitRunner();
+    const faultyMarkerPush: GitRunner = (cwd, ...args) => {
+      if (args[0] === "push" && args.some((a) => a.includes("refs/sandcastle/conflict/"))) {
+        return { ok: false, stdout: "", stderr: "simulated marker push failure" };
+      }
+      return real(cwd, ...args);
+    };
+
+    const result = await convergeLanes(faultyMarkerPush, {
+      repoRoot: converger,
+      branch: BRANCH,
+      hostId: "converger",
+      remote: "origin",
+    });
+
+    const conflictLane = result.perLane.find((l) => l.result === "conflict");
+    expect(conflictLane).toBeDefined();
+    // The lane is truthful: no markerRef, and a reason explaining the failure.
+    expect(conflictLane?.markerRef).toBeUndefined();
+    expect(conflictLane?.reason).toMatch(/marker/i);
+    // It must NOT be claimed as a written marker.
+    expect(result.conflicts).toEqual([]);
+    // WHEN the marker push failed: origin genuinely carries NO conflict ref.
+    expect(git(converger, "ls-remote", "origin", "refs/sandcastle/conflict/*")).toBe("");
+  });
+
+  // -------------------------------------------------------------------------
+  // (f) A dirty tree is refused BEFORE any checkout, and the operator's branch
+  //     is left exactly where they had it.
+  // -------------------------------------------------------------------------
+  it("refuses a dirty tree BEFORE checkout and leaves the operator's branch and changes untouched", async () => {
+    const hostA = makeHost("host-A");
+    commitAndPublishLane(hostA, "host-A", "issueA.txt", "issue A work\n");
+
+    // Operator is sitting on their own branch with uncommitted work.
+    git(converger, "checkout", "-b", "operator-branch");
+    const dirtyFile = path.join(converger, "wip.txt");
+    writeFileSync(dirtyFile, "precious uncommitted work\n");
+
+    await expect(
+      convergeLanes(makeExecFileGitRunner(), {
+        repoRoot: converger,
+        branch: BRANCH,
+        hostId: "converger",
+        remote: "origin",
+      }),
+    ).rejects.toThrow(ConvergeError);
+
+    // Never checked out over the dirty tree: still on operator-branch, work intact.
+    expect(git(converger, "symbolic-ref", "--short", "HEAD")).toBe("operator-branch");
+    expect(existsSync(dirtyFile)).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // (g) On the SUCCESS path the operator's original branch is restored.
+  // -------------------------------------------------------------------------
+  it("restores the operator's original branch after a successful convergence", async () => {
+    const hostA = makeHost("host-A");
+    commitAndPublishLane(hostA, "host-A", "issueA.txt", "issue A work\n");
+    git(converger, "checkout", "-b", "operator-branch");
+
+    const result = await convergeLanes(makeExecFileGitRunner(), {
+      repoRoot: converger,
+      branch: BRANCH,
+      hostId: "converger",
+      remote: "origin",
+    });
+
+    expect(result.perLane).toEqual([
+      { host: "host-A", result: "merged", tip: expect.any(String) },
+    ]);
+    // The operator is put back where they were, not stranded on the run branch.
+    expect(git(converger, "symbolic-ref", "--short", "HEAD")).toBe("operator-branch");
+    // And the convergence genuinely landed on origin.
+    const verify = path.join(tmp, "verify-restored");
+    git(tmp, "clone", "--branch", BRANCH, remote, verify);
+    expect(existsSync(path.join(verify, "issueA.txt"))).toBe(true);
   });
 
   // -------------------------------------------------------------------------
