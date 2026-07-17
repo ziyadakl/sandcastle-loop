@@ -103,6 +103,8 @@ import {
   createLaneSync,
   createStatusSync,
   resolveLeaseState,
+  strandRef,
+  wipRef,
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
@@ -3222,6 +3224,19 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
       expect(issue71?.phase).not.toBe("merged");
       expect(issue71?.phase).toBe("needs-human");
       expect(issue71?.attention).toBe(true);
+
+      // ...and the work must actually be RECOVERABLE, not merely flagged. Read
+      // the REAL ref store: assert the durable strand ref (and #71's per-issue
+      // WIP ref) pin the exact stranded staging tip. Sourced from git, not from
+      // an injected dep — the arguments handed to `handleStrandedPromotion`
+      // (`stagingBranch`, `issues`) are only proven by the refs they produce.
+      const git = (cwd: string, ...args: string[]): string =>
+        execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+      const strandedTip = git(repoRoot, "rev-parse", "integration-candidate");
+      expect(git(repoRoot, "rev-parse", strandRef("integration-candidate"))).toBe(
+        strandedTip,
+      );
+      expect(git(repoRoot, "rev-parse", wipRef(71))).toBe(strandedTip);
     } finally {
       __setStagingWorktreePathForTests("");
       cleanup();
@@ -8045,5 +8060,192 @@ describe("syncStatusOnce (cross-host status fold)", () => {
     expect(writes.length).toBeGreaterThan(beforeLen);
     const written = JSON.parse(writes.at(-1)!) as SandcastleStatus;
     expect("peers" in written).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WIRING GAP — `syncEnabled: crossHostSyncEnabled()` at the loop's
+// handleStrandedPromotion call site (main.mts, the FF-refusal branch).
+//
+// The 1a policy is already unit-tested against a real bare origin in
+// tests/strand-backup.test.ts, and the staging suite proves the strand's LOCAL
+// refs. Neither proves the loop hands the FLAG through: hardcoding
+// `syncEnabled: false` at the call site left the entire suite green, so the loop
+// could silently stop publishing stranded work to origin — peers would never see
+// certified work that a refused promotion left behind — with nothing red.
+//
+// So these two drive the REAL runMain through a REAL fast-forward refusal
+// against a REAL bare origin, and read the outcome back out of the remote ref
+// store with `ls-remote`. Sourcing the assertion from an injected dep or a spy
+// would re-create the exact hole: only the refs that actually landed on origin
+// prove the argument was wired.
+//
+// The pair is deliberate, mirroring tests/checkpoint-resume-e2e.test.ts's
+// sync-OFF control: ON proves the push HAPPENS, OFF proves origin stays EMPTY
+// *while the local refs still hold the tip* — distinguishing "correctly gated"
+// from "silently did nothing". Either one alone is satisfied by a constant.
+// ---------------------------------------------------------------------------
+describe("stranded promotion — cross-host sync flag wiring (real bare origin)", () => {
+  const SYNC_ENV_KEYS = ["SANDCASTLE_CROSS_HOST_LEASE", "SANDCASTLE_CROSS_HOST_SYNC"];
+  afterEach(() => {
+    for (const k of SYNC_ENV_KEYS) delete process.env[k];
+    __setStagingWorktreePathForTests("");
+  });
+
+  // Same shape as the staging suite's initStagingRepo, plus a real bare origin
+  // the loop's own `runGitLease` can push to (it shells to git for real, so the
+  // strand push is a genuine network-shaped operation, not a stub).
+  function initStagingRepoWithOrigin(): {
+    repoRoot: string;
+    originPath: string;
+    stagingPath: string;
+    gitEnv: NodeJS.ProcessEnv;
+    git: (cwd: string, ...args: string[]) => string;
+    cleanup: () => void;
+  } {
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-strandsync-"));
+    const originPath = mkdtempSync(path.join(tmpdir(), "sc-strandsync-origin-"));
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    };
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+
+    git(originPath, "init", "-q", "--bare", "-b", "main");
+    git(repoRoot, "init", "-q", "-b", "main");
+    git(repoRoot, "config", "user.email", "test@example.com");
+    git(repoRoot, "config", "user.name", "Test");
+    writeFileSync(path.join(repoRoot, "README.md"), "hello\n");
+    git(repoRoot, "add", "README.md");
+    git(repoRoot, "commit", "-q", "-m", "init");
+    git(repoRoot, "branch", "feature/work");
+    git(repoRoot, "branch", "integration-candidate");
+    git(repoRoot, "remote", "add", "origin", originPath);
+    git(repoRoot, "push", "-q", "origin", "main", "feature/work", "integration-candidate");
+
+    const stagingPath = mkdtempSync(path.join(tmpdir(), "sc-strandsync-staging-"));
+    rmSync(stagingPath, { recursive: true, force: true });
+    git(repoRoot, "worktree", "add", "-q", stagingPath, "integration-candidate");
+    return {
+      repoRoot,
+      originPath,
+      stagingPath,
+      gitEnv,
+      git,
+      cleanup: () => {
+        for (const p of [repoRoot, originPath, stagingPath]) {
+          rmSync(p, { recursive: true, force: true });
+        }
+      },
+    };
+  }
+
+  /** Refs present on the bare origin under `refs/sandcastle/` → ref → sha. */
+  function originSandcastleRefs(
+    git: (cwd: string, ...args: string[]) => string,
+    repoRoot: string,
+  ): Map<string, string> {
+    const out = git(repoRoot, "ls-remote", "origin", "refs/sandcastle/*");
+    const map = new Map<string, string>();
+    for (const line of out.split("\n").filter(Boolean)) {
+      const [sha, ref] = line.split("\t");
+      map.set(ref, sha);
+    }
+    return map;
+  }
+
+  /**
+   * Queue one issue all the way to a REFUSED final promotion: the merger hook
+   * diverges `feature/work` behind the loop's back, exactly the trick the
+   * staging suite uses, so the FF onto the integration branch cannot advance and
+   * the certified work strands on integration-candidate.
+   */
+  function buildStrandingRun(repoRoot: string, gitEnv: NodeJS.ProcessEnv) {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+    const realRun = b.deps.run.bind(b.deps);
+    b.deps.run = async (spec) => {
+      const handle = await realRun(spec);
+      if (spec.name === "merger") {
+        const wt = mkdtempSync(path.join(tmpdir(), "sc-strandsync-divert-"));
+        rmSync(wt, { recursive: true, force: true });
+        const git = (cwd: string, ...args: string[]): string =>
+          execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8" }).trim();
+        git(repoRoot, "worktree", "add", "-q", wt, "feature/work");
+        writeFileSync(path.join(wt, "operator.ts"), "export const OP = 1;\n");
+        git(wt, "add", "operator.ts");
+        git(wt, "commit", "-q", "-m", "operator hotfix — diverges integration");
+        git(repoRoot, "worktree", "remove", "--force", wt);
+      }
+      return handle;
+    };
+    return b;
+  }
+
+  it("sync ON: the stranded tip LANDS on origin so a peer can recover it", async () => {
+    // Sync requires the lease (main.mts's startup guard) — set both.
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
+    const { repoRoot, stagingPath, gitEnv, git, cleanup } = initStagingRepoWithOrigin();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      const b = buildStrandingRun(repoRoot, gitEnv);
+
+      await runMain(baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }), b.deps);
+
+      // The promotion really was refused (otherwise nothing is stranded and the
+      // assertions below would be vacuous).
+      const status = JSON.parse(
+        readFileSync(path.join(repoRoot, ".sandcastle", "status.json"), "utf8"),
+      ) as SandcastleStatus;
+      expect(status.totals.merged).toBe(0);
+
+      // THE ASSERTION: read the REMOTE ref store. Both durable refs must pin the
+      // exact stranded tip on origin — that is the only thing that proves
+      // `syncEnabled: crossHostSyncEnabled()` reached backupStrand's push.
+      const strandedTip = git(repoRoot, "rev-parse", "integration-candidate");
+      const onOrigin = originSandcastleRefs(git, repoRoot);
+      expect(onOrigin.get(strandRef("integration-candidate"))).toBe(strandedTip);
+      expect(onOrigin.get(wipRef(71))).toBe(strandedTip);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("sync OFF: origin is untouched, yet the strand still survives LOCALLY", async () => {
+    // No flags — the default single-host consumer, which must never push.
+    const { repoRoot, stagingPath, gitEnv, git, cleanup } = initStagingRepoWithOrigin();
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      const b = buildStrandingRun(repoRoot, gitEnv);
+
+      await runMain(baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }), b.deps);
+
+      const strandedTip = git(repoRoot, "rev-parse", "integration-candidate");
+      // Gated OFF: origin must carry NO sandcastle refs at all.
+      expect([...originSandcastleRefs(git, repoRoot).keys()]).toEqual([]);
+      // ...but the work is NOT lost — the local refs still pin the tip. Without
+      // this half, a call site that skipped the backup entirely would also pass.
+      expect(git(repoRoot, "rev-parse", strandRef("integration-candidate"))).toBe(
+        strandedTip,
+      );
+      expect(git(repoRoot, "rev-parse", wipRef(71))).toBe(strandedTip);
+    } finally {
+      cleanup();
+    }
   });
 });
