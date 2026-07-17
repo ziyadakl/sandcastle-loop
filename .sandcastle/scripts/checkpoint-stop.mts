@@ -26,16 +26,43 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/**
+ * The loop's STAGING_BRANCH. This entry point is the right place to own the
+ * default: `lib/state/checkpoint-stop.ts` takes the branch as an explicit,
+ * required option so the library never hardcodes a branch name it doesn't own.
+ */
+const DEFAULT_STAGING_BRANCH = "integration-candidate";
+
+/**
+ * Whether cross-host sync is enabled, read straight from the environment with
+ * the SAME semantics as main.mts's `crossHostSyncEnabled()` / `envFlagEnabled()`
+ * (truthy iff the trimmed, lowercased value is "1" or "true"). Duplicated rather
+ * than imported because main.mts is a consumer of this lib, not a dependency of
+ * it — importing it here would be a cycle.
+ *
+ * Default OFF: per ADR 0021 a single-host stop with the flag unset must be inert
+ * (no new origin writes).
+ */
+function crossHostSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.SANDCASTLE_CROSS_HOST_SYNC ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
 interface Args {
   repoRoot: string;
   integrationBranch: string;
   remote: string;
+  stagingBranch: string;
+  /** undefined = not overridden on the CLI; fall back to the env flag. */
+  syncEnabled?: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
   let repoRoot = process.cwd();
   let integrationBranch: string | undefined;
   let remote = "origin";
+  let stagingBranch = DEFAULT_STAGING_BRANCH;
+  let syncEnabled: boolean | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = (): string => {
@@ -53,12 +80,19 @@ function parseArgs(argv: string[]): Args {
       case "--remote":
         remote = next();
         break;
+      case "--staging-branch":
+        stagingBranch = next();
+        break;
+      case "--sync":
+        // Explicit opt-in on the CLI, overriding the env flag.
+        syncEnabled = true;
+        break;
       default:
         fail(`unknown flag: ${a}`);
     }
   }
   if (!integrationBranch) fail("--integration-branch is required");
-  return { repoRoot, integrationBranch, remote };
+  return { repoRoot, integrationBranch, remote, stagingBranch, syncEnabled };
 }
 
 async function main(): Promise<void> {
@@ -69,6 +103,9 @@ async function main(): Promise<void> {
     hostId,
     integrationBranch: args.integrationBranch,
     remote: args.remote,
+    stagingBranch: args.stagingBranch,
+    // `--sync` wins; otherwise the env flag decides, defaulting OFF (inert).
+    syncEnabled: args.syncEnabled ?? crossHostSyncEnabled(),
   });
   console.log(formatCheckpointStop(results));
 
