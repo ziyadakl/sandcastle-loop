@@ -50,6 +50,8 @@ The per-host **pre-flight and deletion mechanics** are identical on both paths �
 
    **These checks MUST run on the target, and that's the whole reason the all-machines path is delicate.** A local pgrep — or a local `status.json` — cannot see the VPS's loop. Never let this machine's quiet evidence authorize a remote deletion.
 
+   **This refusal covers EVERY destructive step for that host — worktrees, coordination-ref/lock purge, docker containers, and per-issue worktrees alike.** A live loop reads and writes coordination refs and runs inside its container; sweeping any of them mid-run corrupts the live run. A host that fails this gate is skipped whole; the new container/ref/worktree sweeps are not exceptions to it.
+
    The pgrep is **project-scoped by cwd on purpose**: every sandcastle loop on a machine shares an identical command line, so a bare `pgrep` surfaces _other_ repos' loops and would refuse for the wrong reason. For a remote host, `ssh` lands in the login dir — `cd <repoPath>` first (from that host's registry entry) so `$PWD` is the checkout and so `.sandcastle/status.json` and `.sandcastle/.loop.lock` resolve to that host's repo, not the login dir.
 
 2. **Confirm the target is a sandcastle project.** `.sandcastle/` must exist at that host's repo root. If not, skip that host with a reason.
@@ -81,7 +83,20 @@ In order. **Where the confirmation lands depends on the path:** single-machine a
 
 3. **Backup folders** named `.sandcastle.old-*`, `.sandcastle.broken-*`, `.sandcastle.bak-*` in the project root. These are from past failed inits. Confirm before removing each (single-machine) or list them in the combined proposal (all-machines) — never remove one unlisted.
 
-4. **Stale `agent/issue-*` branches.** After removing worktrees, the branches may still exist as refs. For each:
+4. **Stale coordination refs + lease locks** — `refs/sandcastle/lanes/*`, `refs/sandcastle/peers/*`, `refs/sandcastle/peer-status/*`, `refs/sandcastle/status/*`, `refs/sandcastle/conflict/*`, and `refs/locks/issue-*`, on **local + origin + each host**. In the normal flow `sandcastle-complete` purges these at retirement; a stale one surviving here is a leftover from a run that was retired without a clean finalize — exactly what poisons the next run's converge (a lane ref left pointing at an archive tip fakes an iteration-1 merge conflict).
+   - **Verify-before-delete — cite the evidence each ref is worthless** (per the "cite the file:line / commit before any destructive op" rule). A coordination ref is sweepable ONLY when its tip proves it belongs to no live run: it is **merged into `main`** (`git merge-base --is-ancestor <tip> origin/main`), **matches an `archive/*` tag/branch** (`git for-each-ref refs/tags/archive/ refs/heads/archive/` contains the same SHA), OR **belongs to no run in `status.json`/`hosts.json` and no loop is alive** (see the guard below). If you cannot prove any of those, leave it and say why — an unproven ref is treated as live.
+   - **NEVER delete `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*`** — that's real preserved WIP, not scheduling state. The enumerated prefixes above are exhaustive; if you ever widen them, restore this exclusion explicitly.
+   - Delete a proven-worthless ref with `git update-ref -d <ref>` (local + each host over its transport) and `git push origin :<ref>` (origin). Local + origin + host are separate locations — sweeping this Mac never touches origin or the VPS's local refs, so enumerate each.
+
+5. **Orphaned docker containers.** Only on a host whose loop is NOT running (the pre-flight guard already refuses that host — it now covers this sweep too).
+   - **EXITED `sandcastle-*` containers:** `docker rm` unconditionally — an exited container is dead state, worthless by definition, no per-item proof needed. Enumerate with `docker ps -a --filter name=sandcastle- --filter status=exited -q`.
+   - **RUNNING `sandcastle-*` containers:** remove ONLY ones tied to no live loop — i.e. no sandcastle loop process is alive for that container's repo (the cwd-filtered pgrep from pre-flight, run for that repo). **Never kill a container while its loop is running** — that destroys in-flight agent work no WIP ref has captured yet. If you cannot prove the loop is dead, leave the container and say so.
+
+6. **Leftover per-issue worktrees + branches** — `agent-issue-*` worktrees whose branch sits **at base with no commits** (`git log <base>..agent/issue-N` empty AND `git rev-parse agent/issue-N` == the base tip → nothing was ever committed, pure leftover). Remove the worktree and delete its branch.
+   - **PRESERVE any worktree on a `wip/issue-*` branch** — that's checkpointed WIP, never a no-commit leftover; skip it unconditionally.
+   - This is narrower than step 1: step 1 handles worktrees whose branch HAS commits (merged → remove, unmerged → adjudicate). This one reaps the empty shells a crashed or never-started issue leaves behind.
+
+7. **Stale `agent/issue-*` branches.** After removing worktrees, the branches may still exist as refs. For each:
    - Try `git branch -d <branch>` (the safe variant). Git refuses unless the branch is merged into the currently-checked-out branch — that's the safety net.
    - If `-d` refuses, surface the branch in the refused list with one of these reasons:
      - `squash-decoupled` — likely landed via a squash-merged human PR to `main`, so the original commits are no longer ancestors.

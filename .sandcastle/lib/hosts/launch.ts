@@ -76,7 +76,12 @@ function wrapperInvocation(host: HostConfig, spec: LaunchSpec): string {
     `--iterations ${spec.iterations}`,
     `--max-concurrent ${host.maxConcurrent}`,
   ];
-  if (spec.base) flags.push(`--base ${spec.base}`);
+  // NOTE: spec.base is intentionally NOT forwarded. main.mts's parseSandcastleArgs
+  // runs `parseArgs({ strict:true })` with NO `--base` option, so emitting
+  // `--base <x>` here makes the loop die with "Unknown option '--base'" and kills
+  // every all-machines launch. `--base` is consumed by scripts/launch.mts for the
+  // launcher's own use (the gate leaves the host checked out on spec.branch); it
+  // must never reach the wrapper/main.mts command line.
   if (spec.action === "resume") flags.push("--resume");
   return `bash .sandcastle/sandcastle-wrapper.sh ${flags.join(" ")}`;
 }
@@ -157,7 +162,10 @@ function shq(s: string): string {
  * multi-line element (the pgrep script, or a `bash -lc '<script>'` launch)
  * round-trips instead of being mangled.
  */
-export function buildRemoteCommand(repoPath: string, argv: readonly string[]): string {
+export function buildRemoteCommand(
+  repoPath: string,
+  argv: readonly string[],
+): string {
   return `cd ${shq(repoPath)} && ${argv.map(shq).join(" ")}`;
 }
 
@@ -175,8 +183,14 @@ const PGREP_SCRIPT = [
   "done",
 ].join("\n");
 
-function skip(host: HostConfig, outcome: HostOutcome, detail?: string): HostResult {
-  return detail ? { host: host.name, outcome, detail } : { host: host.name, outcome };
+function skip(
+  host: HostConfig,
+  outcome: HostOutcome,
+  detail?: string,
+): HostResult {
+  return detail
+    ? { host: host.name, outcome, detail }
+    : { host: host.name, outcome };
 }
 
 /**
@@ -218,12 +232,17 @@ export async function runLaunch(
   try {
     // 1. reachable
     const reach = await deps.exec(host, ["true"]);
-    if (!reach.ok) return skip(host, "unreachable", reach.stderr.trim() || undefined);
+    if (!reach.ok)
+      return skip(host, "unreachable", reach.stderr.trim() || undefined);
 
     // 2. not already running (cwd-filtered pgrep on the host)
     const pgrep = await deps.exec(host, ["bash", "-lc", PGREP_SCRIPT]);
     if (pgrep.ok && pgrep.stdout.trim() !== "") {
-      return skip(host, "already-running", `pid ${pgrep.stdout.trim().split(/\s+/)[0]}`);
+      return skip(
+        host,
+        "already-running",
+        `pid ${pgrep.stdout.trim().split(/\s+/)[0]}`,
+      );
     }
 
     // 3. clean working tree
@@ -234,44 +253,85 @@ export async function runLaunch(
 
     // 4. fast-forward-only update — never pull, never reset. Leave the host
     //    checked out ON spec.branch, fast-forwarded to origin's tip.
-    const fetch = await deps.exec(host, ["git", "fetch", "origin", spec.branch]);
-    if (!fetch.ok) return skip(host, "diverged", fetch.stderr.trim() || "fetch failed");
+    const fetch = await deps.exec(host, [
+      "git",
+      "fetch",
+      "origin",
+      spec.branch,
+    ]);
+    if (!fetch.ok)
+      return skip(host, "diverged", fetch.stderr.trim() || "fetch failed");
 
     const localExists = await deps.exec(host, [
-      "git", "rev-parse", "--verify", "--quiet", `refs/heads/${spec.branch}`,
+      "git",
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `refs/heads/${spec.branch}`,
     ]);
     if (localExists.ok) {
       // Local branch exists: check it out, then ff-only merge origin's tip onto
       // it. Step 3 guaranteed a clean tree, so the checkout can't lose work.
       const checkout = await deps.exec(host, ["git", "checkout", spec.branch]);
       if (!checkout.ok) {
-        return skip(host, "preflight-error", checkout.stderr.trim() || `checkout ${spec.branch} failed`);
+        return skip(
+          host,
+          "preflight-error",
+          checkout.stderr.trim() || `checkout ${spec.branch} failed`,
+        );
       }
-      const merge = await deps.exec(host, ["git", "merge", "--ff-only", "FETCH_HEAD"]);
-      if (!merge.ok) return skip(host, "diverged", merge.stderr.trim() || undefined);
+      const merge = await deps.exec(host, [
+        "git",
+        "merge",
+        "--ff-only",
+        "FETCH_HEAD",
+      ]);
+      if (!merge.ok)
+        return skip(host, "diverged", merge.stderr.trim() || undefined);
     } else {
       // Absent locally: create the branch at the fetched tip — no reset.
-      const checkout = await deps.exec(host, ["git", "checkout", "-b", spec.branch, "FETCH_HEAD"]);
+      const checkout = await deps.exec(host, [
+        "git",
+        "checkout",
+        "-b",
+        spec.branch,
+        "FETCH_HEAD",
+      ]);
       if (!checkout.ok) {
-        return skip(host, "preflight-error", checkout.stderr.trim() || `checkout -b ${spec.branch} failed`);
+        return skip(
+          host,
+          "preflight-error",
+          checkout.stderr.trim() || `checkout -b ${spec.branch} failed`,
+        );
       }
     }
 
     // re-verify HEAD is attached AND equals spec.branch after the update (ADR 0016)
-    const symref = await deps.exec(host, ["git", "symbolic-ref", "--short", "HEAD"]);
+    const symref = await deps.exec(host, [
+      "git",
+      "symbolic-ref",
+      "--short",
+      "HEAD",
+    ]);
     const head = symref.stdout.trim();
     if (!symref.ok || head === "") {
       return skip(host, "preflight-error", "HEAD is detached after update");
     }
     if (head !== spec.branch) {
-      return skip(host, "preflight-error", `HEAD is ${head} after update, expected ${spec.branch}`);
+      return skip(
+        host,
+        "preflight-error",
+        `HEAD is ${head} after update, expected ${spec.branch}`,
+      );
     }
 
     // 5. auth — host uses its OWN gh credentials; never forward a token
     const ghAuth = await deps.exec(host, ["gh", "auth", "status"]);
-    if (!ghAuth.ok) return skip(host, "auth-failed", ghAuth.stderr.trim() || undefined);
+    if (!ghAuth.ok)
+      return skip(host, "auth-failed", ghAuth.stderr.trim() || undefined);
     const ghIssue = await deps.exec(host, ["gh", "issue", "list", "-L", "1"]);
-    if (!ghIssue.ok) return skip(host, "auth-failed", ghIssue.stderr.trim() || undefined);
+    if (!ghIssue.ok)
+      return skip(host, "auth-failed", ghIssue.stderr.trim() || undefined);
 
     // 6. launch
     const command = buildLaunchCommand(host, spec);
@@ -280,7 +340,11 @@ export async function runLaunch(
     }
     const launched = await deps.exec(host, ["bash", "-lc", command]);
     if (!launched.ok) {
-      return skip(host, "preflight-error", launched.stderr.trim() || "launch command failed");
+      return skip(
+        host,
+        "preflight-error",
+        launched.stderr.trim() || "launch command failed",
+      );
     }
     return { host: host.name, outcome: "launched", detail: command };
   } catch (err) {

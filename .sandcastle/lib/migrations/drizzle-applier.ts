@@ -547,21 +547,28 @@ export function _createExecRunner(
       if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
         return { stdout: "", stderr: MAXBUFFER_OVERFLOW_MSG, exitCode: 1 };
       }
+      // A spawn failure where the binary is missing rejects with the string
+      // code "ENOENT" (never a numeric exit code, because the child never ran).
+      // Map it to the conventional command-not-found exit code (127) so callers
+      // can distinguish "binary not installed" from an ordinary non-zero exit
+      // and surface an actionable message (see isPsqlNotFound below).
       const exitCode =
-        typeof e.code === "number" ? e.code : e.code === undefined ? 1 : 1;
+        typeof e.code === "number" ? e.code : e.code === "ENOENT" ? 127 : 1;
       return {
         stdout: typeof e.stdout === "string" ? e.stdout : "",
         stderr:
           typeof e.stderr === "string"
             ? e.stderr
-            : e.message ?? "execFile failed",
+            : (e.message ?? "execFile failed"),
         exitCode,
       };
     }
   };
 }
 
-const defaultExecRunner: ExecRunner = _createExecRunner(DEFAULT_EXEC_MAX_BUFFER);
+const defaultExecRunner: ExecRunner = _createExecRunner(
+  DEFAULT_EXEC_MAX_BUFFER,
+);
 
 // Exported for tests only — production code uses applyMigrationsBetween /
 // validateJournalRegistration which inject _exec for tests but fall back to
@@ -589,6 +596,32 @@ export function toPsqlUri(databaseUrl: string): string {
   } catch {
     return databaseUrl;
   }
+}
+
+/**
+ * Actionable message shown when `psql` isn't installed — install the Postgres
+ * client. Replaces the cryptic `psql exited 127 with no parseable ERROR lines:
+ * (no output)` the applier would otherwise report for a missing binary.
+ */
+export const PSQL_NOT_FOUND_MSG =
+  "psql not found on PATH — install the Postgres client " +
+  "(macOS: brew install libpq && brew link --force libpq; " +
+  "Linux: apt-get install -y postgresql-client)";
+
+/**
+ * True iff an exec result looks like `psql` (or any invoked binary) was NOT
+ * FOUND, as opposed to a real SQL/connection failure. Two signals:
+ *   - exitCode 127 — the conventional "command not found" code, which
+ *     `_createExecRunner` now emits for a spawn ENOENT (binary missing).
+ *   - the combined output carries a spawn/shell not-found signature (`ENOENT`,
+ *     `command not found`, `: not found`) — covers injected test runners and
+ *     shell-mediated invocations that report the failure textually.
+ * A real connection error (psql exits 2 with "could not connect …") matches
+ * NEITHER, so existing behavior for genuine SQL/connection errors is preserved.
+ */
+function isPsqlNotFound(exitCode: number, combined: string): boolean {
+  if (exitCode === 127) return true;
+  return /\bENOENT\b|command not found|: not found/i.test(combined);
 }
 
 /**
@@ -681,7 +714,20 @@ export async function applyMigrationsBetween(
       );
 
       const combined = `${stdout}\n${stderr}`.trim();
-      const { real: realLines, benign: benignErrors } = classifyPsqlErrors(combined);
+
+      // psql not installed: the binary is missing, so nothing can be applied and
+      // every subsequent statement would fail identically. Surface one clear,
+      // actionable error and stop, instead of the cryptic "exited 127 with no
+      // parseable ERROR lines" once per statement. Guarded by exitCode !== 0 so a
+      // benign statement whose SQL text happens to contain "not found" can never
+      // trip it on a clean run.
+      if (exitCode !== 0 && isPsqlNotFound(exitCode, combined)) {
+        realErrors.push({ file: mig, stmt, msg: PSQL_NOT_FOUND_MSG });
+        return { applied, benignSkipped, realErrors };
+      }
+
+      const { real: realLines, benign: benignErrors } =
+        classifyPsqlErrors(combined);
 
       if (realLines.length > 0) {
         realErrors.push({

@@ -89,7 +89,20 @@ Standing checks every completion, subagents returning file:line evidence:
 
 Per issue: checkpoint its work to a WIP ref if stop didn't already (reuse stop's `checkpoint-stop.mts` mechanic — don't hand-roll a second version; quarantine otherwise leaves it dangling/GC-bound). Classify — infra-timeout-work-intact (e.g. e2e cold-compile) vs deterministic-infra (no-output psql/OOM) vs real-code-bug. Then resolve to a **terminal disposition** from the stage-5 set (landed / cherry-picked / re-queued / confirmed-dead), not a dangling "recommend" — a needs-human branch left at "recommend recover" is exactly the limbo clean can't act on.
 
-### 10 — Durable run ledger + then hand to clean
+### 10 — Purge the retired run's coordination refs + lease locks (retirement)
+
+Once the run is landed, it is **retired** — and a retired run must leave **ZERO coordination refs behind.** These refs are cross-host scheduling state, not work; leaving them poisons the NEXT run. Purge, on **every** location — local, `origin`, and each host in `.sandcastle/hosts.json` — for the retired run's hosts:
+
+- `refs/sandcastle/lanes/*`, `refs/sandcastle/peers/*`, `refs/sandcastle/peer-status/*`, `refs/sandcastle/status/*`, `refs/sandcastle/conflict/*`
+- `refs/locks/issue-*`
+
+Delete with `git update-ref -d <ref>` locally and per host (over `ssh <transport> --`, `cd <repoPath>` first), and `git push origin :<ref>` on origin.
+
+**CRITICAL — never delete `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*`.** Those are real preserved WIP, not coordination state. This purge is scoped to the scheduling/lease refs above and nothing else.
+
+**Why this is a retirement step, not optional hygiene:** a retired run whose `refs/sandcastle/lanes/<hub>` still points at its archive tip (`87e4b18c` = `archive/hub-queue-20260723-salvaged`) fed that stale tip into the NEXT run's converge and **faked a merge conflict on iteration 1** — a full incident to untangle. Retiring without purging is the bug. Do it before handing to clean.
+
+### 11 — Durable run ledger + then hand to clean
 
 Write everything (manifest, adjudication, findings→spec traceability, decisions, deferred debt) to **`docs/sandcastle/runs/<run>.md` committed** AND a **GitHub tracking issue**. Deferred items carry a "dismissed by user" state so nothing re-surfaces after a ruling. **Then hand off to `sandcastle-clean`** to reap the now-terminal leftovers — do not delete them yourself.
 
@@ -99,16 +112,17 @@ Batch ALL genuine decisions into ONE sheet, pre-ranked with a recommended defaul
 
 ## Quick reference
 
-| Need                 | Do                                                                                                         |
-| -------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Loop still running   | invoke `sandcastle-stop` first (don't reimplement)                                                         |
-| Reconcile lanes      | `tsx .sandcastle/scripts/converge.mts --branch <b>`                                                        |
-| Poisoned checkpoint? | `git merge-base --is-ancestor <winning-tip> refs/sandcastle/wip/issue-N` → not ancestor = purge + re-queue |
-| Landmine check       | `git diff --name-status <branch> main` → refuse deletes/renames of main's files                            |
-| Shipped?             | verify feature files/symbols on `main` by content, not ancestry/status                                     |
-| Review               | `/thermo-review` + `superpowers:requesting-code-review`, both loaded                                       |
-| Land to main         | FF local main; then integration-branch → main + push (you do this hop)                                     |
-| Delete leftovers     | hand off to `sandcastle-clean` (last, never before landing)                                                |
+| Need                 | Do                                                                                                                                                                |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Loop still running   | invoke `sandcastle-stop` first (don't reimplement)                                                                                                                |
+| Reconcile lanes      | `tsx .sandcastle/scripts/converge.mts --branch <b>`                                                                                                               |
+| Poisoned checkpoint? | `git merge-base --is-ancestor <winning-tip> refs/sandcastle/wip/issue-N` → not ancestor = purge + re-queue                                                        |
+| Landmine check       | `git diff --name-status <branch> main` → refuse deletes/renames of main's files                                                                                   |
+| Shipped?             | verify feature files/symbols on `main` by content, not ancestry/status                                                                                            |
+| Review               | `/thermo-review` + `superpowers:requesting-code-review`, both loaded                                                                                              |
+| Land to main         | FF local main; then integration-branch → main + push (you do this hop)                                                                                            |
+| Retire (purge refs)  | `git update-ref -d` (local/host) + `git push origin :<ref>` for `lanes/peers/peer-status/status/conflict/*` + `refs/locks/issue-*`; PRESERVE `strand/*` + `wip/*` |
+| Delete leftovers     | hand off to `sandcastle-clean` (last, never before landing)                                                                                                       |
 
 ## Red flags — STOP
 
@@ -117,6 +131,8 @@ Batch ALL genuine decisions into ONE sheet, pre-ranked with a recommended defaul
 - `git merge` a branch without `--name-status` vs main → **landmine**.
 - Resuming a checkpoint before validating it against the reconciled winner → **poisons main**.
 - Trusting "issue closed"/"branch deleted" as proof it shipped → **verify content**.
+- Retiring a run but leaving its `lanes/peers/peer-status/status/conflict/*` or `refs/locks/issue-*` behind → **poisons the next run** (stale lane tip = faked iteration-1 conflict).
+- Touching `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*` during the coordination-ref purge → **that's preserved WIP, not scheduling state**.
 - Reading/editing product code in the main thread to design a fix → **delegate**.
 - 5 findings over 100+ files presented as an audit → **shard and go deep**.
 - Relaying a handoff "blocker" or a subagent finding as fact → **re-verify first**.

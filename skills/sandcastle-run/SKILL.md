@@ -20,7 +20,7 @@ Work out which path you're on. Both paths share the planning stage, so if the an
 2. `.sandcastle/hosts.json` lists exactly one host (or is missing) → single machine, don't ask.
 3. Otherwise (registry has 2+ hosts and nothing named a target) → **you must ask.** Carry it as the **Machines** question in the §7 batched picker: `this machine only (default) / all healthy hosts / pick one host`. Do not infer it, and do not default to single machine — guessing here silently deletes the concurrency question too (§7a), so one wrong inference costs the user both.
 
-The two paths **share the planning stage** (group issues, pick base, name+fork the run branch, size iterations, pick mode) — plan once regardless. They differ only at launch: single-machine launches locally via the wrapper (see *Run*); all-machines pushes the branch and fans out via the launch script (see *Launch across all machines*). When you're on the all-machines path, also run the **All-machines preconditions** below before launching.
+The two paths **share the planning stage** (group issues, pick base, name+fork the run branch, size iterations, pick mode) — plan once regardless. They differ only at launch: single-machine launches locally via the wrapper (see _Run_); all-machines pushes the branch and fans out via the launch script (see _Launch across all machines_). When you're on the all-machines path, also run the **All-machines preconditions** below before launching.
 
 ## Producing work for the loop
 
@@ -59,11 +59,13 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    - `--provider anthropic` → require `ANTHROPIC_API_KEY`.
 
    When a key IS required, confirm it resolves from at least one source. Quick shell test (substitute the required var):
+
    ```
    ( source "$HOME/.config/sandcastle/.env" 2>/dev/null; \
      source "<repoRoot>/.env" 2>/dev/null; \
      test -n "$KIMI_API_KEY" )   # ← swap KIMI_API_KEY for the mode's required var
    ```
+
    If the required key doesn't resolve, tell the user to create `~/.config/sandcastle/.env` (recommended, set once for all projects) or `<repoRoot>/.env` (project-only), using `.sandcastle/.env.example` as a template, then stop. When creating `~/.config/sandcastle/.env`, `mkdir -p ~/.config/sandcastle && chmod 600 ~/.config/sandcastle/.env`.
 
    **Refresh `GH_TOKEN` if needed** (handles macOS Keychain storage + token rotation). On macOS `gh auth login` stores the token in the system Keychain, so the sandbox mount of `~/.config/gh/hosts.yml` doesn't carry a usable token and `gh issue list` inside the container returns 401. Before launching the loop:
@@ -106,30 +108,31 @@ If you catch yourself typing a sentence that explains a check that passed, delet
 
 4b. **Project's sandcastle image built? (Docker runtime only.)** Skip this step entirely when `sandbox_runtime == "mac-host"` — there is no docker image to build, the Dockerfile is inert under host-native sandboxing.
 
-   The loop's iteration 1 fails immediately with `Image 'sandcastle:<name>' not found locally` if the named docker image doesn't exist. Common on fresh worktrees or after `docker prune`. Catch it here, auto-build to fix it.
+The loop's iteration 1 fails immediately with `Image 'sandcastle:<name>' not found locally` if the named docker image doesn't exist. Common on fresh worktrees or after `docker prune`. Catch it here, auto-build to fix it.
 
-   - Derive the expected image name. If the user passed `--image-name NAME` in their flags, use that. Otherwise the orchestrator default is `sandcastle:<basename of repo-root>` (e.g. `~/Dev/myproj` → `sandcastle:myproj`).
-   - Check existence: `docker image inspect <image-name> > /dev/null 2>&1`. Exit 0 = exists; non-zero = missing.
-   - **If the image exists**, continue.
-   - **If missing**, build it before launching the loop:
-     ```
-     <pkg-mgr-bin>/sandcastle docker build-image --image-name <image-name> --dockerfile .sandcastle/Dockerfile
-     ```
-     Where `<pkg-mgr-bin>` is `node_modules/.bin` for npm/pnpm/yarn projects. Build takes ~30s and produces a ~750MB image. Stream output to the user so they see progress; don't background it (pre-flight must complete before launch).
-   - If the build fails (Dockerfile syntax error, network issue), bubble the build's stderr verbatim and stop. Don't continue to launch — iteration 1 will just fail the same way.
-   - On success, log "built `<image-name>` (Dockerfile=.sandcastle/Dockerfile)" and continue.
+- Derive the expected image name. If the user passed `--image-name NAME` in their flags, use that. Otherwise the orchestrator default is `sandcastle:<basename of repo-root>` (e.g. `~/Dev/myproj` → `sandcastle:myproj`).
+- Check existence: `docker image inspect <image-name> > /dev/null 2>&1`. Exit 0 = exists; non-zero = missing.
+- **If the image exists**, continue.
+- **If missing**, build it before launching the loop:
+  ```
+  <pkg-mgr-bin>/sandcastle docker build-image --image-name <image-name> --dockerfile .sandcastle/Dockerfile
+  ```
+  Where `<pkg-mgr-bin>` is `node_modules/.bin` for npm/pnpm/yarn projects. Build takes ~30s and produces a ~750MB image. Stream output to the user so they see progress; don't background it (pre-flight must complete before launch).
+- If the build fails (Dockerfile syntax error, network issue), bubble the build's stderr verbatim and stop. Don't continue to launch — iteration 1 will just fail the same way.
+- On success, log "built `<image-name>` (Dockerfile=.sandcastle/Dockerfile)" and continue.
 
 4c. **`.sandcastle/` prompt files committed to git? — `mac-host` ONLY. SKIP this entire step under docker.** This gate is **runtime-specific**, and applying it to docker is a false-positive that refuses working repos.
 
-   - **Under `docker`** (`sandbox_runtime == "docker"`): **skip — do not run the check.** The orchestrator reads each prompt file from the **host launch root** (`process.cwd()`), not from inside the worktree — the SDK resolves `promptFile` against `process.cwd()` (verified: `@ai-hero/sandcastle` `index.d.ts` "`promptFile` is always resolved against `process.cwd()`"; `main.mts` preflight also checks them at `<repoRoot>/.sandcastle`). So a gitignored `.sandcastle/` runs perfectly — which is the **normal, template-default docker setup**. Requiring a commit here would refuse a healthy repo (this is the career-ops regression: a long-working docker repo that gitignores `.sandcastle/` by design).
-   - **Under `mac-host`** (`sandbox_runtime == "mac-host"`): run the check below. The host-native executor reads the prompt from **inside the per-issue worktree** (`lib/mac-host-sandbox.ts` `spawnAgent(wtPath, …)` → `path.join(wtPath, promptFile)`), and worktrees cut from HEAD carry **only tracked files** — so here `.sandcastle/` genuinely must be committed or the implementer dies mid-run with `prompt file not found: .../worktrees/agent-issue-N/.sandcastle/implement-prompt.md`.
+- **Under `docker`** (`sandbox_runtime == "docker"`): **skip — do not run the check.** The orchestrator reads each prompt file from the **host launch root** (`process.cwd()`), not from inside the worktree — the SDK resolves `promptFile` against `process.cwd()` (verified: `@ai-hero/sandcastle` `index.d.ts` "`promptFile` is always resolved against `process.cwd()`"; `main.mts` preflight also checks them at `<repoRoot>/.sandcastle`). So a gitignored `.sandcastle/` runs perfectly — which is the **normal, template-default docker setup**. Requiring a commit here would refuse a healthy repo (this is the career-ops regression: a long-working docker repo that gitignores `.sandcastle/` by design).
+- **Under `mac-host`** (`sandbox_runtime == "mac-host"`): run the check below. The host-native executor reads the prompt from **inside the per-issue worktree** (`lib/mac-host-sandbox.ts` `spawnAgent(wtPath, …)` → `path.join(wtPath, promptFile)`), and worktrees cut from HEAD carry **only tracked files** — so here `.sandcastle/` genuinely must be committed or the implementer dies mid-run with `prompt file not found: .../worktrees/agent-issue-N/.sandcastle/implement-prompt.md`.
 
-   mac-host check:
-   ```
-   git ls-files --error-unmatch .sandcastle/implement-prompt.md >/dev/null 2>&1; echo $?
-   ```
+mac-host check:
 
-   Exit `0` = tracked, continue. Non-zero = untracked (or `.sandcastle/` was never committed). **Refuse** with: "on the `mac-host` profile the loop reads prompts from inside each per-issue worktree, which carries only git-tracked files — and `.sandcastle/` isn't committed, so the implementer would fail with `prompt file not found`. Commit the tooling first: `git add .sandcastle/ && git commit -m \"chore: track sandcastle tooling\"` — your `.env` stays excluded via `.sandcastle/.gitignore` (verify with `git status --porcelain .sandcastle/.env` showing nothing staged). Then re-run." Do not auto-commit into the user's product repo — committing tooling into their repo is their call; surface it and stop.
+```
+git ls-files --error-unmatch .sandcastle/implement-prompt.md >/dev/null 2>&1; echo $?
+```
+
+Exit `0` = tracked, continue. Non-zero = untracked (or `.sandcastle/` was never committed). **Refuse** with: "on the `mac-host` profile the loop reads prompts from inside each per-issue worktree, which carries only git-tracked files — and `.sandcastle/` isn't committed, so the implementer would fail with `prompt file not found`. Commit the tooling first: `git add .sandcastle/ && git commit -m \"chore: track sandcastle tooling\"` — your `.env` stays excluded via `.sandcastle/.gitignore` (verify with `git status --porcelain .sandcastle/.env` showing nothing staged). Then re-run." Do not auto-commit into the user's product repo — committing tooling into their repo is their call; surface it and stop.
 
 5. **Canonical labels present?** The orchestrator writes `ready-for-agent`, `in-progress`, `done`, `needs-human`, `merged-to-staging`, and `quarantine` — and crashes the claim path (or post-merge path, for `merged-to-staging`) if any are missing. This is normally handled at `/sandcastle-init`, but they can drift (a user deletes one, a fresh re-init was skipped, an upstream template added a new required label that the user hasn't re-init'd to pick up, etc).
 
@@ -143,16 +146,20 @@ If you catch yourself typing a sentence that explains a check that passed, delet
 
    Don't auto-create here — pre-flight should fail fast and surface the drift, not silently mutate the remote during a run command. Init is the place for creates.
 
-6. **Loop already running — FOR THIS PROJECT?** A bare `pgrep` on `.sandcastle/main.mts` is **project-blind**: every sandcastle loop on the machine has the identical command line (`tsx .sandcastle/main.mts …`), so it matches loops in *other* repos too. Reporting "a loop is already running" because a **different** project's loop is alive is a false positive that blocks a legitimate launch (and the mirror mistake — a monitor keyed to the same broad pattern — will latch onto the wrong project's PID and kill/wait on it). Scope the match to **this repo** by the process's working directory.
+6. **Loop already running — FOR THIS PROJECT?** A bare `pgrep` on `.sandcastle/main.mts` is **project-blind**: every sandcastle loop on the machine has the identical command line (`tsx .sandcastle/main.mts …`), so it matches loops in _other_ repos too. Reporting "a loop is already running" because a **different** project's loop is alive is a false positive that blocks a legitimate launch (and the mirror mistake — a monitor keyed to the same broad pattern — will latch onto the wrong project's PID and kill/wait on it). Scope the match to **this repo** by the process's working directory.
 
    Get candidate PIDs, then keep only those whose cwd is this repo root (`$PWD`):
+
    ```
    for pid in $(pgrep -f '\.sandcastle/main\.mts (--iterations|--issue|--max-concurrent|--repo-root|--branch)'); do
      cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p')
      [ "$cwd" = "$PWD" ] && echo "$pid"
    done
    ```
+
    (A loop launched with `--repo-root <other>` runs from a different cwd, so cwd-matching is the reliable discriminator; if the user passes `--repo-root` explicitly, compare against that path instead of `$PWD`.) If a PID survives the filter, THIS project's loop is already alive — tell the user and offer `/sandcastle-stop` first. If the only matches are other projects' loops, they are irrelevant — **continue silently** (per Output discipline; do not report other projects' loops as a blocker).
+
+   **To stop an existing or stuck loop, ALWAYS go through `/sandcastle-stop --now` — NEVER `kill -9` the loop process.** `/sandcastle-stop --now` releases leases, deletes lease locks (`refs/locks/issue-N`), and checkpoints in-flight work to a WIP ref. A hard `kill -9` skips all of that: it strands lease locks and orphaned `in-progress` labels, so the **next** launch reads those issues as "another host is working it" and stalls (and can surface a misleading "missing `type:` label"). This holds on every relaunch path — stop cleanly, then relaunch.
 
 7. **One-shot label sanity check (only when `--issue N` is in the args).** The orchestrator's `claim()` flips `ready-for-agent` → `in-progress`; running on an issue that isn't currently `ready-for-agent` will silently no-op the flip or throw mid-stream. A previously-crashed run can leave an `in-progress` label orphaned on the issue, which looks identical from the agent's side until it tries to claim. Catch it here.
 
@@ -163,7 +170,6 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    ```
 
    Then check the JSON:
-
    - **gh command failed?** Bubble the gh error verbatim and stop. Don't try to be clever — could be auth, network, or a typo'd issue number, and the user needs to see which.
    - **`state` != `OPEN`?** Stop with: "issue #N is `<state>` (closed/merged/etc.) — sandcastle only runs on open issues. Re-open it on GitHub if you want to retry."
    - **`labels` includes `in-progress`?** Stop with: "issue #N still has the `in-progress` label — likely orphaned from a prior crashed run. Remove the label on GitHub (or `gh issue edit <N> --remove-label in-progress`), confirm `ready-for-agent` is set, then re-run."
@@ -179,11 +185,28 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    ```
 
    (`labels` is fetched so the planning stage below can partition by `type:`.) Checks against the result:
-
-   - **Empty queue?** Stop with: "no open issues labeled `ready-for-agent` — planner has nothing to claim. Use `/triage-plus-skills` to stamp `type:X` and `ready-for-agent` on triaged issues first." Also treat the queue as effectively empty when `SANDCASTLE.md` exists at the repo root AND *every* ready issue is missing a `type:` label — the planner excludes all of them and the loop would exit on iteration 1. Same message.
-   - **Under-provisioned?** If `count < iterations × max-concurrent`, warn with: "queue has N issues but the loop is configured for up to iterations × max-concurrent slices — loop may exit early when claimable runs out. Proceed?" Don't refuse — the user may want to launch anyway and let the loop exit cleanly when claimable runs out. **Suppress this warning when the planning stage (*Plan the run* §6) auto-sized iterations** — the over-provisioning is deliberate headroom for issues grilled in mid-run, not a misconfiguration.
+   - **Empty queue?** Stop with: "no open issues labeled `ready-for-agent` — planner has nothing to claim. Use `/triage-plus-skills` to stamp `type:X` and `ready-for-agent` on triaged issues first." Also treat the queue as effectively empty when `SANDCASTLE.md` exists at the repo root AND _every_ ready issue is missing a `type:` label — the planner excludes all of them and the loop would exit on iteration 1. Same message.
+   - **Under-provisioned?** If `count < iterations × max-concurrent`, warn with: "queue has N issues but the loop is configured for up to iterations × max-concurrent slices — loop may exit early when claimable runs out. Proceed?" Don't refuse — the user may want to launch anyway and let the loop exit cleanly when claimable runs out. **Suppress this warning when the planning stage (_Plan the run_ §6) auto-sized iterations** — the over-provisioning is deliberate headroom for issues grilled in mid-run, not a misconfiguration.
    - **Dependency-blocked?** Case-insensitive substring match in title OR body for any of `blocked on #`, `depends on #`, `blocks #`, `blocked by #`, `waiting on #` — a broad operator heuristic. But the planner only ENFORCES the directive **`Blocked by: #N`** (colon required; `Blocked-by:` too), per `.sandcastle/plan-prompt.md` HARD RULE 2 / ADR 0013. The other phrasings — and a bare `blocked by` with no colon — are prose the planner IGNORES: if a match uses one of those, warn that ordering will NOT be honored and to rewrite it as `Blocked by: #N`. For a referenced blocker, the planner treats it as resolved ONLY when it is **closed** (absent from the open-issue list) — NOT merely labeled `done` / `merged-to-staging` while still open. Warn on any still-open blocker with the affected issue numbers — heuristic, not a contract. (Real example: a loop exited at iteration 4 because every remaining slice was blocked on a single unshipped issue.)
    - **Never advise "holding" a blocked issue by removing `ready-for-agent`.** A `Blocked by: #N` issue should stay `ready-for-agent` with the note in its body — the planner auto-excludes it while #N is open and auto-claims it once #N closes (ADR 0013). Unlabeling it to "hold" it defeats the auto-pickup: the planner can't see a label-less issue.
+
+9. **`psql` present on the local host? — REFUSE if missing.** The host-side migration applier (`main.mts` → `applyMigrationsBetween` in `.sandcastle/lib/migrations/drizzle-applier.ts`) shells out to `psql` on the machine running the loop. If `psql` is absent, **every** schema-touching issue fails the migration step with the misleading `migrations failed: psql exited 1 with no parseable ERROR lines: (no output)` and quarantines to `needs-human` — the loop looks like it's working but silently poisons every migration issue. Catch it here:
+
+   ```
+   command -v psql
+   ```
+
+   Exit 0 = present, continue. Non-zero = **refuse** with the fix for this OS: macOS → `brew install libpq && brew link --force libpq`; Linux → `sudo apt-get install -y postgresql-client`. (Real incident 2026-07-25: the Mac had no `psql` and silently quarantined every schema issue it worked, while the Linux hub — which had `psql` — was fine. The failure hid on one host in an all-machines run.)
+
+10. **Reconcile orphaned lease state from a dead prior run of THIS host.** A prior loop that was hard-killed (see step 6) leaves `refs/locks/issue-N` lease locks and `in-progress` labels stranded, so this launch would read those issues as claimed by a live peer and stall. Before launching, reclaim them:
+    - Find issues labeled `in-progress` that carry a `refs/locks/issue-N` lock whose owning run/PID is **dead** (the lock's recorded owner is no longer a running loop — cross-check against step 6's live-PID scan; a lock with no live owner is orphaned).
+    - For each: delete the lock (`git update-ref -d refs/locks/issue-N`) and flip the issue back to `ready-for-agent` (`gh issue edit N --remove-label in-progress --add-label ready-for-agent`).
+    - **Only touch locks whose owner is provably dead.** A lock held by a live loop (this project's or, on all-machines, a peer host still running) is real — leave it. This is a delete op: cite the dead owner before removing.
+
+11. **Reap leftovers from aborted runs.** A crashed/aborted run leaves per-issue worktrees and docker containers behind that waste disk and can confuse the next launch. Before launching:
+    - **Stale per-issue worktrees:** for each `.sandcastle/worktrees/agent-issue-*`, if its branch sits at the base SHA with **no new commits**, `git worktree remove --force <path>` and delete its branch. **PRESERVE any preserved-WIP worktree** — one checked out on a `wip/issue-*` branch holds real checkpointed work; never remove it.
+    - **Orphaned containers:** `docker rm` any **exited** `sandcastle-*` containers (skip when `sandbox_runtime == "mac-host"` — no docker). Leave running containers alone.
+    - Delete op — only remove a worktree once you've confirmed its branch is at base with no commits, and only remove exited (not running) containers.
 
 ## All-machines preconditions (all-machines path ONLY — refuse loudly if unmet)
 
@@ -192,17 +215,25 @@ Run these only when you're on the all-machines fork. They're in addition to the 
 1. **Host registry exists.** Read `.sandcastle/hosts.json`. Each entry is `{ name, transport: "local"|"<ssh-alias>", maxConcurrent, repoPath }`. **`repoPath` is REQUIRED for every remote host** (transport ≠ `"local"`) — the absolute path to the repo checkout on that machine; without it the registry parser refuses the whole file (a non-interactive `ssh <alias>` lands in `$HOME`, not the checkout). It is optional + ignored for the `local` host. If the file is missing, tell the user to create it (seed: `{ "hosts": [ { "name": "local", "transport": "local", "maxConcurrent": 2 }, { "name": "hub", "transport": "hub", "maxConcurrent": 1, "repoPath": "/home/deploy/dev/sandcastle-loop" } ] }`) and stop.
 2. **Cross-host flags on, on EVERY host.** The combined run only coordinates if both `SANDCASTLE_CROSS_HOST_LEASE=1` and `SANDCASTLE_CROSS_HOST_SYNC=1` are set (in each host's `.env` / `~/.config/sandcastle/.env`). SYNC-without-LEASE makes the loop refuse to start. If you can't confirm both are set on a host, warn — without them the machines will double-work and won't hand off.
 3. **Not on a protected branch** — already covered by pre-flight check 3; it applies here too.
+4. **`psql` present on EVERY host — REFUSE if any host lacks it.** Pre-flight step 9 checks the local host; here extend the same check to every remote target via its transport: `ssh <alias> 'command -v psql'`. If `psql` is missing on **any** targeted host, refuse and name the host + its fix (macOS → `brew install libpq && brew link --force libpq`; Linux → `sudo apt-get install -y postgresql-client`). This is exactly the 2026-07-25 failure mode: one host (the Mac) had no `psql` and silently quarantined every schema issue it worked while the other host was fine — a per-host gap is invisible unless you check each host.
+5. **Purge ghost cross-host refs + stale lease locks before launching (and before ANY relaunch).** Stale coordination refs from a RETIRED or previous run poison the cross-host sync — real incident: `refs/sandcastle/lanes/<hub>` still pointed at a retired queue's archive tip and faked a merge CONFLICT on iteration 1. Sweep them before the fan-out:
+   - **Enumerate** the coordination refs on local + origin + each host: `refs/sandcastle/{lanes,peers,peer-status,status,conflict}/*` and `refs/locks/issue-*` (local/host: `git for-each-ref`; origin: `git ls-remote origin 'refs/sandcastle/*' 'refs/locks/*'`; remote host: `ssh <alias> 'git -C <repoPath> for-each-ref refs/sandcastle refs/locks'`).
+   - **Identify STALE ones:** a ref is stale if it points at a commit **not in the current run branch's history**, matches an `archive/*` tag, or belongs to a dead/retired prior run.
+   - **Delete the stale ones:** local/host `git update-ref -d <ref>` (remote: `ssh <alias> 'git -C <repoPath> update-ref -d <ref>'`); origin `git push origin :<ref>`.
+   - **CRITICAL — PRESERVE `refs/sandcastle/strand/*` and `refs/sandcastle/wip/*`.** Those hold real checkpointed WIP; deleting them destroys in-flight work. Never sweep them.
+   - This is a delete op: cite the evidence per ref (the commit tip it points at, and that it's absent from the run branch / matches an archive tag) before removing.
+6. **Per-host reconcile + reap.** Run pre-flight steps 10 (reconcile orphaned lease state from a dead prior run) and 11 (reap stale worktrees + exited `sandcastle-*` containers) on **each** targeted host, not just local — a host that crashed on a previous run carries its own stranded locks, `in-progress` labels, worktrees, and containers. Same preserves apply per host: never touch a live peer's lock, and never remove a `wip/issue-*` worktree.
 
 ## Plan the run (auto-scoping for bare invocations)
 
 This is the friction-killer. A bare `/sandcastle-run` auto-discovers everything mechanical — surveys the queue, picks a base, names the branch, sizes iterations — so the user never hand-picks a base branch or invents a name. It then asks only the two operational choices the user wants control of (**concurrency** and **mode**), plus **epic-scope** when more than one epic is ready, each with a smart default pre-selected. Discovery is automatic; the handful of real preferences are a couple of taps.
 
-**When this runs.** If the args contain `--issue`, skip this whole section (one-shot mode — go to package-manager detection and run on the current branch). Otherwise, treat any of `--branch` / `--label` / `--iterations` / `--max-concurrent` the user *did* pass as fixed, and auto-derive only the ones they left out. A bare `/sandcastle-run` auto-derives all four.
+**When this runs.** If the args contain `--issue`, skip this whole section (one-shot mode — go to package-manager detection and run on the current branch). Otherwise, treat any of `--branch` / `--label` / `--iterations` / `--max-concurrent` the user _did_ pass as fixed, and auto-derive only the ones they left out. A bare `/sandcastle-run` auto-derives all four.
 
 You already have the claimable set from step 8 (`gh issue list --state open --label ready-for-agent --json number,title,body,labels`). Reuse it — don't re-query.
 
 1. **Filter to dispatchable, then group.** First decide whether skill discipline is on: does `SANDCASTLE.md` exist at the repo root (`test -f SANDCASTLE.md`)?
-   - **If it exists**, the dispatch contract needs BOTH labels — an issue runs only if it carries `ready-for-agent` AND exactly one `type:` label. Partition the ready set (you have `labels` from step 8) into **dispatchable** (has a `type:`) and **typeless** (no `type:`). The planner excludes typeless issues and the host re-validates them out (`main.mts` skill-discipline gate, `plan-prompt.md` rule 3), so they will NOT run. Count, group, name, and size using **only the dispatchable set**. **Surface the typeless ones** among §7's inline warnings: "#X, #Y are `ready-for-agent` but missing a `type:` label — they won't be dispatched. Run `/triage-plus-skills` (the only skill that stamps `type:`) or add one by hand." If *every* ready issue is typeless, the dispatchable queue is empty — say so and don't launch.
+   - **If it exists**, the dispatch contract needs BOTH labels — an issue runs only if it carries `ready-for-agent` AND exactly one `type:` label. Partition the ready set (you have `labels` from step 8) into **dispatchable** (has a `type:`) and **typeless** (no `type:`). The planner excludes typeless issues and the host re-validates them out (`main.mts` skill-discipline gate, `plan-prompt.md` rule 3), so they will NOT run. Count, group, name, and size using **only the dispatchable set**. **Surface the typeless ones** among §7's inline warnings: "#X, #Y are `ready-for-agent` but missing a `type:` label — they won't be dispatched. Run `/triage-plus-skills` (the only skill that stamps `type:`) or add one by hand." If _every_ ready issue is typeless, the dispatchable queue is empty — say so and don't launch.
    - **If `SANDCASTLE.md` is absent**, skill discipline is off and `type:` isn't required — every `ready-for-agent` issue is dispatchable.
 
    Then **group the dispatchable issues** into epics/themes (strongest signal first): an explicit parent reference in the body (`epic #N`, `parent #N`, `part of #N`), a shared milestone, a shared area label, or a common title prefix / feature noun. Short kebab slug + count per group. One cohesive feature = one group.
@@ -225,7 +256,7 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
    - `name = sandcastle/<theme>-$(date +%Y%m%d)`.
    - **If that branch already exists** (`git rev-parse --verify --quiet refs/heads/<name>`), **reuse it** — continue the same batch. This is the relaunch path after a drain (§8). Do NOT suffix `-2`; reusing keeps re-launched work on one branch. Check it out in the launch worktree: `git checkout <name>`.
    - If it doesn't exist, **create it and check it out** in the launch worktree: `git checkout -b <name> <base>`.
-   - Pass `--branch <name>` to the loop. **The launch worktree MUST be on `<name>`** — this is load-bearing, not cosmetic. The orchestrator cuts each per-issue worktree from the launch worktree's *current HEAD* (the SDK runs `git worktree add -b <issue> <path> HEAD`, not off `--branch`), and `fastForwardIntegration` advances `<name>` through whichever worktree has it checked out. If the launch worktree is parked on a stale branch, every merged issue re-bases off that stale HEAD and silently re-does the foundation — the layering bug. (Earlier versions of this step created the ref *without* checking out on the theory that the orchestrator bases worktrees on `--branch`; that theory is false — verified in the SDK's `WorktreeManager` and `main.mts` `fastForwardIntegration`.)
+   - Pass `--branch <name>` to the loop. **The launch worktree MUST be on `<name>`** — this is load-bearing, not cosmetic. The orchestrator cuts each per-issue worktree from the launch worktree's _current HEAD_ (the SDK runs `git worktree add -b <issue> <path> HEAD`, not off `--branch`), and `fastForwardIntegration` advances `<name>` through whichever worktree has it checked out. If the launch worktree is parked on a stale branch, every merged issue re-bases off that stale HEAD and silently re-does the foundation — the layering bug. (Earlier versions of this step created the ref _without_ checking out on the theory that the orchestrator bases worktrees on `--branch`; that theory is false — verified in the SDK's `WorktreeManager` and `main.mts` `fastForwardIntegration`.)
    - The checkout needs a clean-enough tree. If `git checkout` refuses because another session left uncommitted changes, **stop and surface it** — don't `-f`. Starting an unattended run over another session's live edits is the failure this whole step exists to prevent.
 
 5. **Recommend concurrency** — this becomes the pre-selected default for the §7 question; the user can override it there. Recommend `2` (independent slices of one cohesive group). Recommend `1` (sequential) on collision risk:
@@ -238,7 +269,7 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
 7. **Ask the launch questions, then launch.** A bare run never makes the user hand-pick a branch — but it DOES ask the operational knobs they want control of.
 
-   **This picker is REQUIRED, and skipping it is not a FIDO win.** A global "default to action / never ask which approach do you prefer / only ask on WHAT not HOW" instruction does **not** authorize skipping these questions, and they are not HOW. Machines, concurrency and mode are WHAT: they commit the user's money, machines and hours to an unattended metered run. Launching without asking is the irreversible-action exception that FIDO itself carves out — a `2` you inferred spends real credits the user never agreed to. Having a *recommended default* (§5) is not the same as having an *answer*; recommend it as the default option, don't assume it. The only license to drop a question is an explicit flag that already fixes it.
+   **This picker is REQUIRED, and skipping it is not a FIDO win.** A global "default to action / never ask which approach do you prefer / only ask on WHAT not HOW" instruction does **not** authorize skipping these questions, and they are not HOW. Machines, concurrency and mode are WHAT: they commit the user's money, machines and hours to an unattended metered run. Launching without asking is the irreversible-action exception that FIDO itself carves out — a `2` you inferred spends real credits the user never agreed to. Having a _recommended default_ (§5) is not the same as having an _answer_; recommend it as the default option, don't assume it. The only license to drop a question is an explicit flag that already fixes it.
 
    Ask with the **`AskUserQuestion` tool** (the tappable multiple-choice picker), **batched into a SINGLE call** — one question per knob (machines, concurrency, mode, and scope when it applies) — so it's one picker and a couple of taps, not separate prompts. Order each option list with the recommended default first and mark it `(default)`. Then launch on the answers. **Omit any question already fixed by an explicit flag** (user passed `--max-concurrent` → drop the concurrency question; `--backend`/`--provider` → drop the mode question; if that leaves nothing to ask, skip the picker entirely and launch). AskUserQuestion takes up to 4 questions and 2–4 options each, which fits: concurrency (4), mode (4), scope (≤3).
 
@@ -247,16 +278,16 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
    a. **Concurrency?** Options `1 / 2 / 3 / 4`, default = the §5 recommendation. If you recommended `1` for a collision, show the reason here. Note that >2 raises collision risk on shared files. **All-machines path: SKIP this question entirely** — per-host concurrency comes from each host's `maxConcurrent` in the registry, not from a single answer.
 
    b. **Mode?** Options `claude / codex / kimi / glm`, default = the remembered mode (§7b) or `claude`. Translate the pick to flags — they are **mutually exclusive** (`--backend codex` refuses `--provider`, `main.mts:641-643`):
-      - `claude` → no flag (`models.ts` defaults — opus-heavy, the priciest under metered billing)
-      - `codex` → `--backend codex` (gpt-5.5)
-      - `kimi` → `--provider kimi` (kimi-for-coding)
-      - `glm` → `--provider glm` (glm-4.6)
+   - `claude` → no flag (`models.ts` defaults — opus-heavy, the priciest under metered billing)
+   - `codex` → `--backend codex` (gpt-5.5)
+   - `kimi` → `--provider kimi` (kimi-for-coding)
+   - `glm` → `--provider glm` (glm-4.6)
 
    c. **Scope? — only when 2+ epics are ready.** Options `both interleaved / <epic-A> only / <epic-B> only`, default `both`. If the user picks one epic, scope the run to it (claim only that epic's issues) and name the branch for that single epic.
 
    **Surface the warnings inline while asking** (don't make them separate gates) so the choice is informed: a base already resolved in §3, any `Blocked by:` open-issue ordering caveat, and any typeless `ready-for-agent` issues that won't run.
 
-   After the answers: record the chosen mode (§7b), create/reuse the branch (§4), then **fork on the path**: single-machine → launch locally and report (§8); all-machines → go to *Launch across all machines* (push the branch, fan out via the launch script, report per-host) instead of §8.
+   After the answers: record the chosen mode (§7b), create/reuse the branch (§4), then **fork on the path**: single-machine → launch locally and report (§8); all-machines → go to _Launch across all machines_ (push the branch, fan out via the launch script, report per-host) instead of §8.
 
 7b. **Remember the mode** so "ask every time" stays one tap. Read `.sandcastle/.last-run-mode` (single line: `claude`|`codex`|`kimi`|`glm`) for the §7b default; if absent, default `claude`. After the user picks, write their choice back to that file. Ensure it's gitignored — add `.last-run-mode` to `.sandcastle/.gitignore` if not already covered. (Per-project, so different projects can keep different default modes.)
 
@@ -264,18 +295,20 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
    - the grouping, base, branch name, concurrency + one-word reason, iterations;
    - alive-check + log path + "run /sandcastle-status to watch" (see Run section);
    - the merge-back command for when they're happy: `git checkout <base> && git merge --ff-only <name>`;
-   - the encompass-more reality: *"The planner re-checks `ready-for-agent` every cycle, so anything you grill in mid-run gets claimed automatically — as long as the bucket doesn't fully empty. If it drains to zero the loop exits cleanly by design; just re-run `/sandcastle-run` and it continues on the same branch. (A keep-alive 'drain-wait' mode is a planned follow-up.)"*
+   - the encompass-more reality: _"The planner re-checks `ready-for-agent` every cycle, so anything you grill in mid-run gets claimed automatically — as long as the bucket doesn't fully empty. If it drains to zero the loop exits cleanly by design; just re-run `/sandcastle-run` and it continues on the same branch. (A keep-alive 'drain-wait' mode is a planned follow-up.)"_
 
 ## Detect package manager
 
 Same as `/sandcastle-init`:
+
 - `pnpm-lock.yaml` → pnpm
 - `yarn.lock` → yarn
 - `package-lock.json` → npm
 
 ## Defaults
 
-For a bare or partially-flagged invocation, `--branch`, `--iterations`, and `--max-concurrent` come from the planning stage above (*Plan the run*). The static fallbacks below apply only when planning is skipped — i.e. one-shot mode (`--issue N`) or a flag the user passed explicitly:
+For a bare or partially-flagged invocation, `--branch`, `--iterations`, and `--max-concurrent` come from the planning stage above (_Plan the run_). The static fallbacks below apply only when planning is skipped — i.e. one-shot mode (`--issue N`) or a flag the user passed explicitly:
+
 - `--iterations 50`
 - `--max-concurrent 2`
 - `--branch <current-branch>`
@@ -287,13 +320,16 @@ If the user passed flags (e.g. `/sandcastle-run --iterations 10`), pass them thr
 Pass these through verbatim when the user names them. Source of truth is `.sandcastle/main.mts` `--help`.
 
 Required:
+
 - `--iterations N` — outer cycles (≥ 1).
 
 Mode:
+
 - `--issue N` — one-shot: skip planner, work this issue only.
 - `--dry-run` — skip claim/quarantine/markDone side effects.
 
 Scope:
+
 - `--repo-root PATH` — working dir (default: cwd).
 - `--branch NAME` — base branch (default: current; refuses main/master regardless of current branch).
 - `--label NAME` — label to claim (default: `ready-for-agent`).
@@ -302,28 +338,33 @@ Scope:
 - `--log-file PATH` — tee output.
 
 Models (defaults read from `.sandcastle/models.ts`):
+
 - `--planner-model M`, `--implementer-model M`, `--reviewer-model M`,
   `--merger-model M`, `--post-merge-reviewer-model M`, `--recovery-model M`.
 
 Provider:
+
 - `--provider kimi|glm|anthropic` — overrides implementer for the run. Maps to that provider's default coding model (`kimi-for-coding`, `glm-4.6`, `claude-sonnet-4-6`). Reads `KIMI_API_KEY` / `GLM_API_KEY` from the env chain (see step 2 above; canonical location is `~/.config/sandcastle/.env`). Anthropic uses the local Claude subscription. Default: no override (uses `models.implementer.default`, currently `claude-sonnet-4-6`).
 
 Resilience:
+
 - `--recovery off` — disable the single recovery pass before quarantine. Default: on.
 - `--no-retry` — disable per-issue retry ladder (HAS_BLOCKERS triggers one escalated implementer + reviewer pass before quarantine). Default: on.
 - `--no-staging` — disable the integration-candidate staging branch and post-merge fix loop; merger writes directly to `--branch`. Default: staging on.
 - `--consecutive-failure-limit N` — circuit-breaker threshold (default: 3).
 
 Timeouts:
+
 - `--implementer-timeout-sec N` (default: 1200), `--reviewer-timeout-sec N` (default: 600).
 
 Exit codes: 0 = no claimable / clean finish; 1 = circuit breaker or fatal; 2 = iterations exhausted (still ran fine).
 
 ## Run
 
-**The real launcher is the wrapper — `bash .sandcastle/sandcastle-wrapper.sh`.** `sandcastle-init` adds a `sandcastle` package.json script pointing at it (`bin/init.mjs`), so `pnpm sandcastle` / `npm run sandcastle` normally *is* the wrapper. Always launch through the wrapper, never `tsx .sandcastle/main.mts` directly — the wrapper adds two load-bearing things the direct call skips: **hot-reload restart** (exit 75, so a recovery agent's on-disk fix gets picked up) and **`--sandbox` forwarding** from `.sandcastle/.sandbox-flag`.
+**The real launcher is the wrapper — `bash .sandcastle/sandcastle-wrapper.sh`.** `sandcastle-init` adds a `sandcastle` package.json script pointing at it (`bin/init.mjs`), so `pnpm sandcastle` / `npm run sandcastle` normally _is_ the wrapper. Always launch through the wrapper, never `tsx .sandcastle/main.mts` directly — the wrapper adds two load-bearing things the direct call skips: **hot-reload restart** (exit 75, so a recovery agent's on-disk fix gets picked up) and **`--sandbox` forwarding** from `.sandcastle/.sandbox-flag`.
 
 **Confirm the launcher exists before building the launch line** (silently — see Output discipline): does a `sandcastle` script exist? Check `node --print "require('./package.json').scripts?.sandcastle || ''"` (or just grep `package.json`).
+
 - **Script present** → launch via the package manager (forms below).
 - **Script missing** (repo init'd with an older template, or a manually-wired setup — this is the career-ops failure mode: `npm run sandcastle` exits "missing script" and there's nothing to improvise) → do NOT hunt or fall back to `tsx`. Launch the wrapper directly with `node_modules/.bin` on PATH so bare `tsx` inside it resolves:
   ```
@@ -332,6 +373,7 @@ Exit codes: 0 = no claimable / clean finish; 1 = circuit breaker or fatal; 2 = i
   and add the script so next time is clean: `npm pkg set scripts.sandcastle="bash .sandcastle/sandcastle-wrapper.sh"` (idempotent; works for pnpm/yarn too). Don't announce either of these — a missing script is a silently-handled snag, not a blocker.
 
 Foreground (short test runs), when the script is present:
+
 - pnpm: `pnpm sandcastle <flags>`
 - npm: `npm run sandcastle -- <flags>`
 - yarn: `yarn sandcastle <flags>`
@@ -339,6 +381,7 @@ Foreground (short test runs), when the script is present:
 **Do NOT insert `--` after `pnpm sandcastle` or `yarn sandcastle`** — only `npm run` needs the `--` separator to pass args through. pnpm rejects the stray `--` with an arg-parse error and the orchestrator never starts. The forms above are correct as written; copy them verbatim per package manager.
 
 For background (overnight, default for runs with `--iterations >= 5`):
+
 - **Use a per-project log path**, not a shared `/tmp/sandcastle.log` — a shared file is a cross-project confound (two projects' loops interleave into one log and you can't tell whose planner started). Use `/tmp/sandcastle-<repo-basename>.log` (basename of the repo root). Remember the exact path for the alive-check and the final summary.
 - Wrap in `nohup <launch> > /tmp/sandcastle-<basename>.log 2>&1 < /dev/null & disown` — **do NOT prefix `setsid`**. `setsid` does not exist on macOS (the default host); the launch line then fails or, worse, the shell parses it in a way that spawns the loop twice. `nohup ... & disown` already detaches the process so it survives the shell exiting.
 - **Capture the launched PID immediately** — `echo $!` right after the `nohup … &` (before `disown`, or grab `$!` into a var). The alive-check keys on THIS PID, never a bare `pgrep` (which is project-blind — see step 6; it will match other repos' loops and give a false "alive"/false "dead" reading). Wait 8 seconds, then confirm with `kill -0 <pid>` (exit 0 = alive) or `ps -p <pid>`.
@@ -351,11 +394,24 @@ On the all-machines fork, you've already done the shared planning stage (theme, 
 
 1. **Push the run branch to origin** so every host can fetch it (the launch gate fast-forwards each host onto it). The remote host must be able to check out the run branch.
 2. **Pick the targets.** Default = all hosts in the registry. If the user named one (`--host <name>`) or wants one, scope to it. Report which hosts you're targeting.
-3. **Launch on each target** via the shared script — per-host concurrency comes from the registry automatically:
+3. **Launch the targets ONE AT A TIME — never fan out simultaneously.** Two hosts that plan at the same moment race on the same narrow claimable set: the second host's pick collides with the first's in-flight claim and it exits on an empty iteration (real incident: 2026-07-25, both hosts planned together, host 2 died on iteration 1). So launch a host, **wait until it has actually claimed work, THEN launch the next.** Order the local host first when it's a target (fastest to confirm), then remotes.
+
+   Per-host launch is the shared script — per-host concurrency comes from the registry automatically:
+
    ```
-   tsx .sandcastle/scripts/launch.mts --action run --branch <run-branch> --mode <mode> --iterations <n> [--base <base>] [--host <name>]
+   tsx .sandcastle/scripts/launch.mts --action run --branch <run-branch> --mode <mode> --iterations <n> [--host <name>]
    ```
-   Run once with no `--host` to sweep all hosts, or with `--host <name>` for one. **Dry-run first** with `--dry-run` to show the user the exact command each host would run (especially the remote ssh + detach line) before committing.
+
+   Do NOT pass `--base` — `main.mts` has **no** `--base` flag and rejects it (`Unknown option '--base'`), killing the launch instantly. The run branch was already created + pushed in the planning stage (§4), so each host fast-forwards onto `--branch`; `--base` is not a valid orchestrator flag and must not be passed.
+
+   **Dry-run first** with `--dry-run` (all hosts) to show the user the exact command each host would run (especially the remote ssh + detach line) before committing. Then launch for real, per host, in sequence:
+
+   a. Launch host with `--host <name>`.
+   b. **Poll until it has claimed work** before launching the next: every ~10s, up to ~90s, check whether the host's `in-progress` label count has risen OR its log shows a `plan:` / `claimed` / `→ agent/issue-` line (local: tail the per-project log; remote: `ssh <alias> 'tail -n 40 <its log path>'`). The moment claim is confirmed, move to the next host.
+   c. If a host hasn't claimed after ~90s, launch the next host **anyway** and note it in the summary (e.g. "host `hub` hadn't claimed after 90s — launched `local` regardless; check `hub` with /sandcastle-status"). Don't stall the whole fan-out on one slow planner.
+
+   **Why sequential:** it guarantees each host claims against a claimable set the previous host has already narrowed, so no two planners race on the same small ready-set.
+
 4. **Report the per-host outcome** the script prints — one line each: `launched`, or `skipped (<reason>)` where reason is `unreachable / already-running / dirty-tree / diverged / auth-failed / preflight-error`. A skipped host is never forced; tell the user what to fix (e.g. a `diverged` host has local commits not on origin — resolve by hand). The local machine and healthy remotes that launched are now running the same queue. **Never forward credentials to a remote host; each uses its own auth.**
 
 After an all-machines launch: watch the combined view with `/sandcastle-status` (its all-machines branch, or `pnpm sandcastle:watch`) — the viewer fuses all hosts' counts. Stop with `/sandcastle-stop --all` (add `--now` when you must leave immediately — it checkpoints in-flight work first). To bring a stopped machine back into an in-flight run without planning new work, use `/sandcastle-resume`.

@@ -12,6 +12,16 @@ Rejoin a run that's already going, rather than planning a new one. Resume asks w
 1. **Host registry** `.sandcastle/hosts.json` exists.
 2. **Both cross-host flags on** on every host (`SANDCASTLE_CROSS_HOST_LEASE=1` + `SANDCASTLE_CROSS_HOST_SYNC=1`) — resume-from-WIP and lease handoff depend on them.
 
+## Pre-resume hygiene (mirror /sandcastle-run's preflights — run on EACH target host before it rejoins)
+
+Resuming rejoins an in-flight run, so a host coming back in carries the same landmines a fresh launch guards against. Run these on every host you're bringing in, over ssh for remotes — they mirror `/sandcastle-run`'s preflight steps 9, 10/11, and 5:
+
+- **`psql` present? — REFUSE if missing.** `command -v psql` on the host. The host-side migration applier (`main.mts` → `drizzle-applier.ts`) shells out to `psql`; if it's absent, **every** schema-touching issue fails the migration step and quarantines to `needs-human` while the loop looks healthy. Missing → refuse with the fix for that OS: macOS `brew install libpq && brew link --force libpq`; Linux `sudo apt-get install -y postgresql-client`. Then re-run.
+- **Purge ghost cross-host refs + stale lease locks.** Stale coordination refs from a RETIRED/previous run poison the sync (real incident: a `refs/sandcastle/lanes/*` pointing at a retired queue's archive tip faked an iteration-1 merge conflict). On local + origin + each host, enumerate `refs/sandcastle/{lanes,peers,peer-status,status,conflict}/*` and `refs/locks/issue-*`; delete any that point at a commit **not in the resumed run branch's history**, match an `archive/*` tag, or belong to a dead/retired run (`git update-ref -d` local/host, `git push origin :<ref>`). **PRESERVE `refs/sandcastle/strand/*` and `refs/sandcastle/wip/*`** — those hold real checkpointed WIP the resume depends on; never sweep them. Also clear any `refs/locks/issue-N` still tagged to a dead prior run of THIS host and flip that issue back to `ready-for-agent` (`gh issue edit N --remove-label in-progress --add-label ready-for-agent`) — otherwise the resumed loop reads its own stranded lock as a live peer and stalls.
+- **Reap leftover worktrees + containers.** For each `.sandcastle/worktrees/agent-issue-*`, if its branch sits at the base SHA with **no new commits**, `git worktree remove --force <path>` and delete the branch; remove orphaned **exited** `sandcastle-*` containers. **PRESERVE any worktree checked out on a `wip/issue-*` branch** — it holds checkpointed work the resume continues from.
+
+These are the same preflights `/sandcastle-run` documents (steps 9, 10, 11, 5); do not re-derive them, just apply them per target host before the launch call below.
+
 ## Steps
 
 1. **Discover the in-flight run.** The launch script reads the shared status refs (`refs/sandcastle/status/*`) to find the run currently reporting `state == running` across hosts, and pre-fills its branch. If nothing is in flight, it stops with "no in-flight run found" — there's nothing to resume (use `/sandcastle-run` to start fresh).

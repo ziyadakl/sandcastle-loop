@@ -47,7 +47,9 @@ export interface LockBackend {
    * carrying `lease`. Resolves `{ ok: true, oid }` on win, `{ ok: false }` if
    * the ref already exists (contended). MUST NOT overwrite an existing ref.
    */
-  createRef(lease: Omit<LockLease, "refOid">): Promise<{ ok: boolean; oid?: string }>;
+  createRef(
+    lease: Omit<LockLease, "refOid">,
+  ): Promise<{ ok: boolean; oid?: string }>;
   /** Read the current lease, or null if the ref does not exist. */
   readRef(issue: number): Promise<LockLease | null>;
   /**
@@ -180,6 +182,20 @@ export async function reclaimIfExpired(
   const current = await deps.backend.readRef(issue);
   if (!current) return null; // no ref — nothing to reclaim
   const now = deps.now();
+  // DEFERRED (fast self-reclaim): a quick stop+relaunch on the SAME host is
+  // currently blocked by its own still-live lease until the TTL (900s) elapses,
+  // because a lease held by THIS host's now-dead previous run still classifies
+  // as "live". The desired behavior is to treat a lease whose holder === this
+  // host AND whose owning run is provably dead as reclaimable IMMEDIATELY here,
+  // bypassing the skew-grace/TTL wait. This is NOT implemented because it is not
+  // low-risk: LockLease carries no PID/run-id (see the record at top of file),
+  // so "owning run is dead" cannot be proven from the lease alone — threading a
+  // PID/run-id through LockLease, serializeLease/parseLease and every
+  // acquire/reclaim/renew candidate would touch the CAS/fencing core. And a
+  // wrong guess (holder === thisHost but a graceful-stop run is still finishing
+  // an issue, or the launch-gate pgrep missed a live loop) would let two runs
+  // work the same issue — exactly the double-work this lease prevents. Revisit
+  // by adding a run-id to the lease and gating self-reclaim on liveness proof.
   if (!isExpired(current.expiresAt, now)) return null; // still live — no steal
   const candidate: Omit<LockLease, "refOid"> = {
     issue,
@@ -281,7 +297,10 @@ function parseLease(body: string, refOid: string): LockLease | null {
   const end = body.lastIndexOf("}");
   if (start < 0 || end < start) return null;
   try {
-    const raw = JSON.parse(body.slice(start, end + 1)) as Record<string, unknown>;
+    const raw = JSON.parse(body.slice(start, end + 1)) as Record<
+      string,
+      unknown
+    >;
     if (
       typeof raw.issue !== "number" ||
       typeof raw.holder !== "string" ||
@@ -384,7 +403,9 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
     opts.git(opts.repoRoot, ...args);
 
   /** Create a fresh parentless lock-commit carrying `lease`; return its oid. */
-  async function makeLockCommit(lease: Omit<LockLease, "refOid">): Promise<string> {
+  async function makeLockCommit(
+    lease: Omit<LockLease, "refOid">,
+  ): Promise<string> {
     // -c user.* keeps commit-tree from failing on hosts without a git identity.
     const res = await run(
       "-c",
@@ -397,7 +418,9 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
       serializeLease(lease),
     );
     if (!res.ok || !res.stdout) {
-      throw new Error(`lock commit-tree failed: ${res.stderr || "no oid returned"}`);
+      throw new Error(
+        `lock commit-tree failed: ${res.stderr || "no oid returned"}`,
+      );
     }
     return res.stdout.trim();
   }
@@ -436,11 +459,17 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
       await run("fetch", "--quiet", remote, lockRef(issue));
       const body = await run("log", "-1", "--format=%B", oid);
       if (!body.ok) {
-        throw new LeaseReadError(issue, body.stderr || "git log of lock-commit failed");
+        throw new LeaseReadError(
+          issue,
+          body.stderr || "git log of lock-commit failed",
+        );
       }
       const lease = parseLease(body.stdout, oid);
       if (!lease) {
-        throw new LeaseReadError(issue, "lock-commit body was not a parseable lease");
+        throw new LeaseReadError(
+          issue,
+          "lock-commit body was not a parseable lease",
+        );
       }
       return lease;
     },
