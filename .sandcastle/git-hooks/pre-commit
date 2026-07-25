@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# Tracked pre-commit hook (wired up by skills/install.sh via
+# `git config core.hooksPath .sandcastle/git-hooks`). It fails CLOSED against an
+# AGENT hand-committing the sandcastle template (incident behind commit dfb4e92)
+# but stays inert for a HUMAN maintainer — the agent/loop env gate lives in the
+# lib decision, not here. All logic is in
+# .sandcastle/scripts/check-template-commit.mts.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec tsx "$REPO_ROOT/.sandcastle/scripts/check-template-commit.mts"

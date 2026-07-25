@@ -29,6 +29,8 @@ The audit file (AUDIT mode) serves two purposes: (a) the summary you relay in th
 
 ## DIRECT PROPOSAL mode procedure
 
+**NEVER edit-and-commit the sandcastle template directly (`.sandcastle/lib/**`, `skills/**`). Always output a proposal file instead.** A pre-commit guard enforces this in agent contexts (`CLAUDECODE` / `SANDCASTLE_LOOP`) — an agent commit touching those paths is refused, and this proposal file is exactly the substitute. A human maintainer reads it, then reviews and lands the change.
+
 If the focus-area is forward-looking, do NOT export the transcript and do NOT dispatch a subagent. Just:
 
 1. Write the proposal to a file at `mktemp -t sc-proposal-XXXXXX.md`. Three short sub-sections:

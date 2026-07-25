@@ -62,6 +62,20 @@ echo "linked $linked, already-ok $skipped, backed up $backed_up"
 [ "$backed_up" -gt 0 ] && echo "previous copies kept at: $BACKUP"
 echo "skills now track: $REPO_SKILLS"
 
+REPO_ROOT="$(cd "$REPO_SKILLS/.." && pwd)"
+
+# --- pre-commit template guard: point git at the tracked hooks dir ------------
+#
+# Fail-closed guard so an AGENT/loop context can't hand-commit the sandcastle
+# template (.sandcastle/lib/**, skills/**) — incident behind commit dfb4e92. A
+# HUMAN maintainer has no agent env marker, so their commits pass untouched.
+# Only meaningful inside the template checkout itself; skip outside a git repo.
+if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$REPO_ROOT" config core.hooksPath .sandcastle/git-hooks
+  chmod +x "$REPO_ROOT/.sandcastle/git-hooks/pre-commit" 2>/dev/null || true
+  echo "git-hooks: core.hooksPath -> .sandcastle/git-hooks (agent template-commit guard)"
+fi
+
 # --- hosts.json: report only, WRITE NOTHING ----------------------------------
 #
 # The per-machine registry (.sandcastle/hosts.json) is untracked. An existing
@@ -74,7 +88,6 @@ echo "skills now track: $REPO_SKILLS"
 # and absent-because-new are indistinguishable on disk, so no gate can tell them
 # apart. Print guidance and let the human — who alone knows which case they are
 # in — run the one command. (Full rationale: docs/adr/0022.)
-REPO_ROOT="$(cd "$REPO_SKILLS/.." && pwd)"
 if [ -f "$REPO_ROOT/.sandcastle/hosts.json" ]; then
   echo "hosts.json: present, left alone"
 else

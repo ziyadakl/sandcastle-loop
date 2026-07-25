@@ -1296,6 +1296,24 @@ export function preflight(args: SandcastleArgs, opts: {
     }
   }
 
+  // 7b. psql on PATH — same `migrations.length > 0` gate as check #7. When a
+  // project ships drizzle migrations the applier shells out to `psql`, so a
+  // missing binary fails the run mid-pipeline after the planner has already
+  // burned tokens. Probe it at boot with `command -v psql` (via `sh -c` so the
+  // shell builtin resolves) and refuse launch with a clear message when absent.
+  if (migrations.length > 0) {
+    const psql = exec("sh", ["-c", "command -v psql"]);
+    if (!psql.ok) {
+      errors.push(
+        `psql not found on PATH but ${migrations.length} migration(s) present ` +
+          `— refusing to launch. The drizzle migration applier shells out to ` +
+          `psql; install PostgreSQL client tools (e.g. \`brew install ` +
+          `libpq\` / \`apt-get install postgresql-client\`) so psql is on PATH, ` +
+          `then re-run the loop.`,
+      );
+    }
+  }
+
   // 8. Sandcastle source code dirty-check. Refuse-launch when
   // `.sandcastle/main.mts` has uncommitted modifications vs HEAD. This
   // is the discipline guard against the "patched locally but never

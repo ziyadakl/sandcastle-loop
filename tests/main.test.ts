@@ -2236,6 +2236,66 @@ describe("sandcastle-loop main.mts — DATABASE_URL preflight", () => {
   });
 });
 
+describe("sandcastle-loop main.mts — psql PATH preflight", () => {
+  // Same migrations.length > 0 gate as the DB-URL check: when a project has
+  // drizzle migrations on disk the applier shells out to `psql`, so refuse
+  // launch at boot if psql isn't on PATH rather than fail mid-pipeline after
+  // a model call has burned tokens. exec stub: everything ok EXCEPT the
+  // `command -v psql` probe, whose result is driven by `psqlFound`.
+  function execWithPsql(psqlFound: boolean) {
+    return (bin: string, a: readonly string[]) => {
+      if (bin === "sh" && a[0] === "-c" && a[1] === "command -v psql") {
+        return psqlFound
+          ? { ok: true, stdout: "/usr/bin/psql\n" }
+          : { ok: false, stderr: "" };
+      }
+      return { ok: true };
+    };
+  }
+
+  it("fails when migrations exist on disk but psql is not on PATH", () => {
+    const res = preflight(baseArgs(), {
+      exec: execWithPsql(false),
+      fileExists: () => true,
+      listMigrations: () => ["db/migrations/0001_init.sql"],
+      getEnv: () => "postgres://fake@localhost/db",
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/psql not found on PATH/);
+  });
+
+  it("passes the psql check when migrations exist and psql is on PATH", () => {
+    const res = preflight(baseArgs(), {
+      exec: execWithPsql(true),
+      fileExists: () => true,
+      listMigrations: () => ["db/migrations/0001_init.sql"],
+      getEnv: () => "postgres://fake@localhost/db",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("never runs the psql probe when there are no migrations", () => {
+    let psqlProbed = false;
+    const res = preflight(baseArgs(), {
+      exec: (bin, a) => {
+        if (bin === "sh" && a[0] === "-c" && a[1] === "command -v psql") {
+          psqlProbed = true;
+          // If anything DID probe, simulate psql-missing to prove we didn't
+          // observe it.
+          return { ok: false, stderr: "" };
+        }
+        return { ok: true };
+      },
+      fileExists: () => true,
+      listMigrations: () => [],
+      getEnv: () => undefined,
+    });
+    expect(psqlProbed).toBe(false);
+    expect(res.errors.join("\n")).not.toMatch(/psql not found on PATH/);
+  });
+});
+
 describe("sandcastle-loop main.mts — sandbox image preflight", () => {
   // Regression guard: iteration 1 used to crash with "Image not found" on a
   // fresh worktree because preflight only checked `docker info`. Preflight
