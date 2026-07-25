@@ -633,6 +633,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 99,
+    opusProfile: "4.8",
     dryRun: false,
     // The whole point: retry/recovery off so an implementer error or a
     // HAS_BLOCKERS reviewer routes straight to quarantine with no further

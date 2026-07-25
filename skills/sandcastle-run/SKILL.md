@@ -52,7 +52,7 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    4. `$XDG_CONFIG_HOME/sandcastle/.env` or `~/.config/sandcastle/.env` (host-level default)
 
    **Which key (if any) is required depends on the chosen mode (§7b) — check only the one that applies:**
-   - `claude` (default — no `--provider`/`--backend`): uses the local Claude subscription. **No API key needed — skip this check entirely.** (This is the common case; requiring a key here is a false alarm that blocks the default run.)
+   - `opus-4.8` (default — no `--provider`/`--backend`) and `opus-5` (`--opus 5`): both use the local Claude subscription — the `--opus 5` model profile changes the model, not the auth. **No API key needed — skip this check entirely.** (This is the common case; requiring a key here is a false alarm that blocks the default run.)
    - `codex` (`--backend codex`): uses Codex's own auth, not one of these keys. **Skip this check** (codex auth is validated on its own path).
    - `--provider kimi` → require `KIMI_API_KEY`.
    - `--provider glm` → require `GLM_API_KEY`.
@@ -277,11 +277,12 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
    a. **Concurrency?** Options `1 / 2 / 3 / 4`, default = the §5 recommendation. If you recommended `1` for a collision, show the reason here. Note that >2 raises collision risk on shared files. **All-machines path: SKIP this question entirely** — per-host concurrency comes from each host's `maxConcurrent` in the registry, not from a single answer.
 
-   b. **Mode?** Options `claude / codex / kimi / glm`, default = the remembered mode (§7b) or `claude`. Translate the pick to flags — they are **mutually exclusive** (`--backend codex` refuses `--provider`, `main.mts:641-643`):
-   - `claude` → no flag (`models.ts` defaults — opus-heavy, the priciest under metered billing)
-   - `codex` → `--backend codex` (gpt-5.5)
-   - `kimi` → `--provider kimi` (kimi-for-coding)
-   - `glm` → `--provider glm` (glm-4.6)
+   b. **Mode?** Options `opus-4.8 (default) / opus-5 / codex / kimi / glm`, default = the remembered mode (§7b) or `opus-4.8`. The two `opus-*` options are both the claude backend (the old `claude` option, now split by model profile). Translate the pick to flags — they are **mutually exclusive** (`--backend codex` refuses `--provider`, and `--opus 5` applies only to the claude path — not combinable with `codex`/`kimi`/`glm` — `main.mts:641-643`):
+      - `opus-4.8` → no extra model-profile flag (current claude `models.ts` defaults — the priciest under metered billing)
+      - `opus-5` → `--opus 5` (claude backend, Opus-5 model profile — same $5/$25 price as 4.8, 1M context with adaptive thinking on by default: more reasoning tokens per call but likely fewer retries; NOT combinable with codex/kimi/glm)
+      - `codex` → `--backend codex` (gpt-5.5)
+      - `kimi` → `--provider kimi` (kimi-for-coding)
+      - `glm` → `--provider glm` (glm-4.6)
 
    c. **Scope? — only when 2+ epics are ready.** Options `both interleaved / <epic-A> only / <epic-B> only`, default `both`. If the user picks one epic, scope the run to it (claim only that epic's issues) and name the branch for that single epic.
 
@@ -289,7 +290,7 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
    After the answers: record the chosen mode (§7b), create/reuse the branch (§4), then **fork on the path**: single-machine → launch locally and report (§8); all-machines → go to _Launch across all machines_ (push the branch, fan out via the launch script, report per-host) instead of §8.
 
-7b. **Remember the mode** so "ask every time" stays one tap. Read `.sandcastle/.last-run-mode` (single line: `claude`|`codex`|`kimi`|`glm`) for the §7b default; if absent, default `claude`. After the user picks, write their choice back to that file. Ensure it's gitignored — add `.last-run-mode` to `.sandcastle/.gitignore` if not already covered. (Per-project, so different projects can keep different default modes.)
+7b. **Remember the mode** so "ask every time" stays one tap. Read `.sandcastle/.last-run-mode` (single line: `opus-4.8`|`opus-5`|`codex`|`kimi`|`glm`) for the §7b default; if absent, default `opus-4.8`. (A legacy `claude` value from an earlier run means `opus-4.8`.) After the user picks, write their choice back to that file. Ensure it's gitignored — add `.last-run-mode` to `.sandcastle/.gitignore` if not already covered. (Per-project, so different projects can keep different default modes.)
 
 8. **After launch, always tell the user** (plain English):
    - the grouping, base, branch name, concurrency + one-word reason, iterations;
@@ -341,6 +342,7 @@ Models (defaults read from `.sandcastle/models.ts`):
 
 - `--planner-model M`, `--implementer-model M`, `--reviewer-model M`,
   `--merger-model M`, `--post-merge-reviewer-model M`, `--recovery-model M`.
+- `--opus 4.8|5` — claude-only model profile; default `4.8` (no flag needed). `--opus 5` selects the Opus-5 profile (same $5/$25 price, 1M context, adaptive thinking on). Mutually exclusive with `--backend codex` / `--provider kimi|glm`.
 
 Provider:
 
@@ -402,6 +404,8 @@ On the all-machines fork, you've already done the shared planning stage (theme, 
    tsx .sandcastle/scripts/launch.mts --action run --branch <run-branch> --mode <mode> --iterations <n> [--host <name>]
    ```
 
+   > **Opus profile is single-host only for now.** The `--opus 4.8|5` model profile is threaded on the single-host `main.mts` path; the multi-host `launch.mts --mode` axis still takes `claude`/`codex`/`kimi`/`glm` only. On an all-machines run, `opus-4.8`/`opus-5` both map to `--mode claude`; per-host Opus-5 selection isn't carried across hosts yet.
+
    Do NOT pass `--base` — `main.mts` has **no** `--base` flag and rejects it (`Unknown option '--base'`), killing the launch instantly. The run branch was already created + pushed in the planning stage (§4), so each host fast-forwards onto `--branch`; `--base` is not a valid orchestrator flag and must not be passed.
 
    **Dry-run first** with `--dry-run` (all hosts) to show the user the exact command each host would run (especially the remote ssh + detach line) before committing. Then launch for real, per host, in sequence:
@@ -411,6 +415,7 @@ On the all-machines fork, you've already done the shared planning stage (theme, 
    c. If a host hasn't claimed after ~90s, launch the next host **anyway** and note it in the summary (e.g. "host `hub` hadn't claimed after 90s — launched `local` regardless; check `hub` with /sandcastle-status"). Don't stall the whole fan-out on one slow planner.
 
    **Why sequential:** it guarantees each host claims against a claimable set the previous host has already narrowed, so no two planners race on the same small ready-set.
+
 
 4. **Report the per-host outcome** the script prints — one line each: `launched`, or `skipped (<reason>)` where reason is `unreachable / already-running / dirty-tree / diverged / auth-failed / preflight-error`. A skipped host is never forced; tell the user what to fix (e.g. a `diverged` host has local commits not on origin — resolve by hand). The local machine and healthy remotes that launched are now running the same queue. **Never forward credentials to a remote host; each uses its own auth.**
 

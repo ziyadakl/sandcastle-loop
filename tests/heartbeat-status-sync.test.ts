@@ -287,6 +287,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
+    opusProfile: "4.8",
     dryRun: false,
     recoveryEnabled: true,
     retryEnabled: true,

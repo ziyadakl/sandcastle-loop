@@ -94,7 +94,7 @@ import {
   snapshotImportedFiles,
   detectImportedFileChange,
 } from "./lib/restart-detector.js";
-import { models, codexModels } from "./models.js";
+import { models, codexModels, opus5Models, type OpusProfile } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   CritiqueCriticalError,
@@ -237,6 +237,15 @@ export interface SandcastleArgs {
    * `models.ts`. Set by `--backend`. Undefined is treated as `"claude"`.
    */
   backend?: AgentBackend;
+  /**
+   * Launch-time Opus model profile (`--opus`, default `"4.8"`). NOT a backend —
+   * both values run the same anthropic provider on the `claude` backend; they
+   * differ only by the model string on the six opus-heavy roles. `"5"` swaps
+   * {@link roleModelsFor} from `models` to `opus5Models` (`claude-opus-5`,
+   * empty escalations). `"5"` is claude-backend-only: it cannot combine with
+   * `--backend codex` or any `--provider`. `"4.8"` is the byte-for-byte default.
+   */
+  opusProfile: OpusProfile;
   /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
@@ -698,6 +707,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "no-staging": { type: "boolean" },
       "provider": { type: "string" },
       "backend": { type: "string" },
+      "opus": { type: "string" },
       "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
@@ -793,6 +803,32 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
+  // --opus selects the Opus model profile (4.8 vs 5). NOT a backend/provider —
+  // both are the anthropic provider on the claude backend, differing only by the
+  // model string on the opus-heavy roles. `"5"` (claude-opus-5, 1M default) is
+  // claude-backend-only, so it cannot combine with codex or a --provider swap;
+  // `"4.8"` (default) is a no-op that must never error.
+  const opusProfile: OpusProfile = (() => {
+    const v = values.opus;
+    if (v === undefined) return "4.8";
+    if (v !== "4.8" && v !== "5") {
+      throw new Error(
+        `--opus: expected one of 4.8|5, got ${JSON.stringify(v)}`,
+      );
+    }
+    return v;
+  })();
+  if (opusProfile === "5" && backend === "codex") {
+    throw new Error(
+      "--opus 5 applies only to the claude backend; it cannot combine with --backend codex",
+    );
+  }
+  if (opusProfile === "5" && provider !== undefined) {
+    throw new Error(
+      "--opus 5 applies only to the anthropic default; it cannot combine with --provider",
+    );
+  }
+
   // Reconcile the OTHER role-model flags against the resolved backend. A
   // sandcastle run is single-backend end-to-end: escalations, skill-discipline,
   // and AGENTS.md staging all key off `args.backend`, while per-role dispatch
@@ -831,7 +867,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
-  const roleModels = roleModelsFor({ backend });
+  const roleModels = roleModelsFor({ backend, opusProfile });
 
   const implementerModel =
     explicitImplModel ??
@@ -881,6 +917,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     plannerModel: values["planner-model"] ?? roleModels.planner.default,
     implementerModel,
     backend,
+    opusProfile,
     reviewerModel: values["reviewer-model"] ?? roleModels.reviewer.default,
     critiqueModel: values["critique-model"] ?? roleModels.critique.default,
     mergerModel: values["merger-model"] ?? roleModels.merger.default,
@@ -955,9 +992,17 @@ function detectBranchOr(fallback: string): string {
  * `codexModels`; everything else uses the Claude `models` map. Reading
  * escalations through this (not `models.X` directly) is what keeps a
  * `--backend codex` run from silently escalating onto a Claude model.
+ *
+ * On the claude backend, the Opus profile (`--opus`) selects the map: `"5"`
+ * draws every role from `opus5Models` (`claude-opus-5`, empty escalations),
+ * `"4.8"` (default, or unset) uses `models`. Codex ignores the profile.
  */
-function roleModelsFor(a: { readonly backend?: AgentBackend }) {
-  return a.backend === "codex" ? codexModels : models;
+export function roleModelsFor(a: {
+  readonly backend?: AgentBackend;
+  readonly opusProfile?: OpusProfile;
+}) {
+  if (a.backend === "codex") return codexModels;
+  return a.opusProfile === "5" ? opus5Models : models;
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -979,6 +1024,7 @@ function defaultArgs(): SandcastleArgs {
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
+    opusProfile: "4.8",
     dryRun: false,
     recoveryEnabled: true,
     retryEnabled: true,

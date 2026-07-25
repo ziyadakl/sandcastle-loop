@@ -56,4 +56,27 @@ export const codexModels = {
   recovery:          { default: "gpt-5.5", escalations: [] },
 } as const satisfies Record<keyof typeof models, RoleConfig>;
 
+/**
+ * Opus 5 profile (`--opus 5`). NOT a new backend/provider — this is the same
+ * anthropic provider on the `claude` backend as `models`, differing ONLY by the
+ * model string on the six opus-heavy roles. `claude-opus-5` is the dateless
+ * `claude-{name}-{major}` id and ships with a 1M-context window BY DEFAULT, so
+ * there is no `[1m]` escalation tier for it — `escalations` is empty. Reviewer
+ * and critique stay byte-identical to `models` (Haiku default, Sonnet
+ * escalation) — the profile only touches the heavy roles.
+ */
+export const opus5Models = {
+  planner:           { default: "claude-opus-5", escalations: [] },
+  implementer:       { default: "claude-opus-5", escalations: [] },
+  reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
+  critique:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
+  merger:            { default: "claude-opus-5", escalations: [] },
+  postMergeReviewer: { default: "claude-opus-5", escalations: [] },
+  postMergeFixer:    { default: "claude-opus-5", escalations: [] },
+  recovery:          { default: "claude-opus-5", escalations: [] },
+} as const satisfies Record<keyof typeof models, RoleConfig>;
+
+/** Launch-time Opus model profile selector (`--opus`). */
+export type OpusProfile = "4.8" | "5";
+
 export type ModelRole = keyof typeof models;
