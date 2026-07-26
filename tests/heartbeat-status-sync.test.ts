@@ -288,6 +288,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
     opusProfile: "4.8",
+    budget: false,
     dryRun: false,
     recoveryEnabled: true,
     retryEnabled: true,

@@ -94,7 +94,13 @@ import {
   snapshotImportedFiles,
   detectImportedFileChange,
 } from "./lib/restart-detector.js";
-import { models, codexModels, opus5Models, type OpusProfile } from "./models.js";
+import {
+  models,
+  codexModels,
+  opus5Models,
+  BUDGET_IMPLEMENTER_MODEL,
+  type OpusProfile,
+} from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
 import {
   CritiqueCriticalError,
@@ -246,6 +252,15 @@ export interface SandcastleArgs {
    * `--backend codex` or any `--provider`. `"4.8"` is the byte-for-byte default.
    */
   opusProfile: OpusProfile;
+  /**
+   * Budget mode (`--budget`, default `false`). Swaps ONLY the implementer's
+   * first-pass model to Sonnet 5 ({@link BUDGET_IMPLEMENTER_MODEL}); the retry
+   * ladder still escalates onto Opus via {@link roleModelsFor}. The implementer
+   * is the loop's dominant token consumer, so this is the main cost lever.
+   * Claude-anthropic-only: cannot combine with `--backend codex` or `--provider`.
+   * An explicit `--implementer-model` still wins over it.
+   */
+  budget: boolean;
   /**
    * Docker image to run the sandbox in. Defaults to the same name
    * `sandcastle docker build-image` produces — `sandcastle:<basename>` of
@@ -646,6 +661,15 @@ Optional:
                             (codexModels in models.ts → sandcastle.codex) and
                             authenticates via the mounted ~/.codex subscription
                             (ADR 0012). Cannot combine with --provider.
+  --opus 4.8|5              Opus model profile for the claude backend (default
+                            4.8). 5 = claude-opus-5 (1M context, adaptive
+                            thinking on) for the opus-heavy roles. Cannot
+                            combine with --backend codex or --provider.
+  --budget                  Budget mode: run the implementer's first pass on
+                            claude-sonnet-5 (~40% cheaper) while keeping the
+                            Opus 1M escalation on retry. Only the implementer
+                            changes. Cannot combine with --backend codex or
+                            --provider; an explicit --implementer-model wins.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -708,6 +732,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "provider": { type: "string" },
       "backend": { type: "string" },
       "opus": { type: "string" },
+      "budget": { type: "boolean" },
       "sandbox": { type: "string" },
       "image-name": { type: "string" },
       "allow-dirty-sandcastle": { type: "boolean" },
@@ -829,6 +854,25 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
+  // --budget swaps ONLY the implementer's first-pass model to Sonnet 5 (the loop's
+  // dominant token consumer). The retry ladder is untouched (roleModelsFor's
+  // implementer.escalations still escalates onto Opus 1M), so hard issues keep
+  // their muscle. Claude-anthropic-only, mirroring --opus 5: a cheaper Anthropic
+  // first pass is meaningless under a codex backend or a kimi/glm provider swap
+  // (which already redirects the implementer), so a combination is an operator
+  // error, not a silent no-op. An explicit --implementer-model still wins below.
+  const budget = values.budget === true;
+  if (budget && backend === "codex") {
+    throw new Error(
+      "--budget applies only to the claude backend; it cannot combine with --backend codex",
+    );
+  }
+  if (budget && provider !== undefined) {
+    throw new Error(
+      "--budget applies only to the anthropic default; it cannot combine with --provider",
+    );
+  }
+
   // Reconcile the OTHER role-model flags against the resolved backend. A
   // sandcastle run is single-backend end-to-end: escalations, skill-discipline,
   // and AGENTS.md staging all key off `args.backend`, while per-role dispatch
@@ -873,7 +917,9 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     explicitImplModel ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
-      : roleModels.implementer.default);
+      : budget
+        ? BUDGET_IMPLEMENTER_MODEL
+        : roleModels.implementer.default);
 
   const sandbox: "docker" | "mac-host" = (() => {
     const v = values.sandbox;
@@ -918,6 +964,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     implementerModel,
     backend,
     opusProfile,
+    budget,
     reviewerModel: values["reviewer-model"] ?? roleModels.reviewer.default,
     critiqueModel: values["critique-model"] ?? roleModels.critique.default,
     mergerModel: values["merger-model"] ?? roleModels.merger.default,
@@ -1025,6 +1072,7 @@ function defaultArgs(): SandcastleArgs {
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
     opusProfile: "4.8",
+    budget: false,
     dryRun: false,
     recoveryEnabled: true,
     retryEnabled: true,
