@@ -84,9 +84,13 @@ export type ModelRole = keyof typeof models;
 /**
  * Budget mode (`--budget`): the implementer's FIRST-PASS model is swapped to
  * Sonnet 5 (~40% cheaper than Opus per token, same 1M context). Only the first
- * pass changes — the retry ladder still reads `models.implementer.escalations`
- * (`claude-opus-4-8[1m]`), so hard issues that blocker-out still escalate onto
- * Opus. The implementer is the loop's dominant token consumer (only multi-turn
- * role, runs per-issue), so this is the single lever that moves the bill.
+ * pass changes — the retry ladder reads `roleModelsFor(args).implementer.escalations`,
+ * which under the DEFAULT (4.8) profile is `["claude-opus-4-8[1m]"]`, so hard
+ * issues that blocker-out still escalate onto Opus. (Budget is rejected in
+ * combination with `--opus 5`, whose `opus5Models` has an empty implementer
+ * escalation — that combo would leave a Sonnet-5 first pass with no Opus retry;
+ * see the parse-time guard in main.mts.) The implementer is the loop's dominant
+ * token consumer (only multi-turn role, runs per-issue), the single lever that
+ * moves the bill.
  */
 export const BUDGET_IMPLEMENTER_MODEL = "claude-sonnet-5";

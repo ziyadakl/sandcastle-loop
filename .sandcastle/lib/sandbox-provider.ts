@@ -221,12 +221,16 @@ export function makeMacHostProvider(
         cwd: spec.cwd,
         signal: spec.signal,
       });
-      // Forward per-iteration session metadata for Phase-1 cost telemetry
-      // (parity with the docker topLevelRun above). Absent on seams → [].
+      // Forward per-iteration session metadata for Phase-1 cost telemetry,
+      // normalized to the SAME {sessionFilePath, sessionId} shape the docker
+      // topLevelRun emits (avoids a latent shape-mismatch between providers).
       return {
         stdout: r.stdout,
         commits: r.commits,
-        iterations: r.iterations ?? [],
+        iterations: (r.iterations ?? []).map((it) => ({
+          sessionFilePath: it.sessionFilePath,
+          sessionId: it.sessionId,
+        })),
       };
     },
     async createSandbox(spec) {

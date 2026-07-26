@@ -675,8 +675,9 @@ Optional:
   --budget                  Budget mode: run the implementer's first pass on
                             claude-sonnet-5 (~40% cheaper) while keeping the
                             Opus 1M escalation on retry. Only the implementer
-                            changes. Cannot combine with --backend codex or
-                            --provider; an explicit --implementer-model wins.
+                            changes. Cannot combine with --backend codex,
+                            --provider, or --opus 5 (opus-5 has no implementer
+                            escalation); an explicit --implementer-model wins.
   --image-name NAME         Docker image to run sandboxes in.
                             Default: derived from --repo-root basename
                             (e.g. /Dev/myproj → sandcastle:myproj),
@@ -877,6 +878,18 @@ export function parseSandcastleArgs(argv: readonly string[]): {
   if (budget && provider !== undefined) {
     throw new Error(
       "--budget applies only to the anthropic default; it cannot combine with --provider",
+    );
+  }
+  // --budget + --opus 5 is a footgun: opus5Models gives the implementer an EMPTY
+  // escalation ladder, so budget's Sonnet-5 first pass would have NO Opus retry
+  // fallback — a blocked issue would quarantine with no escalation, silently
+  // voiding budget's documented "keep Opus on retry" safety net. Reject it; use
+  // --budget with the default (4.8) profile, whose ladder escalates to Opus 1M.
+  if (budget && opusProfile === "5") {
+    throw new Error(
+      "--budget cannot combine with --opus 5: the Opus-5 profile has no implementer " +
+        "escalation, so a budget (Sonnet-5) first pass would have no Opus retry fallback. " +
+        "Use --budget with the default (4.8) profile.",
     );
   }
 
@@ -6405,11 +6418,11 @@ export async function runMain(
             },
           });
           plannerStdout = planResult.stdout;
-          // Phase-1 cost telemetry (best-effort). NOTE: the top-level runner
-          // (deps.run → provider.topLevelRun in sandbox-provider.ts) does not
-          // forward per-iteration session metadata today, so this is a no-op in
-          // production until that adapter is widened; wired now so it starts
-          // crediting the planner automatically once it is.
+          // Phase-1 cost telemetry (best-effort). The top-level runner
+          // (deps.run → provider.topLevelRun in sandbox-provider.ts) forwards
+          // per-iteration session metadata (sessionId), which
+          // resolveSessionFilePath resolves to the session JSONL — so the
+          // planner's token cost IS credited here in production.
           await captureRoleCost(costLedger, "planner", planResult, deps.logError);
         } catch (err) {
           deps.logError(`planner failed: ${(err as Error).message}`);
@@ -6881,8 +6894,8 @@ export async function runMain(
             ISSUES: issuesArg,
           },
         });
-        // Phase-1 cost telemetry (best-effort). No-op until the top-level
-        // adapter forwards session metadata — see the planner-site note.
+        // Phase-1 cost telemetry (best-effort). Top-level session metadata is
+        // forwarded now, so this credits in production — see the planner-site note.
         await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
       } catch (err) {
         mergerOk = false;
@@ -6978,8 +6991,8 @@ export async function runMain(
               ),
             },
           });
-          // Phase-1 cost telemetry (best-effort). No-op until the top-level
-          // adapter forwards session metadata — see the planner-site note.
+          // Phase-1 cost telemetry (best-effort). Top-level session metadata is
+          // forwarded now, so this credits in production — see the planner-site note.
           await captureRoleCost(costLedger, "postMergeReviewer", r, deps.logError);
           // "contains" mode: the reviewer sometimes writes its verdict marker
           // inside a closing sentence ("Review is done: POST_MERGE_ALL_CLEAR.")
@@ -7098,8 +7111,8 @@ export async function runMain(
             }
           }
           skillsInvokedByIssue.set("fixer", fixerSkillsInvoked);
-          // Phase-1 cost telemetry (best-effort). No-op until the top-level
-          // adapter forwards session metadata — see the planner-site note.
+          // Phase-1 cost telemetry (best-effort). Top-level session metadata is
+          // forwarded now, so this credits in production — see the planner-site note.
           await captureRoleCost(
             costLedger,
             "postMergeFixer",

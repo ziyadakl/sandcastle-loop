@@ -12,7 +12,7 @@
  * from list rates (see pricing.ts) — for relative comparison, not billing.
  */
 
-import { costForUsage, isPricedModel, type Usage } from "./pricing.js";
+import { costForUsage, type Usage } from "./pricing.js";
 import type { ModelUsage } from "./session-usage.js";
 
 /** The 8 loop roles a run dispatches agents for. */
@@ -71,8 +71,10 @@ export class CostLedger {
       acc.tokens.output += usage.outputTokens;
       acc.tokens.write += usage.cacheCreationInputTokens;
       acc.tokens.read += usage.cacheReadInputTokens;
+      // costForUsage returns null iff the model has no baked price — that is the
+      // single source of truth for "unpriced", so surface it and skip the total.
       const cost = costForUsage(model, usage);
-      if (cost === null || !isPricedModel(model)) {
+      if (cost === null) {
         this.unpriced.add(model);
       } else {
         acc.costUsd = (acc.costUsd ?? 0) + cost;

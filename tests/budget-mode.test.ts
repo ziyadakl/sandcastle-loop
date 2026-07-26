@@ -54,4 +54,12 @@ describe("--budget (Sonnet-5 implementer)", () => {
       parseSandcastleArgs(["--iterations", "1", "--budget", "--provider", "kimi"]),
     ).toThrow();
   });
+
+  it("hard-errors on --budget + --opus 5 (opus5 has no implementer escalation)", () => {
+    // The footgun: opus5Models.implementer.escalations is [], so a Sonnet-5
+    // budget first pass would have no Opus retry fallback. Reject the combo.
+    expect(() =>
+      parseSandcastleArgs(["--iterations", "1", "--budget", "--opus", "5"]),
+    ).toThrow(/opus 5/i);
+  });
 });

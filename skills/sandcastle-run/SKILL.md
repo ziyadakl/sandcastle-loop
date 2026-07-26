@@ -284,7 +284,7 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
       - `kimi` → `--provider kimi` (kimi-for-coding)
       - `glm` → `--provider glm` (glm-4.6)
 
-      On either `opus-*` pick, offer `--budget` as an add-on if the user wants to save money: it runs the implementer's first pass on `claude-sonnet-5` (~40% cheaper) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the main cost lever. Not combinable with `codex`/`kimi`/`glm`.
+      On an `opus-4.8` pick, offer `--budget` as an add-on if the user wants to save money: it runs the implementer's first pass on `claude-sonnet-5` (~40% cheaper) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the main cost lever. Not combinable with `opus-5` (no implementer escalation there), `codex`, `kimi`, or `glm`.
 
    c. **Scope? — only when 2+ epics are ready.** Options `both interleaved / <epic-A> only / <epic-B> only`, default `both`. If the user picks one epic, scope the run to it (claim only that epic's issues) and name the branch for that single epic.
 
@@ -345,7 +345,7 @@ Models (defaults read from `.sandcastle/models.ts`):
 - `--planner-model M`, `--implementer-model M`, `--reviewer-model M`,
   `--merger-model M`, `--post-merge-reviewer-model M`, `--recovery-model M`.
 - `--opus 4.8|5` — claude-only model profile; default `4.8` (no flag needed). `--opus 5` selects the Opus-5 profile (same $5/$25 price, 1M context, adaptive thinking on). Mutually exclusive with `--backend codex` / `--provider kimi|glm`.
-- `--budget` — cost-saver: runs the **implementer's first pass** on `claude-sonnet-5` (~40% cheaper than Opus, same 1M context) while keeping the Opus 1M escalation on retry. Only the implementer changes (reviewer/critique are already Haiku; the implementer is the dominant token consumer). Claude-only — mutually exclusive with `--backend codex` / `--provider`; an explicit `--implementer-model` wins over it.
+- `--budget` — cost-saver: runs the **implementer's first pass** on `claude-sonnet-5` (~40% cheaper than Opus, same 1M context) while keeping the Opus 1M escalation on retry. Only the implementer changes (reviewer/critique are already Haiku; the implementer is the dominant token consumer). Claude-only — mutually exclusive with `--backend codex` / `--provider` / `--opus 5` (the opus-5 profile has no implementer escalation, so budget's Sonnet-5 first pass would have no Opus retry); an explicit `--implementer-model` wins over it.
 
 Provider:
 
