@@ -113,6 +113,15 @@ export interface StatusStore {
    */
   markStopping(): void;
   /**
+   * Phase-1 cost telemetry sink: record the run's total ESTIMATED cost in USD
+   * (from the cost ledger's `summary().totalCostUsd`) into `totals.totalCostUsd`
+   * and commit. Called once near run end. The field is OPTIONAL in the schema —
+   * callers that never invoke this leave it absent, so old files and flag-off
+   * runs stay byte-compatible. Synchronous mutate-then-commit like every mutator;
+   * a relative estimate, not a billed figure (see `lib/cost/pricing.ts`).
+   */
+  recordCost(totalCostUsd: number): void;
+  /**
    * Cross-host STATUS SYNC (Task S5): set the peer snapshots that `commit()`
    * folds into the WRITTEN file (via `foldPeers`) so a viewer sees one fused,
    * host-tagged loop. The in-memory `status` (esp. `status.history`) stays
@@ -379,6 +388,11 @@ export function createStatusStore(
 
     setPeers(peers: SandcastleStatus[]): void {
       peerSnapshots = peers;
+      commit();
+    },
+
+    recordCost(totalCostUsd: number): void {
+      status.totals.totalCostUsd = totalCostUsd;
       commit();
     },
 

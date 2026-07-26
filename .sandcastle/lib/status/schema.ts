@@ -141,6 +141,17 @@ export const StatusTotalsSchema = z.object({
   /** Issues released back to `ready-for-agent` (transient defer). */
   requeued: z.number().int().nonnegative(),
   running: z.number().int().nonnegative(),
+  /**
+   * Phase-1 cost telemetry: the run's total ESTIMATED cost in USD, summed
+   * across every role from list-rate pricing (see `lib/cost/`). OPTIONAL and
+   * additive on purpose — a required field or a schema-version bump would break
+   * backward compat with existing status.json files and older viewers (which
+   * guard on `schemaVersion`). Absent whenever cost capture produced nothing
+   * (all roles unpriced, or telemetry was skipped). NOT integer/`.int()`: a
+   * dollar figure is fractional. This is a relative estimate, not a billed
+   * number — see `lib/cost/pricing.ts`.
+   */
+  totalCostUsd: z.number().nonnegative().optional(),
 });
 export type StatusTotals = z.infer<typeof StatusTotalsSchema>;
 

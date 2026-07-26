@@ -49,6 +49,25 @@ function makeStore(overrides: Partial<{ writeFn: (p: string, c: string) => void;
 }
 
 describe("StatusStore", () => {
+  // --- Phase-1 cost telemetry sink ---
+
+  it("recordCost writes an optional totalCostUsd into totals and stays schema-valid", () => {
+    const { store, writes } = makeStore();
+    store.recordCost(0.4271);
+    const snap = store.snapshot();
+    expect(snap.totals.totalCostUsd).toBeCloseTo(0.4271, 10);
+    const written = JSON.parse(writes.at(-1)!.content);
+    expect(written.totals.totalCostUsd).toBeCloseTo(0.4271, 10);
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
+  it("a snapshot without recordCost omits totalCostUsd (backward-compat)", () => {
+    const { store } = makeStore();
+    const snap = store.snapshot();
+    expect(snap.totals.totalCostUsd).toBeUndefined();
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
   // --- cross-host identity (Task S1) ---
 
   it("a fresh snapshot carries hostId and runId from meta", () => {

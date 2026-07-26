@@ -133,7 +133,18 @@ export function makeDockerProvider(
         completionSignal: [...config.completionSignal],
         signal: spec.signal,
       });
-      return { stdout: result.stdout, commits: result.commits };
+      // Forward per-iteration session metadata (sessionFilePath/sessionId) so
+      // the run-level roles (planner, merger, post-merge reviewer/fixer) can
+      // resolve their session JSONL for Phase-1 cost telemetry — same shape the
+      // createSandbox `run` path below forwards. Absent on test seams → [].
+      return {
+        stdout: result.stdout,
+        commits: result.commits,
+        iterations: result.iterations?.map((it) => ({
+          sessionFilePath: it.sessionFilePath,
+          sessionId: it.sessionId,
+        })),
+      };
     },
     async createSandbox(spec) {
       const handle = await sandcastle.createSandbox({
@@ -210,7 +221,13 @@ export function makeMacHostProvider(
         cwd: spec.cwd,
         signal: spec.signal,
       });
-      return { stdout: r.stdout, commits: r.commits };
+      // Forward per-iteration session metadata for Phase-1 cost telemetry
+      // (parity with the docker topLevelRun above). Absent on seams → [].
+      return {
+        stdout: r.stdout,
+        commits: r.commits,
+        iterations: r.iterations ?? [],
+      };
     },
     async createSandbox(spec) {
       // Per-call sandboxEnv lands in the mac-host construction here. The

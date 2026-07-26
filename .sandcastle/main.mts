@@ -110,8 +110,15 @@ import {
   findLoadableRubrics,
   MissingRequiredSkillsError,
   parseRequiredSkillsByType,
+  resolveSessionFilePath,
   validateRequiredSkillsInvoked,
 } from "./lib/skill-discipline.js";
+import {
+  CostLedger,
+  formatCostSummary,
+  type CostRole,
+} from "./lib/cost/ledger.js";
+import { extractUsageFromSession } from "./lib/cost/session-usage.js";
 import {
   envForModel,
   backendForModel,
@@ -3258,7 +3265,18 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         `top-level run "${spec.name}"`,
         (signal) => provider.topLevelRun({ ...spec, signal }),
       );
-      return { stdout: result.stdout, commits: result.commits };
+      // Forward per-iteration session-capture metadata (like the sandbox-run
+      // wrapper above) so run-level roles — planner, merger, post-merge
+      // reviewer/fixer — can resolve their session JSONL for Phase-1 cost
+      // telemetry. Previously stripped; harmless when the provider omits it.
+      return {
+        stdout: result.stdout,
+        commits: result.commits,
+        iterations: result.iterations?.map((it) => ({
+          sessionFilePath: it.sessionFilePath,
+          sessionId: it.sessionId,
+        })),
+      };
     },
     async createSandbox(spec) {
       // The vendored SDK enumerates worktrees inside createSandbox; a corrupt
@@ -3837,9 +3855,52 @@ export function cleanupIssueBranch(
   }
 }
 
+/**
+ * Phase-1 cost telemetry capture — BEST-EFFORT, never fails a run.
+ *
+ * Given a completed role's {@link RunHandle}, resolve each iteration's session
+ * JSONL (reusing the skill-discipline resolver) and fold its per-model token
+ * usage into the run-scoped {@link CostLedger} under `role`. The model
+ * attribution comes from the session JSONL itself (`message.model`), so we
+ * don't pass a dispatched-model hint. Any failure — unresolved path, unreadable
+ * file, parse error — is swallowed: telemetry must never break the loop. Only
+ * the Claude session layout is parsed; Codex rollouts have a different shape and
+ * simply yield no usage (and Codex models are unpriced anyway).
+ */
+async function captureRoleCost(
+  ledger: CostLedger | undefined,
+  role: CostRole,
+  handle: RunHandle | undefined,
+  logError: (line: string) => void,
+): Promise<void> {
+  if (ledger === undefined) return;
+  try {
+    for (const it of handle?.iterations ?? []) {
+      const path = await resolveSessionFilePath(it);
+      if (path === undefined) continue;
+      const entries = extractUsageFromSession(path);
+      if (entries.length > 0) ledger.add(role, entries);
+    }
+  } catch (err) {
+    try {
+      logError(`cost capture (${role}) skipped: ${(err as Error).message}`);
+    } catch {
+      // never fail a run over telemetry, not even the error log
+    }
+  }
+}
+
 interface PipelineCtx {
   readonly args: SandcastleArgs;
   readonly deps: Deps;
+  /**
+   * Run-scoped cost ledger (Phase-1 telemetry). Constructed once in
+   * {@link runMain} next to the status store and threaded per-issue so each
+   * role runner can fold its session's token usage in via {@link captureRoleCost}.
+   * OPTIONAL so unit tests that build a bare ctx can omit it — capture no-ops
+   * when it's absent, and never throws into the pipeline regardless.
+   */
+  readonly costLedger?: CostLedger;
   readonly iteration: number;
   readonly issueNumber: number;
   readonly issue: PlanIssue;
@@ -4012,6 +4073,9 @@ export async function runImplementer(
       skillsInvoked.push(name);
     }
   }
+  // Phase-1 cost telemetry (best-effort): fold this run's token usage into the
+  // run-scoped ledger under the implementer role. Never throws.
+  await captureRoleCost(ctx.costLedger, "implementer", r, ctx.deps.logError);
   // Per-issue skill-discipline gate — RE-PROMOTED to a hard throw per
   // ADR 0006 v3. Original v1 demotion to telemetry assumed critique-as-gate
   // fully replaced this check, but empirical log analysis (see
@@ -4595,6 +4659,8 @@ async function runReviewer(
     `reviewer (issue=${ctx.issueNumber})`,
     "reviewer",
   );
+  // Phase-1 cost telemetry (best-effort).
+  await captureRoleCost(ctx.costLedger, "reviewer", r, ctx.deps.logError);
   try {
     const marker = extractMarker(
       r.stdout,
@@ -4651,6 +4717,8 @@ async function runRecovery(
         DIAGNOSE_HINT: diagnoseHint,
       },
     });
+    // Phase-1 cost telemetry (best-effort).
+    await captureRoleCost(ctx.costLedger, "recovery", r, ctx.deps.logError);
     const marker = extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
     return { marker };
   } catch (err) {
@@ -4772,8 +4840,8 @@ export async function runCritique(
   // One critique dispatch + verdict parse. marker=null means the sub-agent
   // emitted no recognizable marker (malformed) — the caller fails closed
   // per attempt. Collapses the two formerly-duplicated sandbox.run blocks.
-  const runCritiqueOnce = (name: string): Promise<{ stdout: string }> =>
-    sandbox.run({
+  const runCritiqueOnce = async (name: string): Promise<{ stdout: string }> => {
+    const r = await sandbox.run({
       name,
       maxIterations: 1,
       model: ctx.args.critiqueModel,
@@ -4788,6 +4856,11 @@ export async function runCritique(
         REQUIRED_PRINCIPLES: requiredSkills.join(", "),
       },
     });
+    // Phase-1 cost telemetry (best-effort) — captures every critique dispatch,
+    // including the no-verdict retry, since both flow through here.
+    await captureRoleCost(ctx.costLedger, "critique", r, ctx.deps.logError);
+    return r;
+  };
   const dispatchCritique = async (
     name: string,
   ): Promise<{ marker: CritiqueVerdict | null; stdout: string }> => {
@@ -5999,6 +6072,11 @@ export async function runMain(
     },
     { onError: (err) => deps.logError(`status write failed: ${(err as Error).message}`) },
   );
+  // Run-scoped Phase-1 cost ledger. Threaded through PipelineCtx to the
+  // per-issue role runners and referenced directly at the run-level (planner /
+  // merger / post-merge) sites. Its `summary()` is logged at run end and its
+  // total is sunk into status.json. Best-effort — capture never fails a run.
+  const costLedger = new CostLedger();
   // Keep-alive: a phase can run for many minutes without a transition (the log
   // shows a 1200s idle phase), so without this the viewer would mislabel a
   // healthy loop "stale" within seconds. The timer is `unref`'d and cleared by
@@ -6327,6 +6405,12 @@ export async function runMain(
             },
           });
           plannerStdout = planResult.stdout;
+          // Phase-1 cost telemetry (best-effort). NOTE: the top-level runner
+          // (deps.run → provider.topLevelRun in sandbox-provider.ts) does not
+          // forward per-iteration session metadata today, so this is a no-op in
+          // production until that adapter is widened; wired now so it starts
+          // crediting the planner automatically once it is.
+          await captureRoleCost(costLedger, "planner", planResult, deps.logError);
         } catch (err) {
           deps.logError(`planner failed: ${(err as Error).message}`);
           return {
@@ -6519,6 +6603,7 @@ export async function runMain(
               requiredSkills: perIssueRequiredSkills.get(p.id),
               typeLabel: perIssueTypeLabel.get(p.id),
               status: statusStore,
+              costLedger,
             };
             const outcome = await runIssuePipeline(ctx);
             return { issue: p, issueNumber, outcome };
@@ -6783,7 +6868,7 @@ export async function runMain(
 
       let mergerOk = true;
       try {
-        await deps.run({
+        const mergerResult = await deps.run({
           name: "merger",
           maxIterations: 1,
           model: args.mergerModel,
@@ -6796,6 +6881,9 @@ export async function runMain(
             ISSUES: issuesArg,
           },
         });
+        // Phase-1 cost telemetry (best-effort). No-op until the top-level
+        // adapter forwards session metadata — see the planner-site note.
+        await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
       } catch (err) {
         mergerOk = false;
         deps.logError(
@@ -6890,6 +6978,9 @@ export async function runMain(
               ),
             },
           });
+          // Phase-1 cost telemetry (best-effort). No-op until the top-level
+          // adapter forwards session metadata — see the planner-site note.
+          await captureRoleCost(costLedger, "postMergeReviewer", r, deps.logError);
           // "contains" mode: the reviewer sometimes writes its verdict marker
           // inside a closing sentence ("Review is done: POST_MERGE_ALL_CLEAR.")
           // rather than on a bare line — that wrongly quarantined whole merged
@@ -7007,6 +7098,14 @@ export async function runMain(
             }
           }
           skillsInvokedByIssue.set("fixer", fixerSkillsInvoked);
+          // Phase-1 cost telemetry (best-effort). No-op until the top-level
+          // adapter forwards session metadata — see the planner-site note.
+          await captureRoleCost(
+            costLedger,
+            "postMergeFixer",
+            fixerResult,
+            deps.logError,
+          );
 
           // Post-merge fixer skill-discipline telemetry (DEMOTED — was a hard
           // gate before, but the gate had the exact gaming pattern that
@@ -7396,6 +7495,21 @@ export async function runMain(
       quarantinedIssues,
     };
   } finally {
+    // Phase-1 cost telemetry: log the per-role breakdown + total and sink the
+    // total into status.json. Runs on EVERY exit path (this is the one hook all
+    // paths pass through), AFTER `finish()` has stamped the terminal state — a
+    // trailing synchronous commit that just adds `totals.totalCostUsd`. Purely
+    // best-effort: an estimate for relative comparison, wrapped so a telemetry
+    // hiccup can never mask the real exit.
+    try {
+      const cost = costLedger.summary();
+      if (Object.keys(cost.perRole).length > 0 || cost.unpricedModels.length > 0) {
+        deps.log(formatCostSummary(cost));
+      }
+      if (cost.totalCostUsd > 0) statusStore.recordCost(cost.totalCostUsd);
+    } catch (err) {
+      deps.logError(`cost summary skipped: ${(err as Error).message}`);
+    }
     // Always stop the lease heartbeat, on every exit path (clean, error,
     // circuit-breaker return, hot-reload). undefined when the lease is off.
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
