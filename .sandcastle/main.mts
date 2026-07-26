@@ -110,15 +110,10 @@ import {
   findLoadableRubrics,
   MissingRequiredSkillsError,
   parseRequiredSkillsByType,
-  resolveSessionFilePath,
   validateRequiredSkillsInvoked,
 } from "./lib/skill-discipline.js";
-import {
-  CostLedger,
-  formatCostSummary,
-  type CostRole,
-} from "./lib/cost/ledger.js";
-import { extractUsageFromSession } from "./lib/cost/session-usage.js";
+import { CostLedger, formatCostSummary } from "./lib/cost/ledger.js";
+import { captureRoleCost } from "./lib/cost/capture.js";
 import {
   envForModel,
   backendForModel,
@@ -3868,40 +3863,9 @@ export function cleanupIssueBranch(
   }
 }
 
-/**
- * Phase-1 cost telemetry capture — BEST-EFFORT, never fails a run.
- *
- * Given a completed role's {@link RunHandle}, resolve each iteration's session
- * JSONL (reusing the skill-discipline resolver) and fold its per-model token
- * usage into the run-scoped {@link CostLedger} under `role`. The model
- * attribution comes from the session JSONL itself (`message.model`), so we
- * don't pass a dispatched-model hint. Any failure — unresolved path, unreadable
- * file, parse error — is swallowed: telemetry must never break the loop. Only
- * the Claude session layout is parsed; Codex rollouts have a different shape and
- * simply yield no usage (and Codex models are unpriced anyway).
- */
-async function captureRoleCost(
-  ledger: CostLedger | undefined,
-  role: CostRole,
-  handle: RunHandle | undefined,
-  logError: (line: string) => void,
-): Promise<void> {
-  if (ledger === undefined) return;
-  try {
-    for (const it of handle?.iterations ?? []) {
-      const path = await resolveSessionFilePath(it);
-      if (path === undefined) continue;
-      const entries = extractUsageFromSession(path);
-      if (entries.length > 0) ledger.add(role, entries);
-    }
-  } catch (err) {
-    try {
-      logError(`cost capture (${role}) skipped: ${(err as Error).message}`);
-    } catch {
-      // never fail a run over telemetry, not even the error log
-    }
-  }
-}
+// Phase-1 cost telemetry capture (captureRoleCost) lives in
+// ./lib/cost/capture.ts (imported above) so its "never throw into a run"
+// contract is unit-testable directly instead of only through a full runMain.
 
 interface PipelineCtx {
   readonly args: SandcastleArgs;

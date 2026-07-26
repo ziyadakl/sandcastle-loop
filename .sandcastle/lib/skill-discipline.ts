@@ -42,7 +42,8 @@
  *      outcome-gate). See `docs/adr/0006-sandcastle-critique-as-gate.md`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { forEachAssistantMessage } from "./session-jsonl.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findClaudeSessionOnHost, findCodexSessionOnHost } from "@ai-hero/sandcastle";
@@ -138,31 +139,11 @@ export async function resolveSessionFilePath(
 export function extractSkillInvocationsFromSession(
   sessionFilePath: string | undefined,
 ): readonly string[] {
-  if (sessionFilePath === undefined) return [];
-  if (!existsSync(sessionFilePath)) return [];
-  let raw: string;
-  try {
-    raw = readFileSync(sessionFilePath, "utf8");
-  } catch {
-    return [];
-  }
   const out: string[] = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
-    if (!trimmed.startsWith("{")) continue;
-    let obj: unknown;
-    try {
-      obj = JSON.parse(trimmed);
-    } catch {
-      continue; // partial / corrupt line — skip silently
-    }
-    if (typeof obj !== "object" || obj === null) continue;
-    const o = obj as { type?: unknown; message?: unknown };
-    if (o.type !== "assistant") continue;
-    const message = o.message as { content?: unknown } | null | undefined;
-    if (!message || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
+  forEachAssistantMessage(sessionFilePath, (message) => {
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
       if (typeof block !== "object" || block === null) continue;
       const b = block as { type?: unknown; name?: unknown; input?: unknown };
       if (b.type !== "tool_use") continue;
@@ -172,7 +153,7 @@ export function extractSkillInvocationsFromSession(
         out.push(input.skill);
       }
     }
-  }
+  });
   return out;
 }
 

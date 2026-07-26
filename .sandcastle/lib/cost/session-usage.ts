@@ -1,27 +1,19 @@
 /**
  * Extract per-model token usage from a captured Claude Code session JSONL.
  *
- * This is the cost analogue of
- * `skill-discipline.ts:extractSkillInvocationsFromSession` and deliberately
- * MIRRORS its file-walk exactly: readFileSync, split on newlines, JSON.parse
- * each line, filter `o.type === "assistant"`, read `message`. The one
- * difference is what we harvest — here it's `message.model` + `message.usage`
- * (the token counts) instead of `Skill` tool_use blocks.
- *
- * Robustness contract (identical to the skill-discipline extractor — telemetry
- * is BEST-EFFORT and must NEVER throw into a run):
- *   - undefined path or non-existent file → `[]`.
- *   - unreadable file → `[]`.
- *   - malformed / partial JSON lines → skipped silently (a killed agent leaves
- *     truncated logs).
- *   - non-assistant lines, or assistant lines with no `message.usage` → skipped.
- *   - missing individual usage sub-fields default to 0.
+ * The cost analogue of `skill-discipline.ts:extractSkillInvocationsFromSession`:
+ * both walk the session JSONL via the shared {@link forEachAssistantMessage}
+ * (the single source of the read/parse/filter robustness contract — missing or
+ * unreadable file and malformed lines are skipped, never thrown). This extractor
+ * harvests `message.model` + `message.usage` (token counts) instead of `Skill`
+ * tool_use blocks; an assistant line with no usage (or no string model) is
+ * skipped, and missing individual usage sub-fields default to 0.
  *
  * The JSONL usage fields are snake_case; we map them to camelCase so the rest
  * of the cost pipeline (pricing.ts, ledger.ts) never sees the wire shape.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { forEachAssistantMessage } from "../session-jsonl.js";
 import type { Usage } from "./pricing.js";
 
 /** One model's aggregated usage across every assistant line in a session. */
@@ -42,35 +34,17 @@ function num(v: unknown): number {
 export function extractUsageFromSession(
   sessionFilePath: string | undefined,
 ): ModelUsage[] {
-  if (sessionFilePath === undefined) return [];
-  if (!existsSync(sessionFilePath)) return [];
-  let raw: string;
-  try {
-    raw = readFileSync(sessionFilePath, "utf8");
-  } catch {
-    return [];
-  }
   // Preserve first-seen order while aggregating by model.
   const order: string[] = [];
   const acc = new Map<string, { input: number; output: number; write: number; read: number }>();
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
-    if (!trimmed.startsWith("{")) continue;
-    let obj: unknown;
-    try {
-      obj = JSON.parse(trimmed);
-    } catch {
-      continue; // partial / corrupt line — skip silently
-    }
-    if (typeof obj !== "object" || obj === null) continue;
-    const o = obj as { type?: unknown; message?: unknown };
-    if (o.type !== "assistant") continue;
-    const message = o.message as { model?: unknown; usage?: unknown } | null | undefined;
-    if (!message || typeof message.model !== "string") continue;
-    const usage = message.usage as Record<string, unknown> | null | undefined;
-    if (!usage || typeof usage !== "object") continue;
-    const model = message.model;
+  forEachAssistantMessage(sessionFilePath, (message) => {
+    const model = (message as { model?: unknown }).model;
+    if (typeof model !== "string") return;
+    const usage = (message as { usage?: unknown }).usage as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!usage || typeof usage !== "object") return;
     let bucket = acc.get(model);
     if (bucket === undefined) {
       bucket = { input: 0, output: 0, write: 0, read: 0 };
@@ -81,7 +55,7 @@ export function extractUsageFromSession(
     bucket.output += num(usage.output_tokens);
     bucket.write += num(usage.cache_creation_input_tokens);
     bucket.read += num(usage.cache_read_input_tokens);
-  }
+  });
   return order.map((model) => {
     const b = acc.get(model)!;
     return {
