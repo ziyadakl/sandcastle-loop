@@ -17,6 +17,8 @@ export {
   transitionLabel,
   closeIssue,
   getIssueBody,
+  getIssueClosure,
+  parseSupersededBy,
   // V1 label-state-machine surface.
   listReadyIssues,
   listIssuesByLabel,
@@ -48,6 +50,8 @@ export type {
   LabelledIssueSummary,
   OpenIssueWithBody,
 } from "./gh.js";
+
+export { collectIssueRefs } from "./issue-refs.js";
 
 export { withPrdLock, withSingleInstance, acquireSingleInstanceLock } from "./locks.js";
 

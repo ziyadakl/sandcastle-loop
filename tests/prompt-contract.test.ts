@@ -131,6 +131,16 @@ describe("lint-gate ↔ prompt contract", () => {
     expect(reviewPrompt).toMatch(/Test suite/);
     expect(reviewPrompt).toMatch(/RUN the project's test script/i);
   });
+
+  it("the reviewer confirms user-facing exports are reachable via a CATEGORY SWEEP line", () => {
+    // Slice A: catches "correct + tested but nothing calls it" — an exported
+    // tRPC procedure / route / top-level component with no real non-test
+    // caller. Pin the load-bearing rule, not just the heading, so the guidance
+    // (caller check + escape hatch) can't be gutted while the test stays green.
+    expect(reviewPrompt).toMatch(/Reachability/);
+    expect(reviewPrompt).toMatch(/real NON-TEST caller/);
+    expect(reviewPrompt).toMatch(/Wiring tracked in #NNN/);
+  });
 });
 
 describe("reviewer reviews the cumulative branch diff (issue #340)", () => {

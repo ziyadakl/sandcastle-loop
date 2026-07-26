@@ -280,6 +280,22 @@ Category-specific guidance:
   leak — see the credential carve-out above.)
 - **Error handling**: failure paths with no fallback or logging?
 - **Edge cases**: off-by-one, empty arrays, null inputs, concurrent access?
+- **Reachability**: if the diff adds or exports a user-facing capability —
+  something meant to be invoked from the running app (in THIS project's stack
+  that might be a route/RPC handler, a CLI command, an exported top-level UI
+  component, a queue/event consumer, etc.) — confirm a real NON-TEST caller
+  exists. Use the project's OWN source layout: `git grep <exported symbol>`
+  scoped to wherever this repo keeps source (`src/`, `app/`, `apps/**`, `lib/`,
+  `pkg/`, … — whatever applies here), excluding tests (append
+  `':!*.test.*' ':!*.spec.*' ':!**/__tests__/**'` or the repo's test convention).
+  Do NOT assume a monorepo `apps/**` layout if this repo isn't one. Zero callers
+  is a MEDIUM finding by default, and HARD if the issue's own acceptance criteria
+  claim end-to-end / user-facing behaviour (e.g. "a user does X and sees Y").
+  Escape hatch (must be explicit, never assumed): a slice may legitimately be
+  backend-only when its paired "wire it in" work is a separate, NAMED issue —
+  the issue body or the commit must say e.g. `Wiring tracked in #NNN`. Absent a
+  named wiring issue, unreachable user-facing code is a finding, not an accepted
+  split. Target user-facing exports only — NOT every new internal helper.
 - **Skill discipline**: only if SANDCASTLE.md exists at the repo root.
 
   1. Read SANDCASTLE.md.
@@ -399,6 +415,7 @@ CATEGORY SWEEP:
 - Security: <ok | n/a (...) | <finding>>
 - Error handling: <ok | n/a (...) | <finding>>
 - Edge cases: <ok | n/a (...) | <finding>>
+- Reachability: <ok | n/a (...) | <finding>>
 - Skill discipline: <ok | n/a (...) | <finding>>
 - Migration schema qualification: <ok | n/a (...) | <finding>>
 - Lint / code style: <ok | n/a (...) | <finding>>

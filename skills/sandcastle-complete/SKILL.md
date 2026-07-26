@@ -61,6 +61,8 @@ Subagent generates: per-issue commits, files touched, diffstat vs `origin/main`,
 
 Per closed issue, verify by **content on main** (Rule 3). Classify: already-shipped · **partially-shipped** (some feature files present, others missing → salvage the missing slice, never "done") · superseded (verify by _intent_ — does main actually consume the purpose-built code? Rule 6) · needs-salvage (unshipped, stranded) · dead. Evidence-backed ledger, one line + verdict + proof each.
 
+**The GitHub close-reason is not proof of ship — treat it as UNPROVEN.** Any close whose reason is **not `COMPLETED`** (`NOT_PLANNED`, `DUPLICATE`, …), including a "superseded by #N" close, means the behaviour was never certified here. Read it deterministically: `tsx .sandcastle/scripts/issue-closure.mts <n>` (core `getIssueClosure` + `parseSupersededBy` in `.sandcastle/lib/state/gh.ts`) prints PROVEN vs UNPROVEN and, on a supersession, the successor issue numbers — it reads the issue body + every comment, where the "superseded by #N" note actually lives (the reason alone can't see it). On a supersession, **follow the chain, don't trust it**: prove the _destination_ issue's behaviour actually landed on main by **content** (Rule 3) + the wired-end-to-end check Stage 7 applies. If the chain dead-ends without landed, content-verified, reachable code, the scope is needs-salvage/dead — never "done". (This is exactly how a re-filed scope closed as "superseded by #N" after an e2e timeout was never wired and still read as shipped.)
+
 ### 5 — Safe extraction (stranded work → main)
 
 Per needs-salvage branch: Rule 2 (name landmine files, exclude them). Prefer additive-only cherry-pick; if the WIP→finalize chain degenerates into empty commits (common on divergent bases, esp. security code), fall back to per-file base-relative reconstruction with a required test gate. Each extraction = its own PR/branch, typecheck + targeted tests before push.
@@ -78,6 +80,7 @@ Standing checks every completion, subagents returning file:line evidence:
 - **Wired end-to-end:** grep callers of every new procedure (exclude `.next`/`dist`); a closed issue with zero callers is not done.
 - **Security/tenancy:** RLS `ENABLE`+policy on every new tenant table; route-guard (not just nav-hiding) on gated pages; no exported RLS-bypass procedure factories; IDOR on id-only lookups; secret/credential scan.
 - **Money/parity (project-specific):** no hardcoded side/status/role derivations; per-type flows diffed against the system-of-record before cutover. Block go-live on unverified parity.
+- **Deploy-config blind spots (ops-config to-do):** the sandbox cannot see production scheduling or secrets, so a slice can ship green and still be inert live. On EVERY run, look for deploy config the sandbox can't verify — **scheduled jobs** (a shipped handler does nothing until something calls it on an interval) and **newly-required secrets/env** — in whatever form THIS project uses (Vercel `vercel.json` crons, GitHub Actions `schedule:`, a system crontab, k8s `CronJob`, Fly/Render config; `process.env` / `os.environ` / `ENV[...]` reads). For a JS/TS-on-Vercel repo, `tsx .sandcastle/scripts/scan-ops-config.mts` (pure core `scanOpsConfig` in `.sandcastle/lib/ops-config/scan.ts`) auto-surfaces the common cron-route + `process.env` cases; on other stacks it prints `none` by design, so inspect the diff yourself for that stack's equivalents. Emit each blind spot as an explicit **ops-config to-do** in the run ledger (Stage 11) so the human owner provisions it — the loop cannot verify these itself, so an unowned one silently stops running (exactly how an emptied `vercel.json` left a background-read drainer un-scheduled).
 
 ### 8 — Land on main + push
 
@@ -104,7 +107,7 @@ Delete with `git update-ref -d <ref>` locally and per host (over `ssh <transport
 
 ### 11 — Durable run ledger + then hand to clean
 
-Write everything (manifest, adjudication, findings→spec traceability, decisions, deferred debt) to **`docs/sandcastle/runs/<run>.md` committed** AND a **GitHub tracking issue**. Deferred items carry a "dismissed by user" state so nothing re-surfaces after a ruling. **Then hand off to `sandcastle-clean`** to reap the now-terminal leftovers — do not delete them yourself.
+Write everything (manifest, adjudication, findings→spec traceability, decisions, deferred debt, **and any ops-config to-dos from Stage 7**) to **`docs/sandcastle/runs/<run>.md` committed** AND a **GitHub tracking issue**. Deferred items carry a "dismissed by user" state so nothing re-surfaces after a ruling. **Then hand off to `sandcastle-clean`** to reap the now-terminal leftovers — do not delete them yourself.
 
 ## The decision sheet (how you involve the user — business-first)
 
