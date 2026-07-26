@@ -8,6 +8,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
 
+import { collectIssueRefs } from "./issue-refs.js";
+
 const execFileP = promisify(execFile);
 
 const GH_BIN = "gh";
@@ -269,6 +271,114 @@ export async function closeIssue(
     args.push("--comment", comment);
   }
   await runGh(args);
+}
+
+/**
+ * Injectable command runner for {@link getIssueClosure}. Mirrors the shape of
+ * the module-level `runGh`; tests pass a stub so the JSON parsing can be driven
+ * deterministically without a child_process mock. Production callers omit it.
+ */
+export interface GetIssueClosureDeps {
+  runGh?: (args: string[]) => Promise<RunResult>;
+}
+
+/** `gh issue view --json state,stateReason,body,comments` output shape. */
+const IssueClosureShape = z.object({
+  state: z.string().optional(),
+  stateReason: z.string().nullable().optional(),
+  body: z.string().nullable().optional(),
+  comments: z
+    .array(z.object({ body: z.string().nullable().optional() }))
+    .optional(),
+});
+
+/**
+ * Fetch a GH issue's open/closed state, its state reason, and the free text a
+ * "superseded by #N" reference would live in (issue body + every comment).
+ *
+ * `gh` reports `state` as `"OPEN" | "CLOSED"` and `stateReason` as one of
+ * GitHub's `IssueStateReason` values (`COMPLETED`, `NOT_PLANNED`, `DUPLICATE`,
+ * `REOPENED`, …) or `null`/`""`. We normalize `state` to lowercase and pass the
+ * reason through RAW (empty → `null`) — deliberately NOT enumerating it — so the
+ * caller can treat **any closed issue whose `stateReason !== "COMPLETED"`** as
+ * UNPROVEN. Enumerating would silently drop future/other not-done reasons (a
+ * `DUPLICATE` close is exactly a superseded-style close that must not read as
+ * shipped).
+ *
+ * A GitHub "superseded" close is a not-completed reason PLUS a human comment
+ * naming the successor — the reason alone cannot see it. So we also return
+ * `closeText` (body + all comment bodies) as the sourced input for
+ * {@link parseSupersededBy}, rather than leaving the completion agent to
+ * hand-run `gh issue view` for it.
+ */
+export async function getIssueClosure(
+  issueNum: number,
+  deps?: GetIssueClosureDeps,
+): Promise<{
+  state: "open" | "closed";
+  stateReason: string | null;
+  closeText: string;
+}> {
+  if (!Number.isInteger(issueNum) || issueNum <= 0) {
+    throw new Error(`getIssueClosure: invalid issueNum '${issueNum}'`);
+  }
+  const run = deps?.runGh ?? runGh;
+  const { stdout } = await run([
+    "issue",
+    "view",
+    String(issueNum),
+    "--json",
+    "state,stateReason,body,comments",
+  ]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout || "{}");
+  } catch (err) {
+    throw new Error(
+      `getIssueClosure(${issueNum}): failed to parse gh output as JSON: ${
+        (err as Error).message
+      }`,
+    );
+  }
+  const result = IssueClosureShape.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `getIssueClosure(${issueNum}): unexpected gh output shape: ${result.error.message}`,
+    );
+  }
+  const data = result.data;
+  const state =
+    String(data.state ?? "").toLowerCase() === "closed" ? "closed" : "open";
+  // Pass the reason through raw (empty → null). Callers key "unproven" on
+  // `stateReason !== "COMPLETED"`, so we must NOT collapse DUPLICATE/other
+  // not-done reasons here.
+  const reason = data.stateReason;
+  const stateReason =
+    typeof reason === "string" && reason !== "" ? reason : null;
+  const closeText = [
+    data.body ?? "",
+    ...(data.comments ?? []).map((c) => c.body ?? ""),
+  ]
+    .filter((s) => s !== "")
+    .join("\n");
+  return { state, stateReason, closeText };
+}
+
+/**
+ * Pure extractor for "superseded by #N" references in issue-close text.
+ *
+ * Collects the `#N` references that appear AFTER a supersession phrase
+ * (`superseded`, case-insensitive) up to the end of that line — i.e. the
+ * successor refs, not any predecessor mentioned earlier on the line. Returns
+ * de-duplicated issue numbers in first-seen order; `[]` when there is no
+ * supersession language (a bare `#N` with no such phrase is ignored).
+ */
+export function parseSupersededBy(text: string): number[] {
+  if (text.length === 0) return [];
+  // Gather the tail of every supersession line, then run the canonical `#N`
+  // sweep once (it dedupes first-seen across the joined text).
+  const supersededText = (text.match(/superseded[^\n]*/gi) ?? []).join("\n");
+  return collectIssueRefs(supersededText);
 }
 
 /**

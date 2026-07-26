@@ -63,6 +63,7 @@ import {
   listWipRefIssues,
   STAGING_BRANCH,
   handleStrandedPromotion,
+  collectIssueRefs,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
@@ -3527,11 +3528,10 @@ export function parsePlan(stdout: string): PlanIssue[] {
 export function parseBlockedBy(body: string): number[] {
   if (typeof body !== "string" || body.length === 0) return [];
   const found = new Set<number>();
+  // Canonical `#N` sweep (shared with parseSupersededBy); this parser dedupes
+  // via `found` and returns ascending below, so first-seen order is irrelevant.
   const addRefs = (text: string): void => {
-    for (const ref of text.matchAll(/#(\d+)/g)) {
-      const n = Number(ref[1]);
-      if (Number.isInteger(n) && n > 0) found.add(n);
-    }
+    for (const n of collectIssueRefs(text)) found.add(n);
   };
   // Form 1 — inline directive: `Blocked by: #N` (case-insensitive, hyphen ok).
   // Match the directive, then sweep the rest of that line for `#N` tokens.
