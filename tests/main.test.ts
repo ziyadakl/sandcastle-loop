@@ -108,7 +108,7 @@ import {
   strandRef,
   wipRef,
 } from "../.sandcastle/lib/state/index.js";
-import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
+import type { LockLease, LockBackend, LockDeps, CheckpointStopResult } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
@@ -180,6 +180,14 @@ interface MockState {
   // asserted without a real git remote (status-sync.ts is proven separately).
   publishStatusCalls: string[];
   fetchStatusPeersCalls: string[];
+  // ADR 0021 launch-time reaper (Fix 2) — count invocations so the startup
+  // suite can assert the reaper fires on a crashed prior status and is skipped
+  // on a live one, without a real git worktree (checkpointStop is proven in
+  // tests/checkpoint-stop.test.ts + tests/checkpoint-resume-e2e.test.ts).
+  checkpointInflightCalls: number;
+  // Snapshot of `releases.length` captured AT the reaper call, or -1 if never
+  // called. 0 proves the reaper ran BEFORE reconciliation released anything.
+  checkpointInflightReleasesAtCall: number;
   // Ordered event log across mock deps so tests can assert RELATIVE ordering
   // (e.g. lane publish must fire AFTER the Phase-3 merger lands the work on the
   // launch branch, not before). Each recorder pushes a marker onto this array.
@@ -211,6 +219,8 @@ function newState(): MockState {
     publishLaneCalls: [],
     publishStatusCalls: [],
     fetchStatusPeersCalls: [],
+    checkpointInflightCalls: 0,
+    checkpointInflightReleasesAtCall: -1,
     eventOrder: [],
   };
 }
@@ -281,6 +291,9 @@ function buildDeps(opts: {
   leaseFenceValue?: boolean;
   /** Per-issue override for fenceIssue; wins over leaseFenceValue. */
   leaseFenceFor?: (issueNum: number) => boolean;
+  /** ADR 0021 launch-time reaper (Fix 2): canned results the recorder returns.
+   *  Defaults to none (empty). Tests that assert the log line set this. */
+  checkpointInflightResults?: readonly CheckpointStopResult[];
 } = {}): DepsBuilder {
   const state = newState();
   const queues = new Map<string, RunOutcome[]>();
@@ -441,6 +454,16 @@ function buildDeps(opts: {
     async fetchStatusPeers(runId) {
       state.fetchStatusPeersCalls.push(runId);
       return [];
+    },
+    async checkpointInflight() {
+      // ADR 0021 launch-time reaper (Fix 2): record the invocation so the
+      // startup-reconcile suite can assert it fired (crashed prior) or did NOT
+      // (live prior). Snapshot releases.length so a 0 proves the reaper ran
+      // BEFORE reconciliation released any orphan. Returns the caller-supplied
+      // canned results (default none).
+      state.checkpointInflightCalls += 1;
+      state.checkpointInflightReleasesAtCall = state.releases.length;
+      return opts.checkpointInflightResults ?? [];
     },
     log(line) {
       state.logs.push(line);
@@ -4943,6 +4966,7 @@ function makeNoopDeps(): Deps {
     publishLane: unused,
     publishStatus: unused,
     fetchStatusPeers: unused,
+    checkpointInflight: unused,
     log: () => undefined,
     logError: () => undefined,
   };
@@ -6934,6 +6958,100 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     expect(b.state.releases.map((r) => r.issueNum).sort()).toEqual([10, 11, 12]);
     // The lease was never consulted.
     expect(b.state.leaseStateCalls).toEqual([]);
+  });
+
+  // Hook 4b — ADR 0021 launch-time reaper (Fix 2). Gated on the prior run's
+  // liveness: it fires when the previous status.json proves a hard crash, and is
+  // skipped when the prior run is still live. Uses a per-test repoRoot so the
+  // seeded prior status.json isn't the shared TEST_REPO_ROOT's.
+  function seedPriorStatus(
+    repoRoot: string,
+    fields: { state: string; updatedAt: string; pid: number; hostId: string },
+  ): void {
+    mkdirSync(path.join(repoRoot, ".sandcastle"), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, ".sandcastle", "status.json"),
+      JSON.stringify(fields),
+    );
+  }
+
+  it("hook 4b: crashed prior run → reaper fires BEFORE reconciliation releases", async () => {
+    process.env.SANDCASTLE_HOST_ID = "reaper-host";
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-reaper-"));
+    try {
+      // Prior status: OUR host, `running`, but its pid is dead → deriveLiveness
+      // returns `crashed` → not live → reaper must run. A huge pid can never be
+      // signalled, so the probe reports it gone.
+      seedPriorStatus(repoRoot, {
+        state: "running",
+        updatedAt: new Date().toISOString(),
+        pid: 2_147_483_646,
+        hostId: "reaper-host",
+      });
+      const b = buildDeps();
+      // Seed one orphaned in-progress issue so we can prove the reaper runs
+      // BEFORE the reconciliation release below.
+      b.deps.listIssuesByLabel = async (label) =>
+        label === "in-progress"
+          ? [{ number: 7, title: "orphan", labels: ["in-progress"] }]
+          : [];
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+
+      const result = await runMain(baseArgs({ iterations: 1, repoRoot }), b.deps);
+
+      expect(result.exitCode).toBe(0);
+      // The reaper fired exactly once...
+      expect(b.state.checkpointInflightCalls).toBe(1);
+      // ...BEFORE reconciliation released the orphan (0 releases at call time)...
+      expect(b.state.checkpointInflightReleasesAtCall).toBe(0);
+      // ...and reconciliation still released the orphan afterwards.
+      expect(b.state.releases.map((r) => r.issueNum)).toContain(7);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("hook 4b: live prior run → reaper is NOT invoked", async () => {
+    process.env.SANDCASTLE_HOST_ID = "reaper-host";
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-reaper-"));
+    try {
+      // Prior status: OUR host, `running`, pid = THIS process (alive) + fresh
+      // timestamp → deriveLiveness returns live → reaper must be skipped.
+      seedPriorStatus(repoRoot, {
+        state: "running",
+        updatedAt: new Date().toISOString(),
+        pid: process.pid,
+        hostId: "reaper-host",
+      });
+      const b = buildDeps();
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+
+      const result = await runMain(baseArgs({ iterations: 1, repoRoot }), b.deps);
+
+      expect(result.exitCode).toBe(0);
+      // A live prior run means nothing dead to reap — no git work at all.
+      expect(b.state.checkpointInflightCalls).toBe(0);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("hook 4b: no prior status.json → reaper still runs (self-gating no-op)", async () => {
+    process.env.SANDCASTLE_HOST_ID = "reaper-host";
+    // Fresh repoRoot with NO prior status.json → the gate falls through to the
+    // reaper, which self-gates to a no-op via empty worktree discovery.
+    const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-reaper-"));
+    try {
+      const b = buildDeps();
+      b.enqueue("planner", { stdout: plannerStdout([]) });
+
+      const result = await runMain(baseArgs({ iterations: 1, repoRoot }), b.deps);
+
+      expect(result.exitCode).toBe(0);
+      expect(b.state.checkpointInflightCalls).toBe(1);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 
   // Hook 5 — heartbeat.

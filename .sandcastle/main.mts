@@ -64,12 +64,16 @@ import {
   STAGING_BRANCH,
   handleStrandedPromotion,
   collectIssueRefs,
+  checkpointStop,
+  formatCheckpointStop,
+  makeExecFileGitRunner,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
   LaneSyncResult,
   PublishResult,
   GitRunner,
+  CheckpointStopResult,
 } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
@@ -85,6 +89,7 @@ import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, 
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
+import { deriveLiveness } from "./lib/status/liveness.js";
 import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
 import {
   applyMigrationsBetween,
@@ -594,6 +599,21 @@ export interface Deps {
    * any fault at any step skips the bad peer, worst case returning `[]`.
    */
   fetchStatusPeers(runId: string): Promise<SandcastleStatus[]>;
+  /**
+   * ADR 0021 LAUNCH-TIME REAPER (Fix 2). Discover any orphaned `agent/issue-<N>`
+   * worktree left behind by a HARD-killed prior loop (SIGKILL/OOM/laptop sleep),
+   * checkpoint its in-flight WIP to the issue's WIP ref and RELEASE its lease —
+   * the exact post-kill reap the graceful `--now` stop performs, now also run at
+   * startup so a crashed run's work is rescued before the new loop begins. Wraps
+   * {@link checkpointStop} bound to a real git runner in production; tests inject
+   * a recorder. Called BEFORE startup label/lease reconciliation so WIP is saved
+   * before the reconcile frees the issue for re-claim. Best-effort + NON-FATAL:
+   * the caller wraps it so a fault only logs and never blocks the loop starting.
+   * NO-OP on a clean launch — discovery returns empty when no agent worktrees
+   * survive — and the caller additionally gates the whole call on a liveness
+   * probe of the prior status so a normal (live) start does no git work at all.
+   */
+  checkpointInflight(): Promise<readonly CheckpointStopResult[]>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -3524,6 +3544,29 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // Fail-soft inside the module: never throws, worst case returns [].
       return statusSync.fetchPeers(runId);
     },
+    async checkpointInflight() {
+      // ADR 0021 launch-time reaper: bind the proven post-kill `checkpointStop`
+      // to a real git runner and the current run's config, mirroring the thin
+      // `scripts/checkpoint-stop.mts` runner (same hostId + integration-branch
+      // resolution). `integrationBranch` is the run branch — commits a surviving
+      // worktree has that the run branch does not are the rescued WIP, exactly
+      // what the `--now` skill passes as `--integration-branch <run-branch>`.
+      // `stagingBranch: null` SKIPS the certified-but-unpromoted staging strand
+      // backup — that is the graceful `--now` stop's job (it runs when no agent
+      // is active); the launch-time reaper only rescues per-issue worktrees.
+      // The origin write it does perform (WIP push + lease delete) mirrors the
+      // existing `--now` behavior and needs no new auth beyond what checkpoint-
+      // stop already assumes; `syncEnabled` gates only the NEW strand write,
+      // which is skipped here anyway.
+      return checkpointStop(makeExecFileGitRunner(), {
+        repoRoot: args.repoRoot,
+        hostId: resolveHostId(),
+        integrationBranch: args.branch,
+        remote: "origin",
+        stagingBranch: null,
+        syncEnabled: crossHostSyncEnabled(),
+      });
+    },
     log,
     logError: logErr,
   };
@@ -6040,6 +6083,37 @@ async function publishLaneOrLog(
 // ---------------------------------------------------------------------------
 
 /**
+ * Best-effort read of the PRIOR run's status.json, reduced to just the fields
+ * {@link deriveLiveness} consumes, for the ADR 0021 launch-time reaper gate
+ * (Fix 2). Returns `null` when the file is absent / unreadable / unparseable /
+ * missing the required fields — the caller treats `null` as "no evidence either
+ * way" and lets the reaper's own empty-discovery no-op self-gate. NEVER throws:
+ * a torn status file must not block startup.
+ */
+export function readPriorStatusForLiveness(
+  repoRoot: string,
+): { state: string; updatedAt: string; pid?: number; hostId?: string } | null {
+  const statusPath = path.join(repoRoot, ".sandcastle", "status.json");
+  if (!existsSync(statusPath)) return null;
+  try {
+    const raw = JSON.parse(
+      readFileSync(statusPath, "utf8"),
+    ) as Partial<SandcastleStatus>;
+    if (typeof raw.state !== "string" || typeof raw.updatedAt !== "string") {
+      return null;
+    }
+    return {
+      state: raw.state,
+      updatedAt: raw.updatedAt,
+      ...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
+      ...(typeof raw.hostId === "string" ? { hostId: raw.hostId } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Drive the orchestrator. Returns a structured result instead of calling
  * `process.exit` so tests can assert.
  *
@@ -6204,6 +6278,60 @@ export async function runMain(
       shippedIssues: [],
       quarantinedIssues: [],
     };
+  }
+
+  // ADR 0021 LAUNCH-TIME REAPER (Fix 2 — crash recovery). Workstream 1b chose
+  // NOT to build the live-heartbeat checkpoint (see the STAGED note by the lease
+  // heartbeat below) because snapshotting a worktree an agent is actively using
+  // races the agent. This closes the same gap from the OTHER side: at startup —
+  // when NO agent is running and the single-instance lock above guarantees no
+  // live loop holds these worktrees — we run the proven post-kill reaper so a
+  // HARD-killed prior run's in-flight WIP is captured (pushed to its WIP ref)
+  // and its lease released BEFORE the reconciliation below frees the issue for
+  // re-claim. Without this, a SIGKILL/OOM/sleep re-runs the issue from scratch
+  // and strands its lease. The graceful `--now` skill already invokes this same
+  // reaper; here we auto-invoke it so a crash needs no human `--now`.
+  //
+  // Gate on evidence the prior run actually died so a NORMAL (live) start does
+  // no git work and logs nothing: read the previous status.json and run
+  // `deriveLiveness` with a real same-host pid probe. Run the reaper only when
+  // the prior run is NOT live (crashed/stale/stopped/…); a missing or
+  // unparseable file falls through to the self-gating discovery path (the reaper
+  // is a no-op when no `agent/issue-<N>` worktree survives). Best-effort +
+  // NON-FATAL: a crash-recovery step must never crash the loop it protects.
+  try {
+    const priorStatus = readPriorStatusForLiveness(args.repoRoot);
+    const priorLive =
+      priorStatus !== null &&
+      deriveLiveness(priorStatus, {
+        now: Date.now(),
+        probeAlive: (pid) => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        selfHostId: resolveHostId(),
+      }).live;
+    if (priorLive) {
+      // A live prior loop on this host means the lock above should have refused
+      // us; either way there is nothing dead to reap. Skip silently.
+    } else {
+      const reaped = await deps.checkpointInflight();
+      // Only speak when there was actually something to reap — a clean launch
+      // (empty discovery) stays quiet so this adds no noise to a normal start.
+      if (reaped.length > 0) {
+        deps.log(
+          `[startup] launch-time reaper: rescued in-flight work from a prior killed run:\n${formatCheckpointStop([...reaped])}`,
+        );
+      }
+    }
+  } catch (err) {
+    deps.logError(
+      `[startup] launch-time reaper skipped: ${(err as Error).message} — the loop still starts; a crashed prior run's WIP may need a manual \`--now\` reap`,
+    );
   }
 
   // Status feed for the `sandcastle-watch` viewer. Constructed ONLY after the
@@ -6374,6 +6502,16 @@ export async function runMain(
     // from scratch (git history has the old version); the FF-refused strand
     // backup (1a) and `--now` staging backup (1c) — both run when no agent is
     // concurrently active — ship in this pass.
+    //
+    // CRASH-RECOVERY UPDATE (ADR 0021 Fix 2): the hard-crash gap this live
+    // heartbeat would have closed is NOW closed at the OTHER end — the
+    // launch-time reaper at startup (see the "LAUNCH-TIME REAPER" block above,
+    // right after the single-instance lock). Because it runs before any agent is
+    // spawned, it sidesteps the shared-worktree race entirely: a run killed by
+    // SIGKILL/OOM/sleep is reaped on the NEXT launch (WIP pushed, lease
+    // released) instead of mid-run by a heartbeat. So Workstream 1b (the
+    // live-heartbeat approach) remains deliberately un-built; the crash-recovery
+    // need it targeted is served at launch, not via heartbeat.
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {

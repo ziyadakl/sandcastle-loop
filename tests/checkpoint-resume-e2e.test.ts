@@ -31,6 +31,8 @@ import {
 } from "../.sandcastle/lib/state/index.js";
 import { macHostSandbox } from "../.sandcastle/lib/mac-host-sandbox.js";
 import { worktreePathFor } from "../.sandcastle/lib/worktree-path.js";
+import { buildDefaultDeps } from "../.sandcastle/main.mjs";
+import type { SandcastleArgs } from "../.sandcastle/main.mjs";
 
 /** Run git synchronously for TEST SETUP/ASSERTIONS (not production code). */
 function git(cwd: string, ...args: string[]): string {
@@ -187,6 +189,96 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     expect(lsRemote(host, "refs/sandcastle/wip/issue-9")).toBe("");
     // ... and the lease is STILL held (clean worktree must not release it).
     expect(lsRemote(host, "refs/locks/issue-9")).not.toBe("");
+  });
+
+  // -------------------------------------------------------------------------
+  // TEST 1c (ADR 0021 Fix 2) — LAUNCH-TIME REAPER via the PRODUCTION binding.
+  // The startup reaper is `buildDefaultDeps(args).checkpointInflight()`; driving
+  // THAT (not a hand-rolled checkpointStop call) proves the wiring decision the
+  // launch path adds — integrationBranch = args.branch, stagingBranch = null,
+  // remote = origin — actually persists WIP + releases the lease, and that a
+  // fresh clone can then RESUME from the checkpoint rather than start from
+  // scratch. Paired with a clean-launch control so the assertions are non-vacuous.
+  // -------------------------------------------------------------------------
+
+  /** A full SandcastleArgs pinned to `host` with `main` as the run branch (so
+   *  the reaper measures in-flight commits against main). Only the fields
+   *  buildDefaultDeps touches for the reaper matter; the rest are inert defaults. */
+  function reaperArgs(host: string): SandcastleArgs {
+    return {
+      iterations: 1,
+      repoRoot: host,
+      branch: "main",
+      runId: "main",
+      label: "ready-for-agent",
+      maxConcurrent: 1,
+      imageName: "sandcastle:test",
+      plannerModel: "claude-opus-4-8",
+      implementerModel: "claude-sonnet-4-6",
+      reviewerModel: "claude-haiku-4-5",
+      critiqueModel: "claude-haiku-4-5",
+      mergerModel: "claude-opus-4-8",
+      postMergeReviewerModel: "claude-opus-4-8",
+      recoveryModel: "claude-opus-4-8",
+      implementerTimeoutSec: 1200,
+      implementerTimeoutSecExplicit: false,
+      reviewerTimeoutSec: 600,
+      hardCeilingSec: 3600,
+      consecutiveFailureLimit: 3,
+      opusProfile: "4.8",
+      budget: false,
+      dryRun: false,
+      recoveryEnabled: true,
+      retryEnabled: true,
+      stagingEnabled: true,
+      allowDirtySandcastle: false,
+      sandbox: "mac-host",
+      stuckDetector: false,
+    };
+  }
+
+  it("LAUNCH-TIME REAPER: production checkpointInflight() persists WIP + releases the lease, and a fresh clone resumes from it", async () => {
+    const hostA = makeHost("hostReaperA");
+    const marker = "PARTIAL-WORK-MARKER-issue7-launch-reaper";
+    makeInflightWorktree(hostA, 7, marker);
+    pushLock(hostA, 7);
+    // Precondition: lease held, no WIP yet.
+    expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+    expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
+
+    // Drive the REAL startup-reaper dep (production wiring under test).
+    const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
+
+    const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
+    expect(r7.outcome).toBe("checkpointed");
+    expect(r7.wipRef).toBe("refs/sandcastle/wip/issue-7");
+
+    // WIP is on origin carrying the exact partial work ...
+    const wipSha = lsRemote(hostA, "refs/sandcastle/wip/issue-7");
+    expect(wipSha).not.toBe("");
+    expect(git(remote, "show", `${wipSha}:PARTIAL_WORK.txt`)).toBe(marker);
+    // ... and the lease is released (so a peer / the next loop may reclaim).
+    expect(lsRemote(hostA, "refs/locks/issue-7")).toBe("");
+
+    // RESUME: a fresh clone materializes a worktree AT the checkpoint, not fresh.
+    const hostB = makeHost("hostReaperB");
+    const handle = await macHostSandbox({
+      repoRoot: hostB,
+      crossHostSync: true,
+    }).createSandbox({ branch: "agent/issue-7" });
+    const wtMarker = path.join(handle.worktreePath, "PARTIAL_WORK.txt");
+    expect(existsSync(wtMarker)).toBe(true);
+    expect(readFileSync(wtMarker, "utf8")).toBe(marker);
+    expect(git(handle.worktreePath, "rev-parse", "HEAD")).toBe(wipSha);
+    await handle.close();
+  }, 30_000);
+
+  it("CONTROL: a clean launch (no agent worktree) → checkpointInflight is a no-op, nothing on origin", async () => {
+    const host = makeHost("hostReaperClean");
+    const results = await buildDefaultDeps(reaperArgs(host)).checkpointInflight();
+    // Empty discovery ⇒ no per-issue results, no WIP ref, no lease touched.
+    expect(results).toEqual<CheckpointStopResult[]>([]);
+    expect(lsRemote(host, "refs/sandcastle/wip/issue-7")).toBe("");
   });
 
   // -------------------------------------------------------------------------
