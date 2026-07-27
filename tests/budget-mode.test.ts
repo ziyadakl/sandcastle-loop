@@ -6,25 +6,25 @@ import {
 } from "../.sandcastle/main.mjs";
 import { models, budgetModels } from "../.sandcastle/models.js";
 
-describe("--budget (Sonnet fix-it rung)", () => {
+describe("--budget (per-role ladder)", () => {
   it("defaults budget to false with no flag", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1"]);
     expect(args.budget).toBe(false);
     expect(args.implementerModel).toBe(models.implementer.default);
   });
 
-  it("puts the implementer first-pass on Sonnet 5", () => {
+  it("puts the implementer first-pass on Opus 4.8 (1M)", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--budget"]);
     expect(args.budget).toBe(true);
-    expect(args.implementerModel).toBe("claude-sonnet-5");
+    expect(args.implementerModel).toBe("claude-opus-4-8[1m]");
   });
 
-  it("gives the budget implementer a Sonnet fix-it rung then Opus 1M", () => {
+  it("gives the budget implementer an Opus-1M retry rung then Opus 5", () => {
     const impl = roleModelsFor({ budget: true }).implementer;
-    expect(impl.default).toBe("claude-sonnet-5");
+    expect(impl.default).toBe("claude-opus-4-8[1m]");
     expect(impl.escalations).toEqual([
-      "claude-sonnet-5",
       "claude-opus-4-8[1m]",
+      "claude-opus-5",
     ]);
   });
 
@@ -42,8 +42,8 @@ describe("--budget (Sonnet fix-it rung)", () => {
       escalations: [],
     });
     expect(budgetModels.implementer).toEqual({
-      default: "claude-sonnet-5",
-      escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"],
+      default: "claude-opus-4-8[1m]",
+      escalations: ["claude-opus-4-8[1m]", "claude-opus-5"],
     });
     expect(budgetModels.reviewer).toEqual({
       default: "claude-haiku-4-5",
@@ -62,12 +62,12 @@ describe("--budget (Sonnet fix-it rung)", () => {
       escalations: ["claude-opus-5"],
     });
     expect(budgetModels.postMergeFixer).toEqual({
-      default: "claude-sonnet-5",
-      escalations: ["claude-opus-5"],
+      default: "claude-opus-4-8[1m]",
+      escalations: ["claude-opus-4-8[1m]"],
     });
     expect(budgetModels.recovery).toEqual({
       default: "claude-opus-4-8[1m]",
-      escalations: [],
+      escalations: ["claude-opus-4-8[1m]"],
     });
   });
 
@@ -116,10 +116,10 @@ describe("--budget (Sonnet fix-it rung)", () => {
 });
 
 describe("escalationForAttempt", () => {
-  it("walks the budget ladder: attempt 2 → Sonnet, attempt 3 → Opus 1M", () => {
+  it("walks the budget ladder: attempt 2 → Opus 1M, attempt 3 → Opus 5", () => {
     const escalations = budgetModels.implementer.escalations;
-    expect(escalationForAttempt(escalations, 2)).toBe("claude-sonnet-5");
-    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-4-8[1m]");
+    expect(escalationForAttempt(escalations, 2)).toBe("claude-opus-4-8[1m]");
+    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-5");
   });
 
   it("clamps a single-element (non-budget) array to index 0 for BOTH attempts 2 and 3", () => {

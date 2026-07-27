@@ -107,13 +107,13 @@ export const opus5Models = {
  */
 export const budgetModels = {
   planner:           { default: "claude-sonnet-5", escalations: [] },
-  implementer:       { default: "claude-sonnet-5", escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"] },
+  implementer:       { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]", "claude-opus-5"] },
   reviewer:          { default: "claude-haiku-4-5", escalations: ["claude-sonnet-5"] },
   critique:          { default: "claude-haiku-4-5", escalations: [] },
   merger:            { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
   postMergeReviewer: { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
-  postMergeFixer:    { default: "claude-sonnet-5", escalations: ["claude-opus-5"] },
-  recovery:          { default: "claude-opus-4-8[1m]", escalations: [] },
+  postMergeFixer:    { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
+  recovery:          { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
 } as const satisfies Record<keyof typeof models, RoleConfig>;
 
 /** Launch-time Opus model profile selector (`--opus`). */
