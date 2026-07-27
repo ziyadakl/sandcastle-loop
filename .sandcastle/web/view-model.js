@@ -15,6 +15,8 @@
  * failure class that made T3 blank the screen).
  */
 
+import { isOwnProcessDead } from "./own-process-dead.js";
+
 /** Staleness threshold — mirror of STALE_AFTER_MS in lib/status/schema.ts (3 min). */
 export const STALE_AFTER_MS = 180_000;
 
@@ -225,12 +227,9 @@ export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP, probe = {}) {
   // --- banner (keyed to OWN host staleness + a same-host crash probe). ---
   // Crash detection fires ONLY for our own snapshot with a pid we can actually
   // signal; a peer's pid is unsignalable from here, so it stays freshness-gated.
-  const ownCrashed =
-    typeof probe.probeAlive === "function" &&
-    probe.selfHostId !== undefined &&
-    snap.hostId === probe.selfHostId &&
-    typeof snap.pid === "number" &&
-    !probe.probeAlive(snap.pid);
+  // The guard is the shared `isOwnProcessDead` authority (same code the pure
+  // `deriveLiveness` core runs) so the web and terminal viewers can't disagree.
+  const ownCrashed = isOwnProcessDead(probe, snap);
   const banner = computeBanner(snap.state, hosts[0].stale, snap.activity, ownCrashed);
 
   // --- meta.perMachine (own + each peer). ---

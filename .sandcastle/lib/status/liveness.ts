@@ -31,6 +31,11 @@
  * lives only at the impure call sites; absent it, behaviour is unchanged.
  */
 import { STALE_AFTER_MS } from "./schema.js";
+// The five-clause "our own host's dead pid" guard lives in ONE place — a tiny
+// browser-ESM module the web viewer (`view-model.js`) imports as a same-dir
+// sibling and this pure core reaches through its companion `.d.ts`. Sharing it
+// stops the terminal and web viewers from ever drifting on what "crashed" means.
+import { isOwnProcessDead } from "../../web/own-process-dead.js";
 
 /** Why a snapshot is / isn't live. Maps 1:1 onto the viewer's terminal banners. */
 export type LivenessReason =
@@ -115,13 +120,9 @@ export function deriveLiveness(
   // a same-host pid we can actually signal, proven gone by the injected probe, is
   // a hard kill regardless of write-age (crashed OUTRANKS stale). A peer's pid is
   // unsignalable from here, so we never probe it and let it fall to freshness.
-  if (
-    opts.probeAlive !== undefined &&
-    opts.selfHostId !== undefined &&
-    status.hostId === opts.selfHostId &&
-    status.pid !== undefined &&
-    !opts.probeAlive(status.pid)
-  ) {
+  // The guard itself is the shared `isOwnProcessDead` authority (short-circuits
+  // before probing a peer) so this can't drift from the web viewer's copy.
+  if (isOwnProcessDead(opts, status)) {
     return { live: false, reason: "crashed" };
   }
 
