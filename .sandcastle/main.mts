@@ -1228,19 +1228,23 @@ function crossHostSyncEnabled(
 /**
  * Resolve the `SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC` env fallback for the
  * implementer idle-timeout. Returns the parsed positive integer, or null when
- * the var is unset. A malformed value throws a clearly-labeled error (reusing
- * {@link parsePositiveInt}). `getEnv` is an injectable seam for tests, matching
- * {@link crossHostLeaseEnabled}. This must be read in runMain, NOT at parse
- * time: `loadDotenv` runs in the entrypoint AFTER `parseSandcastleArgs` but
- * BEFORE runMain, so the `.sandcastle/.env` value isn't visible until then.
+ * the var is unset OR blank/whitespace-only. A blank value is the shipped state
+ * (`.env.example` ships the key with an empty value) and MUST be treated as
+ * unset — falling through to the 1200 default, NOT crashing. This mirrors
+ * {@link resolveLockTtlSec}, the sibling numeric env var that ships blank the
+ * same way. A genuinely malformed value (e.g. "abc") still throws a
+ * clearly-labeled error (reusing {@link parsePositiveInt}). `getEnv` is an
+ * injectable seam for tests, matching {@link crossHostLeaseEnabled}. This must
+ * be read in runMain, NOT at parse time: `loadDotenv` runs in the entrypoint
+ * AFTER `parseSandcastleArgs` but BEFORE runMain, so the `.sandcastle/.env`
+ * value isn't visible until then.
  */
 export function implementerTimeoutFromEnv(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): number | null {
-  return parsePositiveInt(
-    getEnv("SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC"),
-    "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC",
-  );
+  const raw = (getEnv("SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC") ?? "").trim();
+  if (raw === "") return null;
+  return parsePositiveInt(raw, "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC");
 }
 
 /** Parse a single .env file into process.env. Earlier writers win — we never

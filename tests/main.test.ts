@@ -1653,6 +1653,22 @@ describe("sandcastle-loop main.mts — implementer idle-timeout env fallback", (
     expect(implementerTimeoutFromEnv(() => undefined)).toBe(null);
   });
 
+  it("implementerTimeoutFromEnv: treats a blank value as unset (returns null, no throw)", () => {
+    // .env.example ships the key blank (SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC=), so
+    // a consumer copying it verbatim yields "" — this MUST fall through to the
+    // 1200 default, not crash the loop. Mirrors resolveLockTtlSec.
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "" : undefined,
+      ),
+    ).toBe(null);
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "   " : undefined,
+      ),
+    ).toBe(null);
+  });
+
   it("implementerTimeoutFromEnv: parses a valid positive integer", () => {
     expect(
       implementerTimeoutFromEnv((k) =>
@@ -1737,6 +1753,17 @@ describe("sandcastle-loop main.mts — implementer idle-timeout env fallback", (
   });
 
   it("neither CLI flag nor env → hardcoded 1200 default lands", async () => {
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("blank env value (shipped state) → runMain does NOT crash; 1200 default lands", async () => {
+    // Regression guard: .env.example ships the key blank, so a fresh consumer
+    // who copies it verbatim sets the var to "". That must resolve to the 1200
+    // default, NOT throw at startup and crash the loop.
+    process.env[ENV_KEY] = "";
     const landed = await implementerIdleTimeoutFor(
       baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
     );
