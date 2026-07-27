@@ -143,6 +143,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       // Per-issue sweep only — no staging strand in this fixture.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     // Outcome for issue 7 is "checkpointed" at the canonical WIP ref.
@@ -181,6 +183,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     const r9 = results.find((r) => r.issue === 9) as CheckpointStopResult;
@@ -492,6 +496,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     expect(aResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
 
@@ -551,6 +557,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     expect(aResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
     const wipAfterA = lsRemote(hostB, "refs/sandcastle/wip/issue-7");
@@ -575,6 +583,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     const r7 = bResults.find((r) => r.issue === 7) as CheckpointStopResult;
     expect(r7.outcome).toBe("checkpointed");
@@ -612,6 +622,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     // --- Host B: resume A's checkpoint and commit on top (NOT yet pushed). ---
@@ -636,6 +648,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     expect(cResults.find((r) => r.issue === 7)?.outcome).toBe("checkpointed");
     const wipAfterC = lsRemote(hostC, "refs/sandcastle/wip/issue-7");
@@ -648,6 +662,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     // REFUSED — not silently accepted (the lease did its job) ...
     expect(bResults.find((r) => r.issue === 7)?.outcome).toBe("error");
@@ -686,6 +702,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: "integration-candidate",
       syncEnabled: SYNC_ON,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
     expect(results).toEqual<CheckpointStopResult[]>([]);
 
@@ -714,6 +732,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: "integration-candidate",
       syncEnabled: true,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");
@@ -754,6 +774,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: "integration-candidate",
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     // Nothing new on ORIGIN — the flag-off consumer's push surface is unchanged.
@@ -776,6 +798,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: "integration-candidate",
       syncEnabled: true,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe(
@@ -796,6 +820,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
       remote: "origin",
       stagingBranch: null,
       syncEnabled: true,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(lsRemote(host, "refs/sandcastle/strand/integration-candidate")).toBe("");

@@ -148,6 +148,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -196,6 +198,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -246,6 +250,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -288,6 +294,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     const byIssue = new Map(results.map((r) => [r.issue, r]));
@@ -329,6 +337,8 @@ describe("checkpointStop", () => {
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     const leaseDel = calls.find((c) =>
@@ -415,7 +425,7 @@ describe("checkpointStop — canReleaseLease guard (DEFECT 1 / launch-time reape
     expect(results[0]?.outcome).toBe("checkpointed");
   });
 
-  it("ABSENT guard preserves today's UNCONDITIONAL delete (graceful --now unchanged)", async () => {
+  it("explicit always-permit guard reproduces the former UNCONDITIONAL delete (graceful --now unchanged)", async () => {
     const { git, calls } = dirtyGit();
 
     await checkpointStop(git, {
@@ -424,7 +434,10 @@ describe("checkpointStop — canReleaseLease guard (DEFECT 1 / launch-time reape
       integrationBranch: "sandcastle/theme",
       stagingBranch: null,
       syncEnabled: false,
-      // no canReleaseLease — the graceful `--now` stop's own-host leases.
+      // `canReleaseLease` is now REQUIRED (no delete-by-default fall-through).
+      // The graceful `--now` stop reaps its OWN host's leases, so it passes an
+      // explicit always-permit policy — byte-for-byte the old absent-guard delete.
+      canReleaseLease: async () => true,
     });
 
     expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(true);
@@ -465,6 +478,7 @@ describe("checkpointStop — wipOriginPush mode (ADR 0021 launch-reaper inertnes
       stagingBranch: null,
       syncEnabled: false,
       wipOriginPush: "when-sync",
+      canReleaseLease: async () => true,
     });
 
     // Work is still rescued: outcome checkpointed at the canonical WIP ref.
@@ -479,9 +493,8 @@ describe("checkpointStop — wipOriginPush mode (ADR 0021 launch-reaper inertnes
           c.args.includes("refs/sandcastle/wip/issue-5"),
       ),
     ).toBe(true);
-    // NOTHING was pushed to origin — no WIP push, no lease delete (lease-mode off
-    // ⇒ no guard passed here, so the unconditional delete would fire in the OLD
-    // mode; the point of this assertion is the WIP-push side).
+    // NOTHING was pushed to origin on the WIP-push side (the point of this
+    // assertion) — the WIP ref was captured locally via update-ref instead.
     expect(
       calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
     ).toBe(false);
@@ -497,6 +510,7 @@ describe("checkpointStop — wipOriginPush mode (ADR 0021 launch-reaper inertnes
       stagingBranch: null,
       syncEnabled: true,
       wipOriginPush: "when-sync",
+      canReleaseLease: async () => true,
     });
 
     expect(results[0]?.outcome).toBe("checkpointed");
@@ -516,6 +530,7 @@ describe("checkpointStop — wipOriginPush mode (ADR 0021 launch-reaper inertnes
       stagingBranch: null,
       syncEnabled: false,
       // no wipOriginPush — the operator-invoked `--now` path.
+      canReleaseLease: async () => true,
     });
 
     // Legacy behavior preserved: WIP pushed to origin even with sync off.
