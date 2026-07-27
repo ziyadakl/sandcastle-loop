@@ -3727,6 +3727,85 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
     }
   });
 
+  // The merger retries once on its escalation model when attempt 1 throws.
+  // WHEN-landed: first merger dispatch throws → staging is reset again
+  // (discarding the partial merge) → a SECOND merger runs on the escalation
+  // model. A combined timeline proves the reset ran BETWEEN the two dispatches.
+  it("retries the merger on its escalation model after a first-attempt throw", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-merger-retry-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      // First merger dispatch throws; the escalation retry succeeds.
+      b.enqueue("merger", { stdout: "", throw: new Error("merge conflict boom") });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // Combined ordering timeline: merger dispatches + staging-reset log lines.
+      const timeline: string[] = [];
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        if (spec.name === "merger") timeline.push("merger");
+        return realRun(spec);
+      };
+      const realLog = b.deps.log.bind(b.deps);
+      b.deps.log = (line: string) => {
+        if (line.includes("staging-reset:")) timeline.push("reset");
+        realLog(line);
+      };
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const mergerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "merger",
+      );
+      // Two merger dispatches — the retry actually fired.
+      expect(mergerCalls).toHaveLength(2);
+      expect(mergerCalls[0]!.spec.model).toBe(baseArgs().mergerModel);
+      expect(mergerCalls[1]!.spec.model).toBe(
+        models.merger.escalations[0],
+      );
+      // reset (prelude) → merger#1 (throws) → reset (discard partial) → merger#2.
+      expect(timeline).toEqual(["reset", "merger", "reset", "merger"]);
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
   // Review follow-up: when the FF SUCCEEDS (code shipped) but the GitHub
   // promotion (label flip / close) fails for an issue, that issue must NOT be
   // left in silent `merge` limbo — it is flagged needs-human so a human finishes

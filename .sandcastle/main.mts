@@ -7018,29 +7018,69 @@ export async function runMain(
       // intermediate state. Keep this alias for downstream readability.
       const stagingActive = args.stagingEnabled;
 
+      // Bounded 2-attempt merger. Attempt 1 uses `args.mergerModel`; if it
+      // throws AND an escalation rung exists, discard attempt-1's partial
+      // merge (reset staging back to the integration tip) and re-dispatch the
+      // merger on the escalation model. Capped at 2. With an empty escalations
+      // array this is byte-identical to the legacy single dispatch (one
+      // attempt, same catch log, no reset). If attempt 2 also fails, mergerOk
+      // stays false and the existing quarantine path runs unchanged.
       let mergerOk = true;
-      try {
-        const mergerResult = await deps.run({
-          name: "merger",
-          maxIterations: 1,
-          model: args.mergerModel,
-          promptFile: "./.sandcastle/merge-prompt.md",
-          idleTimeoutSeconds: args.implementerTimeoutSec,
-          cwd: stagingActive ? stagingWorktreePath : undefined,
-          promptArgs: {
-            ITERATION: String(it),
-            BRANCHES: branchesArg,
-            ISSUES: issuesArg,
-          },
-        });
-        // Phase-1 cost telemetry (best-effort). Top-level session metadata is
-        // forwarded now, so this credits in production — see the planner-site note.
-        await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
-      } catch (err) {
-        mergerOk = false;
-        deps.logError(
-          `merge phase threw: ${(err as Error).message} — continuing to next iteration`,
-        );
+      const mergerEscalations = roleModelsFor(args).merger.escalations;
+      const maxMergerAttempts = mergerEscalations.length > 0 ? 2 : 1;
+      for (
+        let mergerAttempt = 1;
+        mergerAttempt <= maxMergerAttempts;
+        mergerAttempt++
+      ) {
+        // On a retry, discard attempt-1's partial merge by resetting the
+        // dedicated staging worktree back to the integration tip before the
+        // escalated merger runs. `lastFailedStagingIteration` is already null
+        // here (the prelude cleared it), so no bad-merge tag is written.
+        if (mergerAttempt > 1 && stagingActive) {
+          resetStagingToIntegrationTip(
+            args.repoRoot,
+            stagingWorktreePath,
+            args.branch,
+            lastFailedStagingIteration,
+            (s) => deps.log(s),
+            (s) => deps.logError(s),
+          );
+        }
+        const mergerModel =
+          mergerAttempt === 1
+            ? args.mergerModel
+            : escalationForAttempt(mergerEscalations, mergerAttempt);
+        mergerOk = true;
+        try {
+          const mergerResult = await deps.run({
+            name: "merger",
+            maxIterations: 1,
+            model: mergerModel,
+            promptFile: "./.sandcastle/merge-prompt.md",
+            idleTimeoutSeconds: args.implementerTimeoutSec,
+            cwd: stagingActive ? stagingWorktreePath : undefined,
+            promptArgs: {
+              ITERATION: String(it),
+              BRANCHES: branchesArg,
+              ISSUES: issuesArg,
+            },
+          });
+          // Phase-1 cost telemetry (best-effort). Top-level session metadata is
+          // forwarded now, so this credits in production — see the planner-site note.
+          await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
+          break;
+        } catch (err) {
+          mergerOk = false;
+          const willRetry = mergerAttempt < maxMergerAttempts;
+          deps.logError(
+            `merge phase threw${mergerAttempt > 1 ? ` (attempt ${mergerAttempt})` : ""}: ` +
+              `${(err as Error).message} — ` +
+              (willRetry
+                ? `retrying merger on escalation model`
+                : `continuing to next iteration`),
+          );
+        }
       }
 
       // After a successful merger, flip every shipped issue's label from
