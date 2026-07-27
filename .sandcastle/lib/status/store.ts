@@ -28,6 +28,7 @@ import {
   HEARTBEAT_MS,
 } from "./schema.js";
 import { foldPeers } from "./merge.js";
+import type { RoleBreakdown } from "../cost/ledger.js";
 
 export interface StatusStoreMeta {
   branch: string;
@@ -131,12 +132,7 @@ export interface StatusStore {
    * dispatch runs stay byte-compatible. Synchronous mutate-then-commit like every
    * mutator; relative estimates, not billed figures (see `lib/cost/pricing.ts`).
    */
-  recordRoleBreakdown(
-    perRole: Record<
-      string,
-      { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
-    >,
-  ): void;
+  recordRoleBreakdown(perRole: Record<string, RoleBreakdown>): void;
   /**
    * Cross-host STATUS SYNC (Task S5): set the peer snapshots that `commit()`
    * folds into the WRITTEN file (via `foldPeers`) so a viewer sees one fused,
@@ -412,12 +408,7 @@ export function createStatusStore(
       commit();
     },
 
-    recordRoleBreakdown(
-      perRole: Record<
-        string,
-        { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
-      >,
-    ): void {
+    recordRoleBreakdown(perRole: Record<string, RoleBreakdown>): void {
       status.totals.perRole = perRole;
       commit();
     },

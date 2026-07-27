@@ -45,6 +45,24 @@ export interface CostSummary {
   readonly unpricedModels: string[];
 }
 
+/**
+ * Canonical per-role breakdown row merged from the cost ledger (estimated USD +
+ * total tokens) and the timing ledger (cumulative wall-clock ms + dispatch
+ * count). This is the ONE definition of the shape that flows into the status
+ * store's `recordRoleBreakdown` and out to the web view-model; every field is
+ * optional so a partial source (cost-only, timing-only, absent) stays valid.
+ */
+export interface RoleBreakdown {
+  /** Estimated USD for the role's priced models; `null` when all unpriced. */
+  costUsd?: number | null;
+  /** Total tokens across the role's models (priced + unpriced). */
+  tokens?: number;
+  /** Cumulative wall-clock milliseconds across the role's dispatches. */
+  wallMs?: number;
+  /** Number of agent dispatches attributed to the role. */
+  runs?: number;
+}
+
 interface RoleAcc {
   /** Running dollar total for PRICED models; stays null until one prices. */
   costUsd: number | null;
@@ -82,7 +100,13 @@ export class CostLedger {
     }
   }
 
-  /** Roles in a stable pipeline order for deterministic summary rendering. */
+  /**
+   * Roles in a stable pipeline order for deterministic summary rendering.
+   *
+   * DRIFT-GUARD: this list is mirrored by `ROLE_ORDER` in
+   * `.sandcastle/web/view-model.js` (the browser bundle can't import this TS
+   * module). Keep the two in sync — if a 9th role is added, update both.
+   */
   static readonly ROLE_ORDER: readonly CostRole[] = [
     "planner",
     "implementer",

@@ -7,6 +7,8 @@
  * JSDoc. Keep the two in sync on any shape change.
  */
 
+import type { RoleBreakdown } from "../lib/cost/ledger.js";
+
 export type BannerKind =
   | "no-run"
   | "live"
@@ -32,13 +34,16 @@ export interface PerMachine {
   total: number;
 }
 
-export interface PerRoleRow {
+/**
+ * One rendered per-role row. Reuses the canonical {@link RoleBreakdown} shape
+ * (tokens/wallMs/runs) from ledger.ts and adds the required `role` key; `costUsd`
+ * is tightened to REQUIRED here because {@link buildPerRole} always sets it
+ * (null when the source is null/absent).
+ */
+export interface PerRoleRow extends RoleBreakdown {
   role: string;
   /** null when the role saw only unpriced models or cost was absent (renders `—`). */
   costUsd: number | null;
-  tokens?: number;
-  wallMs?: number;
-  runs?: number;
 }
 
 export interface Totals {

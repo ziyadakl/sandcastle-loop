@@ -50,6 +50,11 @@ export const TERMINAL_PHASES = new Set(["merged", "needs-human", "deferred"]);
  * Pipeline order for the per-role cost/timing breakdown. Roles absent from the
  * status data are omitted; a role present in the data but NOT listed here is
  * appended after the known ones (so a future role never vanishes silently).
+ *
+ * DRIFT-GUARD: this list mirrors `CostLedger.ROLE_ORDER` in
+ * `.sandcastle/lib/cost/ledger.ts`. The browser bundle can't import that TS
+ * module, so the copy is intentional — keep the two in sync (e.g. a 9th role
+ * must be added to both).
  */
 export const ROLE_ORDER = [
   "planner",
