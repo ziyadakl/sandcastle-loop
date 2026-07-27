@@ -609,8 +609,11 @@ export interface Deps {
    * before the reconcile frees the issue for re-claim. Best-effort + NON-FATAL:
    * the caller wraps it so a fault only logs and never blocks the loop starting.
    * NO-OP on a clean launch — discovery returns empty when no agent worktrees
-   * survive — and the caller additionally gates the whole call on a liveness
-   * probe of the prior status so a normal (live) start does no git work at all.
+   * survive, so a normal start does no git work. The call is deliberately NOT
+   * gated on a prior-status liveness probe: the single-instance lock acquired
+   * above already proves no live loop of ours is running, and a reused PID that
+   * probes "alive" must never suppress a real rescue (see the DEFECT-4 note at
+   * the call site). Inert under `--dry-run`.
    */
   checkpointInflight(): Promise<readonly CheckpointStopResult[]>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
@@ -3582,6 +3585,15 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         // no lock ref at all, so releasing is pointless — return false and skip
         // the delete (DEFECT 5). WIP capture still runs regardless of this
         // guard, so the crashed work is always rescued.
+        //
+        // `leaseState` is TTL-based and owner-blind: it cannot tell a PEER's
+        // live lease from THIS host's own crashed-but-not-yet-expired lease, so
+        // a fast crash+restart within TTL reads "live" and leaves our own lock
+        // ref standing until it lapses. That is intentional and harmless — the
+        // single-instance lock guarantees we (and only we) will re-process the
+        // issue, so a bounded wait for TTL expiry costs nothing and beats the
+        // risk of yanking a real peer. Same conservative choice startup
+        // reconciliation already makes (`st === "live"` → skip).
         canReleaseLease: async (issue) =>
           leaseEnabled && (await leaseCoord.leaseState(issue)) !== "live",
       });

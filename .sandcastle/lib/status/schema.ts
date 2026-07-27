@@ -75,11 +75,15 @@ export const STALE_AFTER_MS = 180_000; // 3 minutes (1.5× heartbeat)
  * "recent").
  *
  * NO VERSION BUMP: adding an enum member is additive — same reasoning as
- * `stopping` on `RunStateSchema` above. The project moved off the strict
- * version gate for the lite viewer (which owns its own staleness and never
- * blank-screens on an unknown value); a viewer new enough to know the member
- * renders it, and the raw-`schemaVersion` guard in `reducer.ts` routes any
- * genuinely version-skewed old viewer to the graceful "outdated" banner.
+ * `stopping` on `RunStateSchema` above. A viewer new enough to know the member
+ * renders it. An OLD viewer (compiled before `needs-rerun` existed) does NOT
+ * hit the raw-`schemaVersion` "outdated" banner here — that fires only on a
+ * version mismatch, and we deliberately did not bump — so its `safeParse`
+ * simply fails on the unknown enum value and it degrades to the "stale" banner,
+ * keeping its last-good frame rather than blank-screening. That degradation is
+ * acceptable because `/sandcastle-update` ships writer + viewer atomically, so
+ * the skew window is momentary. (The "outdated" route is reserved for changes
+ * that DO bump the version.)
  */
 export const IssuePhaseSchema = z.enum([
   "planned",
