@@ -223,6 +223,11 @@ interface RunOutcome {
   readonly stdout: string;
   readonly commits?: readonly { sha: string }[];
   readonly throw?: Error;
+  /** Simulate a provider stuck-abort graceful result (ticket 03): the docker
+   *  provider sets this on the RunHandle it returns after converting a
+   *  stuck-detector abort into a graceful completion. Threaded through so
+   *  pipeline tests can drive the stuck-partial-work routing. */
+  readonly stuckAborted?: boolean;
 }
 
 interface DepsBuilder {
@@ -292,7 +297,11 @@ function buildDeps(opts: {
 
   const handleOutcome = (name: string, outcome: RunOutcome): RunHandle => {
     if (outcome.throw) throw outcome.throw;
-    return { stdout: outcome.stdout, commits: outcome.commits ?? [] };
+    return {
+      stdout: outcome.stdout,
+      commits: outcome.commits ?? [],
+      ...(outcome.stuckAborted ? { stuckAborted: true } : {}),
+    };
   };
 
   const deps: Deps = {
@@ -490,6 +499,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     stagingEnabled: true,
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
     ...over,
   };
 }
@@ -984,6 +994,78 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(result.exitCode).toBe(0);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(300);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  // Loop-cost ticket 03: a docker stuck-detector abort returns a GRACEFUL
+  // RunHandle carrying `stuckAborted: true` + the partial commits. The
+  // pipeline must feed that partial work to the reviewer — NOT trip the
+  // envelope re-ask (the stuck banner is not a valid certification envelope)
+  // and NOT quarantine before review. These two tests pin the WHEN-landed
+  // routing at the full runMain boundary.
+  it("stuck-abort with commits: pipeline reviews the partial work (no envelope re-ask), then ships on ALL_CLEAR", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "230", title: "stuck but committed", branch: "agent/issue-230" },
+      ]),
+    });
+    // Implementer comes back as a stuck-abort graceful result: no envelope,
+    // one recovered WIP commit, stuckAborted flag set.
+    b.enqueue("implementer", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [{ sha: "wip-stuck-230" }],
+      stuckAborted: true,
+    });
+    b.enqueue("reviewer", { stdout: "Partial work is fine.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // Routing proof: exactly ONE implementer call (no envelope re-ask), and
+    // the reviewer ran on the partial work.
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(0);
+    expect(names).toContain("reviewer");
+    expect(result.shippedIssues).toEqual([230]);
+    expect(b.state.quarantines).toEqual([]);
+  });
+
+  it("stuck-abort with ZERO commits: quarantines via no-commit path — reviewer never runs, no envelope re-ask", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "231", title: "stuck no commits", branch: "agent/issue-231" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [],
+      stuckAborted: true,
+    });
+    // A reviewer outcome is enqueued but must NEVER be consumed — the zero-
+    // commit stuck result quarantines before review.
+    b.enqueue("reviewer", { stdout: "should not run\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(0);
+    expect(names).not.toContain("reviewer");
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(231);
     expect(b.state.marksDone).toEqual([]);
   });
 
@@ -4813,6 +4895,80 @@ describe("runImplementer skill-discipline gate", () => {
       requiredSkills: [],
     });
     expect(r.skillsInvoked).toEqual([]);
+  });
+});
+
+describe("runImplementer stuck-abort carve-outs (loop-cost ticket 03)", () => {
+  // The docker stuck-detector (stuck-detector.ts) converts a demonstrably-
+  // spinning implementer into a GRACEFUL RunHandle carrying `stuckAborted:
+  // true` plus whatever it managed to commit. runImplementer must route that
+  // partial work to the reviewer instead of tripping its envelope/skill/
+  // no-commit gates — those gates assume a NORMAL run. These tests assert the
+  // three carve-outs directly at runImplementer's contract (the pipeline's
+  // happy path continues to the reviewer precisely BECAUSE runImplementer
+  // returns normally here).
+
+  /** A sandbox whose run() returns a provider stuck-abort graceful result:
+   *  no envelope (stdout is the "[stuck-detector] …" banner), zero iterations
+   *  (so skillsInvoked resolves to []), and `stuckAborted: true`. */
+  function makeStuckSandbox(commits: readonly { sha: string }[]): SandboxHandle {
+    const handle: RunHandle = {
+      stdout: "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits,
+      iterations: [],
+      stuckAborted: true,
+    };
+    return {
+      branch: "agent/issue-1",
+      run: async () => handle,
+      close: async () => undefined,
+    };
+  }
+
+  function stuckCtx(issueNumber: number): Parameters<typeof runImplementer>[1] {
+    return {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber,
+      issue: { id: String(issueNumber), title: "stuck issue", branch: "agent/issue-1" },
+      status: testStatusStore,
+    } as Parameters<typeof runImplementer>[1];
+  }
+
+  it("stuck + commits>0 + required skills: does NOT throw skill/envelope gates — returns partial work for review", async () => {
+    // attemptNumber:1 (requireCommits true) AND requiredSkills present with
+    // ZERO skills invoked (iterations: []) AND a non-envelope stdout — all
+    // three gates would fire on a normal run. The stuckAborted carve-out must
+    // suppress every one of them so the pipeline reviews the recovered commit.
+    const sandbox = makeStuckSandbox([{ sha: "wip-partial-1" }]);
+    const r = await runImplementer(sandbox, stuckCtx(42), {
+      attemptNumber: 1,
+      requiredSkills: ["impeccable", "polish"],
+    });
+    expect(r.commits).toEqual([{ sha: "wip-partial-1" }]);
+    // Zero skills legitimately invoked on a stuck run — gate carved out.
+    expect(r.skillsInvoked).toEqual([]);
+  });
+
+  it("stuck + ZERO commits: throws 'implementer made no commits' (→ existing quarantine), not an envelope re-ask", async () => {
+    const sandbox = makeStuckSandbox([]);
+    await expect(
+      runImplementer(sandbox, stuckCtx(43), {
+        attemptNumber: 1,
+        requiredSkills: ["impeccable", "polish"],
+      }),
+    ).rejects.toThrowError("implementer made no commits");
+  });
+
+  it("stuck + ZERO commits on attempt 2: STILL throws 'implementer made no commits' regardless of attempt number", async () => {
+    // Attempt 2 normally bypasses requireCommits (a rebuttal can have zero
+    // commits). A stuck run with zero commits is NOT a rebuttal — the
+    // `|| r.stuckAborted` clause forces the no-commit throw anyway.
+    const sandbox = makeStuckSandbox([]);
+    await expect(
+      runImplementer(sandbox, stuckCtx(44), { attemptNumber: 2 }),
+    ).rejects.toThrowError("implementer made no commits");
   });
 });
 

@@ -295,6 +295,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     stagingEnabled: true,
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
     ...over,
   };
 }

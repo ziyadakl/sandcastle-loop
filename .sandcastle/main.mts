@@ -293,6 +293,12 @@ export interface SandcastleArgs {
    * unavailable. Wired via `--sandbox docker|mac-host`.
    */
   sandbox: "docker" | "mac-host";
+  /**
+   * Loop-cost ticket 03 opt-in (`--stuck-detector`). Docker-only live safety
+   * net that aborts a demonstrably-spinning implementer and hands its
+   * committed work to the reviewer. Default false = today's run path.
+   */
+  stuckDetector: boolean;
 }
 
 /**
@@ -325,6 +331,15 @@ export interface RunHandle {
     readonly sessionFilePath?: string;
     readonly sessionId?: string;
   }[];
+  /**
+   * Set by the docker provider (loop-cost ticket 03) when it converts a
+   * stuck-detector abort into a GRACEFUL result carrying whatever the aborted
+   * implementer already committed. Downstream {@link runImplementer} reads it
+   * to route that partial work to the reviewer instead of tripping its
+   * envelope/skill/no-commit gates — those gates assume a normal run.
+   * Absent/`false` on every ordinary run and on the mac-host path.
+   */
+  readonly stuckAborted?: boolean;
 }
 
 export interface SandboxHandle {
@@ -652,6 +667,12 @@ Optional:
                             writes directly to --branch and the post-merge
                             reviewer is advisory-only (no fixer pass, no
                             fast-forward gating). Default: staging ON.
+  --stuck-detector          Docker-only opt-in safety net. Aborts a
+                            demonstrably-spinning implementer (same tool called
+                            with identical args ~6× in a row) and hands its
+                            already-committed work to the reviewer instead of
+                            burning the full iteration budget. Ignored on
+                            --sandbox mac-host. Default: off.
   --provider NAME           Override the implementer provider for this run.
                             One of: kimi | glm | anthropic. Maps to that
                             provider's default coding model (kimi-for-coding,
@@ -734,6 +755,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "recovery": { type: "string" },
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
+      "stuck-detector": { type: "boolean" },
       "provider": { type: "string" },
       "backend": { type: "string" },
       "opus": { type: "string" },
@@ -1011,6 +1033,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     recoveryEnabled: values["recovery"] !== "off",
     retryEnabled: values["no-retry"] !== true,
     stagingEnabled: values["no-staging"] !== true,
+    stuckDetector: values["stuck-detector"] === true,
     provider,
     sandbox,
     imageName:
@@ -1119,6 +1142,7 @@ function defaultArgs(): SandcastleArgs {
     imageName: defaultImageName(process.cwd()),
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
   };
 }
 
@@ -4118,10 +4142,17 @@ export async function runImplementer(
   // re-ask legitimately invokes NO skills. Without this carve-out the gate
   // would fire on every re-ask (it always sees zero skills) and the feature
   // would self-defeat into a skill-discipline quarantine.
+  //
+  // `!r.stuckAborted` (loop-cost ticket 03): a stuck-detector abort returns a
+  // graceful result with `iterations: []`, so skillsInvoked is always empty —
+  // but that reflects the ABORT, not a non-compliant implementer. Its partial
+  // work belongs in front of the reviewer, so we carve the stuck case out of
+  // this gate exactly like the re-ask carve-out above.
   if (
     opts.requiredSkills &&
     opts.requiredSkills.length > 0 &&
-    !opts.envelopeReask
+    !opts.envelopeReask &&
+    !r.stuckAborted
   ) {
     const { missing } = validateRequiredSkillsInvoked(
       opts.requiredSkills,
@@ -4140,7 +4171,17 @@ export async function runImplementer(
   // attemptNumber unthreaded, so requireCommits recomputes to true, but a
   // compliant re-ask makes NO new commits (the work is already on the
   // branch) — so this throw must not fire on a re-ask.
-  if (requireCommits && r.commits.length === 0 && !opts.envelopeReask) {
+  //
+  // `|| r.stuckAborted` (loop-cost ticket 03): a stuck-abort with ZERO
+  // recovered commits has no partial work to review, so it must fall into the
+  // existing no-commit quarantine/defer path — regardless of attemptNumber
+  // (an attempt-2 stuck-abort is NOT a rebuttal, so the normal requireCommits
+  // bypass must not let it through). A stuck-abort WITH commits skips this
+  // throw (commits.length > 0) and flows on to the reviewer.
+  if (
+    ((requireCommits && !opts.envelopeReask) || r.stuckAborted) &&
+    r.commits.length === 0
+  ) {
     throw new Error("implementer made no commits");
   }
   // Sandcastle's r.stdout is the parsed `result.result` from claude's final
@@ -4168,7 +4209,12 @@ export async function runImplementer(
       return false;
     }
   })();
-  if (!rebuttalPresent && !halted) {
+  // `!r.stuckAborted` (loop-cost ticket 03): a stuck-abort's stdout is the
+  // "[stuck-detector] run aborted — …" banner, never a certification envelope.
+  // Running parseVerdict on it would throw VerdictParseError and burn a
+  // wasteful envelope re-ask; instead we skip the parse (like the HALT/rebuttal
+  // cases) and return the recovered partial work for the reviewer to judge.
+  if (!rebuttalPresent && !halted && !r.stuckAborted) {
     // Dual-mode parse (stream-json first, assistant-text fallback). On a
     // genuine missing-envelope failure — the implementer emitted a real
     // STORY_COMPLETE but dropped the fenced ```json``` certification

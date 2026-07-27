@@ -644,6 +644,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     stagingEnabled: false,
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
     ...over,
   };
 }
