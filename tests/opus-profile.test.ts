@@ -4,9 +4,8 @@ import { parseSandcastleArgs, roleModelsFor } from "../.sandcastle/main.mjs";
 import { codexModels } from "../.sandcastle/models.js";
 
 describe("opus5Models", () => {
-  it("sets the 6 opus-heavy roles to claude-opus-5 with empty escalations", () => {
+  it("sets the 5 opus-heavy roles to claude-opus-5 with empty escalations", () => {
     for (const role of [
-      "planner",
       "implementer",
       "merger",
       "postMergeReviewer",
@@ -16,6 +15,11 @@ describe("opus5Models", () => {
       expect(opus5Models[role].default).toBe("claude-opus-5");
       expect(opus5Models[role].escalations).toEqual([]);
     }
+  });
+
+  it("runs the planner on Sonnet, escalating to claude-opus-5 on a failed plan", () => {
+    expect(opus5Models.planner.default).toBe("claude-sonnet-5");
+    expect(opus5Models.planner.escalations).toEqual(["claude-opus-5"]);
   });
 
   it("keeps reviewer + critique byte-identical to models", () => {
@@ -53,7 +57,7 @@ describe("parseSandcastleArgs --opus", () => {
   it("parses --opus 5", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--opus", "5"]);
     expect(args.opusProfile).toBe("5");
-    expect(args.plannerModel).toBe("claude-opus-5");
+    expect(args.plannerModel).toBe("claude-sonnet-5");
     expect(args.implementerModel).toBe("claude-opus-5");
   });
 

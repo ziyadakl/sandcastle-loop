@@ -99,7 +99,7 @@ import {
   models,
   codexModels,
   opus5Models,
-  BUDGET_IMPLEMENTER_MODEL,
+  budgetModels,
   type OpusProfile,
 } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
@@ -256,12 +256,13 @@ export interface SandcastleArgs {
    */
   opusProfile: OpusProfile;
   /**
-   * Budget mode (`--budget`, default `false`). Swaps ONLY the implementer's
-   * first-pass model to Sonnet 5 ({@link BUDGET_IMPLEMENTER_MODEL}); the retry
-   * ladder still escalates onto Opus via {@link roleModelsFor}. The implementer
-   * is the loop's dominant token consumer, so this is the main cost lever.
-   * Claude-anthropic-only: cannot combine with `--backend codex` or `--provider`.
-   * An explicit `--implementer-model` still wins over it.
+   * Budget mode (`--budget`, default `false`). Selects `budgetModels` via
+   * {@link roleModelsFor}, giving the implementer a "Sonnet fix-it rung"
+   * ladder: Sonnet-5 first pass, a second Sonnet-5 pass WITH reviewer feedback
+   * (cheap fix-it), then `claude-opus-4-8[1m]` reserved for the round-3 grant.
+   * The implementer is the loop's dominant token consumer, so this is the main
+   * cost lever. Claude-anthropic-only: cannot combine with `--backend codex` or
+   * `--provider`. An explicit `--implementer-model` still wins over it.
    */
   budget: boolean;
   /**
@@ -858,13 +859,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
-  // --budget swaps ONLY the implementer's first-pass model to Sonnet 5 (the loop's
-  // dominant token consumer). The retry ladder is untouched (roleModelsFor's
-  // implementer.escalations still escalates onto Opus 1M), so hard issues keep
-  // their muscle. Claude-anthropic-only, mirroring --opus 5: a cheaper Anthropic
-  // first pass is meaningless under a codex backend or a kimi/glm provider swap
-  // (which already redirects the implementer), so a combination is an operator
-  // error, not a silent no-op. An explicit --implementer-model still wins below.
+  // --budget selects `budgetModels` (via roleModelsFor), giving the implementer
+  // a "Sonnet fix-it rung" ladder — Sonnet-5 first pass, a second Sonnet-5 pass
+  // WITH reviewer feedback, then Opus 1M reserved for the round-3 grant — so the
+  // cheap model is spent twice before any Opus. The implementer is the loop's
+  // dominant token consumer, the single lever that moves the bill.
+  // Claude-anthropic-only, mirroring --opus 5: a cheaper Anthropic ladder is
+  // meaningless under a codex backend or a kimi/glm provider swap (which already
+  // redirects the implementer), so a combination is an operator error, not a
+  // silent no-op. An explicit --implementer-model still wins below.
   const budget = values.budget === true;
   if (budget && backend === "codex") {
     throw new Error(
@@ -876,15 +879,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "--budget applies only to the anthropic default; it cannot combine with --provider",
     );
   }
-  // --budget + --opus 5 is a footgun: opus5Models gives the implementer an EMPTY
-  // escalation ladder, so budget's Sonnet-5 first pass would have NO Opus retry
-  // fallback — a blocked issue would quarantine with no escalation, silently
-  // voiding budget's documented "keep Opus on retry" safety net. Reject it; use
-  // --budget with the default (4.8) profile, whose ladder escalates to Opus 1M.
+  // --budget + --opus 5 express CONTRADICTORY profiles and cannot both apply:
+  // budget is cheapest-first (Sonnet fix-it rung, Opus reserved for the round-3
+  // grant only), while --opus 5 is Opus-5-everywhere. There is no coherent
+  // single map that is both, so reject the combo at parse time. Use --budget
+  // with the default (4.8) profile.
   if (budget && opusProfile === "5") {
     throw new Error(
-      "--budget cannot combine with --opus 5: the Opus-5 profile has no implementer " +
-        "escalation, so a budget (Sonnet-5) first pass would have no Opus retry fallback. " +
+      "--budget cannot combine with --opus 5: they express contradictory model " +
+        "profiles (budget is cheapest-first, --opus 5 is Opus-5-everywhere). " +
         "Use --budget with the default (4.8) profile.",
     );
   }
@@ -927,15 +930,13 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
-  const roleModels = roleModelsFor({ backend, opusProfile });
+  const roleModels = roleModelsFor({ backend, opusProfile, budget });
 
   const implementerModel =
     explicitImplModel ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
-      : budget
-        ? BUDGET_IMPLEMENTER_MODEL
-        : roleModels.implementer.default);
+      : roleModels.implementer.default);
 
   const sandbox: "docker" | "mac-host" = (() => {
     const v = values.sandbox;
@@ -1056,16 +1057,38 @@ function detectBranchOr(fallback: string): string {
  * escalations through this (not `models.X` directly) is what keeps a
  * `--backend codex` run from silently escalating onto a Claude model.
  *
- * On the claude backend, the Opus profile (`--opus`) selects the map: `"5"`
- * draws every role from `opus5Models` (`claude-opus-5`, empty escalations),
- * `"4.8"` (default, or unset) uses `models`. Codex ignores the profile.
+ * On the claude backend the map is selected by precedence: budget first
+ * (`budgetModels` — the implementer's Sonnet fix-it rung ladder, every other
+ * role verbatim from `models`), then the Opus profile (`--opus 5` →
+ * `opus5Models`), then the default `models`. Codex ignores both budget and the
+ * profile. `--budget` and `--opus 5` are mutually exclusive at parse time, so
+ * the budget-before-opus5 ordering here is belt-and-suspenders, not a real
+ * conflict.
  */
 export function roleModelsFor(a: {
   readonly backend?: AgentBackend;
   readonly opusProfile?: OpusProfile;
+  readonly budget?: boolean;
 }) {
   if (a.backend === "codex") return codexModels;
+  if (a.budget === true) return budgetModels;
   return a.opusProfile === "5" ? opus5Models : models;
+}
+
+/**
+ * Resolve the implementer model for a given retry attempt by walking an
+ * `escalations` ladder. Attempt 2 (the first retry) → `escalations[0]`,
+ * attempt 3 → `escalations[1]`, clamped to the last element so a shorter ladder
+ * simply repeats its final rung. Under the default (non-budget) profile
+ * `escalations` has length 1, so attempts 2 AND 3 both clamp to index 0 (Opus)
+ * — byte-for-byte the legacy behavior. Under `--budget` the two-rung ladder
+ * yields Sonnet on attempt 2 (cheap fix-it pass) and Opus 1M on attempt 3.
+ */
+export function escalationForAttempt(
+  escalations: readonly string[],
+  attemptNumber: number,
+): string {
+  return escalations[Math.min(attemptNumber - 2, escalations.length - 1)];
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -5193,14 +5216,15 @@ async function runIssuePipeline(
     // Phase 2c: implementer attempt 2 (escalated, with reviewer feedback).
     // Worktree is NOT reset — the implementer sees its own commits and
     // either appends a fix on top OR emits a <rebuttal> instead of code.
+    const implModel2 = escalationForAttempt(implEscalations, 2);
     ctx.deps.log(
       `[issue=${ctx.issueNumber}] reviewer attempt 1 HAS_BLOCKERS — ` +
-        `escalating implementer to ${implEscalations[0]}`,
+        `escalating implementer to ${implModel2}`,
     );
     ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 2");
     const impl2 = await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
-      model: implEscalations[0],
+      model: implModel2,
       reviewerFeedback: review1.stdout,
       requiredSkills: ctx.requiredSkills,
     });
@@ -5269,15 +5293,16 @@ async function runIssuePipeline(
     }
 
     if (grantRound3) {
+      const implModel3 = escalationForAttempt(implEscalations, 3);
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] reviewer attempt 2 HAS_BLOCKERS but ` +
           `round-1 categories resolved — granting attempt 3 on ` +
-          `${implEscalations[0]}`,
+          `${implModel3}`,
       );
       ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 3");
       const impl3 = await runImplementer(sandbox, ctx, {
         attemptNumber: 3,
-        model: implEscalations[0],
+        model: implModel3,
         reviewerFeedback: review2.stdout,
         requiredSkills: ctx.requiredSkills,
       });

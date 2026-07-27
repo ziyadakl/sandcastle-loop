@@ -1,8 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { parseSandcastleArgs, roleModelsFor } from "../.sandcastle/main.mjs";
-import { models, BUDGET_IMPLEMENTER_MODEL } from "../.sandcastle/models.js";
+import {
+  parseSandcastleArgs,
+  roleModelsFor,
+  escalationForAttempt,
+} from "../.sandcastle/main.mjs";
+import { models, budgetModels } from "../.sandcastle/models.js";
 
-describe("--budget (Sonnet-5 implementer)", () => {
+describe("--budget (Sonnet fix-it rung)", () => {
   it("defaults budget to false with no flag", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1"]);
     expect(args.budget).toBe(false);
@@ -12,15 +16,36 @@ describe("--budget (Sonnet-5 implementer)", () => {
   it("puts the implementer first-pass on Sonnet 5", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--budget"]);
     expect(args.budget).toBe(true);
-    expect(args.implementerModel).toBe(BUDGET_IMPLEMENTER_MODEL);
-    expect(BUDGET_IMPLEMENTER_MODEL).toBe("claude-sonnet-5");
+    expect(args.implementerModel).toBe("claude-sonnet-5");
   });
 
-  it("keeps the Opus 1M escalation rung intact (budget touches only first pass)", () => {
-    // The implementer's retry escalation reads roleModelsFor(...).implementer,
-    // which --budget must NOT alter — hard issues still get Opus muscle.
-    expect(roleModelsFor({ backend: "claude" }).implementer.escalations[0]).toBe(
+  it("gives the budget implementer a Sonnet fix-it rung then Opus 1M", () => {
+    const impl = roleModelsFor({ budget: true }).implementer;
+    expect(impl.default).toBe("claude-sonnet-5");
+    expect(impl.escalations).toEqual([
+      "claude-sonnet-5",
       "claude-opus-4-8[1m]",
+    ]);
+  });
+
+  it("keeps the Opus 1M escalation rung intact on the non-budget default", () => {
+    // The implementer's retry escalation reads roleModelsFor(...).implementer,
+    // which the DEFAULT (non-budget) profile leaves as the single Opus rung.
+    expect(
+      roleModelsFor({ backend: "claude" }).implementer.escalations,
+    ).toEqual(["claude-opus-4-8[1m]"]);
+  });
+
+  it("changes ONLY the implementer under budget — every other role equals the default map", () => {
+    for (const role of Object.keys(models) as (keyof typeof models)[]) {
+      if (role === "implementer") continue;
+      expect(budgetModels[role]).toEqual(models[role]);
+    }
+  });
+
+  it("has the same role keys as models", () => {
+    expect(Object.keys(budgetModels).sort()).toEqual(
+      Object.keys(models).sort(),
     );
   });
 
@@ -35,7 +60,7 @@ describe("--budget (Sonnet-5 implementer)", () => {
     expect(args.implementerModel).toBe("claude-opus-4-8");
   });
 
-  it("does NOT change the other role models", () => {
+  it("does NOT change the other resolved role models", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--budget"]);
     expect(args.reviewerModel).toBe(models.reviewer.default);
     expect(args.critiqueModel).toBe(models.critique.default);
@@ -55,11 +80,23 @@ describe("--budget (Sonnet-5 implementer)", () => {
     ).toThrow();
   });
 
-  it("hard-errors on --budget + --opus 5 (opus5 has no implementer escalation)", () => {
-    // The footgun: opus5Models.implementer.escalations is [], so a Sonnet-5
-    // budget first pass would have no Opus retry fallback. Reject the combo.
+  it("hard-errors on --budget + --opus 5 (contradictory profiles)", () => {
     expect(() =>
       parseSandcastleArgs(["--iterations", "1", "--budget", "--opus", "5"]),
     ).toThrow(/opus 5/i);
+  });
+});
+
+describe("escalationForAttempt", () => {
+  it("walks the budget ladder: attempt 2 → Sonnet, attempt 3 → Opus 1M", () => {
+    const escalations = budgetModels.implementer.escalations;
+    expect(escalationForAttempt(escalations, 2)).toBe("claude-sonnet-5");
+    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-4-8[1m]");
+  });
+
+  it("clamps a single-element (non-budget) array to index 0 for BOTH attempts 2 and 3", () => {
+    const escalations = models.implementer.escalations; // ["claude-opus-4-8[1m]"]
+    expect(escalationForAttempt(escalations, 2)).toBe("claude-opus-4-8[1m]");
+    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-4-8[1m]");
   });
 });
