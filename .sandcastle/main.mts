@@ -7224,10 +7224,18 @@ export async function runMain(
         );
 
       // Fix-ladder. Only runs under staging AND only when the first pass
-      // flagged ISSUES_FOUND. The fixer runs on its DEFAULT (first-pick) model
-      // like every other role — its escalation rung is reserved for a retry
-      // pass (see the 2-pass fix loop). Then re-run the reviewer on the
-      // escalated model.
+      // flagged ISSUES_FOUND. Bounded 2-pass loop:
+      //   - pass 1: fixer on `postMergeFixer.default` (cheap first pick) →
+      //             re-review → if ALL_CLEAR, done.
+      //   - pass 2: only when pass-1 re-review still flags ISSUES_FOUND AND an
+      //             escalation rung exists — fixer on
+      //             `escalationForAttempt(postMergeFixer.escalations, 2)` →
+      //             re-review → if ALL_CLEAR, done; else quarantine as today.
+      // Each fixer pass is threaded the LATEST re-review feedback (we re-capture
+      // the re-review's stdout into `postMergeFeedback` between passes). An
+      // empty escalations array collapses this to a single pass — byte-identical
+      // to the legacy one-fix-one-review behavior. The re-review always runs on
+      // the reviewer's escalation model, as before.
       if (
         stagingActive &&
         postMergeMarker === "POST_MERGE_ISSUES_FOUND"
@@ -7236,35 +7244,48 @@ export async function runMain(
         // SAME `roleModelsFor(args)` source every other role uses — never a
         // second derivation off the model, which could split from args.backend.
         const fixerSrc = roleModelsFor(args);
-        const fixerModel = fixerSrc.postMergeFixer.default;
-        deps.log(
-          `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
-        );
-        let fixerOk = true;
-        let fixerResult: RunHandle | undefined;
-        try {
-          fixerResult = await deps.run({
-            name: "post-merge-fixer",
-            maxIterations: 1,
-            model: fixerModel,
-            promptFile: "./.sandcastle/post-merge-fix-prompt.md",
-            idleTimeoutSeconds: args.implementerTimeoutSec,
-            cwd: stagingWorktreePath,
-            promptArgs: {
-              ITERATION: String(it),
-              INTEGRATION_BRANCH: args.branch,
-              BRANCHES: branchesArg,
-              ISSUES: issuesArg,
-              POST_MERGE_FEEDBACK: postMergeFeedback.slice(0, 8000),
-            },
-          });
-        } catch (err) {
-          fixerOk = false;
-          deps.logError(
-            `post-merge fixer threw: ${(err as Error).message} — falling through to quarantine`,
+        const fixerEscalations = fixerSrc.postMergeFixer.escalations;
+        const maxFixerPasses = fixerEscalations.length > 0 ? 2 : 1;
+        for (
+          let fixerPass = 1;
+          fixerPass <= maxFixerPasses &&
+          postMergeMarker === "POST_MERGE_ISSUES_FOUND";
+          fixerPass++
+        ) {
+          const fixerModel =
+            fixerPass === 1
+              ? fixerSrc.postMergeFixer.default
+              : escalationForAttempt(fixerEscalations, fixerPass);
+          deps.log(
+            `post-merge fix-loop: spawning fixer (pass ${fixerPass}, model=${fixerModel}) on ${STAGING_BRANCH}`,
           );
-        }
-        if (fixerOk) {
+          let fixerOk = true;
+          let fixerResult: RunHandle | undefined;
+          try {
+            fixerResult = await deps.run({
+              name: "post-merge-fixer",
+              maxIterations: 1,
+              model: fixerModel,
+              promptFile: "./.sandcastle/post-merge-fix-prompt.md",
+              idleTimeoutSeconds: args.implementerTimeoutSec,
+              cwd: stagingWorktreePath,
+              promptArgs: {
+                ITERATION: String(it),
+                INTEGRATION_BRANCH: args.branch,
+                BRANCHES: branchesArg,
+                ISSUES: issuesArg,
+                POST_MERGE_FEEDBACK: postMergeFeedback.slice(0, 8000),
+              },
+            });
+          } catch (err) {
+            fixerOk = false;
+            deps.logError(
+              `post-merge fixer threw: ${(err as Error).message} — falling through to quarantine`,
+            );
+          }
+          // A thrown fixer leaves `postMergeMarker` at ISSUES_FOUND and does NOT
+          // retry (no re-review ran) — fall through to quarantine as before.
+          if (!fixerOk) break;
           // Capture the fixer's Skill() invocations from its session JSONL
           // — same pattern as runImplementer (see
           // extractSkillInvocationsFromSession). The fixer is required
@@ -7345,10 +7366,10 @@ export async function runMain(
           deps.log(
             `post-merge fix-loop: re-running reviewer (model=${reviewerEscModel}) on fixed staging`,
           );
-          ({ marker: postMergeMarker } = await runPostMergeReviewer(
-            reviewerEscModel,
-            skillsInvokedByIssue,
-          ));
+          // Re-capture BOTH marker and stdout: the next fixer pass (if any)
+          // must be threaded THIS re-review's feedback, not the stale first pass.
+          ({ marker: postMergeMarker, stdout: postMergeFeedback } =
+            await runPostMergeReviewer(reviewerEscModel, skillsInvokedByIssue));
         }
       }
 

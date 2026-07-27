@@ -3727,6 +3727,86 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
     }
   });
 
+  // The post-merge fixer gets a bounded 2-pass retry: when pass-1's re-review
+  // still flags ISSUES_FOUND, a SECOND fixer runs on the escalation model, and
+  // if its re-review clears, the batch promotes. WHEN-landed under the default
+  // profile (postMergeFixer.default="claude-opus-4-8", escalations[0]=
+  // "claude-opus-4-8[1m]") so the two fixer dispatches are distinguishable.
+  it("runs a second post-merge fixer pass on the escalation model, then promotes", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-fixer-2pass-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      // pass 1: review flags issues → fixer → re-review STILL flags issues.
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      b.enqueue("post-merge-fixer", { stdout: "fix attempt 1" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      // pass 2: escalated fixer → re-review clears → promote.
+      b.enqueue("post-merge-fixer", { stdout: "fix attempt 2" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const fixerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "post-merge-fixer",
+      );
+      expect(fixerCalls).toHaveLength(2);
+      expect(fixerCalls[0]!.spec.model).toBe(models.postMergeFixer.default);
+      expect(fixerCalls[1]!.spec.model).toBe(
+        models.postMergeFixer.escalations[0],
+      );
+      // Cleared on pass 2 → the batch promotes.
+      const status = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, ".sandcastle", "status.json"),
+          "utf8",
+        ),
+      ) as SandcastleStatus;
+      expect(status.state).not.toBe("unhealthy");
+      expect(status.totals.merged).toBe(1);
+      expect(
+        status.issues.find((i) => i.number === 71)?.phase,
+      ).toBe("merged");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
   // The merger retries once on its escalation model when attempt 1 throws.
   // WHEN-landed: first merger dispatch throws → staging is reset again
   // (discarding the partial merge) → a SECOND merger runs on the escalation
