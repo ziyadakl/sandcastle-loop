@@ -237,16 +237,20 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     };
   }
 
-  it("LAUNCH-TIME REAPER: production checkpointInflight() persists WIP + releases the lease, and a fresh clone resumes from it", async () => {
+  it("LAUNCH-TIME REAPER: production checkpointInflight() persists WIP (lease OFF ⇒ no lock touched, DEFECT 5), and a fresh clone resumes from it", async () => {
     const hostA = makeHost("hostReaperA");
     const marker = "PARTIAL-WORK-MARKER-issue7-launch-reaper";
     makeInflightWorktree(hostA, 7, marker);
+    // A lock ref only EXISTS here as a fixture — in real lease-OFF operation the
+    // loop never creates one. DEFECT 5: with the lease disabled the reaper has
+    // no business touching leases, so this ref must be LEFT ALONE.
     pushLock(hostA, 7);
-    // Precondition: lease held, no WIP yet.
     expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
     expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
 
-    // Drive the REAL startup-reaper dep (production wiring under test).
+    // Drive the REAL startup-reaper dep (production wiring under test). Lease is
+    // OFF (reaperArgs sets no lease env), so the guard is `false` and the delete
+    // is skipped — the WIP rescue still runs unconditionally.
     const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
 
     const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
@@ -257,8 +261,9 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     const wipSha = lsRemote(hostA, "refs/sandcastle/wip/issue-7");
     expect(wipSha).not.toBe("");
     expect(git(remote, "show", `${wipSha}:PARTIAL_WORK.txt`)).toBe(marker);
-    // ... and the lease is released (so a peer / the next loop may reclaim).
-    expect(lsRemote(hostA, "refs/locks/issue-7")).toBe("");
+    // ... and the (fixture) lock is UNTOUCHED — lease-off skips the pointless
+    // delete (DEFECT 5); there is nothing lease-related for the reaper to do.
+    expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
 
     // RESUME: a fresh clone materializes a worktree AT the checkpoint, not fresh.
     const hostB = makeHost("hostReaperB");
@@ -279,6 +284,74 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     // Empty discovery ⇒ no per-issue results, no WIP ref, no lease touched.
     expect(results).toEqual<CheckpointStopResult[]>([]);
     expect(lsRemote(host, "refs/sandcastle/wip/issue-7")).toBe("");
+  });
+
+  // -------------------------------------------------------------------------
+  // DEFECT 1 (HIGH) — the launch-time reaper must NOT delete a lease a PEER
+  // holds LIVE. A crashed host's lease can expire and be re-claimed by a peer
+  // before the crashed host restarts; the reaper deleting it here would strand
+  // the peer's active work. Drives the PRODUCTION `checkpointInflight` wiring
+  // (guard = leaseEnabled && leaseState !== "live") against a GENUINE peer-held
+  // live lease on the shared origin. Non-vacuous: the reaper still runs and
+  // pushes the WIP ref (work rescued) — only the lease delete is skipped.
+  // -------------------------------------------------------------------------
+  it("LAUNCH-TIME REAPER: with the lease ON and a peer holding it LIVE, WIP is pushed but the lease is NOT deleted", async () => {
+    const prev = process.env.SANDCASTLE_CROSS_HOST_LEASE;
+    process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    try {
+      const peer = makeHost("hostPeerLease");
+      // A real, LIVE lease on origin (proper lease blob, default TTL) — the
+      // "another host is working issue 7" a crashed host would wake up into.
+      const acquired = await buildDefaultDeps(reaperArgs(peer)).acquireIssueLease(7);
+      expect(acquired).toBe(true);
+
+      const hostA = makeHost("hostCrashedA");
+      const marker = "PARTIAL-WORK-MARKER-issue7-peer-live-lease";
+      makeInflightWorktree(hostA, 7, marker);
+      // Precondition: the peer's lease is visible on origin, no WIP yet.
+      expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+      expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
+
+      const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
+
+      // Work was RESCUED: the WIP ref now carries the exact partial work ...
+      const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
+      expect(r7.outcome).toBe("checkpointed");
+      const wipSha = lsRemote(hostA, "refs/sandcastle/wip/issue-7");
+      expect(wipSha).not.toBe("");
+      expect(git(remote, "show", `${wipSha}:PARTIAL_WORK.txt`)).toBe(marker);
+      // ... but the peer's LIVE lease was LEFT INTACT — not yanked.
+      expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+    } finally {
+      if (prev === undefined) delete process.env.SANDCASTLE_CROSS_HOST_LEASE;
+      else process.env.SANDCASTLE_CROSS_HOST_LEASE = prev;
+    }
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // DEFECT 2 (HIGH) — the launch-time reaper must be INERT under --dry-run:
+  // no commit, no WIP push, no lease delete — mirroring every sibling dep
+  // (release / publishStatus). Even with a dirty in-flight worktree AND a lease
+  // present, a dry run touches ORIGIN not at all and returns [].
+  // -------------------------------------------------------------------------
+  it("DRY-RUN: checkpointInflight is a no-op — returns [] and writes nothing to origin", async () => {
+    const host = makeHost("hostDry");
+    makeInflightWorktree(host, 7, "PARTIAL-WORK-MARKER-issue7-dryrun");
+    pushLock(host, 7);
+    const lockBefore = lsRemote(host, "refs/locks/issue-7");
+    expect(lockBefore).not.toBe("");
+
+    const results = await buildDefaultDeps({
+      ...reaperArgs(host),
+      dryRun: true,
+    }).checkpointInflight();
+
+    // Returns [] — nothing reaped ...
+    expect(results).toEqual<CheckpointStopResult[]>([]);
+    // ... no WIP ref created ...
+    expect(lsRemote(host, "refs/sandcastle/wip/issue-7")).toBe("");
+    // ... and the lease is untouched (byte-for-byte the pre-run ref).
+    expect(lsRemote(host, "refs/locks/issue-7")).toBe(lockBefore);
   });
 
   // -------------------------------------------------------------------------

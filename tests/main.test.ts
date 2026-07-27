@@ -6960,10 +6960,12 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     expect(b.state.leaseStateCalls).toEqual([]);
   });
 
-  // Hook 4b — ADR 0021 launch-time reaper (Fix 2). Gated on the prior run's
-  // liveness: it fires when the previous status.json proves a hard crash, and is
-  // skipped when the prior run is still live. Uses a per-test repoRoot so the
-  // seeded prior status.json isn't the shared TEST_REPO_ROOT's.
+  // Hook 4b — ADR 0021 launch-time reaper (Fix 2). DEFECT 4: it is NOT gated on
+  // the prior run's liveness — we hold the single-instance lock, so our loop is
+  // provably the only one running and the reaper ALWAYS runs (a no-op when no
+  // `agent/issue-<N>` worktree survives). This is what stops a REUSED pid that
+  // probes "alive" from suppressing a real WIP rescue. Uses a per-test repoRoot
+  // so the seeded prior status.json isn't the shared TEST_REPO_ROOT's.
   function seedPriorStatus(
     repoRoot: string,
     fields: { state: string; updatedAt: string; pid: number; hostId: string },
@@ -6979,9 +6981,8 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     process.env.SANDCASTLE_HOST_ID = "reaper-host";
     const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-reaper-"));
     try {
-      // Prior status: OUR host, `running`, but its pid is dead → deriveLiveness
-      // returns `crashed` → not live → reaper must run. A huge pid can never be
-      // signalled, so the probe reports it gone.
+      // Prior status: OUR host, `running`, its pid long dead — the classic hard
+      // crash. The reaper must run (and BEFORE reconciliation frees the label).
       seedPriorStatus(repoRoot, {
         state: "running",
         updatedAt: new Date().toISOString(),
@@ -7011,12 +7012,17 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
     }
   });
 
-  it("hook 4b: live prior run → reaper is NOT invoked", async () => {
+  it("hook 4b: prior status.json pid probes ALIVE (pid reuse) → reaper STILL runs (DEFECT 4)", async () => {
     process.env.SANDCASTLE_HOST_ID = "reaper-host";
     const repoRoot = mkdtempSync(path.join(tmpdir(), "sc-reaper-"));
     try {
-      // Prior status: OUR host, `running`, pid = THIS process (alive) + fresh
-      // timestamp → deriveLiveness returns live → reaper must be skipped.
+      // Prior status: OUR host, `running`, pid = THIS process so any liveness
+      // probe reports it ALIVE — the exact pid-reuse trap. The dead loop's pid
+      // was recycled by an unrelated live process. The OLD code skipped the
+      // reaper here, letting reconciliation free the label WITHOUT capturing a
+      // surviving worktree's WIP (work lost). Since we hold the single-instance
+      // lock, our loop is provably the only one running, so the reaper MUST run
+      // regardless of what the probe says.
       seedPriorStatus(repoRoot, {
         state: "running",
         updatedAt: new Date().toISOString(),
@@ -7029,8 +7035,9 @@ describe("cross-host issue lease orchestration (ADR 0019)", () => {
       const result = await runMain(baseArgs({ iterations: 1, repoRoot }), b.deps);
 
       expect(result.exitCode).toBe(0);
-      // A live prior run means nothing dead to reap — no git work at all.
-      expect(b.state.checkpointInflightCalls).toBe(0);
+      // The reaper ran despite the "alive" pid — a reused pid can no longer
+      // suppress a real rescue.
+      expect(b.state.checkpointInflightCalls).toBe(1);
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
     }

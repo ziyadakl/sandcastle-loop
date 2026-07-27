@@ -14,7 +14,11 @@
  *      branch (committed-but-unpushed work);
  *   3. if so, push HEAD to the issue's WIP ref ({@link pushWipRef}) and RELEASE
  *      the lease by deleting `refs/locks/issue-<N>` on the remote — the exact
- *      release the dead loop never got to do;
+ *      release the dead loop never got to do. The release is UNCONDITIONAL by
+ *      default (the graceful `--now` stop's leases are its own), but an optional
+ *      `canReleaseLease` guard can veto the DELETE per issue so the launch-time
+ *      reaper never yanks a lease a live peer re-claimed — the WIP push above
+ *      still runs regardless, so the work is rescued either way;
  *   4. a clean, not-ahead worktree has nothing to save: leave its lease and WIP
  *      ref untouched.
  *
@@ -123,6 +127,20 @@ export interface CheckpointStopOpts {
    * pinned by a LOCAL strand ref, so nothing is lost; it just never leaves the box.
    */
   readonly syncEnabled: boolean;
+  /**
+   * DEFECT 1 (ADR 0019/0021): optional per-issue guard consulted right before
+   * the lease DELETE. Returns `true` when it is safe to release issue `n`'s
+   * lease, `false` to LEAVE it in place. ABSENT ⇒ today's UNCONDITIONAL release
+   * — the graceful `--now` stop's leases are its own host's, so deleting them is
+   * always correct. The LAUNCH-TIME reaper (main.mts `checkpointInflight`) passes
+   * a guard that refuses to yank a lease a PEER host currently holds LIVE: a
+   * crashed host's lease can expire and be re-claimed by a peer before the
+   * crashed host restarts, and deleting it here would strand the peer's active
+   * work. CRITICAL: WIP capture ({@link pushWipRef}) ALWAYS runs first, before
+   * this guard — we ALWAYS rescue the work; only the lease DELETE is gated, so a
+   * refused release never leaves work unsaved.
+   */
+  readonly canReleaseLease?: (issue: number) => Promise<boolean>;
 }
 
 /**
@@ -197,15 +215,26 @@ export async function checkpointStop(
       }
 
       // 3b. release the lease so a peer may reclaim the issue: delete
-      //     refs/locks/issue-<N> on the remote (empty-source delete refspec).
-      const release = await releaseLeaseRef(opts.repoRoot, wt.issue, git, remote);
-      if (!release.ok) {
-        results.push({
-          issue: wt.issue,
-          outcome: "error",
-          detail: release.stderr.trim() || "lease release failed",
-        });
-        continue;
+      //     refs/locks/issue-<N> on the remote (empty-source delete refspec) —
+      //     but ONLY when the caller's guard (if any) permits (DEFECT 1). The
+      //     WIP push above already rescued the work, so a REFUSED release just
+      //     leaves the lease standing (a live peer already re-claimed the issue,
+      //     or lease-mode is off so there is no ref worth deleting). Absent
+      //     guard ⇒ unconditional delete — the graceful `--now` stop's own-host
+      //     leases, unchanged.
+      const mayRelease =
+        opts.canReleaseLease === undefined ||
+        (await opts.canReleaseLease(wt.issue));
+      if (mayRelease) {
+        const release = await releaseLeaseRef(opts.repoRoot, wt.issue, git, remote);
+        if (!release.ok) {
+          results.push({
+            issue: wt.issue,
+            outcome: "error",
+            detail: release.stderr.trim() || "lease release failed",
+          });
+          continue;
+        }
       }
 
       results.push({

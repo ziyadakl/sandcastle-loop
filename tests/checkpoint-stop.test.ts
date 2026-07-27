@@ -346,6 +346,91 @@ describe("checkpointStop", () => {
   });
 });
 
+describe("checkpointStop — canReleaseLease guard (DEFECT 1 / launch-time reaper)", () => {
+  const dirtyPorcelain = [
+    "worktree /repo/.sandcastle/wt/issue-5",
+    "HEAD 8888888888888888888888888888888888888888",
+    "branch refs/heads/agent/issue-5",
+    "",
+  ].join("\n");
+
+  /** Fake git for a single DIRTY issue-5 worktree (always something to save). */
+  function dirtyGit(): { git: GitRunner; calls: Call[] } {
+    return makeFakeGit((args) => {
+      if (args.includes("worktree") && args.includes("list")) {
+        return { stdout: dirtyPorcelain };
+      }
+      if (args[0] === "status") return { stdout: " M src/x.ts\n" };
+      return {};
+    });
+  }
+
+  it("guard returning FALSE still pushes the WIP ref but does NOT delete the lease (peer holds it live)", async () => {
+    const { git, calls } = dirtyGit();
+    const seen: number[] = [];
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      canReleaseLease: async (issue) => {
+        seen.push(issue);
+        return false; // a live peer lease — must NOT be yanked
+      },
+    });
+
+    // The work was still RESCUED: committed + pushed to the WIP ref.
+    expect(callsMatching(calls, "commit").length).toBe(1);
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
+    // But the lease delete was SKIPPED entirely.
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(false);
+    // The guard was consulted for exactly this issue.
+    expect(seen).toEqual([5]);
+    // Outcome is still checkpointed — the WIP is safe, only the lease stayed put.
+    expect(results).toEqual<CheckpointStopResult[]>([
+      { issue: 5, outcome: "checkpointed", wipRef: "refs/sandcastle/wip/issue-5" },
+    ]);
+  });
+
+  it("guard returning TRUE releases the lease (safe-to-reclaim path)", async () => {
+    const { git, calls } = dirtyGit();
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      canReleaseLease: async () => true,
+    });
+
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(true);
+    expect(results[0]?.outcome).toBe("checkpointed");
+  });
+
+  it("ABSENT guard preserves today's UNCONDITIONAL delete (graceful --now unchanged)", async () => {
+    const { git, calls } = dirtyGit();
+
+    await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      // no canReleaseLease — the graceful `--now` stop's own-host leases.
+    });
+
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(true);
+  });
+});
+
 describe("checkpoint-stop.mts (post-kill runner) — status reconciliation", () => {
   it("writes state:'stopped' to status.json as its FINAL step, stopping the running lie", () => {
     // A hard kill leaves status.json saying `running` forever with no reconciler.

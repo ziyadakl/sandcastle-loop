@@ -89,7 +89,6 @@ import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, 
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
-import { deriveLiveness } from "./lib/status/liveness.js";
 import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
 import {
   applyMigrationsBetween,
@@ -3545,6 +3544,15 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       return statusSync.fetchPeers(runId);
     },
     async checkpointInflight() {
+      // DEFECT 2: INERT under --dry-run, mirroring every sibling dep
+      // (release/publishStatus/syncLanes). A dry run must touch NO git — no
+      // commit into a worktree, no WIP push, no lease delete — so we
+      // short-circuit BEFORE discovery and return []. Logs one `[dry-run]` line
+      // like its siblings.
+      if (args.dryRun) {
+        dryLog("checkpointInflight");
+        return [];
+      }
       // ADR 0021 launch-time reaper: bind the proven post-kill `checkpointStop`
       // to a real git runner and the current run's config, mirroring the thin
       // `scripts/checkpoint-stop.mts` runner (same hostId + integration-branch
@@ -3565,6 +3573,17 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         remote: "origin",
         stagingBranch: null,
         syncEnabled: crossHostSyncEnabled(),
+        // DEFECT 1: never yank a lease a PEER currently holds LIVE. Unlike the
+        // graceful `--now` stop (whose leases are its own host's), the launch-
+        // time reaper runs after a CRASH — this host's lease may have expired
+        // and been re-claimed by a peer that is now actively working the issue,
+        // so deleting `refs/locks/issue-<N>` here would strand the peer's work.
+        // Release ONLY when the lease is NOT live. With lease-mode OFF there is
+        // no lock ref at all, so releasing is pointless — return false and skip
+        // the delete (DEFECT 5). WIP capture still runs regardless of this
+        // guard, so the crashed work is always rescued.
+        canReleaseLease: async (issue) =>
+          leaseEnabled && (await leaseCoord.leaseState(issue)) !== "live",
       });
     },
     log,
@@ -6083,37 +6102,6 @@ async function publishLaneOrLog(
 // ---------------------------------------------------------------------------
 
 /**
- * Best-effort read of the PRIOR run's status.json, reduced to just the fields
- * {@link deriveLiveness} consumes, for the ADR 0021 launch-time reaper gate
- * (Fix 2). Returns `null` when the file is absent / unreadable / unparseable /
- * missing the required fields — the caller treats `null` as "no evidence either
- * way" and lets the reaper's own empty-discovery no-op self-gate. NEVER throws:
- * a torn status file must not block startup.
- */
-export function readPriorStatusForLiveness(
-  repoRoot: string,
-): { state: string; updatedAt: string; pid?: number; hostId?: string } | null {
-  const statusPath = path.join(repoRoot, ".sandcastle", "status.json");
-  if (!existsSync(statusPath)) return null;
-  try {
-    const raw = JSON.parse(
-      readFileSync(statusPath, "utf8"),
-    ) as Partial<SandcastleStatus>;
-    if (typeof raw.state !== "string" || typeof raw.updatedAt !== "string") {
-      return null;
-    }
-    return {
-      state: raw.state,
-      updatedAt: raw.updatedAt,
-      ...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
-      ...(typeof raw.hostId === "string" ? { hostId: raw.hostId } : {}),
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Drive the orchestrator. Returns a structured result instead of calling
  * `process.exit` so tests can assert.
  *
@@ -6292,41 +6280,24 @@ export async function runMain(
   // and strands its lease. The graceful `--now` skill already invokes this same
   // reaper; here we auto-invoke it so a crash needs no human `--now`.
   //
-  // Gate on evidence the prior run actually died so a NORMAL (live) start does
-  // no git work and logs nothing: read the previous status.json and run
-  // `deriveLiveness` with a real same-host pid probe. Run the reaper only when
-  // the prior run is NOT live (crashed/stale/stopped/…); a missing or
-  // unparseable file falls through to the self-gating discovery path (the reaper
-  // is a no-op when no `agent/issue-<N>` worktree survives). Best-effort +
-  // NON-FATAL: a crash-recovery step must never crash the loop it protects.
+  // DEFECT 4: do NOT gate the reaper on a prior-status liveness probe. We hold
+  // the single-instance lock acquired above, so OUR loop is provably the ONLY
+  // one running here — regardless of what a stale status.json's stamped pid
+  // claims. A hard-killed loop's pid can be REUSED by an unrelated live process,
+  // making the probe report "alive" and (under the old gate) SKIP the reaper —
+  // after which reconciliation frees the label without ever capturing the
+  // surviving worktree's WIP, losing the work. So we ALWAYS run discovery. The
+  // reaper is a natural no-op when no `agent/issue-<N>` worktree survives, and
+  // stays SILENT unless it actually reaped something, so a clean start adds no
+  // noise. Best-effort + NON-FATAL: crash recovery must never crash the loop it
+  // protects. (Dropping the probe here also retires the second, drift-prone pid
+  // probe DEFECT 5 flagged — the ONE remaining probe lives in the viewer.)
   try {
-    const priorStatus = readPriorStatusForLiveness(args.repoRoot);
-    const priorLive =
-      priorStatus !== null &&
-      deriveLiveness(priorStatus, {
-        now: Date.now(),
-        probeAlive: (pid) => {
-          try {
-            process.kill(pid, 0);
-            return true;
-          } catch {
-            return false;
-          }
-        },
-        selfHostId: resolveHostId(),
-      }).live;
-    if (priorLive) {
-      // A live prior loop on this host means the lock above should have refused
-      // us; either way there is nothing dead to reap. Skip silently.
-    } else {
-      const reaped = await deps.checkpointInflight();
-      // Only speak when there was actually something to reap — a clean launch
-      // (empty discovery) stays quiet so this adds no noise to a normal start.
-      if (reaped.length > 0) {
-        deps.log(
-          `[startup] launch-time reaper: rescued in-flight work from a prior killed run:\n${formatCheckpointStop([...reaped])}`,
-        );
-      }
+    const reaped = await deps.checkpointInflight();
+    if (reaped.length > 0) {
+      deps.log(
+        `[startup] launch-time reaper: rescued in-flight work from a prior killed run:\n${formatCheckpointStop([...reaped])}`,
+      );
     }
   } catch (err) {
     deps.logError(

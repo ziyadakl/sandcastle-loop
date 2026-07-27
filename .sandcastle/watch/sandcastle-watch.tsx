@@ -105,13 +105,21 @@ const MUTED_FG: string | undefined = undefined;
 const W = { marker: 2, num: 6, title: 38, phase: 13 } as const;
 /** Outer width of the running panel = grid + paddingX(1·2) + border(1·2). */
 const RULE_W = W.marker + W.num + W.title + W.phase + 4;
-/** Phases where the issue is actively being worked by an agent. */
+/**
+ * Phases where the issue is actively being worked by an agent — OR is parked
+ * TRANSIENTLY awaiting re-run. `needs-rerun` is included (DEFECT 3): its label
+ * was released back to `ready-for-agent` for a re-run/peer to reclaim, so it
+ * belongs in the ACTIVE panel, matching the web viewer (view-model.js) and the
+ * schema's stated intent (schema.ts: "transient … belongs in active not
+ * recent"). Without it a parked `needs-rerun` issue rendered in NEITHER panel.
+ */
 const ACTIVE_PHASES: ReadonlySet<IssuePhase> = new Set<IssuePhase>([
   "implementer",
   "reviewer",
   "implementer-retry",
   "recovery",
   "merge",
+  "needs-rerun",
 ]);
 
 /** Phases that are terminal for the current iteration (the "recent" strip). */
