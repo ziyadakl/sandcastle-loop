@@ -36,11 +36,39 @@ describe("--budget (Sonnet fix-it rung)", () => {
     ).toEqual(["claude-opus-4-8[1m]"]);
   });
 
-  it("changes ONLY the implementer under budget — every other role equals the default map", () => {
-    for (const role of Object.keys(models) as (keyof typeof models)[]) {
-      if (role === "implementer") continue;
-      expect(budgetModels[role]).toEqual(models[role]);
-    }
+  it("pins the finalized budget ladder for every role", () => {
+    expect(budgetModels.planner).toEqual({
+      default: "claude-sonnet-5",
+      escalations: [],
+    });
+    expect(budgetModels.implementer).toEqual({
+      default: "claude-sonnet-5",
+      escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"],
+    });
+    expect(budgetModels.reviewer).toEqual({
+      default: "claude-haiku-4-5",
+      escalations: ["claude-sonnet-5"],
+    });
+    expect(budgetModels.critique).toEqual({
+      default: "claude-haiku-4-5",
+      escalations: [],
+    });
+    expect(budgetModels.merger).toEqual({
+      default: "claude-opus-4-8[1m]",
+      escalations: ["claude-opus-5"],
+    });
+    expect(budgetModels.postMergeReviewer).toEqual({
+      default: "claude-opus-4-8[1m]",
+      escalations: ["claude-opus-5"],
+    });
+    expect(budgetModels.postMergeFixer).toEqual({
+      default: "claude-sonnet-5",
+      escalations: ["claude-opus-5"],
+    });
+    expect(budgetModels.recovery).toEqual({
+      default: "claude-opus-4-8[1m]",
+      escalations: ["claude-opus-5"],
+    });
   });
 
   it("has the same role keys as models", () => {
@@ -60,12 +88,12 @@ describe("--budget (Sonnet fix-it rung)", () => {
     expect(args.implementerModel).toBe("claude-opus-4-8");
   });
 
-  it("does NOT change the other resolved role models", () => {
+  it("resolves the other role models from the budget map", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--budget"]);
-    expect(args.reviewerModel).toBe(models.reviewer.default);
-    expect(args.critiqueModel).toBe(models.critique.default);
-    expect(args.plannerModel).toBe(models.planner.default);
-    expect(args.mergerModel).toBe(models.merger.default);
+    expect(args.reviewerModel).toBe(budgetModels.reviewer.default);
+    expect(args.critiqueModel).toBe(budgetModels.critique.default);
+    expect(args.plannerModel).toBe(budgetModels.planner.default);
+    expect(args.mergerModel).toBe(budgetModels.merger.default);
   });
 
   it("hard-errors on --budget + --backend codex", () => {

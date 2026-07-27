@@ -81,35 +81,39 @@ export const opus5Models = {
 
 /**
  * Budget profile (`--budget`). NOT a new backend/provider — the same anthropic
- * provider on the `claude` backend as `models`, differing ONLY on the
- * implementer (the loop's dominant token consumer: the only multi-turn role,
- * runs per-issue — the single lever that moves the bill). Every other role is
- * copied verbatim from `models`.
+ * provider on the `claude` backend as `models`, differing per-role to spend the
+ * cheapest model that can do each job and reserve the expensive tiers for a
+ * single escalation rung.
  *
- * The implementer gets a "Sonnet fix-it rung" ladder that spends the cheap
- * model twice before any Opus:
- *   - first pass       → `claude-sonnet-5` (~40% cheaper than Opus, same 1M ctx)
- *   - attempt 2 (fix)  → `claude-sonnet-5` WITH the reviewer's HAS_BLOCKERS
- *                        feedback — a cheap fix-it pass, no Opus spent yet
- *   - attempt 3        → `claude-opus-4-8[1m]` — Opus is reserved for the
- *                        round-3 grant path only, when a Sonnet fix-it still
- *                        can't clear the reviewer.
- * The retry loop walks this array by attempt number (see `escalationForAttempt`
- * in main.mts), so the ordering here is what defines the ladder.
+ * The finalized ladder (cheapest-first, one escalation rung where retries make
+ * sense; empty `escalations` means the role has no model-tier retry):
+ *   - planner            → `claude-sonnet-5`, no escalation
+ *   - implementer        → `claude-sonnet-5` first pass, then a `claude-sonnet-5`
+ *                          "fix-it rung" (attempt 2, cheap, WITH the reviewer's
+ *                          HAS_BLOCKERS feedback), then `claude-opus-4-8[1m]`
+ *                          (attempt 3) — Opus reserved for the round-3 grant
+ *   - reviewer           → `claude-haiku-4-5`, escalates to `claude-sonnet-5`
+ *   - critique           → `claude-haiku-4-5`, no escalation
+ *   - merger             → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
+ *   - postMergeReviewer  → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
+ *   - postMergeFixer     → `claude-sonnet-5`, escalates to `claude-opus-5`
+ *   - recovery           → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
+ * The retry loops walk each `escalations` array by attempt number (see
+ * `escalationForAttempt` in main.mts), so the ordering here defines the ladder.
  *
  * Budget is rejected in combination with `--opus 5`: the two flags express
  * CONTRADICTORY profiles (budget = cheapest-first, opus5 = Opus-5-everywhere)
  * and cannot both apply. See the parse-time guard in main.mts.
  */
 export const budgetModels = {
-  planner:           { default: "claude-sonnet-5",   escalations: ["claude-opus-4-8[1m]"] },
-  implementer:       { default: "claude-sonnet-5",   escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"] },
-  reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  critique:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  merger:            { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
-  postMergeReviewer: { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
-  postMergeFixer:    { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
-  recovery:          { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  planner:           { default: "claude-sonnet-5", escalations: [] },
+  implementer:       { default: "claude-sonnet-5", escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"] },
+  reviewer:          { default: "claude-haiku-4-5", escalations: ["claude-sonnet-5"] },
+  critique:          { default: "claude-haiku-4-5", escalations: [] },
+  merger:            { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
+  postMergeReviewer: { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
+  postMergeFixer:    { default: "claude-sonnet-5", escalations: ["claude-opus-5"] },
+  recovery:          { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
 } as const satisfies Record<keyof typeof models, RoleConfig>;
 
 /** Launch-time Opus model profile selector (`--opus`). */
