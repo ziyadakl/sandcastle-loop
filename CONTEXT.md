@@ -46,7 +46,7 @@ The agent run that writes code to close one issue inside a sandboxed container.
 Agent runs that gate-check the implementer's commits before they ship.
 
 **Recovery**:
-Off by default; enabled with `--recovery on`. When on, runs a single retry of the implementer with the same model before quarantining. (Earlier design had a fixer/recovery escalation ladder; that was cut — see "Keep-vs-cut criterion" below.)
+Off by default; enabled with `--recovery on`. When on, retries the implementer before quarantining, walking the recovery role's `escalations` ladder (see `.sandcastle/models.ts`): one attempt per rung, escalating the model each retry, then quarantine. A role with empty `escalations` collapses to a single retry. Under `--budget` the merger, post-merge-fixer, and recovery roles carry bounded escalation-retry loops (see "Keep-vs-cut criterion" below).
 
 **Agent backend**:
 Which coding-agent binary/SDK factory drives a run — `claudeCode()` (Claude
@@ -165,8 +165,9 @@ The predecessor at `/home/deploy/dev/affinity-tracker/scripts/ralph/afk-ralph.sh
 When deciding what to keep from FIX-5 vs. cut on the move to `.sandcastle/main.mts`:
 
 - **Kept** the FIX-5 helpers (typed verdict parsing, label-transition retry, migration applier) because they fix specific failure modes observed in this project's overnight runs.
-- **Cut** the fixer/recovery escalation ladders because (1) Matt's published philosophy [per published video content] explicitly rejects cheap-then-strong escalation, (2) the user is non-technical and cannot debug downstream errors a cheaper model leaves behind, and (3) integration test #71 needed recovery only because the implementer was Sonnet — switching the default to Opus addresses the same need at the source.
-- **However**, recovery is being restored as an opt-in flag (`--recovery on`) because we have not empirically verified Opus eliminates the failure mode.
+- **Originally cut** the fixer/recovery escalation ladders because (1) Matt's published philosophy [per published video content] explicitly rejects cheap-then-strong escalation, (2) the user is non-technical and cannot debug downstream errors a cheaper model leaves behind, and (3) integration test #71 needed recovery only because the implementer was Sonnet — switching the default to Opus addresses the same need at the source.
+- **Recovery** was first restored as an opt-in flag (`--recovery on`) because we have not empirically verified Opus eliminates the failure mode.
+- **Now reintroduced**: bounded escalation-retry loops for the merger, post-merge-fixer, and recovery roles. Each role walks its `escalations` array by attempt number — one attempt per rung, then quarantine — so the ladders are back but bounded and per-role. They are opt-in via `--budget` (where the budget ladder reserves the expensive tiers for a single escalation rung); a role with empty `escalations` still collapses to a single attempt, preserving the no-escalation behavior everywhere it was the deliberate choice. See `.sandcastle/models.ts` (`budgetModels`) and `escalationForAttempt` in `main.mts`.
 
 ## Footnote on evidence base
 

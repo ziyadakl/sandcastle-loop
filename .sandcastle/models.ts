@@ -88,16 +88,17 @@ export const opus5Models = {
  * The finalized ladder (cheapest-first, one escalation rung where retries make
  * sense; empty `escalations` means the role has no model-tier retry):
  *   - planner            → `claude-sonnet-5`, no escalation
- *   - implementer        → `claude-sonnet-5` first pass, then a `claude-sonnet-5`
- *                          "fix-it rung" (attempt 2, cheap, WITH the reviewer's
- *                          HAS_BLOCKERS feedback), then `claude-opus-4-8[1m]`
- *                          (attempt 3) — Opus reserved for the round-3 grant
+ *   - implementer        → `claude-opus-4-8[1m]` first pass, then a
+ *                          `claude-opus-4-8[1m]` "fix-it rung" (attempt 2, WITH
+ *                          the reviewer's HAS_BLOCKERS feedback), then
+ *                          `claude-opus-5` (attempt 3) — Opus 5 reserved for the
+ *                          round-3 grant
  *   - reviewer           → `claude-haiku-4-5`, escalates to `claude-sonnet-5`
  *   - critique           → `claude-haiku-4-5`, no escalation
  *   - merger             → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
  *   - postMergeReviewer  → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
- *   - postMergeFixer     → `claude-sonnet-5`, escalates to `claude-opus-5`
- *   - recovery           → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
+ *   - postMergeFixer     → `claude-opus-4-8[1m]`, escalates to `claude-opus-4-8[1m]`
+ *   - recovery           → `claude-opus-4-8[1m]`, escalates to `claude-opus-4-8[1m]`
  * The retry loops walk each `escalations` array by attempt number (see
  * `escalationForAttempt` in main.mts), so the ordering here defines the ladder.
  *
