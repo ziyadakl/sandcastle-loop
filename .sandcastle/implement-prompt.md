@@ -510,6 +510,18 @@ failure was inherited from the prior iteration, you must not ship until you
 have verified the feature you wrote actually works end-to-end. If you
 cannot fix the pre-existing condition, HALT.
 
+**Run it synchronously — never background-and-poll.** Run the e2e command
+inline in THIS turn and WAIT for it to finish, then read the log ONCE. Do NOT
+launch it in the background (no trailing `&`, no `run_in_background`, no
+detached process) and then re-read `/tmp/sandcastle-e2e-it{{ITERATION}}.log`
+across multiple turns waiting for it to appear — that pins a growing log in the
+conversation and re-reads it every turn for no benefit. The host already awaits
+your turn (idle + hard-ceiling timeouts), so there is nothing to gain by
+polling. A slow suite is NOT a reason to background a waiter: wait for it inline.
+If the suite genuinely cannot finish inside the turn's time budget, HALT with
+the reason — the remedy for a too-slow suite is a longer
+`--implementer-timeout-sec`, never agent-side polling.
+
 <!-- variant:e2e-command -->
 **Required artifacts.** Save the full playwright output to
 `/tmp/sandcastle-e2e-it{{ITERATION}}.log`. Detect the project's playwright
