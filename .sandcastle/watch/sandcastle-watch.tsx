@@ -155,6 +155,7 @@ const PHASE_LABEL: Record<IssuePhase, string> = {
   merge: "merging",
   merged: "merged",
   "needs-human": "needs-you",
+  "needs-rerun": "needs-re-run",
   deferred: "deferred",
 };
 

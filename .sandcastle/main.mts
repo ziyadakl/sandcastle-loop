@@ -7375,14 +7375,32 @@ export async function runMain(
                 if (await deps.fenceIssue(n)) {
                   fencedIssueNums.push(n);
                 } else {
+                  // TRANSIENT, not human-triage: another host won the lease, so
+                  // this is a mechanical race, not a review quarantine. Release
+                  // the label back to `ready-for-agent` so the owner/next run
+                  // re-claims it, and park it in the transient `needs-rerun`
+                  // phase (informational row, does NOT bump the "needs you"
+                  // pill). Reserve `needs-human` for REAL quarantines.
                   deps.logError(
                     `[issue=${n}] lease lost before promotion (inline fence failed) — ` +
-                      `NOT shipping this round; flagged needs-human.`,
+                      `NOT shipping this round; releasing label for re-claim (needs-rerun).`,
                   );
+                  try {
+                    await deps.release(
+                      n,
+                      `lease lost before promotion — another host may own this issue; ` +
+                        `released for re-claim`,
+                    );
+                  } catch (relErr) {
+                    deps.logError(
+                      `[issue=${n}] release after lost-lease fence failed (non-fatal): ` +
+                        `${(relErr as Error).message}`,
+                    );
+                  }
                   statusStore.setIssuePhase(
                     n,
-                    "needs-human",
-                    `lease lost before promotion — another host may own this issue`,
+                    "needs-rerun",
+                    `lease lost before promotion — released to ready-for-agent for re-claim`,
                   );
                 }
               }
@@ -7491,8 +7509,11 @@ export async function runMain(
             await handleStrandedPromotion(runGitLease, {
               log: (line) => deps.log(line),
               logError: (line) => deps.logError(line),
-              setIssuePhase: (n, phase, detail) =>
-                statusStore.setIssuePhase(n, phase, detail),
+              recordQuarantineOutcome: (n, detail) =>
+                statusStore.recordOutcome(n, {
+                  status: "quarantined",
+                  finalMarker: detail,
+                }),
               quarantine: (n, reason) => deps.quarantine(n, reason),
               releaseIssueLease: (n) => deps.releaseIssueLease(n),
               publishLane: (branch, context) =>

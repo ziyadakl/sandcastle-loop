@@ -40,10 +40,17 @@ export const PHASE_LABELS = {
   merge: "Merging",
   merged: "Merged",
   "needs-human": "Needs you",
+  "needs-rerun": "Needs re-run",
   deferred: "Deferred",
 };
 
-/** Phases that put an issue in "Recent" rather than "Active". */
+/**
+ * Phases that put an issue in "Recent" rather than "Active".
+ *
+ * `needs-rerun` is deliberately NOT here: it is transient (the issue's label was
+ * released back to `ready-for-agent` and a re-run/peer will re-claim it), so it
+ * belongs in the live "Active" list, not the "Recent"/terminal list.
+ */
 export const TERMINAL_PHASES = new Set(["merged", "needs-human", "deferred"]);
 
 /** Cap for the Recent list. */
