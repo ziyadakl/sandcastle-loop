@@ -107,7 +107,13 @@ attempt is made to restore a phase pointer or agent transcript.
 - **New origin write surface.** WIP refs join locks/status/lanes under
   `refs/sandcastle/*`. Same push-auth requirement as ADR 0019/0020 — gated behind
   the existing cross-host opt-in; a single-host consumer with the flag off keeps
-  force-reset behavior and pushes nothing new.
+  force-reset behavior and pushes nothing new. This holds on the LAUNCH-TIME
+  reaper too (it runs at every start): its per-issue WIP capture is
+  `wipOriginPush: "when-sync"` — the WIP ref is written to a LOCAL ref always
+  (enough for a same-host resume) and pushed to origin only when sync is on. Only
+  the operator-invoked graceful `--now` stop pushes WIP unconditionally
+  (`wipOriginPush: "always"`, the default), because running it is itself the
+  opt-in to that origin write.
 - **A half-written checkpoint may hold syntactically broken code.** Acceptable:
   the resuming implementer treats it as in-progress work to finish, exactly as if
   the same host had continued. Tests must cover "reuse a WIP ref whose tree

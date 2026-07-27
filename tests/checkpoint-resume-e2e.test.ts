@@ -237,45 +237,92 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     };
   }
 
-  it("LAUNCH-TIME REAPER: production checkpointInflight() persists WIP (lease OFF ⇒ no lock touched, DEFECT 5), and a fresh clone resumes from it", async () => {
-    const hostA = makeHost("hostReaperA");
-    const marker = "PARTIAL-WORK-MARKER-issue7-launch-reaper";
-    makeInflightWorktree(hostA, 7, marker);
-    // A lock ref only EXISTS here as a fixture — in real lease-OFF operation the
-    // loop never creates one. DEFECT 5: with the lease disabled the reaper has
-    // no business touching leases, so this ref must be LEFT ALONE.
-    pushLock(hostA, 7);
-    expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
-    expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
+  /** Run `fn` with SANDCASTLE_CROSS_HOST_SYNC forced to `val` (undefined = unset),
+   *  restoring the prior value afterwards — the reaper reads it via
+   *  `crossHostSyncEnabled()` straight off `process.env`. */
+  async function withSyncEnv(
+    val: string | undefined,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    const prev = process.env.SANDCASTLE_CROSS_HOST_SYNC;
+    if (val === undefined) delete process.env.SANDCASTLE_CROSS_HOST_SYNC;
+    else process.env.SANDCASTLE_CROSS_HOST_SYNC = val;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.SANDCASTLE_CROSS_HOST_SYNC;
+      else process.env.SANDCASTLE_CROSS_HOST_SYNC = prev;
+    }
+  }
 
-    // Drive the REAL startup-reaper dep (production wiring under test). Lease is
-    // OFF (reaperArgs sets no lease env), so the guard is `false` and the delete
-    // is skipped — the WIP rescue still runs unconditionally.
-    const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
+  // ADR 0021 INERTNESS: the launch-time reaper runs at EVERY start, so a flag-OFF
+  // single-host consumer that crashed must NOT push WIP refs to its app's origin.
+  // With sync OFF the reaper captures the crashed WIP to a LOCAL ref (enough for a
+  // same-host resume) and writes NOTHING to origin. Non-vacuous: the local ref IS
+  // written (asserted via rev-parse) AND origin is proven empty (ls-remote).
+  it("LAUNCH-TIME REAPER (sync OFF): WIP captured to a LOCAL ref, NOTHING pushed to origin (ADR 0021 inertness)", async () => {
+    await withSyncEnv(undefined, async () => {
+      const hostA = makeHost("hostReaperOff");
+      const marker = "PARTIAL-WORK-MARKER-issue7-reaper-syncoff";
+      makeInflightWorktree(hostA, 7, marker);
+      // A lock ref only EXISTS here as a fixture — in real lease-OFF operation the
+      // loop never creates one. DEFECT 5: with the lease disabled the reaper has
+      // no business touching leases, so this ref must be LEFT ALONE.
+      pushLock(hostA, 7);
+      expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+      expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
 
-    const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
-    expect(r7.outcome).toBe("checkpointed");
-    expect(r7.wipRef).toBe("refs/sandcastle/wip/issue-7");
+      // Drive the REAL startup-reaper dep (production wiring under test).
+      const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
 
-    // WIP is on origin carrying the exact partial work ...
-    const wipSha = lsRemote(hostA, "refs/sandcastle/wip/issue-7");
-    expect(wipSha).not.toBe("");
-    expect(git(remote, "show", `${wipSha}:PARTIAL_WORK.txt`)).toBe(marker);
-    // ... and the (fixture) lock is UNTOUCHED — lease-off skips the pointless
-    // delete (DEFECT 5); there is nothing lease-related for the reaper to do.
-    expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+      const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
+      expect(r7.outcome).toBe("checkpointed");
+      expect(r7.wipRef).toBe("refs/sandcastle/wip/issue-7");
 
-    // RESUME: a fresh clone materializes a worktree AT the checkpoint, not fresh.
-    const hostB = makeHost("hostReaperB");
-    const handle = await macHostSandbox({
-      repoRoot: hostB,
-      crossHostSync: true,
-    }).createSandbox({ branch: "agent/issue-7" });
-    const wtMarker = path.join(handle.worktreePath, "PARTIAL_WORK.txt");
-    expect(existsSync(wtMarker)).toBe(true);
-    expect(readFileSync(wtMarker, "utf8")).toBe(marker);
-    expect(git(handle.worktreePath, "rev-parse", "HEAD")).toBe(wipSha);
-    await handle.close();
+      // The WIP ref exists LOCALLY, carrying the exact partial work — a same-host
+      // resume can find it (the surviving worktree carries it too).
+      const localWip = git(hostA, "rev-parse", "refs/sandcastle/wip/issue-7");
+      expect(localWip).not.toBe("");
+      expect(git(hostA, "show", `${localWip}:PARTIAL_WORK.txt`)).toBe(marker);
+      // ... but ORIGIN has NO such ref — the flag-off consumer pushed nothing new.
+      expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
+      // ... and the (fixture) lock is UNTOUCHED — lease-off skips the delete.
+      expect(lsRemote(hostA, "refs/locks/issue-7")).not.toBe("");
+    });
+  }, 30_000);
+
+  // CONTROL / cross-host recovery: with sync ON the reaper DOES push the WIP ref
+  // to origin, so a fresh clone (a peer) can resume the crashed work. This is the
+  // case the origin push actually serves — and it proves the sync-OFF assertion
+  // above is a real gate, not a reaper that simply never pushes.
+  it("LAUNCH-TIME REAPER (sync ON): WIP pushed to origin, and a fresh clone resumes from it", async () => {
+    await withSyncEnv("1", async () => {
+      const hostA = makeHost("hostReaperOn");
+      const marker = "PARTIAL-WORK-MARKER-issue7-reaper-syncon";
+      makeInflightWorktree(hostA, 7, marker);
+      expect(lsRemote(hostA, "refs/sandcastle/wip/issue-7")).toBe("");
+
+      const results = await buildDefaultDeps(reaperArgs(hostA)).checkpointInflight();
+      const r7 = results.find((r) => r.issue === 7) as CheckpointStopResult;
+      expect(r7.outcome).toBe("checkpointed");
+
+      // WIP is on ORIGIN carrying the exact partial work ...
+      const wipSha = lsRemote(hostA, "refs/sandcastle/wip/issue-7");
+      expect(wipSha).not.toBe("");
+      expect(git(remote, "show", `${wipSha}:PARTIAL_WORK.txt`)).toBe(marker);
+
+      // RESUME: a fresh clone materializes a worktree AT the checkpoint, not fresh.
+      const hostB = makeHost("hostReaperOnB");
+      const handle = await macHostSandbox({
+        repoRoot: hostB,
+        crossHostSync: true,
+      }).createSandbox({ branch: "agent/issue-7" });
+      const wtMarker = path.join(handle.worktreePath, "PARTIAL_WORK.txt");
+      expect(existsSync(wtMarker)).toBe(true);
+      expect(readFileSync(wtMarker, "utf8")).toBe(marker);
+      expect(git(handle.worktreePath, "rev-parse", "HEAD")).toBe(wipSha);
+      await handle.close();
+    });
   }, 30_000);
 
   it("CONTROL: a clean launch (no agent worktree) → checkpointInflight is a no-op, nothing on origin", async () => {
@@ -297,7 +344,11 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
   // -------------------------------------------------------------------------
   it("LAUNCH-TIME REAPER: with the lease ON and a peer holding it LIVE, WIP is pushed but the lease is NOT deleted", async () => {
     const prev = process.env.SANDCASTLE_CROSS_HOST_LEASE;
+    const prevSync = process.env.SANDCASTLE_CROSS_HOST_SYNC;
     process.env.SANDCASTLE_CROSS_HOST_LEASE = "1";
+    // A peer-held live lease is inherently a cross-host scenario, so sync is on —
+    // the reaper therefore pushes the rescued WIP to origin (the sync-ON path).
+    process.env.SANDCASTLE_CROSS_HOST_SYNC = "1";
     try {
       const peer = makeHost("hostPeerLease");
       // A real, LIVE lease on origin (proper lease blob, default TTL) — the
@@ -325,6 +376,8 @@ describe("checkpoint-stop → resume-from-WIP (real bare origin + real clones)",
     } finally {
       if (prev === undefined) delete process.env.SANDCASTLE_CROSS_HOST_LEASE;
       else process.env.SANDCASTLE_CROSS_HOST_LEASE = prev;
+      if (prevSync === undefined) delete process.env.SANDCASTLE_CROSS_HOST_SYNC;
+      else process.env.SANDCASTLE_CROSS_HOST_SYNC = prevSync;
     }
   }, 30_000);
 

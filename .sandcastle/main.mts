@@ -3565,10 +3565,13 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // `stagingBranch: null` SKIPS the certified-but-unpromoted staging strand
       // backup — that is the graceful `--now` stop's job (it runs when no agent
       // is active); the launch-time reaper only rescues per-issue worktrees.
-      // The origin write it does perform (WIP push + lease delete) mirrors the
-      // existing `--now` behavior and needs no new auth beyond what checkpoint-
-      // stop already assumes; `syncEnabled` gates only the NEW strand write,
-      // which is skipped here anyway.
+      // Because the reaper runs at EVERY launch, its origin writes MUST honor
+      // ADR 0021's inertness contract (a flag-off single-host consumer pushes
+      // nothing new): `wipOriginPush: "when-sync"` captures each crashed WIP to a
+      // LOCAL ref always and pushes it to origin only when `syncEnabled` — unlike
+      // the graceful `--now` stop, which pushes unconditionally by default. The
+      // lease DELETE is separately gated by `canReleaseLease` below (false when
+      // lease-mode is off), so no origin write escapes when the flags are off.
       return checkpointStop(makeExecFileGitRunner(), {
         repoRoot: args.repoRoot,
         hostId: resolveHostId(),
@@ -3576,6 +3579,10 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
         remote: "origin",
         stagingBranch: null,
         syncEnabled: crossHostSyncEnabled(),
+        // Launch-time reaper: local WIP capture always, origin push only when
+        // sync is on (ADR 0021 inertness). The `--now` stop keeps the default
+        // "always" push, so its behavior is byte-for-byte unchanged.
+        wipOriginPush: "when-sync",
         // DEFECT 1: never yank a lease a PEER currently holds LIVE. Unlike the
         // graceful `--now` stop (whose leases are its own host's), the launch-
         // time reaper runs after a CRASH — this host's lease may have expired
