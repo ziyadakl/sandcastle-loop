@@ -31,6 +31,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   runMain,
+  runWithEscalation,
+  escalationForAttempt,
   runImplementer,
   runCritique,
   shipAfterMigrations,
@@ -564,6 +566,125 @@ function plannerStdout(issues: { id: string; title: string; branch: string }[]):
 // cases. Cheap; safe.
 beforeEach(() => {
   __resetTransientStateForTests();
+});
+
+describe("runWithEscalation — shared bounded-escalation scaffold", () => {
+  it("empty escalations ⇒ exactly ONE attempt (legacy single-dispatch path)", async () => {
+    const models: string[] = [];
+    const attempts: Array<{ model: string; attempt: number }> = [];
+    const shouldRetry = vi.fn(() => true); // always wants more — must be ignored
+    const beforeRetry = vi.fn();
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: [],
+      run: (model, attempt) => {
+        attempts.push({ model, attempt });
+        models.push(model);
+        return Promise.resolve(`ran:${attempt}`);
+      },
+      shouldRetry,
+      beforeRetry,
+    });
+
+    expect(attempts).toEqual([{ model: "first-model", attempt: 1 }]);
+    expect(result).toBe("ran:1");
+    // With no escalation rung, shouldRetry/beforeRetry are never consulted.
+    expect(shouldRetry).not.toHaveBeenCalled();
+    expect(beforeRetry).not.toHaveBeenCalled();
+  });
+
+  it("non-empty escalations + shouldRetry=true ⇒ retries once on escalationForAttempt(esc, 2)", async () => {
+    const escalations = ["esc-2", "esc-3"]; // two-rung ladder
+    const attempts: Array<{ model: string; attempt: number }> = [];
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations,
+      run: (model, attempt) => {
+        attempts.push({ model, attempt });
+        return Promise.resolve(`ran:${attempt}`);
+      },
+      // Bounded to 2 even though the ladder has more rungs and we always ask.
+      shouldRetry: () => true,
+    });
+
+    expect(attempts).toEqual([
+      { model: "first-model", attempt: 1 },
+      // attempt 2 uses escalationForAttempt(esc, 2) === esc[0].
+      { model: escalationForAttempt(escalations, 2), attempt: 2 },
+    ]);
+    expect(attempts[1].model).toBe("esc-2");
+    expect(result).toBe("ran:2");
+    // Never a third attempt — capped at 2.
+    expect(attempts).toHaveLength(2);
+  });
+
+  it("shouldRetry=false after attempt 1 stops early (no escalated run)", async () => {
+    const attempts: string[] = [];
+    const beforeRetry = vi.fn();
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model) => {
+        attempts.push(model);
+        return Promise.resolve("done");
+      },
+      shouldRetry: () => false, // attempt 1 was good enough
+      beforeRetry,
+    });
+
+    expect(attempts).toEqual(["first-model"]);
+    expect(result).toBe("done");
+    expect(beforeRetry).not.toHaveBeenCalled();
+  });
+
+  it("beforeRetry runs exactly once, BEFORE the escalated attempt, with the prior result", async () => {
+    const order: string[] = [];
+    const beforeRetry = vi.fn((attempt: number, prev: string) => {
+      order.push(`beforeRetry(attempt=${attempt},prev=${prev})`);
+    });
+
+    await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model, attempt) => {
+        order.push(`run(${model},${attempt})`);
+        return Promise.resolve(`result-${attempt}`);
+      },
+      shouldRetry: (_r, attempt) => attempt === 1, // retry once, then stop
+      beforeRetry,
+    });
+
+    expect(order).toEqual([
+      "run(first-model,1)",
+      "beforeRetry(attempt=2,prev=result-1)",
+      "run(esc-2,2)",
+    ]);
+    expect(beforeRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("awaits an async beforeRetry before dispatching the escalated attempt (merger staging-reset ordering)", async () => {
+    const order: string[] = [];
+
+    await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model) => {
+        order.push(`run:${model}`);
+        return Promise.resolve(model);
+      },
+      shouldRetry: (_r, attempt) => attempt === 1,
+      beforeRetry: async () => {
+        await Promise.resolve();
+        order.push("reset-staging");
+      },
+    });
+
+    // The reset must complete before the escalated dispatch, never interleaved.
+    expect(order).toEqual(["run:first-model", "reset-staging", "run:esc-2"]);
+  });
 });
 
 describe("sandcastle-loop main.mts — happy path", () => {

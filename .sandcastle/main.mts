@@ -114,6 +114,7 @@ import {
   validateRequiredSkillsInvoked,
 } from "./lib/skill-discipline.js";
 import { CostLedger, formatCostSummary, totalTokens } from "./lib/cost/ledger.js";
+import type { RoleBreakdown } from "./lib/cost/ledger.js";
 import { TimingLedger, timeRole } from "./lib/cost/timing.js";
 import { captureRoleCost } from "./lib/cost/capture.js";
 import {
@@ -1120,13 +1121,63 @@ export function roleModelsFor(a: {
  * simply repeats its final rung. Under the default (non-budget) profile
  * `escalations` has length 1, so attempts 2 AND 3 both clamp to index 0 (Opus)
  * — byte-for-byte the legacy behavior. Under `--budget` the two-rung ladder
- * yields Sonnet on attempt 2 (cheap fix-it pass) and Opus 1M on attempt 3.
+ * yields `claude-opus-4-8[1m]` on attempt 2 (the fix-it pass, WITH the
+ * reviewer's HAS_BLOCKERS feedback) and `claude-opus-5` on attempt 3 (the
+ * round-3 grant).
  */
 export function escalationForAttempt(
   escalations: readonly string[],
   attemptNumber: number,
 ): string {
   return escalations[Math.min(attemptNumber - 2, escalations.length - 1)];
+}
+
+/**
+ * Shared bounded-escalation scaffold behind the three retry ladders (recovery,
+ * merger, post-merge fixer). Owns ONLY the parts every ladder shares verbatim:
+ *   - max attempts = 2 when an escalation rung exists, else exactly 1. An empty
+ *     `escalations` array collapses this to a single dispatch — the legacy
+ *     single-attempt path, byte-for-byte (attempt 1 runs, `shouldRetry` is
+ *     never consulted, `beforeRetry` never fires).
+ *   - the 1-based attempt counter;
+ *   - per-attempt model selection: attempt 1 uses `firstModel`, later attempts
+ *     use `escalationForAttempt(escalations, attempt)`;
+ *   - `beforeRetry`, invoked ONLY before an escalated (attempt > 1) dispatch —
+ *     never before attempt 1 (the merger uses it to discard a partial merge by
+ *     resetting staging back to the integration tip).
+ *
+ * The per-site differences stay in the caller's thunks, NOT in this helper:
+ * `run` performs the dispatch (and, for the throw-based merger, catches
+ * internally and returns a status flag), and `shouldRetry` inspects the
+ * just-produced result to decide whether to escalate. Each ladder keeps its own
+ * attempt/retry log lines at the call site — they differ in content AND timing
+ * (recovery logs before the escalated run, merger logs inside its catch, the
+ * fixer logs at the start of every pass), so folding them in here would lose
+ * per-site meaning. `beforeRetry` receives the previous attempt's result so a
+ * caller (recovery) can name the prior marker in its retry log.
+ */
+export async function runWithEscalation<T>(opts: {
+  readonly firstModel: string;
+  readonly escalations: readonly string[];
+  readonly run: (model: string, attempt: number) => Promise<T>;
+  readonly shouldRetry: (result: T, attempt: number) => boolean;
+  readonly beforeRetry?: (
+    attempt: number,
+    prevResult: T,
+  ) => void | Promise<void>;
+}): Promise<T> {
+  const maxAttempts = opts.escalations.length > 0 ? 2 : 1;
+  let attempt = 1;
+  let result = await opts.run(opts.firstModel, attempt);
+  while (attempt < maxAttempts && opts.shouldRetry(result, attempt)) {
+    attempt++;
+    if (opts.beforeRetry) await opts.beforeRetry(attempt, result);
+    result = await opts.run(
+      escalationForAttempt(opts.escalations, attempt),
+      attempt,
+    );
+  }
+  return result;
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -5730,31 +5781,33 @@ async function runIssuePipeline(
       // single attempt — the result-handling block below then runs
       // byte-identically to before.
       const recoveryEscalations = roleModelsFor(ctx.args).recovery.escalations;
-      const maxRecoveryAttempts = recoveryEscalations.length > 0 ? 2 : 1;
-      let rec = await runRecovery(sandbox, ctx, errMsg, diagnosis?.hint ?? "");
-      for (
-        let recoveryAttempt = 2;
-        recoveryAttempt <= maxRecoveryAttempts &&
-        rec.marker === "ERRORED" &&
-        !isTransientError(rec.errorMsg ?? "");
-        recoveryAttempt++
-      ) {
-        const escModel = escalationForAttempt(
-          recoveryEscalations,
-          recoveryAttempt,
-        );
-        ctx.deps.log(
-          `[issue=${ctx.issueNumber}] recovery attempt ${recoveryAttempt - 1} did not ship ` +
-            `(marker=${rec.marker}) — retrying recovery on escalation model ${escModel}`,
-        );
-        rec = await runRecovery(
-          sandbox,
-          ctx,
-          errMsg,
-          diagnosis?.hint ?? "",
-          escModel,
-        );
-      }
+      // Capture the narrowed handle in a const: the `if (... && sandbox ...)`
+      // guard above narrows `sandbox` to non-undefined here, but that narrowing
+      // is lost inside the `run` closure (a captured `let`), so bind it once.
+      const sb = sandbox;
+      const rec = await runWithEscalation({
+        firstModel: ctx.args.recoveryModel,
+        escalations: recoveryEscalations,
+        // Attempt 1's model === ctx.args.recoveryModel === runRecovery's own
+        // default, so passing it explicitly here is byte-identical to the
+        // legacy first call that omitted the model argument.
+        run: (model) =>
+          runRecovery(sb, ctx, errMsg, diagnosis?.hint ?? "", model),
+        // Retry ONLY on a genuine, non-transient crash. HALT (deliberate
+        // hand-to-human) and transient ERRORED (deferred below) must NOT retry.
+        shouldRetry: (r) =>
+          r.marker === "ERRORED" && !isTransientError(r.errorMsg ?? ""),
+        beforeRetry: (recoveryAttempt, prev) => {
+          const escModel = escalationForAttempt(
+            recoveryEscalations,
+            recoveryAttempt,
+          );
+          ctx.deps.log(
+            `[issue=${ctx.issueNumber}] recovery attempt ${recoveryAttempt - 1} did not ship ` +
+              `(marker=${prev.marker}) — retrying recovery on escalation model ${escModel}`,
+          );
+        },
+      });
       if (rec.marker === "RECOVERY_COMPLETE") {
         const postSha = sandbox.worktreePath
           ? await ctx.deps.captureSha(sandbox.worktreePath)
@@ -7081,65 +7134,66 @@ export async function runMain(
       // array this is byte-identical to the legacy single dispatch (one
       // attempt, same catch log, no reset). If attempt 2 also fails, mergerOk
       // stays false and the existing quarantine path runs unchanged.
-      let mergerOk = true;
       const mergerEscalations = roleModelsFor(args).merger.escalations;
       const maxMergerAttempts = mergerEscalations.length > 0 ? 2 : 1;
-      for (
-        let mergerAttempt = 1;
-        mergerAttempt <= maxMergerAttempts;
-        mergerAttempt++
-      ) {
+      const mergerOk = await runWithEscalation({
+        firstModel: args.mergerModel,
+        escalations: mergerEscalations,
+        // Throw-based ladder: `run` catches internally and reports success as a
+        // boolean so the marker-inspecting scaffold can drive it. A successful
+        // dispatch returns `true` (shouldRetry=false stops the loop, mirroring
+        // the old `break`); a throw returns `false` and logs the same catch line.
+        run: async (mergerModel, mergerAttempt): Promise<boolean> => {
+          try {
+            const mergerResult = await timeRole(timingLedger, "merger", () =>
+              deps.run({
+              name: "merger",
+              maxIterations: 1,
+              model: mergerModel,
+              promptFile: "./.sandcastle/merge-prompt.md",
+              idleTimeoutSeconds: args.implementerTimeoutSec,
+              cwd: stagingActive ? stagingWorktreePath : undefined,
+              promptArgs: {
+                ITERATION: String(it),
+                BRANCHES: branchesArg,
+                ISSUES: issuesArg,
+              },
+            }),
+            );
+            // Phase-1 cost telemetry (best-effort). Top-level session metadata is
+            // forwarded now, so this credits in production — see the planner-site note.
+            await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
+            return true;
+          } catch (err) {
+            const willRetry = mergerAttempt < maxMergerAttempts;
+            deps.logError(
+              `merge phase threw${mergerAttempt > 1 ? ` (attempt ${mergerAttempt})` : ""}: ` +
+                `${(err as Error).message} — ` +
+                (willRetry
+                  ? `retrying merger on escalation model`
+                  : `continuing to next iteration`),
+            );
+            return false;
+          }
+        },
+        shouldRetry: (ok) => !ok,
         // On a retry, discard attempt-1's partial merge by resetting the
         // dedicated staging worktree back to the integration tip before the
         // escalated merger runs. `lastFailedStagingIteration` is already null
         // here (the prelude cleared it), so no bad-merge tag is written.
-        if (mergerAttempt > 1 && stagingActive) {
-          resetStagingToIntegrationTip(
-            args.repoRoot,
-            stagingWorktreePath,
-            args.branch,
-            lastFailedStagingIteration,
-            (s) => deps.log(s),
-            (s) => deps.logError(s),
-          );
-        }
-        const mergerModel =
-          mergerAttempt === 1
-            ? args.mergerModel
-            : escalationForAttempt(mergerEscalations, mergerAttempt);
-        mergerOk = true;
-        try {
-          const mergerResult = await timeRole(timingLedger, "merger", () =>
-            deps.run({
-            name: "merger",
-            maxIterations: 1,
-            model: mergerModel,
-            promptFile: "./.sandcastle/merge-prompt.md",
-            idleTimeoutSeconds: args.implementerTimeoutSec,
-            cwd: stagingActive ? stagingWorktreePath : undefined,
-            promptArgs: {
-              ITERATION: String(it),
-              BRANCHES: branchesArg,
-              ISSUES: issuesArg,
-            },
-          }),
-          );
-          // Phase-1 cost telemetry (best-effort). Top-level session metadata is
-          // forwarded now, so this credits in production — see the planner-site note.
-          await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
-          break;
-        } catch (err) {
-          mergerOk = false;
-          const willRetry = mergerAttempt < maxMergerAttempts;
-          deps.logError(
-            `merge phase threw${mergerAttempt > 1 ? ` (attempt ${mergerAttempt})` : ""}: ` +
-              `${(err as Error).message} — ` +
-              (willRetry
-                ? `retrying merger on escalation model`
-                : `continuing to next iteration`),
-          );
-        }
-      }
+        beforeRetry: () => {
+          if (stagingActive) {
+            resetStagingToIntegrationTip(
+              args.repoRoot,
+              stagingWorktreePath,
+              args.branch,
+              lastFailedStagingIteration,
+              (s) => deps.log(s),
+              (s) => deps.logError(s),
+            );
+          }
+        },
+      });
 
       // After a successful merger, flip every shipped issue's label from
       // `in-progress` → `merged-to-staging`. Skip when staging is off
@@ -7305,17 +7359,24 @@ export async function runMain(
         // second derivation off the model, which could split from args.backend.
         const fixerSrc = roleModelsFor(args);
         const fixerEscalations = fixerSrc.postMergeFixer.escalations;
-        const maxFixerPasses = fixerEscalations.length > 0 ? 2 : 1;
-        for (
-          let fixerPass = 1;
-          fixerPass <= maxFixerPasses &&
-          postMergeMarker === "POST_MERGE_ISSUES_FOUND";
-          fixerPass++
-        ) {
-          const fixerModel =
-            fixerPass === 1
-              ? fixerSrc.postMergeFixer.default
-              : escalationForAttempt(fixerEscalations, fixerPass);
+        // Marker-inspecting ladder. Each `run` = fixer dispatch + re-review;
+        // it threads the LATEST re-review feedback (outer `postMergeFeedback`)
+        // into the fixer prompt and re-captures BOTH marker and stdout back
+        // into the outer `let`s so a following pass sees fresh feedback and the
+        // promotion decision below reads the final verdict. `shouldRetry`
+        // escalates only when the re-review still flags ISSUES_FOUND AND the
+        // fixer itself did not throw — a thrown fixer ran no re-review, leaves
+        // `postMergeMarker` at ISSUES_FOUND, and must fall straight through to
+        // quarantine (no retry), exactly as the legacy `break` did.
+        await runWithEscalation({
+          firstModel: fixerSrc.postMergeFixer.default,
+          escalations: fixerEscalations,
+          shouldRetry: (r: { marker: string; fixerThrew: boolean }) =>
+            r.marker === "POST_MERGE_ISSUES_FOUND" && !r.fixerThrew,
+          run: async (
+            fixerModel,
+            fixerPass,
+          ): Promise<{ marker: string; fixerThrew: boolean }> => {
           deps.log(
             `post-merge fix-loop: spawning fixer (pass ${fixerPass}, model=${fixerModel}) on ${STAGING_BRANCH}`,
           );
@@ -7347,7 +7408,7 @@ export async function runMain(
           }
           // A thrown fixer leaves `postMergeMarker` at ISSUES_FOUND and does NOT
           // retry (no re-review ran) — fall through to quarantine as before.
-          if (!fixerOk) break;
+          if (!fixerOk) return { marker: postMergeMarker, fixerThrew: true };
           // Capture the fixer's Skill() invocations from its session JSONL
           // — same pattern as runImplementer (see
           // extractSkillInvocationsFromSession). The fixer is required
@@ -7432,7 +7493,9 @@ export async function runMain(
           // must be threaded THIS re-review's feedback, not the stale first pass.
           ({ marker: postMergeMarker, stdout: postMergeFeedback } =
             await runPostMergeReviewer(reviewerEscModel, skillsInvokedByIssue));
-        }
+          return { marker: postMergeMarker, fixerThrew: false };
+          },
+        });
       }
 
       // Promotion / quarantine decision.
@@ -7788,10 +7851,7 @@ export async function runMain(
       // only persisted when the merged record is non-empty, so a no-capture /
       // nothing-dispatched run leaves `totals.perRole` absent (backward-compat).
       const timing = timingLedger.summary();
-      const perRole: Record<
-        string,
-        { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
-      > = {};
+      const perRole: Record<string, RoleBreakdown> = {};
       for (const [role, r] of Object.entries(cost.perRole)) {
         const e = (perRole[role] ??= {});
         e.costUsd = r.costUsd;
