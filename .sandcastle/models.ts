@@ -113,7 +113,7 @@ export const budgetModels = {
   merger:            { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
   postMergeReviewer: { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
   postMergeFixer:    { default: "claude-sonnet-5", escalations: ["claude-opus-5"] },
-  recovery:          { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
+  recovery:          { default: "claude-opus-4-8[1m]", escalations: [] },
 } as const satisfies Record<keyof typeof models, RoleConfig>;
 
 /** Launch-time Opus model profile selector (`--opus`). */

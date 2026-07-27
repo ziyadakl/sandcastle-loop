@@ -67,7 +67,7 @@ describe("--budget (Sonnet fix-it rung)", () => {
     });
     expect(budgetModels.recovery).toEqual({
       default: "claude-opus-4-8[1m]",
-      escalations: ["claude-opus-5"],
+      escalations: [],
     });
   });
 
