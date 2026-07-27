@@ -423,6 +423,52 @@ exactly like a falsified e2e certification. If the project has a test script and
 cannot get it to pass, that is a real blocker — HALT per step 8 rather than
 committing an uncertified diff.
 
+# BOUNDED OUTPUT + NARROW READS — keep the conversation small (all steps)
+
+You run inside `claude --print`, which REPLAYS your whole conversation —
+every tool result — on every turn. A single heavy command that dumps
+thousands of lines (unit tests, lint, build, e2e) therefore gets re-read on
+every subsequent turn for the rest of the session. That re-reading is the
+dominant cost of a long implementer loop. Two habits cut it hard, and you
+lose nothing: if you ever need the full output, just re-run the command.
+
+**1. Pipe heavy commands through the bounding filter.** For the project's
+test, lint, typecheck, and build commands, append
+`| node .sandcastle/lib/bound-output.mjs`. The filter shows the first ~50 and
+last ~100 lines and ALWAYS passes failure/error/summary lines through, so
+pass/fail and the failing-test detail are never hidden — only the benign
+volume in the middle is dropped. Preserve the command's REAL exit status with
+`set -o pipefail` and read it from `${PIPESTATUS[0]}` (the filter always exits
+0 itself). Pattern:
+
+```
+set -o pipefail
+pnpm test 2>&1 | node .sandcastle/lib/bound-output.mjs
+TEST_STATUS=${PIPESTATUS[0]}   # 0 = green; non-zero = real failures — act on THIS, not the filter
+```
+
+Use the same `set -o pipefail` + `| node .sandcastle/lib/bound-output.mjs` +
+`${PIPESTATUS[0]}` shape for `pnpm lint`, the typecheck command, and any build.
+If the bounded view shows a failure and you need more context than the tail
+gave you, re-run that ONE command without the filter (or `grep` it) — do not
+default to un-filtered runs. For e2e, use the tee-then-filter form in the
+STEP 6/9 section below (the tee must come first so the reviewer keeps the full
+log); never bound-filter BEFORE the tee.
+
+**2. Read files narrowly; don't re-read what's already in context.**
+
+- Read large files with `offset`/`limit` (or `sed -n 'A,Bp'` / `grep -n`) —
+  pull the region you need, not the whole file. `cat`-ing a 2,000-line file to
+  find one function pins all 2,000 lines in the conversation for good.
+- Do NOT re-open a file you already read this session unless you edited it and
+  need to re-check — its contents are still in the conversation.
+- To find something in a big log or file, `grep`/`rg` for it; don't dump the
+  whole thing and scan by eye. The same applies to the e2e tee log — `tail`/
+  `grep` it, never `cat` it.
+
+Bounding and narrow reads are safe-by-construction: nothing is deleted, and any
+command or file can be re-read in full on demand.
+
 # STEP 6/9 (E2e) — non-negotiable rules
 
 If the issue spec's Acceptance section contains a playwright command (any
@@ -464,6 +510,18 @@ failure was inherited from the prior iteration, you must not ship until you
 have verified the feature you wrote actually works end-to-end. If you
 cannot fix the pre-existing condition, HALT.
 
+**Run it synchronously — never background-and-poll.** Run the e2e command
+inline in THIS turn and WAIT for it to finish, then read the log ONCE. Do NOT
+launch it in the background (no trailing `&`, no `run_in_background`, no
+detached process) and then re-read `/tmp/sandcastle-e2e-it{{ITERATION}}.log`
+across multiple turns waiting for it to appear — that pins a growing log in the
+conversation and re-reads it every turn for no benefit. The host already awaits
+your turn (idle + hard-ceiling timeouts), so there is nothing to gain by
+polling. A slow suite is NOT a reason to background a waiter: wait for it inline.
+If the suite genuinely cannot finish inside the turn's time budget, HALT with
+the reason — the remedy for a too-slow suite is a longer
+`--implementer-timeout-sec`, never agent-side polling.
+
 <!-- variant:e2e-command -->
 **Required artifacts.** Save the full playwright output to
 `/tmp/sandcastle-e2e-it{{ITERATION}}.log`. Detect the project's playwright
@@ -475,16 +533,29 @@ or `npx playwright test` if pnpm isn't used. Use whatever the project's
 own `package.json` scripts or CI config invoke:
 
 ```
-<project's-playwright-invocation> <args from spec> 2>&1 | tee /tmp/sandcastle-e2e-it{{ITERATION}}.log
+set -o pipefail
+<project's-playwright-invocation> <args from spec> 2>&1 | tee /tmp/sandcastle-e2e-it{{ITERATION}}.log | node .sandcastle/lib/bound-output.mjs
+E2E_STATUS=${PIPESTATUS[0]}   # playwright's real exit code — NOT tee's, NOT the filter's
 ```
 
 **No filtering allowed between playwright and tee.** Run the command EXACTLY
 as written above (with the args from the spec). Do NOT insert `| grep`,
 `| sed`, `| awk`, `--quiet`, `--reporter=dot`, `> /dev/null`, or any other
-output suppression before the tee. The reviewer reads the resulting log to
+output suppression **before the tee**. The reviewer reads the resulting log to
 detect bail signals (auth redirects, 401s, skipped tests). Filtering those
 signals out is a prompt-following failure — the reviewer's check 8 will
 catch and reject the commit.
+
+**The `| node .sandcastle/lib/bound-output.mjs` stage is AFTER the tee, so it
+is allowed and does NOT violate the no-filtering rule.** `tee` still writes the
+FULL, untruncated log to `/tmp/sandcastle-e2e-it{{ITERATION}}.log` (which is what
+the reviewer reads); the bound-output filter only shrinks what appears in YOUR
+conversation so a multi-thousand-line playwright dump is not re-read on every
+subsequent turn. It shows a bounded head + tail and always passes failure/summary
+lines through, so you still see whether the run passed. `set -o pipefail` plus
+`${PIPESTATUS[0]}` preserve playwright's REAL exit status through the pipe — read
+pass/fail from `$E2E_STATUS`, never from the filter's exit code. If you need the
+complete output, read the tee log with `tail`/`grep` (do not `cat` the whole file).
 <!-- /variant:e2e-command -->
 
 <!-- variant:cli-cheatsheet -->

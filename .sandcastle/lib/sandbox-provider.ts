@@ -1,8 +1,47 @@
+import { execFile } from "node:child_process";
+import * as path from "node:path";
+import { promisify } from "node:util";
 import * as sandcastle from "@ai-hero/sandcastle";
 import type { SandboxHooks } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { envForModel, backendForModel } from "../providers.js";
 import { macHostSandbox } from "./mac-host-sandbox.js";
+import {
+  runWithStuckDetection,
+  type StreamEvent,
+} from "./stuck-detector.js";
+
+const execFileAsync = promisify(execFile);
+
+/** HEAD SHA of a worktree (the pre-run base for stuck-abort commit recovery). */
+async function gitHeadSha(cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "HEAD"]);
+  return stdout.trim();
+}
+
+/**
+ * Commits made in `cwd` between `startSha` (exclusive) and the current tip,
+ * oldest-first (so `.at(-1)` is the newest — the tip the pipeline treats as
+ * the implementer's latest commit). Empty when nothing was committed.
+ */
+async function gitCommitsSince(
+  cwd: string,
+  startSha: string,
+): Promise<readonly { sha: string }[]> {
+  const { stdout } = await execFileAsync("git", [
+    "-C",
+    cwd,
+    "log",
+    "--format=%H",
+    `${startSha}..HEAD`,
+  ]);
+  return stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .reverse()
+    .map((sha) => ({ sha }));
+}
 
 import type {
   TopLevelRunSpec,
@@ -100,6 +139,13 @@ export interface DockerProviderConfig {
   readonly copyToWorktree: readonly string[];
   readonly copyToWorktreeMs: number;
   readonly completionSignal: readonly string[];
+  /**
+   * Loop-cost ticket 03 — opt-in (`--stuck-detector`), docker-only. When true,
+   * the per-issue implementer run attaches a live stuck-detector that aborts a
+   * demonstrably-spinning session and hands its committed work to the reviewer.
+   * Default/undefined = off = byte-for-byte today's run path.
+   */
+  readonly stuckDetector?: boolean;
 }
 
 export function makeDockerProvider(
@@ -159,7 +205,7 @@ export function makeDockerProvider(
         branch: handle.branch,
         worktreePath: handle.worktreePath,
         async run(opts) {
-          const r = await handle.run({
+          const baseRunOpts = {
             name: opts.name,
             maxIterations: opts.maxIterations ?? 1,
             agent: agentForModel(opts.model),
@@ -167,16 +213,62 @@ export function makeDockerProvider(
             promptArgs: opts.promptArgs,
             idleTimeoutSeconds: opts.idleTimeoutSeconds,
             completionSignal: [...config.completionSignal],
-            signal: opts.signal,
-          });
-          return {
+          };
+          type SdkRunResult = Awaited<ReturnType<typeof handle.run>>;
+          const shape = (r: SdkRunResult) => ({
             stdout: r.stdout,
             commits: r.commits,
             iterations: r.iterations.map((it) => ({
               sessionFilePath: it.sessionFilePath,
               sessionId: it.sessionId,
             })),
-          };
+          });
+
+          // Stuck-detector path (ticket 03) — opt-in and only when the worktree
+          // is on the host so we can recover its committed work after an abort.
+          // Absent either condition, fall through to today's exact call.
+          if (config.stuckDetector && handle.worktreePath) {
+            const worktreePath = handle.worktreePath;
+            return runWithStuckDetection({
+              externalSignal: opts.signal,
+              captureStartSha: () => gitHeadSha(worktreePath),
+              recoverCommits: (startSha) =>
+                gitCommitsSince(worktreePath, startSha),
+              buildStuckResult: (commits, detail) => ({
+                stdout: `[stuck-detector] run aborted — ${detail}`,
+                commits,
+                iterations: [],
+                // Ticket 03: flag the graceful result so runImplementer routes
+                // this partial work to the reviewer instead of tripping its
+                // envelope/skill/no-commit gates (see main.mts runImplementer).
+                stuckAborted: true,
+              }),
+              runOnce: (signal, onEvent) =>
+                handle
+                  .run({
+                    ...baseRunOpts,
+                    signal,
+                    logging: {
+                      type: "file",
+                      // Unique per issue+role so concurrent implementers don't
+                      // share a log file. The SDK is already in file mode by
+                      // default; passing it explicitly only adds the callback.
+                      path: path.join(
+                        config.repoRoot,
+                        ".sandcastle",
+                        "logs",
+                        `${handle.branch.replace(/[^A-Za-z0-9._-]/g, "_")}-${opts.name}.log`,
+                      ),
+                      onAgentStreamEvent: (event) =>
+                        onEvent(event as StreamEvent),
+                    },
+                  })
+                  .then(shape),
+            });
+          }
+
+          const r = await handle.run({ ...baseRunOpts, signal: opts.signal });
+          return shape(r);
         },
         close: async () => {
           await handle.close();
@@ -282,6 +374,8 @@ export function buildSandboxProvider(
     repoRoot: string;
     /** ADR 0021 §2 branch-reuse opt-in, from `crossHostSyncEnabled()`. */
     crossHostSync?: boolean;
+    /** Ticket 03 opt-in (`--stuck-detector`); docker-only, ignored on mac-host. */
+    stuckDetector?: boolean;
   },
   containerEnv: Record<string, string>,
   dockerConfig?: Omit<DockerProviderConfig, "imageName" | "repoRoot">,
@@ -296,7 +390,12 @@ export function buildSandboxProvider(
     throw new Error("docker provider requires dockerConfig");
   }
   return makeDockerProvider(
-    { ...dockerConfig, imageName: args.imageName, repoRoot: args.repoRoot },
+    {
+      ...dockerConfig,
+      imageName: args.imageName,
+      repoRoot: args.repoRoot,
+      stuckDetector: args.stuckDetector,
+    },
     containerEnv,
   );
 }

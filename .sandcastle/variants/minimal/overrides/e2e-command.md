@@ -13,12 +13,19 @@ files (`pyproject.toml` / `pytest.ini` → `pytest`, `package.json` with a
 exists) and run the full suite:
 
 ```
-<your-detected-test-command> 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log
+set -o pipefail
+<your-detected-test-command> 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log | node .sandcastle/lib/bound-output.mjs
+TEST_STATUS=${PIPESTATUS[0]}   # the runner's real exit code — NOT tee's, NOT the filter's
 ```
 
-For example: `pytest 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log`,
-`npm test 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log`, or
-`cargo test 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log`.
+For example: `pytest 2>&1 | tee /tmp/sandcastle-test-it{{ITERATION}}.log | node .sandcastle/lib/bound-output.mjs`.
+
+The `| node .sandcastle/lib/bound-output.mjs` stage is AFTER the tee, so it does
+NOT violate the no-filtering rule below: `tee` still writes the FULL log the
+reviewer reads, while the filter only bounds what appears in YOUR conversation
+(head + tail, always keeping failure/summary lines). `set -o pipefail` +
+`${PIPESTATUS[0]}` preserve the runner's REAL pass/fail — read it from
+`$TEST_STATUS`, never from the filter's exit code.
 
 **Do NOT attempt Playwright or any browser-driven check — this variant
 has no browser stack.** If the spec's Acceptance literally says

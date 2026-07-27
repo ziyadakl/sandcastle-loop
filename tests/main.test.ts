@@ -38,6 +38,7 @@ import {
   parseBlockedBy,
   buildBlockedByNote,
   parseSandcastleArgs,
+  implementerTimeoutFromEnv,
   preflight,
   loadDotenv,
   isTransientServerError,
@@ -95,6 +96,7 @@ import {
   MarkerNotFoundError,
 } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
+import { StuckError } from "../.sandcastle/lib/stuck-detector.js";
 import {
   LeaseReadError,
   LeaseBackendError,
@@ -223,6 +225,11 @@ interface RunOutcome {
   readonly stdout: string;
   readonly commits?: readonly { sha: string }[];
   readonly throw?: Error;
+  /** Simulate a provider stuck-abort graceful result (ticket 03): the docker
+   *  provider sets this on the RunHandle it returns after converting a
+   *  stuck-detector abort into a graceful completion. Threaded through so
+   *  pipeline tests can drive the stuck-partial-work routing. */
+  readonly stuckAborted?: boolean;
 }
 
 interface DepsBuilder {
@@ -292,7 +299,11 @@ function buildDeps(opts: {
 
   const handleOutcome = (name: string, outcome: RunOutcome): RunHandle => {
     if (outcome.throw) throw outcome.throw;
-    return { stdout: outcome.stdout, commits: outcome.commits ?? [] };
+    return {
+      stdout: outcome.stdout,
+      commits: outcome.commits ?? [],
+      ...(outcome.stuckAborted ? { stuckAborted: true } : {}),
+    };
   };
 
   const deps: Deps = {
@@ -479,6 +490,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     postMergeReviewerModel: "claude-opus-4-8",
     recoveryModel: "claude-opus-4-8",
     implementerTimeoutSec: 1200,
+    implementerTimeoutSecExplicit: false,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
@@ -490,6 +502,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     stagingEnabled: true,
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
     ...over,
   };
 }
@@ -984,6 +997,140 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(result.exitCode).toBe(0);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(300);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  // Loop-cost ticket 03: a docker stuck-detector abort returns a GRACEFUL
+  // RunHandle carrying `stuckAborted: true` + the partial commits. The
+  // pipeline must feed that partial work to the reviewer — NOT trip the
+  // envelope re-ask (the stuck banner is not a valid certification envelope)
+  // and NOT quarantine before review. These two tests pin the WHEN-landed
+  // routing at the full runMain boundary.
+  it("stuck-abort with commits: pipeline reviews the partial work (no envelope re-ask), then ships on ALL_CLEAR", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "230", title: "stuck but committed", branch: "agent/issue-230" },
+      ]),
+    });
+    // Implementer comes back as a stuck-abort graceful result: no envelope,
+    // one recovered WIP commit, stuckAborted flag set.
+    b.enqueue("implementer", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [{ sha: "wip-stuck-230" }],
+      stuckAborted: true,
+    });
+    b.enqueue("reviewer", { stdout: "Partial work is fine.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // Routing proof: exactly ONE implementer call (no envelope re-ask), and
+    // the reviewer ran on the partial work.
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(0);
+    expect(names).toContain("reviewer");
+    expect(result.shippedIssues).toEqual([230]);
+    expect(b.state.quarantines).toEqual([]);
+  });
+
+  it("stuck-abort with ZERO commits: quarantines IMMEDIATELY via the typed StuckError arm — reviewer never runs, no envelope re-ask, NO recovery pass wasted", async () => {
+    // Loop-cost ticket 03, checkbox 3: an abort with nothing committed must
+    // NOT surface as a generic throw that wastes a recovery pass. runImplementer
+    // throws a typed StuckError; the pipeline catch quarantines and RETURNS
+    // before the optional single recovery pass. recoveryEnabled defaults to
+    // TRUE here (baseArgs) so the absence of a "recovery" run call is a real
+    // proof the recovery pass was skipped — pre-fix, the generic error fell
+    // through and a "recovery" run WAS recorded.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "231", title: "stuck no commits", branch: "agent/issue-231" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [],
+      stuckAborted: true,
+    });
+    // A reviewer outcome is enqueued but must NEVER be consumed — the zero-
+    // commit stuck result quarantines before review.
+    b.enqueue("reviewer", { stdout: "should not run\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(baseArgs({ iterations: 2 }), b.deps);
+
+    expect(result.exitCode).toBe(0);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(0);
+    expect(names).not.toContain("reviewer");
+    // The recovery pass must NOT have run — this is the ticket-03 fix.
+    expect(names).not.toContain("recovery");
+    expect(names).not.toContain("recovery-reviewer");
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(231);
+    expect(b.state.quarantines[0]!.reason).toMatch(/stuck-abort-no-commits/);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("attempt-2 stuck-abort with ZERO new commits: quarantines IMMEDIATELY — no reviewer-retry, no recovery pass", async () => {
+    // The attempt-2 case ticket 03 calls out: a HAS_BLOCKERS review1 grants an
+    // implementer attempt 2, which then spins and stuck-aborts with NO new
+    // commits (commit recovery uses the per-attempt base SHA, so there is
+    // nothing to review). It must quarantine via the typed StuckError arm — no
+    // reviewer-retry burned, no recovery pass wasted.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "232", title: "stuck on attempt 2", branch: "agent/issue-232" },
+      ]),
+    });
+    // Attempt 1: real commit, reviewer finds a real blocker → escalation ladder.
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 232 }),
+      commits: [{ sha: "c1" }],
+    });
+    b.enqueue("reviewer", { stdout: "Real problem here.\n\nHAS_BLOCKERS" });
+    // Attempt 2 (escalated leg): spins and stuck-aborts with zero new commits.
+    b.enqueue("implementer-retry", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [],
+      stuckAborted: true,
+    });
+    // Enqueued but must NEVER be consumed — the stuck-abort quarantines first.
+    b.enqueue("reviewer-retry", { stdout: "should not run\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    // Exactly one attempt-1 implementer + one attempt-2 implementer-retry.
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(1);
+    // The escalated reviewer-retry never runs (nothing to review), and no
+    // recovery pass is wasted.
+    expect(names).not.toContain("reviewer-retry");
+    expect(names).not.toContain("recovery");
+    expect(names).not.toContain("recovery-reviewer");
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(232);
+    expect(b.state.quarantines[0]!.reason).toMatch(/stuck-abort-no-commits/);
+    expect(b.state.releases).toEqual([]);
     expect(b.state.marksDone).toEqual([]);
   });
 
@@ -1493,6 +1640,146 @@ describe("sandcastle-loop main.mts — runId / run-branch derivation", () => {
     const r = deriveRunBranchAndId("release/1.2", "release/1.2", true, "hostA");
     expect(r.runId).toBe("release/1.2");
     expect(r.branch).toBe("release/1.2");
+  });
+});
+
+describe("sandcastle-loop main.mts — implementer idle-timeout env fallback", () => {
+  // Precedence: --implementer-timeout-sec (CLI) > SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC
+  // (from .sandcastle/.env, resolved in runMain because loadDotenv runs AFTER
+  // parseSandcastleArgs but BEFORE runMain) > hardcoded 1200.
+
+  // --- Pure helper unit tests (injectable getEnv seam) ---
+  it("implementerTimeoutFromEnv: returns null when the env var is unset", () => {
+    expect(implementerTimeoutFromEnv(() => undefined)).toBe(null);
+  });
+
+  it("implementerTimeoutFromEnv: treats a blank value as unset (returns null, no throw)", () => {
+    // .env.example ships the key blank (SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC=), so
+    // a consumer copying it verbatim yields "" — this MUST fall through to the
+    // 1200 default, not crash the loop. Mirrors resolveLockTtlSec.
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "" : undefined,
+      ),
+    ).toBe(null);
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "   " : undefined,
+      ),
+    ).toBe(null);
+  });
+
+  it("implementerTimeoutFromEnv: parses a valid positive integer", () => {
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "3600" : undefined,
+      ),
+    ).toBe(3600);
+  });
+
+  it("implementerTimeoutFromEnv: throws a clearly-labeled error on a malformed value", () => {
+    expect(() =>
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "not-a-number" : undefined,
+      ),
+    ).toThrow(/SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC/);
+  });
+
+  // --- WHEN-landed tests through runMain (assert the value reaches the run) ---
+  // Runs a single-issue happy path and returns the idleTimeoutSeconds the
+  // implementer sandbox run was actually dispatched with.
+  async function implementerIdleTimeoutFor(
+    args: SandcastleArgs,
+  ): Promise<number | undefined> {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "71", title: "smoke", branch: "agent/issue-71" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    // Second cycle exits 0 on an empty plan (mirrors the happy-path test).
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      { ...args, iterations: 2, stagingEnabled: false },
+      b.deps,
+    );
+    expect(result.exitCode).toBe(0);
+    const impl = b.state.runCalls.find((c) => c.spec.name === "implementer");
+    expect(impl).toBeDefined();
+    return (impl!.spec as SandboxRunSpec).idleTimeoutSeconds;
+  }
+
+  const ENV_KEY = "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC";
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = savedEnv;
+  });
+
+  it("env var set, no CLI flag → env value lands on the implementer run", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(3600);
+  });
+
+  it("CLI flag set AND env set → CLI value wins", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1500, implementerTimeoutSecExplicit: true }),
+    );
+    expect(landed).toBe(1500);
+  });
+
+  it("CLI flag set to the default 1200 still wins over env (explicit beats fallback)", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: true }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("neither CLI flag nor env → hardcoded 1200 default lands", async () => {
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("blank env value (shipped state) → runMain does NOT crash; 1200 default lands", async () => {
+    // Regression guard: .env.example ships the key blank, so a fresh consumer
+    // who copies it verbatim sets the var to "". That must resolve to the 1200
+    // default, NOT throw at startup and crash the loop.
+    process.env[ENV_KEY] = "";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("malformed env value → runMain rejects with a clearly-labeled error", async () => {
+    process.env[ENV_KEY] = "abc";
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    await expect(
+      runMain(
+        baseArgs({ implementerTimeoutSecExplicit: false }),
+        b.deps,
+      ),
+    ).rejects.toThrow(/SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC/);
   });
 });
 
@@ -4813,6 +5100,86 @@ describe("runImplementer skill-discipline gate", () => {
       requiredSkills: [],
     });
     expect(r.skillsInvoked).toEqual([]);
+  });
+});
+
+describe("runImplementer stuck-abort carve-outs (loop-cost ticket 03)", () => {
+  // The docker stuck-detector (stuck-detector.ts) converts a demonstrably-
+  // spinning implementer into a GRACEFUL RunHandle carrying `stuckAborted:
+  // true` plus whatever it managed to commit. runImplementer must route that
+  // partial work to the reviewer instead of tripping its envelope/skill/
+  // no-commit gates — those gates assume a NORMAL run. These tests assert the
+  // three carve-outs directly at runImplementer's contract (the pipeline's
+  // happy path continues to the reviewer precisely BECAUSE runImplementer
+  // returns normally here).
+
+  /** A sandbox whose run() returns a provider stuck-abort graceful result:
+   *  no envelope (stdout is the "[stuck-detector] …" banner), zero iterations
+   *  (so skillsInvoked resolves to []), and `stuckAborted: true`. */
+  function makeStuckSandbox(commits: readonly { sha: string }[]): SandboxHandle {
+    const handle: RunHandle = {
+      stdout: "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits,
+      iterations: [],
+      stuckAborted: true,
+    };
+    return {
+      branch: "agent/issue-1",
+      run: async () => handle,
+      close: async () => undefined,
+    };
+  }
+
+  function stuckCtx(issueNumber: number): Parameters<typeof runImplementer>[1] {
+    return {
+      args: skillGateArgs(),
+      deps: makeNoopDeps(),
+      iteration: 1,
+      issueNumber,
+      issue: { id: String(issueNumber), title: "stuck issue", branch: "agent/issue-1" },
+      status: testStatusStore,
+    } as Parameters<typeof runImplementer>[1];
+  }
+
+  it("stuck + commits>0 + required skills: does NOT throw skill/envelope gates — returns partial work for review", async () => {
+    // attemptNumber:1 (requireCommits true) AND requiredSkills present with
+    // ZERO skills invoked (iterations: []) AND a non-envelope stdout — all
+    // three gates would fire on a normal run. The stuckAborted carve-out must
+    // suppress every one of them so the pipeline reviews the recovered commit.
+    const sandbox = makeStuckSandbox([{ sha: "wip-partial-1" }]);
+    const r = await runImplementer(sandbox, stuckCtx(42), {
+      attemptNumber: 1,
+      requiredSkills: ["impeccable", "polish"],
+    });
+    expect(r.commits).toEqual([{ sha: "wip-partial-1" }]);
+    // Zero skills legitimately invoked on a stuck run — gate carved out.
+    expect(r.skillsInvoked).toEqual([]);
+  });
+
+  it("stuck + ZERO commits: throws the typed StuckError (→ immediate quarantine, NO recovery pass), not the generic no-commit error", async () => {
+    // Ticket 03 checkbox 3: an abort with nothing committed must throw a TYPED
+    // StuckError so the pipeline catch quarantines immediately instead of
+    // falling through to the recovery pass. It must NOT surface as the generic
+    // "implementer made no commits" (which the outer catch does not special-
+    // case, so it would waste a recovery pass).
+    const sandbox = makeStuckSandbox([]);
+    await expect(
+      runImplementer(sandbox, stuckCtx(43), {
+        attemptNumber: 1,
+        requiredSkills: ["impeccable", "polish"],
+      }),
+    ).rejects.toBeInstanceOf(StuckError);
+  });
+
+  it("stuck + ZERO commits on attempt 2: STILL throws the typed StuckError regardless of attempt number", async () => {
+    // Attempt 2 normally bypasses requireCommits (a rebuttal can have zero
+    // commits). A stuck run with zero commits is NOT a rebuttal — the stuck-
+    // abort gate throws the typed StuckError anyway so it quarantines without a
+    // wasted recovery pass, regardless of attempt number.
+    const sandbox = makeStuckSandbox([]);
+    await expect(
+      runImplementer(sandbox, stuckCtx(44), { attemptNumber: 2 }),
+    ).rejects.toBeInstanceOf(StuckError);
   });
 });
 

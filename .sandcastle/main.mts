@@ -99,7 +99,7 @@ import {
   models,
   codexModels,
   opus5Models,
-  BUDGET_IMPLEMENTER_MODEL,
+  budgetModels,
   type OpusProfile,
 } from "./models.js";
 import { diagnoseHaltCause } from "./lib/diagnose.js";
@@ -128,6 +128,7 @@ import {
   buildSandboxProvider,
   type SandboxProvider,
 } from "./lib/sandbox-provider.js";
+import { StuckError } from "./lib/stuck-detector.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -171,6 +172,13 @@ export interface SandcastleArgs {
   postMergeReviewerModel: string;
   recoveryModel: string;
   implementerTimeoutSec: number;
+  /**
+   * Whether `--implementer-timeout-sec` was passed explicitly on the CLI.
+   * When false, runMain applies a `SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC` env
+   * fallback (resolved post-dotenv — see the fallback block in runMain). The
+   * CLI flag always wins, even when its value equals the 1200 default.
+   */
+  implementerTimeoutSecExplicit: boolean;
   reviewerTimeoutSec: number;
   /**
    * Outer wall-clock ceiling around every SDK `run` / `handle.run` call.
@@ -256,12 +264,13 @@ export interface SandcastleArgs {
    */
   opusProfile: OpusProfile;
   /**
-   * Budget mode (`--budget`, default `false`). Swaps ONLY the implementer's
-   * first-pass model to Sonnet 5 ({@link BUDGET_IMPLEMENTER_MODEL}); the retry
-   * ladder still escalates onto Opus via {@link roleModelsFor}. The implementer
-   * is the loop's dominant token consumer, so this is the main cost lever.
-   * Claude-anthropic-only: cannot combine with `--backend codex` or `--provider`.
-   * An explicit `--implementer-model` still wins over it.
+   * Budget mode (`--budget`, default `false`). Selects `budgetModels` via
+   * {@link roleModelsFor}, giving the implementer a "Sonnet fix-it rung"
+   * ladder: Sonnet-5 first pass, a second Sonnet-5 pass WITH reviewer feedback
+   * (cheap fix-it), then `claude-opus-4-8[1m]` reserved for the round-3 grant.
+   * The implementer is the loop's dominant token consumer, so this is the main
+   * cost lever. Claude-anthropic-only: cannot combine with `--backend codex` or
+   * `--provider`. An explicit `--implementer-model` still wins over it.
    */
   budget: boolean;
   /**
@@ -292,6 +301,12 @@ export interface SandcastleArgs {
    * unavailable. Wired via `--sandbox docker|mac-host`.
    */
   sandbox: "docker" | "mac-host";
+  /**
+   * Loop-cost ticket 03 opt-in (`--stuck-detector`). Docker-only live safety
+   * net that aborts a demonstrably-spinning implementer and hands its
+   * committed work to the reviewer. Default false = today's run path.
+   */
+  stuckDetector: boolean;
 }
 
 /**
@@ -324,6 +339,15 @@ export interface RunHandle {
     readonly sessionFilePath?: string;
     readonly sessionId?: string;
   }[];
+  /**
+   * Set by the docker provider (loop-cost ticket 03) when it converts a
+   * stuck-detector abort into a GRACEFUL result carrying whatever the aborted
+   * implementer already committed. Downstream {@link runImplementer} reads it
+   * to route that partial work to the reviewer instead of tripping its
+   * envelope/skill/no-commit gates — those gates assume a normal run.
+   * Absent/`false` on every ordinary run and on the mac-host path.
+   */
+  readonly stuckAborted?: boolean;
 }
 
 export interface SandboxHandle {
@@ -626,7 +650,9 @@ Optional:
   --merger-model M              Default: from .sandcastle/models.ts (merger.default).
   --post-merge-reviewer-model M Default: from .sandcastle/models.ts (postMergeReviewer.default).
   --recovery-model M            Default: from .sandcastle/models.ts (recovery.default). Used by the recovery pass.
-  --implementer-timeout-sec N   Default: 1200.
+  --implementer-timeout-sec N   Default: 1200. Falls back to
+                                SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC (from
+                                .sandcastle/.env) when this flag is omitted.
   --reviewer-timeout-sec N      Default: 600.
   --hard-ceiling-sec N      Outer wall-clock ceiling per SDK call. Fires
                             independently of the SDK's idle timer (which
@@ -651,6 +677,12 @@ Optional:
                             writes directly to --branch and the post-merge
                             reviewer is advisory-only (no fixer pass, no
                             fast-forward gating). Default: staging ON.
+  --stuck-detector          Docker-only opt-in safety net. Aborts a
+                            demonstrably-spinning implementer (same tool called
+                            with identical args ~6× in a row) and hands its
+                            already-committed work to the reviewer instead of
+                            burning the full iteration budget. Ignored on
+                            --sandbox mac-host. Default: off.
   --provider NAME           Override the implementer provider for this run.
                             One of: kimi | glm | anthropic. Maps to that
                             provider's default coding model (kimi-for-coding,
@@ -733,6 +765,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "recovery": { type: "string" },
       "no-retry": { type: "boolean" },
       "no-staging": { type: "boolean" },
+      "stuck-detector": { type: "boolean" },
       "provider": { type: "string" },
       "backend": { type: "string" },
       "opus": { type: "string" },
@@ -858,13 +891,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
-  // --budget swaps ONLY the implementer's first-pass model to Sonnet 5 (the loop's
-  // dominant token consumer). The retry ladder is untouched (roleModelsFor's
-  // implementer.escalations still escalates onto Opus 1M), so hard issues keep
-  // their muscle. Claude-anthropic-only, mirroring --opus 5: a cheaper Anthropic
-  // first pass is meaningless under a codex backend or a kimi/glm provider swap
-  // (which already redirects the implementer), so a combination is an operator
-  // error, not a silent no-op. An explicit --implementer-model still wins below.
+  // --budget selects `budgetModels` (via roleModelsFor), giving the implementer
+  // a "Sonnet fix-it rung" ladder — Sonnet-5 first pass, a second Sonnet-5 pass
+  // WITH reviewer feedback, then Opus 1M reserved for the round-3 grant — so the
+  // cheap model is spent twice before any Opus. The implementer is the loop's
+  // dominant token consumer, the single lever that moves the bill.
+  // Claude-anthropic-only, mirroring --opus 5: a cheaper Anthropic ladder is
+  // meaningless under a codex backend or a kimi/glm provider swap (which already
+  // redirects the implementer), so a combination is an operator error, not a
+  // silent no-op. An explicit --implementer-model still wins below.
   const budget = values.budget === true;
   if (budget && backend === "codex") {
     throw new Error(
@@ -876,15 +911,15 @@ export function parseSandcastleArgs(argv: readonly string[]): {
       "--budget applies only to the anthropic default; it cannot combine with --provider",
     );
   }
-  // --budget + --opus 5 is a footgun: opus5Models gives the implementer an EMPTY
-  // escalation ladder, so budget's Sonnet-5 first pass would have NO Opus retry
-  // fallback — a blocked issue would quarantine with no escalation, silently
-  // voiding budget's documented "keep Opus on retry" safety net. Reject it; use
-  // --budget with the default (4.8) profile, whose ladder escalates to Opus 1M.
+  // --budget + --opus 5 express CONTRADICTORY profiles and cannot both apply:
+  // budget is cheapest-first (Sonnet fix-it rung, Opus reserved for the round-3
+  // grant only), while --opus 5 is Opus-5-everywhere. There is no coherent
+  // single map that is both, so reject the combo at parse time. Use --budget
+  // with the default (4.8) profile.
   if (budget && opusProfile === "5") {
     throw new Error(
-      "--budget cannot combine with --opus 5: the Opus-5 profile has no implementer " +
-        "escalation, so a budget (Sonnet-5) first pass would have no Opus retry fallback. " +
+      "--budget cannot combine with --opus 5: they express contradictory model " +
+        "profiles (budget is cheapest-first, --opus 5 is Opus-5-everywhere). " +
         "Use --budget with the default (4.8) profile.",
     );
   }
@@ -927,15 +962,13 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     );
   }
 
-  const roleModels = roleModelsFor({ backend, opusProfile });
+  const roleModels = roleModelsFor({ backend, opusProfile, budget });
 
   const implementerModel =
     explicitImplModel ??
     (provider !== undefined
       ? defaultCodingModelFor(provider)
-      : budget
-        ? BUDGET_IMPLEMENTER_MODEL
-        : roleModels.implementer.default);
+      : roleModels.implementer.default);
 
   const sandbox: "docker" | "mac-host" = (() => {
     const v = values.sandbox;
@@ -992,6 +1025,10 @@ export function parseSandcastleArgs(argv: readonly string[]): {
         values["implementer-timeout-sec"],
         "--implementer-timeout-sec",
       ) ?? 1200,
+    // Recorded so runMain can apply the SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC
+    // env fallback ONLY when the CLI flag was absent (CLI always wins).
+    implementerTimeoutSecExplicit:
+      values["implementer-timeout-sec"] !== undefined,
     reviewerTimeoutSec:
       parsePositiveInt(
         values["reviewer-timeout-sec"],
@@ -1010,6 +1047,7 @@ export function parseSandcastleArgs(argv: readonly string[]): {
     recoveryEnabled: values["recovery"] !== "off",
     retryEnabled: values["no-retry"] !== true,
     stagingEnabled: values["no-staging"] !== true,
+    stuckDetector: values["stuck-detector"] === true,
     provider,
     sandbox,
     imageName:
@@ -1056,16 +1094,38 @@ function detectBranchOr(fallback: string): string {
  * escalations through this (not `models.X` directly) is what keeps a
  * `--backend codex` run from silently escalating onto a Claude model.
  *
- * On the claude backend, the Opus profile (`--opus`) selects the map: `"5"`
- * draws every role from `opus5Models` (`claude-opus-5`, empty escalations),
- * `"4.8"` (default, or unset) uses `models`. Codex ignores the profile.
+ * On the claude backend the map is selected by precedence: budget first
+ * (`budgetModels` — the implementer's Sonnet fix-it rung ladder, every other
+ * role verbatim from `models`), then the Opus profile (`--opus 5` →
+ * `opus5Models`), then the default `models`. Codex ignores both budget and the
+ * profile. `--budget` and `--opus 5` are mutually exclusive at parse time, so
+ * the budget-before-opus5 ordering here is belt-and-suspenders, not a real
+ * conflict.
  */
 export function roleModelsFor(a: {
   readonly backend?: AgentBackend;
   readonly opusProfile?: OpusProfile;
+  readonly budget?: boolean;
 }) {
   if (a.backend === "codex") return codexModels;
+  if (a.budget === true) return budgetModels;
   return a.opusProfile === "5" ? opus5Models : models;
+}
+
+/**
+ * Resolve the implementer model for a given retry attempt by walking an
+ * `escalations` ladder. Attempt 2 (the first retry) → `escalations[0]`,
+ * attempt 3 → `escalations[1]`, clamped to the last element so a shorter ladder
+ * simply repeats its final rung. Under the default (non-budget) profile
+ * `escalations` has length 1, so attempts 2 AND 3 both clamp to index 0 (Opus)
+ * — byte-for-byte the legacy behavior. Under `--budget` the two-rung ladder
+ * yields Sonnet on attempt 2 (cheap fix-it pass) and Opus 1M on attempt 3.
+ */
+export function escalationForAttempt(
+  escalations: readonly string[],
+  attemptNumber: number,
+): string {
+  return escalations[Math.min(attemptNumber - 2, escalations.length - 1)];
 }
 
 function defaultArgs(): SandcastleArgs {
@@ -1084,6 +1144,7 @@ function defaultArgs(): SandcastleArgs {
     postMergeReviewerModel: models.postMergeReviewer.default,
     recoveryModel: models.recovery.default,
     implementerTimeoutSec: 1200,
+    implementerTimeoutSecExplicit: false,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
@@ -1096,6 +1157,7 @@ function defaultArgs(): SandcastleArgs {
     imageName: defaultImageName(process.cwd()),
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
   };
 }
 
@@ -1161,6 +1223,28 @@ function crossHostSyncEnabled(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): boolean {
   return envFlagEnabled(getEnv, "SANDCASTLE_CROSS_HOST_SYNC");
+}
+
+/**
+ * Resolve the `SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC` env fallback for the
+ * implementer idle-timeout. Returns the parsed positive integer, or null when
+ * the var is unset OR blank/whitespace-only. A blank value is the shipped state
+ * (`.env.example` ships the key with an empty value) and MUST be treated as
+ * unset — falling through to the 1200 default, NOT crashing. This mirrors
+ * {@link resolveLockTtlSec}, the sibling numeric env var that ships blank the
+ * same way. A genuinely malformed value (e.g. "abc") still throws a
+ * clearly-labeled error (reusing {@link parsePositiveInt}). `getEnv` is an
+ * injectable seam for tests, matching {@link crossHostLeaseEnabled}. This must
+ * be read in runMain, NOT at parse time: `loadDotenv` runs in the entrypoint
+ * AFTER `parseSandcastleArgs` but BEFORE runMain, so the `.sandcastle/.env`
+ * value isn't visible until then.
+ */
+export function implementerTimeoutFromEnv(
+  getEnv: (key: string) => string | undefined = (k) => process.env[k],
+): number | null {
+  const raw = (getEnv("SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC") ?? "").trim();
+  if (raw === "") return null;
+  return parsePositiveInt(raw, "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC");
 }
 
 /** Parse a single .env file into process.env. Earlier writers win — we never
@@ -3977,6 +4061,13 @@ export async function runImplementer(
   // On attempt 1, allow a one-hop fallback to escalations[0] when the primary
   // throws a rate-limit error. Attempt 2 is already on the escalation, so no
   // further fallback — it just throws and the pipeline catch handles it.
+  //
+  // Budget-mode note (deliberate): under --budget, escalations[0] is Sonnet
+  // (the fix-it rung), which is the SAME model as the primary — so an attempt-1
+  // rate-limit fallback is a same-model retry after the transient window, NOT
+  // an Opus escalation. That's intended: budget mode stays cheap on a transient
+  // blip rather than jumping to Opus for a rate limit. Non-budget escalations[0]
+  // is Opus[1m] as before.
   const fallbackModel =
     attemptNumber === 1
       ? roleModelsFor(ctx.args).implementer.escalations[0]
@@ -4095,10 +4186,17 @@ export async function runImplementer(
   // re-ask legitimately invokes NO skills. Without this carve-out the gate
   // would fire on every re-ask (it always sees zero skills) and the feature
   // would self-defeat into a skill-discipline quarantine.
+  //
+  // `!r.stuckAborted` (loop-cost ticket 03): a stuck-detector abort returns a
+  // graceful result with `iterations: []`, so skillsInvoked is always empty —
+  // but that reflects the ABORT, not a non-compliant implementer. Its partial
+  // work belongs in front of the reviewer, so we carve the stuck case out of
+  // this gate exactly like the re-ask carve-out above.
   if (
     opts.requiredSkills &&
     opts.requiredSkills.length > 0 &&
-    !opts.envelopeReask
+    !opts.envelopeReask &&
+    !r.stuckAborted
   ) {
     const { missing } = validateRequiredSkillsInvoked(
       opts.requiredSkills,
@@ -4117,6 +4215,25 @@ export async function runImplementer(
   // attemptNumber unthreaded, so requireCommits recomputes to true, but a
   // compliant re-ask makes NO new commits (the work is already on the
   // branch) — so this throw must not fire on a re-ask.
+  //
+  // `|| r.stuckAborted` (loop-cost ticket 03): a stuck-abort with ZERO
+  // recovered commits has no partial work to review, so it must fall into the
+  // existing no-commit quarantine/defer path — regardless of attemptNumber
+  // (an attempt-2 stuck-abort is NOT a rebuttal, so the normal requireCommits
+  // bypass must not let it through). A stuck-abort WITH commits skips this
+  // throw (commits.length > 0) and flows on to the reviewer.
+  if (r.stuckAborted && r.commits.length === 0) {
+    // Stuck-abort with nothing committed: quarantine immediately via the
+    // typed StuckError arm in the pipeline catch — must NOT fall through to
+    // the recovery pass (loop-cost ticket 03, checkbox 3). A non-stuck
+    // no-commit run keeps today's generic-Error path below.
+    //
+    // runImplementer no longer has the aborting tool/count (the provider
+    // already converted the abort into this graceful result), so a
+    // placeholder StuckError is sufficient — the catch arm keys off the type,
+    // not the message.
+    throw new StuckError("implementer", 0);
+  }
   if (requireCommits && r.commits.length === 0 && !opts.envelopeReask) {
     throw new Error("implementer made no commits");
   }
@@ -4145,7 +4262,12 @@ export async function runImplementer(
       return false;
     }
   })();
-  if (!rebuttalPresent && !halted) {
+  // `!r.stuckAborted` (loop-cost ticket 03): a stuck-abort's stdout is the
+  // "[stuck-detector] run aborted — …" banner, never a certification envelope.
+  // Running parseVerdict on it would throw VerdictParseError and burn a
+  // wasteful envelope re-ask; instead we skip the parse (like the HALT/rebuttal
+  // cases) and return the recovered partial work for the reviewer to judge.
+  if (!rebuttalPresent && !halted && !r.stuckAborted) {
     // Dual-mode parse (stream-json first, assistant-text fallback). On a
     // genuine missing-envelope failure — the implementer emitted a real
     // STORY_COMPLETE but dropped the fenced ```json``` certification
@@ -5193,14 +5315,15 @@ async function runIssuePipeline(
     // Phase 2c: implementer attempt 2 (escalated, with reviewer feedback).
     // Worktree is NOT reset — the implementer sees its own commits and
     // either appends a fix on top OR emits a <rebuttal> instead of code.
+    const implModel2 = escalationForAttempt(implEscalations, 2);
     ctx.deps.log(
       `[issue=${ctx.issueNumber}] reviewer attempt 1 HAS_BLOCKERS — ` +
-        `escalating implementer to ${implEscalations[0]}`,
+        `escalating implementer to ${implModel2}`,
     );
     ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 2");
     const impl2 = await runImplementer(sandbox, ctx, {
       attemptNumber: 2,
-      model: implEscalations[0],
+      model: implModel2,
       reviewerFeedback: review1.stdout,
       requiredSkills: ctx.requiredSkills,
     });
@@ -5269,15 +5392,16 @@ async function runIssuePipeline(
     }
 
     if (grantRound3) {
+      const implModel3 = escalationForAttempt(implEscalations, 3);
       ctx.deps.log(
         `[issue=${ctx.issueNumber}] reviewer attempt 2 HAS_BLOCKERS but ` +
           `round-1 categories resolved — granting attempt 3 on ` +
-          `${implEscalations[0]}`,
+          `${implModel3}`,
       );
       ctx.status.setIssuePhase(ctx.issueNumber, "implementer-retry", "attempt 3");
       const impl3 = await runImplementer(sandbox, ctx, {
         attemptNumber: 3,
-        model: implEscalations[0],
+        model: implModel3,
         reviewerFeedback: review2.stdout,
         requiredSkills: ctx.requiredSkills,
       });
@@ -5396,6 +5520,42 @@ async function runIssuePipeline(
             `- Invoked: ${err.invoked.length === 0 ? "_(none)_" : "`" + err.invoked.join("`, `") + "`"}\n` +
             `- Missing: \`${err.missing.join("`, `")}\`\n\n` +
             `The skill-discipline gate is the hard backstop for critique-as-gate's silent-abstention failure mode (see ADR 0006 v3). The implementer's commits are on the agent's branch but have not merged. Re-queue (\`ready-for-agent\`) after the implementer either invokes the missing skills explicitly or the required-principles set in \`SANDCASTLE.md\` is corrected for this \`type:\` label.`,
+        );
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} comment failed: ${(e as Error).message}`,
+        );
+      }
+      try {
+        await ctx.deps.quarantine(ctx.issueNumber, reason);
+        return { status: "quarantined", finalMarker: "HALT" };
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} quarantine failed: ${(e as Error).message}`,
+        );
+        return { status: "error", finalMarker: "HALT" };
+      }
+    }
+    // Stuck-abort with ZERO committed work (loop-cost ticket 03, checkbox 3).
+    // runImplementer throws a typed StuckError here rather than the generic
+    // "implementer made no commits" so this arm can quarantine IMMEDIATELY and
+    // RETURN — a stuck-abort that produced nothing has no partial work to
+    // recover, so it must NOT fall through to the single recovery pass below
+    // (that would waste an Opus recovery re-run on a spinning session).
+    // Mirrors the MissingRequiredSkillsError arm's quarantine-and-return shape.
+    if (err instanceof StuckError) {
+      deferralCounts.delete(ctx.issueNumber);
+      const reasonCode = "stuck-abort-no-commits";
+      const reason =
+        `[issue=${ctx.issueNumber}] ${reasonCode}: ` +
+        `stuck-abort with no committed work — quarantining ` +
+        `(stuck-detector aborted a spinning implementer that produced no commits).`;
+      ctx.deps.logError(reason);
+      try {
+        await ctx.deps.comment(
+          ctx.issueNumber,
+          `**Stuck-detector aborted the implementer with no committed work**\n\n` +
+            `The docker stuck-detector safety net (loop-cost ticket 03) aborted a spinning implementer session, but nothing was committed, so there is no partial work to review. Quarantining instead of wasting a recovery pass. Re-queue (\`ready-for-agent\`) after checking why the implementer spun (a repeated identical tool call, e.g. polling a command).`,
         );
       } catch (e) {
         ctx.deps.logError(
@@ -5893,6 +6053,21 @@ export async function runMain(
   // a `--repo-root` other than cwd resolves correctly (see configureGh). Set
   // first, before the startup reconciliation issues its first `gh issue list`.
   configureGh({ cwd: args.repoRoot });
+
+  // Implementer idle-timeout precedence: --implementer-timeout-sec (CLI) wins;
+  // else SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC from .sandcastle/.env; else the
+  // hardcoded 1200 already baked into args by parseSandcastleArgs. Resolved
+  // HERE rather than at parse time because loadDotenv runs in the entrypoint
+  // AFTER parseSandcastleArgs but BEFORE runMain — so the .env value isn't
+  // visible until now. A malformed value throws a clearly-labeled error. Lets a
+  // project whose inline e2e can exceed the 20-min/1200s default raise the
+  // idle timeout without passing a flag (loop-cost #02 inline-e2e mitigation).
+  if (!args.implementerTimeoutSecExplicit) {
+    const envTimeout = implementerTimeoutFromEnv();
+    if (envTimeout !== null) {
+      args = { ...args, implementerTimeoutSec: envTimeout };
+    }
+  }
 
   let consecutiveFailures = 0;
   let lastFailingIssue: number | undefined;

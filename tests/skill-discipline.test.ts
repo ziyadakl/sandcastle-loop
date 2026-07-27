@@ -630,6 +630,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     postMergeReviewerModel: "claude-opus-4-8",
     recoveryModel: "claude-opus-4-8",
     implementerTimeoutSec: 1200,
+    implementerTimeoutSecExplicit: false,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 99,
@@ -644,6 +645,7 @@ function gateBaseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     stagingEnabled: false,
     allowDirtySandcastle: false,
     sandbox: "docker",
+    stuckDetector: false,
     ...over,
   };
 }
