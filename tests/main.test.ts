@@ -95,6 +95,7 @@ import {
   MarkerNotFoundError,
 } from "../.sandcastle/lib/verdicts/index.js";
 import { createStatusStore } from "../.sandcastle/lib/status/store.js";
+import { StuckError } from "../.sandcastle/lib/stuck-detector.js";
 import {
   LeaseReadError,
   LeaseBackendError,
@@ -1039,7 +1040,14 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(b.state.quarantines).toEqual([]);
   });
 
-  it("stuck-abort with ZERO commits: quarantines via no-commit path — reviewer never runs, no envelope re-ask", async () => {
+  it("stuck-abort with ZERO commits: quarantines IMMEDIATELY via the typed StuckError arm — reviewer never runs, no envelope re-ask, NO recovery pass wasted", async () => {
+    // Loop-cost ticket 03, checkbox 3: an abort with nothing committed must
+    // NOT surface as a generic throw that wastes a recovery pass. runImplementer
+    // throws a typed StuckError; the pipeline catch quarantines and RETURNS
+    // before the optional single recovery pass. recoveryEnabled defaults to
+    // TRUE here (baseArgs) so the absence of a "recovery" run call is a real
+    // proof the recovery pass was skipped — pre-fix, the generic error fell
+    // through and a "recovery" run WAS recorded.
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([
@@ -1064,8 +1072,63 @@ describe("sandcastle-loop main.mts — reviewer + error paths (no ladder)", () =
     expect(names.filter((n) => n === "implementer")).toHaveLength(1);
     expect(names.filter((n) => n === "implementer-retry")).toHaveLength(0);
     expect(names).not.toContain("reviewer");
+    // The recovery pass must NOT have run — this is the ticket-03 fix.
+    expect(names).not.toContain("recovery");
+    expect(names).not.toContain("recovery-reviewer");
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(231);
+    expect(b.state.quarantines[0]!.reason).toMatch(/stuck-abort-no-commits/);
+    expect(b.state.marksDone).toEqual([]);
+  });
+
+  it("attempt-2 stuck-abort with ZERO new commits: quarantines IMMEDIATELY — no reviewer-retry, no recovery pass", async () => {
+    // The attempt-2 case ticket 03 calls out: a HAS_BLOCKERS review1 grants an
+    // implementer attempt 2, which then spins and stuck-aborts with NO new
+    // commits (commit recovery uses the per-attempt base SHA, so there is
+    // nothing to review). It must quarantine via the typed StuckError arm — no
+    // reviewer-retry burned, no recovery pass wasted.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "232", title: "stuck on attempt 2", branch: "agent/issue-232" },
+      ]),
+    });
+    // Attempt 1: real commit, reviewer finds a real blocker → escalation ladder.
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 232 }),
+      commits: [{ sha: "c1" }],
+    });
+    b.enqueue("reviewer", { stdout: "Real problem here.\n\nHAS_BLOCKERS" });
+    // Attempt 2 (escalated leg): spins and stuck-aborts with zero new commits.
+    b.enqueue("implementer-retry", {
+      stdout:
+        "[stuck-detector] run aborted — implementer stuck: repeated Bash 6× in a row with identical args",
+      commits: [],
+      stuckAborted: true,
+    });
+    // Enqueued but must NEVER be consumed — the stuck-abort quarantines first.
+    b.enqueue("reviewer-retry", { stdout: "should not run\n\nALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const names = b.state.runCalls.map((c) => c.spec.name);
+    // Exactly one attempt-1 implementer + one attempt-2 implementer-retry.
+    expect(names.filter((n) => n === "implementer")).toHaveLength(1);
+    expect(names.filter((n) => n === "implementer-retry")).toHaveLength(1);
+    // The escalated reviewer-retry never runs (nothing to review), and no
+    // recovery pass is wasted.
+    expect(names).not.toContain("reviewer-retry");
+    expect(names).not.toContain("recovery");
+    expect(names).not.toContain("recovery-reviewer");
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(232);
+    expect(b.state.quarantines[0]!.reason).toMatch(/stuck-abort-no-commits/);
+    expect(b.state.releases).toEqual([]);
     expect(b.state.marksDone).toEqual([]);
   });
 
@@ -4951,24 +5014,30 @@ describe("runImplementer stuck-abort carve-outs (loop-cost ticket 03)", () => {
     expect(r.skillsInvoked).toEqual([]);
   });
 
-  it("stuck + ZERO commits: throws 'implementer made no commits' (→ existing quarantine), not an envelope re-ask", async () => {
+  it("stuck + ZERO commits: throws the typed StuckError (→ immediate quarantine, NO recovery pass), not the generic no-commit error", async () => {
+    // Ticket 03 checkbox 3: an abort with nothing committed must throw a TYPED
+    // StuckError so the pipeline catch quarantines immediately instead of
+    // falling through to the recovery pass. It must NOT surface as the generic
+    // "implementer made no commits" (which the outer catch does not special-
+    // case, so it would waste a recovery pass).
     const sandbox = makeStuckSandbox([]);
     await expect(
       runImplementer(sandbox, stuckCtx(43), {
         attemptNumber: 1,
         requiredSkills: ["impeccable", "polish"],
       }),
-    ).rejects.toThrowError("implementer made no commits");
+    ).rejects.toBeInstanceOf(StuckError);
   });
 
-  it("stuck + ZERO commits on attempt 2: STILL throws 'implementer made no commits' regardless of attempt number", async () => {
+  it("stuck + ZERO commits on attempt 2: STILL throws the typed StuckError regardless of attempt number", async () => {
     // Attempt 2 normally bypasses requireCommits (a rebuttal can have zero
-    // commits). A stuck run with zero commits is NOT a rebuttal — the
-    // `|| r.stuckAborted` clause forces the no-commit throw anyway.
+    // commits). A stuck run with zero commits is NOT a rebuttal — the stuck-
+    // abort gate throws the typed StuckError anyway so it quarantines without a
+    // wasted recovery pass, regardless of attempt number.
     const sandbox = makeStuckSandbox([]);
     await expect(
       runImplementer(sandbox, stuckCtx(44), { attemptNumber: 2 }),
-    ).rejects.toThrowError("implementer made no commits");
+    ).rejects.toBeInstanceOf(StuckError);
   });
 });
 

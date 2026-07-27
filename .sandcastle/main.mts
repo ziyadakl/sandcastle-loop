@@ -128,6 +128,7 @@ import {
   buildSandboxProvider,
   type SandboxProvider,
 } from "./lib/sandbox-provider.js";
+import { StuckError } from "./lib/stuck-detector.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -4178,10 +4179,19 @@ export async function runImplementer(
   // (an attempt-2 stuck-abort is NOT a rebuttal, so the normal requireCommits
   // bypass must not let it through). A stuck-abort WITH commits skips this
   // throw (commits.length > 0) and flows on to the reviewer.
-  if (
-    ((requireCommits && !opts.envelopeReask) || r.stuckAborted) &&
-    r.commits.length === 0
-  ) {
+  if (r.stuckAborted && r.commits.length === 0) {
+    // Stuck-abort with nothing committed: quarantine immediately via the
+    // typed StuckError arm in the pipeline catch — must NOT fall through to
+    // the recovery pass (loop-cost ticket 03, checkbox 3). A non-stuck
+    // no-commit run keeps today's generic-Error path below.
+    //
+    // runImplementer no longer has the aborting tool/count (the provider
+    // already converted the abort into this graceful result), so a
+    // placeholder StuckError is sufficient — the catch arm keys off the type,
+    // not the message.
+    throw new StuckError("implementer", 0);
+  }
+  if (requireCommits && r.commits.length === 0 && !opts.envelopeReask) {
     throw new Error("implementer made no commits");
   }
   // Sandcastle's r.stdout is the parsed `result.result` from claude's final
@@ -5467,6 +5477,42 @@ async function runIssuePipeline(
             `- Invoked: ${err.invoked.length === 0 ? "_(none)_" : "`" + err.invoked.join("`, `") + "`"}\n` +
             `- Missing: \`${err.missing.join("`, `")}\`\n\n` +
             `The skill-discipline gate is the hard backstop for critique-as-gate's silent-abstention failure mode (see ADR 0006 v3). The implementer's commits are on the agent's branch but have not merged. Re-queue (\`ready-for-agent\`) after the implementer either invokes the missing skills explicitly or the required-principles set in \`SANDCASTLE.md\` is corrected for this \`type:\` label.`,
+        );
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} comment failed: ${(e as Error).message}`,
+        );
+      }
+      try {
+        await ctx.deps.quarantine(ctx.issueNumber, reason);
+        return { status: "quarantined", finalMarker: "HALT" };
+      } catch (e) {
+        ctx.deps.logError(
+          `${reasonCode} quarantine failed: ${(e as Error).message}`,
+        );
+        return { status: "error", finalMarker: "HALT" };
+      }
+    }
+    // Stuck-abort with ZERO committed work (loop-cost ticket 03, checkbox 3).
+    // runImplementer throws a typed StuckError here rather than the generic
+    // "implementer made no commits" so this arm can quarantine IMMEDIATELY and
+    // RETURN — a stuck-abort that produced nothing has no partial work to
+    // recover, so it must NOT fall through to the single recovery pass below
+    // (that would waste an Opus recovery re-run on a spinning session).
+    // Mirrors the MissingRequiredSkillsError arm's quarantine-and-return shape.
+    if (err instanceof StuckError) {
+      deferralCounts.delete(ctx.issueNumber);
+      const reasonCode = "stuck-abort-no-commits";
+      const reason =
+        `[issue=${ctx.issueNumber}] ${reasonCode}: ` +
+        `stuck-abort with no committed work — quarantining ` +
+        `(stuck-detector aborted a spinning implementer that produced no commits).`;
+      ctx.deps.logError(reason);
+      try {
+        await ctx.deps.comment(
+          ctx.issueNumber,
+          `**Stuck-detector aborted the implementer with no committed work**\n\n` +
+            `The docker stuck-detector safety net (loop-cost ticket 03) aborted a spinning implementer session, but nothing was committed, so there is no partial work to review. Quarantining instead of wasting a recovery pass. Re-queue (\`ready-for-agent\`) after checking why the implementer spun (a repeated identical tool call, e.g. polling a command).`,
         );
       } catch (e) {
         ctx.deps.logError(
