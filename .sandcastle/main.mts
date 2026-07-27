@@ -7184,8 +7184,10 @@ export async function runMain(
         );
 
       // Fix-ladder. Only runs under staging AND only when the first pass
-      // flagged ISSUES_FOUND. Single fix attempt with the escalated fixer
-      // model, then re-run the reviewer on the escalated model.
+      // flagged ISSUES_FOUND. The fixer runs on its DEFAULT (first-pick) model
+      // like every other role — its escalation rung is reserved for a retry
+      // pass (see the 2-pass fix loop). Then re-run the reviewer on the
+      // escalated model.
       if (
         stagingActive &&
         postMergeMarker === "POST_MERGE_ISSUES_FOUND"
@@ -7194,9 +7196,7 @@ export async function runMain(
         // SAME `roleModelsFor(args)` source every other role uses — never a
         // second derivation off the model, which could split from args.backend.
         const fixerSrc = roleModelsFor(args);
-        const fixerModel =
-          fixerSrc.postMergeFixer.escalations[0] ??
-          fixerSrc.postMergeFixer.default;
+        const fixerModel = fixerSrc.postMergeFixer.default;
         deps.log(
           `post-merge fix-loop: spawning fixer (model=${fixerModel}) on ${STAGING_BRANCH}`,
         );

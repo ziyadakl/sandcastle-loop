@@ -110,6 +110,7 @@ import {
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
+import { models } from "../.sandcastle/models.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
 
@@ -3642,6 +3643,73 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
       expect(
         status.issues.find((i) => i.number === 71)?.phase,
       ).toBe("merged");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // The post-merge fixer runs on its DEFAULT (first-pick) model like every
+  // other role — NOT the escalation rung. Under the default (non-budget)
+  // profile models.postMergeFixer.default = "claude-opus-4-8" and its
+  // escalations[0] = "claude-opus-4-8[1m]", so the dispatched fixer model
+  // distinguishes the two. WHEN-landed: staging active → ISSUES_FOUND → fixer →
+  // re-review ALL_CLEAR → promote.
+  it("dispatches the post-merge fixer on its DEFAULT model (not escalations[0])", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-fixer-default-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      // First post-merge review flags issues → fixer runs → re-review clears.
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      b.enqueue("post-merge-fixer", { stdout: "fixed" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const fixerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "post-merge-fixer",
+      );
+      expect(fixerCalls).toHaveLength(1);
+      // The whole point: DEFAULT model, not the escalation rung.
+      expect(fixerCalls[0]!.spec.model).toBe(models.postMergeFixer.default);
+      expect(fixerCalls[0]!.spec.model).not.toBe(
+        models.postMergeFixer.escalations[0],
+      );
     } finally {
       __setStagingWorktreePathForTests("");
       if (launchPath) {
