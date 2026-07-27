@@ -4025,6 +4025,13 @@ export async function runImplementer(
   // On attempt 1, allow a one-hop fallback to escalations[0] when the primary
   // throws a rate-limit error. Attempt 2 is already on the escalation, so no
   // further fallback — it just throws and the pipeline catch handles it.
+  //
+  // Budget-mode note (deliberate): under --budget, escalations[0] is Sonnet
+  // (the fix-it rung), which is the SAME model as the primary — so an attempt-1
+  // rate-limit fallback is a same-model retry after the transient window, NOT
+  // an Opus escalation. That's intended: budget mode stays cheap on a transient
+  // blip rather than jumping to Opus for a rate limit. Non-budget escalations[0]
+  // is Opus[1m] as before.
   const fallbackModel =
     attemptNumber === 1
       ? roleModelsFor(ctx.args).implementer.escalations[0]
