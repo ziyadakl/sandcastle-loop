@@ -2188,7 +2188,13 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       stdout: plannerStdout([{ id: "501", title: "rec-perm", branch: "agent/issue-501" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    // Recovery throws a permanent error (auth) — should not defer.
+    // Recovery throws a permanent error (auth) — should not defer. Both the
+    // first-pass and the escalation retry throw permanent errors, so the issue
+    // still quarantines after the ladder is exhausted.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("authentication_error: bad key"),
+    });
     b.enqueue("recovery", {
       stdout: "",
       throw: new Error("authentication_error: bad key"),
@@ -2204,6 +2210,11 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(501);
+    // The recovery ladder tried both rungs before quarantining.
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(2);
   });
 
   it("recovery-throw deferrals are bounded by MAX_DEFERRALS — 4th hit quarantines", async () => {
@@ -2273,8 +2284,12 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       stdout: plannerStdout([{ id: "504", title: "rec-halt", branch: "agent/issue-504" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Both recovery rungs judge the work unrecoverable (HALT) → quarantine.
     b.enqueue("recovery", {
       stdout: "Tried but couldn't fix it.\n\nHALT",
+    });
+    b.enqueue("recovery", {
+      stdout: "Still couldn't fix it.\n\nHALT",
     });
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
@@ -2287,6 +2302,41 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(504);
+  });
+
+  it("retries recovery on its escalation model after a non-COMPLETE first attempt", async () => {
+    // Change 5: attempt 1 returns a non-COMPLETE, non-transient marker (HALT).
+    // The gate must run a SECOND recovery pass on the escalation model before
+    // falling to quarantine. Under the default profile
+    // models.recovery.default="claude-opus-4-8" and escalations[0]=
+    // "claude-opus-4-8[1m]", so the two dispatched models distinguish the rungs.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "508", title: "rec-escalate", branch: "agent/issue-508" },
+      ]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Attempt 1 (default model) HALTs; attempt 2 (escalation model) also HALTs.
+    b.enqueue("recovery", { stdout: "give up\n\nHALT" });
+    b.enqueue("recovery", { stdout: "give up too\n\nHALT" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(2);
+    expect(recoveryCalls[0]!.spec.model).toBe(baseArgs().recoveryModel);
+    expect(recoveryCalls[1]!.spec.model).toBe(models.recovery.escalations[0]);
+    // Both rungs HALT → the issue still quarantines.
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(508);
   });
 
   it("two-tier deferral across iterations shares one MAX_DEFERRALS counter", async () => {
@@ -2387,6 +2437,11 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       stdout: plannerStdout([{ id: "507", title: "leak", branch: "agent/issue-507" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Both recovery rungs throw permanent errors → quarantine (no defer).
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key"),
+    });
     b.enqueue("recovery", {
       stdout: "",
       throw: new Error("invalid_api_key"),
