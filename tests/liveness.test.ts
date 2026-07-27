@@ -26,10 +26,25 @@ type St = {
   state: string;
   updatedAt: string;
   pid?: number;
+  hostId?: string;
 };
 
 function status(over: Partial<St> = {}): St {
   return { state: "running", updatedAt: FRESH, ...over };
+}
+
+const SELF = "mac-abc";
+const PEER = "vps-xyz";
+/** A probe that reports the pid dead, and records that it was consulted. */
+function deadProbe(): { fn: (pid: number) => boolean; calls: number[] } {
+  const calls: number[] = [];
+  return {
+    fn: (pid: number) => {
+      calls.push(pid);
+      return false; // ESRCH ⇒ dead
+    },
+    calls,
+  };
 }
 
 describe("deriveLiveness", () => {
@@ -100,6 +115,103 @@ describe("deriveLiveness", () => {
     expect(
       deriveLiveness(status({ state: "draining-v9", updatedAt: STALE }), { now: NOW }),
     ).toEqual<Liveness>({ live: false, reason: "stale" });
+  });
+
+  // --- crashed detection: same-host PID probe (Fix 1) ---
+  // When a snapshot is OURS (its hostId === selfHostId) and carries a pid, an
+  // injected `probeAlive(pid)===false` proves the loop process is gone — a hard
+  // kill (SIGKILL/OOM/sleep) that never got to flip `state`. This is a stronger
+  // signal than freshness (no need to wait out STALE_AFTER_MS) and gets its own
+  // reason. It must ONLY fire same-host: `process.kill(peerPid,0)` is meaningless
+  // for another machine's PID, so a peer snapshot stays freshness-gated.
+  it("same-host FRESH running + dead pid → crashed (beats freshness — no wait needed)", () => {
+    const probe = deadProbe();
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: FRESH, pid: 4242, hostId: SELF }), {
+        now: NOW,
+        probeAlive: probe.fn,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: false, reason: "crashed" });
+    expect(probe.calls).toEqual([4242]);
+  });
+
+  it("same-host STALE running + dead pid → crashed (crashed outranks stale)", () => {
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: STALE, pid: 4242, hostId: SELF }), {
+        now: NOW,
+        probeAlive: () => false,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: false, reason: "crashed" });
+  });
+
+  it("same-host running + LIVE pid → live/running (a running process is not crashed)", () => {
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: FRESH, pid: 4242, hostId: SELF }), {
+        now: NOW,
+        probeAlive: () => true,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: true, reason: "running" });
+  });
+
+  // THE key non-vacuous guard: a PEER's dead pid must NEVER be labelled crashed,
+  // and the probe must not even be consulted for it — it stays freshness-gated.
+  it("PEER dead pid + FRESH → running, probe NEVER consulted (peer stays freshness-gated)", () => {
+    const probe = deadProbe();
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: FRESH, pid: 99, hostId: PEER }), {
+        now: NOW,
+        probeAlive: probe.fn,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: true, reason: "running" });
+    expect(probe.calls).toEqual([]);
+  });
+
+  it("PEER dead pid + STALE → stale (freshness only), NOT crashed", () => {
+    const probe = deadProbe();
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: STALE, pid: 99, hostId: PEER }), {
+        now: NOW,
+        probeAlive: probe.fn,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: false, reason: "stale" });
+    expect(probe.calls).toEqual([]);
+  });
+
+  it("same-host with an ABSENT pid → unchanged freshness (nothing to probe)", () => {
+    const probe = deadProbe();
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: FRESH, hostId: SELF }), {
+        now: NOW,
+        probeAlive: probe.fn,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: true, reason: "running" });
+    expect(probe.calls).toEqual([]);
+  });
+
+  it("no probe/selfHostId injected → back-compat, pid ignored (freshness only)", () => {
+    expect(
+      deriveLiveness(status({ state: "running", updatedAt: STALE, pid: 4242, hostId: SELF }), {
+        now: NOW,
+      }),
+    ).toEqual<Liveness>({ live: false, reason: "stale" });
+  });
+
+  it("terminal state still wins even with a same-host dead pid", () => {
+    const probe = deadProbe();
+    expect(
+      deriveLiveness(status({ state: "done", updatedAt: STALE, pid: 4242, hostId: SELF }), {
+        now: NOW,
+        probeAlive: probe.fn,
+        selfHostId: SELF,
+      }),
+    ).toEqual<Liveness>({ live: false, reason: "done" });
+    expect(probe.calls).toEqual([]); // terminal short-circuits before any probe
   });
 
   // --- degenerate updatedAt mirrors reducer semantics (non-finite ⇒ not stale) ---

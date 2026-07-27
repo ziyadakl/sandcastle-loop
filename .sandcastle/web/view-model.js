@@ -98,7 +98,7 @@ export function isStale(updatedAt, nowMs) {
  * @param {number} nowMs Date.now() at render time (injected for testability)
  * @param {Record<string,string>} [aliasMap]
  * @returns {{
- *   banner: { kind: "no-run"|"live"|"stale"|"done"|"stopped"|"unhealthy", text: string, live: boolean, activity?: string },
+ *   banner: { kind: "no-run"|"live"|"stale"|"crashed"|"done"|"stopped"|"unhealthy", text: string, live: boolean, activity?: string },
  *   multiHost: boolean,
  *   hosts: Array<{ hostId: string, label: string, state: string, updatedAt: string, stale: boolean, lastSeenMs: number }>,
  *   meta: { perMachine: Array<{ label: string, current: number, total: number }>, branch: string },
@@ -128,11 +128,20 @@ function relativeAge(completedAt, nowMs) {
   return `${Math.floor(h / 24)}d`;
 }
 
-/** Banner kind/text/live from run state + own staleness. */
-function computeBanner(state, ownStale, activity) {
+/**
+ * Banner kind/text/live from run state + own staleness + own crash.
+ *
+ * `ownCrashed` is a PROVEN-dead same-host loop (see {@link buildViewModel}) and
+ * outranks staleness for a non-terminal state: a hard kill (SIGKILL/OOM/sleep)
+ * freezes `state` on `running` with a still-recent `updatedAt`, so freshness
+ * alone can't catch it. Terminal states (done/stopped/unhealthy) still win — the
+ * loop told us how it ended. In the browser there is no pid to signal, so
+ * `ownCrashed` is false and this collapses to the prior freshness-only behaviour.
+ */
+function computeBanner(state, ownStale, activity, ownCrashed) {
   let kind;
-  if (state === "running") kind = ownStale ? "stale" : "live";
-  else if (state === "restarting") kind = "live";
+  if (state === "running") kind = ownCrashed ? "crashed" : ownStale ? "stale" : "live";
+  else if (state === "restarting") kind = ownCrashed ? "crashed" : "live";
   else if (state === "done") kind = "done";
   else if (state === "stopped") kind = "stopped";
   else if (state === "unhealthy") kind = "unhealthy";
@@ -141,6 +150,7 @@ function computeBanner(state, ownStale, activity) {
   const TEXT = {
     live: "Live",
     stale: "Stale — loop may have stopped",
+    crashed: "Crashed — loop died, work may be recoverable",
     done: "Done",
     stopped: "Stopped",
     unhealthy: "Unhealthy — needs attention",
@@ -157,7 +167,16 @@ const PILL_SPEC = [
   { key: "requeued", label: "requeued", tone: "info" },
 ];
 
-export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP) {
+/**
+ * Same-host hard-kill probe, mirroring the pure `deriveLiveness` seam. Injected
+ * (not called directly) so this module stays pure/testable. In the BROWSER no
+ * probe is passed and `ownCrashed` is always false — a page served over HTTP,
+ * possibly from another host, can't signal a pid. A Node caller CAN inject
+ * `{ probeAlive: pid => process.kill(pid,0)…, selfHostId }` to surface `crashed`.
+ * @typedef {{ probeAlive?: (pid: number) => boolean, selfHostId?: string }} LivenessProbe
+ */
+
+export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP, probe = {}) {
   // --- Defensive: a null / structurally-broken snapshot yields a safe model. ---
   if (!snap || typeof snap !== "object" || !snap.hostId || !snap.run) {
     return {
@@ -196,8 +215,16 @@ export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP) {
     ...peers.map((p) => hostRow(p.hostId, p.state, p.updatedAt)),
   ];
 
-  // --- banner (keyed to OWN host staleness). ---
-  const banner = computeBanner(snap.state, hosts[0].stale, snap.activity);
+  // --- banner (keyed to OWN host staleness + a same-host crash probe). ---
+  // Crash detection fires ONLY for our own snapshot with a pid we can actually
+  // signal; a peer's pid is unsignalable from here, so it stays freshness-gated.
+  const ownCrashed =
+    typeof probe.probeAlive === "function" &&
+    probe.selfHostId !== undefined &&
+    snap.hostId === probe.selfHostId &&
+    typeof snap.pid === "number" &&
+    !probe.probeAlive(snap.pid);
+  const banner = computeBanner(snap.state, hosts[0].stale, snap.activity, ownCrashed);
 
   // --- meta.perMachine (own + each peer). ---
   const perMachine = [

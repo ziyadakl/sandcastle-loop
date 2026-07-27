@@ -23,7 +23,8 @@ The all-machines branch requires cross-host sync (`SANDCASTLE_CROSS_HOST_SYNC=1`
 1. **Liveness — read `.sandcastle/status.json` (canonical), NOT `pgrep`.** The loop runs detached / inside a sandbox, so a bare `pgrep -f main.mts` is unreliable in *both* directions: it false-negatives (can't see the sandboxed process) and false-positives (matches your own grep/watcher command text). Determine liveness from the loop's own heartbeat instead:
 
    - Read `<repoRoot>/.sandcastle/status.json`. The loop is **running** iff `state == "running"` **AND** `updatedAt` is fresh — within ~4 minutes (2× the 120s status heartbeat, plus margin for GC pauses). Compare `updatedAt` to now.
-   - **A `running` state with a stale `updatedAt` is a hard death, not a live loop** — report it as "died unexpectedly (status frozen on `running` at <updatedAt>)", not "running".
+   - **CRASHED (proven-dead, this machine only)** — the status file stamps the loop's OS `pid` (and its `hostId`). If the snapshot's `hostId` is THIS machine and `process.kill(<pid>, 0)` throws `ESRCH` (no such process), the loop is **crashed** — report it as "crashed — loop process (pid <pid>) is gone, work may be recoverable", distinct from a merely stale/quiet feed. This is authoritative and immediate: don't wait out the stale window, and don't downgrade it to "stale". Only probe the pid when the snapshot is same-host — a remote host's pid can't be signalled from here, so a peer's frozen `running` stays in the stale/hard-death class below.
+   - **A `running` state with a stale `updatedAt` (and no same-host pid to disprove) is a hard death, not a live loop** — report it as "died unexpectedly (status frozen on `running` at <updatedAt>)", not "running".
    - `state` of `done` / `stopped` means a clean finish; `restarting` is a transient self-restart.
    - Cross-check `.sandcastle/.loop.lock`: it is held while a loop runs and auto-expires ~60s after the holder dies. A held lock with a stale status is also a hard death.
    - You MAY run `pgrep -af '\.sandcastle/main\.mts'` as a *secondary* hint only — never as the primary signal, and never to conclude "running" on its own.
@@ -85,7 +86,7 @@ Plain English summary:
 
 Don't dump raw log output unless the user asks. Don't quote PIDs unless it's relevant for `/sandcastle-stop`.
 
-If `status.json` shows `state: running` but `updatedAt` is stale (step 1), report a **hard death**, not a live loop: the loop crashed without writing a clean `stopped`/`done` state. Point the user at the run log (`.sandcastle/run.log`) for the last lines before the crash.
+If `status.json` shows `state: running` but the loop is not actually alive (step 1), report a death, not a live loop — the loop stopped without writing a clean `stopped`/`done` state. Distinguish the two flavors: a same-host snapshot whose stamped `pid` is gone (`process.kill(pid,0)` ⇒ `ESRCH`) is a **crashed** loop (proven dead now); a stale `updatedAt` with no same-host pid to probe is a **hard death** (inferred from a frozen heartbeat). Either way, point the user at the run log (`.sandcastle/run.log`) for the last lines before the crash.
 
 ---
 

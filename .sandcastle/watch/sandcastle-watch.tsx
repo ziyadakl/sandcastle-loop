@@ -41,8 +41,14 @@ import { render, Box, Text, useApp, useInput } from "ink";
 // tests/watch-viewer-portability.test.ts.
 import React, { useEffect, useState } from "react";
 
-import { reduce, type ReadResult, type ViewState } from "./reducer.js";
+import {
+  reduce,
+  type ReadResult,
+  type ViewState,
+  type LivenessProbe,
+} from "./reducer.js";
 import { computeRecentCap } from "./layout.js";
+import { resolveHostId } from "../lib/host-id.js";
 import { sumTotalsAcrossHosts } from "../lib/status/merge.js";
 import type {
   IssuePhase,
@@ -142,6 +148,27 @@ function readStatus(filePath: string): ReadResult {
   }
 }
 
+/**
+ * The impure OS-liveness probe + this host's identity, handed to the pure
+ * reducer so it can flag a SAME-HOST hard kill as `crashed` rather than waiting
+ * out the stale window. `process.kill(pid, 0)` sends no signal — it only asks
+ * "does this pid exist and can I signal it?": success ⇒ alive, ESRCH ⇒ dead.
+ * (An EPERM would mean the pid exists but is another user's — treat as alive, so
+ * we err toward NOT crying "crashed".) `selfHostId` gates it to our own snapshot;
+ * a peer's pid is unsignalable from here and stays purely freshness-gated.
+ */
+const LIVENESS_PROBE: LivenessProbe = {
+  selfHostId: resolveHostId(),
+  probeAlive: (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException)?.code === "EPERM";
+    }
+  },
+};
+
 // ---------------------------------------------------------------------------
 // presentation helpers
 // ---------------------------------------------------------------------------
@@ -178,6 +205,7 @@ function activityLabel(activity: string): string {
 const BANNER_TEXT: Record<NonNullable<ViewState["banner"]>, string> = {
   waiting: "waiting for loop…",
   stale: "stale — loop may have stopped",
+  crashed: "crashed — loop process died, work may be recoverable",
   outdated: "viewer out of date — run an update",
   done: "done — loop finished",
   stopped: "stopped — loop halted",
@@ -190,6 +218,8 @@ const BANNER_TEXT: Record<NonNullable<ViewState["banner"]>, string> = {
 const BANNER_COLOR: Record<NonNullable<ViewState["banner"]>, string> = {
   waiting: C.neutral,
   stale: C.warning,
+  // A proven-dead process is a harder failure than a merely quiet feed — red.
+  crashed: C.error,
   outdated: C.error,
   done: C.neutral,
   stopped: C.neutral,
@@ -200,6 +230,7 @@ const BANNER_COLOR: Record<NonNullable<ViewState["banner"]>, string> = {
 const BANNER_GLYPH: Record<NonNullable<ViewState["banner"]>, string> = {
   waiting: "○",
   stale: "●",
+  crashed: "✗",
   outdated: "●",
   done: "✓",
   stopped: "■",
@@ -559,7 +590,7 @@ function App({ statusPath }: { statusPath: string }) {
   useEffect(() => {
     const tick = () => {
       const read = readStatus(statusPath);
-      setView((prev) => reduce(prev, read, Date.now()));
+      setView((prev) => reduce(prev, read, Date.now(), LIVENESS_PROBE));
     };
     tick(); // paint immediately rather than wait a full interval
     const id = setInterval(tick, POLL_MS);

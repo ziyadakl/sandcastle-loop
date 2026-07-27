@@ -243,3 +243,50 @@ describe("reduce", () => {
     expect(s.banner).toBeNull();
   });
 });
+
+// Fix 1 — same-host hard-kill detection threaded through the reducer's optional
+// LivenessProbe. A fresh `running` feed whose stamped pid is proven dead by the
+// injected probe raises a `crashed` banner (distinct from `stale`), but only for
+// OUR OWN snapshot; a peer's pid is never probed.
+describe("reduce — crashed banner (same-host pid probe)", () => {
+  const withPid = JSON.stringify({ ...validStatus, pid: 4242 }); // hostId host-a
+
+  it("own snapshot + dead pid → banner 'crashed' even on a FRESH feed", () => {
+    const calls: number[] = [];
+    const s = reduce(EMPTY, ok(withPid), VALID_NOW, {
+      selfHostId: "host-a",
+      probeAlive: (pid) => {
+        calls.push(pid);
+        return false;
+      },
+    });
+    expect(s.banner).toBe("crashed");
+    expect(calls).toEqual([4242]);
+  });
+
+  it("own snapshot + live pid → no banner (still running)", () => {
+    const s = reduce(EMPTY, ok(withPid), VALID_NOW, {
+      selfHostId: "host-a",
+      probeAlive: () => true,
+    });
+    expect(s.banner).toBeNull();
+  });
+
+  it("PEER snapshot + dead pid → NOT crashed, probe never consulted", () => {
+    const calls: number[] = [];
+    const s = reduce(EMPTY, ok(withPid), VALID_NOW, {
+      selfHostId: "some-other-host",
+      probeAlive: (pid) => {
+        calls.push(pid);
+        return false;
+      },
+    });
+    expect(s.banner).toBeNull(); // fresh feed, freshness-gated
+    expect(calls).toEqual([]);
+  });
+
+  it("no probe injected → back-compat, freshness only (no crashed)", () => {
+    const s = reduce(EMPTY, ok(withPid), VALID_NOW);
+    expect(s.banner).toBeNull();
+  });
+});
