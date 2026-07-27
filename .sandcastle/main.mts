@@ -5702,20 +5702,25 @@ async function runIssuePipeline(
           `[issue=${ctx.issueNumber}] diagnose: ${diagnosis.cause} — hinting recovery`,
         );
       }
-      // Bounded 2-attempt recovery. Attempt 1 runs on `recoveryModel`; if it
-      // neither shipped (RECOVERY_COMPLETE) nor hit the transient-defer branch
-      // (ERRORED + transient — handled below), and an escalation rung exists,
-      // retry ONCE on the escalation model before falling to quarantine. An
-      // empty escalations array collapses this to a single attempt — the
-      // result-handling block below then runs byte-identically to before.
+      // Bounded 2-attempt recovery. Attempt 1 runs on `recoveryModel`. Retry
+      // ONCE on the escalation model ONLY when attempt 1 crashed on a genuine,
+      // non-transient error (ERRORED) — i.e. the model/tooling itself failed,
+      // not the work. A HALT is recovery's DELIBERATE "I hit a real blocker,
+      // I'm not going to guess, hand to a human" signal; re-running it on a
+      // stronger model re-introduces the exact data-loss risk HALT exists to
+      // prevent, so HALT must NOT retry — it falls straight to quarantine.
+      // Transient ERRORED is handled by the defer branch below, so it must not
+      // retry here either. An empty escalations array collapses this to a
+      // single attempt — the result-handling block below then runs
+      // byte-identically to before.
       const recoveryEscalations = roleModelsFor(ctx.args).recovery.escalations;
       const maxRecoveryAttempts = recoveryEscalations.length > 0 ? 2 : 1;
       let rec = await runRecovery(sandbox, ctx, errMsg, diagnosis?.hint ?? "");
       for (
         let recoveryAttempt = 2;
         recoveryAttempt <= maxRecoveryAttempts &&
-        rec.marker !== "RECOVERY_COMPLETE" &&
-        !(rec.marker === "ERRORED" && isTransientError(rec.errorMsg ?? ""));
+        rec.marker === "ERRORED" &&
+        !isTransientError(rec.errorMsg ?? "");
         recoveryAttempt++
       ) {
         const escModel = escalationForAttempt(

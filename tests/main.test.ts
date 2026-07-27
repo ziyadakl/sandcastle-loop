@@ -1513,14 +1513,14 @@ describe("sandcastle-loop main.mts — circuit breaker", () => {
         { id: "603", title: "c", branch: "agent/issue-603" },
       ]),
     });
-    // Each issue: implementer throws, both recovery passes HALT.
+    // Each issue: implementer throws, recovery HALTs (a HALT does not retry,
+    // so a single recovery pass quarantines each issue).
     for (let i = 0; i < 3; i++) {
       b.enqueue("implementer", {
         stdout: "",
         throw: new Error(`issue boom ${i}`),
       });
       b.enqueue("recovery", { stdout: "give up\nHALT" });
-      b.enqueue("recovery", { stdout: "give up too\nHALT" });
     }
 
     const result = await runMain(
@@ -2276,15 +2276,19 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases[0]!.reason).not.toMatch(/DISTINCTIVE_PIPELINE_ERROR_TOKEN/);
   });
 
-  it("recovery returns HALT marker → quarantines (no defer, no release)", async () => {
-    // Recovery RAN and judged the work unrecoverable. That's a legit
-    // verdict, not a transient error — should quarantine, not defer.
+  it("recovery returns HALT marker → quarantines WITHOUT a retry (no defer, no release)", async () => {
+    // Recovery RAN and judged the work unrecoverable. HALT is its deliberate
+    // "real blocker, I'm not going to guess, hand to a human" signal — retrying
+    // it on a stronger model re-introduces the data-loss risk HALT exists to
+    // prevent. So a HALT must quarantine on the FIRST pass, never escalate.
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([{ id: "504", title: "rec-halt", branch: "agent/issue-504" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    // Both recovery rungs judge the work unrecoverable (HALT) → quarantine.
+    // A single recovery pass HALTs. A SECOND is enqueued as a tripwire: if the
+    // gate ever retried a HALT, this pass would be consumed and the assertion
+    // below (exactly one recovery call) would fail.
     b.enqueue("recovery", {
       stdout: "Tried but couldn't fix it.\n\nHALT",
     });
@@ -2302,12 +2306,18 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(504);
+    // HALT did NOT retry — exactly one recovery pass ran.
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(1);
   });
 
-  it("retries recovery on its escalation model after a non-COMPLETE first attempt", async () => {
-    // Change 5: attempt 1 returns a non-COMPLETE, non-transient marker (HALT).
-    // The gate must run a SECOND recovery pass on the escalation model before
-    // falling to quarantine. Under the default profile
+  it("retries recovery on its escalation model after a non-transient CRASH (ERRORED)", async () => {
+    // Change 5: retry fires ONLY on a genuine, non-transient crash — the model
+    // or tooling itself failed (ERRORED), not the work. Attempt 1 crashes on a
+    // permanent error; the gate must run a SECOND recovery pass on the
+    // escalation model before falling to quarantine. Under the default profile
     // models.recovery.default="claude-opus-4-8" and escalations[0]=
     // "claude-opus-4-8[1m]", so the two dispatched models distinguish the rungs.
     const b = buildDeps();
@@ -2317,9 +2327,16 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       ]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    // Attempt 1 (default model) HALTs; attempt 2 (escalation model) also HALTs.
-    b.enqueue("recovery", { stdout: "give up\n\nHALT" });
-    b.enqueue("recovery", { stdout: "give up too\n\nHALT" });
+    // Attempt 1 (default model) and attempt 2 (escalation model) both crash on
+    // a permanent (non-transient) error → ERRORED, which is what retries.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key: recovery model crashed"),
+    });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key: recovery model crashed again"),
+    });
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
     const result = await runMain(
@@ -2334,7 +2351,7 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(recoveryCalls).toHaveLength(2);
     expect(recoveryCalls[0]!.spec.model).toBe(baseArgs().recoveryModel);
     expect(recoveryCalls[1]!.spec.model).toBe(models.recovery.escalations[0]);
-    // Both rungs HALT → the issue still quarantines.
+    // Both rungs crash → the issue still quarantines.
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(508);
   });
