@@ -172,6 +172,13 @@ export interface SandcastleArgs {
   postMergeReviewerModel: string;
   recoveryModel: string;
   implementerTimeoutSec: number;
+  /**
+   * Whether `--implementer-timeout-sec` was passed explicitly on the CLI.
+   * When false, runMain applies a `SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC` env
+   * fallback (resolved post-dotenv — see the fallback block in runMain). The
+   * CLI flag always wins, even when its value equals the 1200 default.
+   */
+  implementerTimeoutSecExplicit: boolean;
   reviewerTimeoutSec: number;
   /**
    * Outer wall-clock ceiling around every SDK `run` / `handle.run` call.
@@ -643,7 +650,9 @@ Optional:
   --merger-model M              Default: from .sandcastle/models.ts (merger.default).
   --post-merge-reviewer-model M Default: from .sandcastle/models.ts (postMergeReviewer.default).
   --recovery-model M            Default: from .sandcastle/models.ts (recovery.default). Used by the recovery pass.
-  --implementer-timeout-sec N   Default: 1200.
+  --implementer-timeout-sec N   Default: 1200. Falls back to
+                                SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC (from
+                                .sandcastle/.env) when this flag is omitted.
   --reviewer-timeout-sec N      Default: 600.
   --hard-ceiling-sec N      Outer wall-clock ceiling per SDK call. Fires
                             independently of the SDK's idle timer (which
@@ -1016,6 +1025,10 @@ export function parseSandcastleArgs(argv: readonly string[]): {
         values["implementer-timeout-sec"],
         "--implementer-timeout-sec",
       ) ?? 1200,
+    // Recorded so runMain can apply the SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC
+    // env fallback ONLY when the CLI flag was absent (CLI always wins).
+    implementerTimeoutSecExplicit:
+      values["implementer-timeout-sec"] !== undefined,
     reviewerTimeoutSec:
       parsePositiveInt(
         values["reviewer-timeout-sec"],
@@ -1131,6 +1144,7 @@ function defaultArgs(): SandcastleArgs {
     postMergeReviewerModel: models.postMergeReviewer.default,
     recoveryModel: models.recovery.default,
     implementerTimeoutSec: 1200,
+    implementerTimeoutSecExplicit: false,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
@@ -1209,6 +1223,24 @@ function crossHostSyncEnabled(
   getEnv: (key: string) => string | undefined = (k) => process.env[k],
 ): boolean {
   return envFlagEnabled(getEnv, "SANDCASTLE_CROSS_HOST_SYNC");
+}
+
+/**
+ * Resolve the `SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC` env fallback for the
+ * implementer idle-timeout. Returns the parsed positive integer, or null when
+ * the var is unset. A malformed value throws a clearly-labeled error (reusing
+ * {@link parsePositiveInt}). `getEnv` is an injectable seam for tests, matching
+ * {@link crossHostLeaseEnabled}. This must be read in runMain, NOT at parse
+ * time: `loadDotenv` runs in the entrypoint AFTER `parseSandcastleArgs` but
+ * BEFORE runMain, so the `.sandcastle/.env` value isn't visible until then.
+ */
+export function implementerTimeoutFromEnv(
+  getEnv: (key: string) => string | undefined = (k) => process.env[k],
+): number | null {
+  return parsePositiveInt(
+    getEnv("SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC"),
+    "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC",
+  );
 }
 
 /** Parse a single .env file into process.env. Earlier writers win — we never
@@ -6017,6 +6049,21 @@ export async function runMain(
   // a `--repo-root` other than cwd resolves correctly (see configureGh). Set
   // first, before the startup reconciliation issues its first `gh issue list`.
   configureGh({ cwd: args.repoRoot });
+
+  // Implementer idle-timeout precedence: --implementer-timeout-sec (CLI) wins;
+  // else SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC from .sandcastle/.env; else the
+  // hardcoded 1200 already baked into args by parseSandcastleArgs. Resolved
+  // HERE rather than at parse time because loadDotenv runs in the entrypoint
+  // AFTER parseSandcastleArgs but BEFORE runMain — so the .env value isn't
+  // visible until now. A malformed value throws a clearly-labeled error. Lets a
+  // project whose inline e2e can exceed the 20-min/1200s default raise the
+  // idle timeout without passing a flag (loop-cost #02 inline-e2e mitigation).
+  if (!args.implementerTimeoutSecExplicit) {
+    const envTimeout = implementerTimeoutFromEnv();
+    if (envTimeout !== null) {
+      args = { ...args, implementerTimeoutSec: envTimeout };
+    }
+  }
 
   let consecutiveFailures = 0;
   let lastFailingIssue: number | undefined;

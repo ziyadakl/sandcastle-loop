@@ -38,6 +38,7 @@ import {
   parseBlockedBy,
   buildBlockedByNote,
   parseSandcastleArgs,
+  implementerTimeoutFromEnv,
   preflight,
   loadDotenv,
   isTransientServerError,
@@ -489,6 +490,7 @@ function baseArgs(over: Partial<SandcastleArgs> = {}): SandcastleArgs {
     postMergeReviewerModel: "claude-opus-4-8",
     recoveryModel: "claude-opus-4-8",
     implementerTimeoutSec: 1200,
+    implementerTimeoutSecExplicit: false,
     reviewerTimeoutSec: 600,
     hardCeilingSec: 3600,
     consecutiveFailureLimit: 3,
@@ -1638,6 +1640,119 @@ describe("sandcastle-loop main.mts — runId / run-branch derivation", () => {
     const r = deriveRunBranchAndId("release/1.2", "release/1.2", true, "hostA");
     expect(r.runId).toBe("release/1.2");
     expect(r.branch).toBe("release/1.2");
+  });
+});
+
+describe("sandcastle-loop main.mts — implementer idle-timeout env fallback", () => {
+  // Precedence: --implementer-timeout-sec (CLI) > SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC
+  // (from .sandcastle/.env, resolved in runMain because loadDotenv runs AFTER
+  // parseSandcastleArgs but BEFORE runMain) > hardcoded 1200.
+
+  // --- Pure helper unit tests (injectable getEnv seam) ---
+  it("implementerTimeoutFromEnv: returns null when the env var is unset", () => {
+    expect(implementerTimeoutFromEnv(() => undefined)).toBe(null);
+  });
+
+  it("implementerTimeoutFromEnv: parses a valid positive integer", () => {
+    expect(
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "3600" : undefined,
+      ),
+    ).toBe(3600);
+  });
+
+  it("implementerTimeoutFromEnv: throws a clearly-labeled error on a malformed value", () => {
+    expect(() =>
+      implementerTimeoutFromEnv((k) =>
+        k === "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC" ? "not-a-number" : undefined,
+      ),
+    ).toThrow(/SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC/);
+  });
+
+  // --- WHEN-landed tests through runMain (assert the value reaches the run) ---
+  // Runs a single-issue happy path and returns the idleTimeoutSeconds the
+  // implementer sandbox run was actually dispatched with.
+  async function implementerIdleTimeoutFor(
+    args: SandcastleArgs,
+  ): Promise<number | undefined> {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "71", title: "smoke", branch: "agent/issue-71" },
+      ]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    // Second cycle exits 0 on an empty plan (mirrors the happy-path test).
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      { ...args, iterations: 2, stagingEnabled: false },
+      b.deps,
+    );
+    expect(result.exitCode).toBe(0);
+    const impl = b.state.runCalls.find((c) => c.spec.name === "implementer");
+    expect(impl).toBeDefined();
+    return (impl!.spec as SandboxRunSpec).idleTimeoutSeconds;
+  }
+
+  const ENV_KEY = "SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC";
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = savedEnv;
+  });
+
+  it("env var set, no CLI flag → env value lands on the implementer run", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(3600);
+  });
+
+  it("CLI flag set AND env set → CLI value wins", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1500, implementerTimeoutSecExplicit: true }),
+    );
+    expect(landed).toBe(1500);
+  });
+
+  it("CLI flag set to the default 1200 still wins over env (explicit beats fallback)", async () => {
+    process.env[ENV_KEY] = "3600";
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: true }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("neither CLI flag nor env → hardcoded 1200 default lands", async () => {
+    const landed = await implementerIdleTimeoutFor(
+      baseArgs({ implementerTimeoutSec: 1200, implementerTimeoutSecExplicit: false }),
+    );
+    expect(landed).toBe(1200);
+  });
+
+  it("malformed env value → runMain rejects with a clearly-labeled error", async () => {
+    process.env[ENV_KEY] = "abc";
+    const b = buildDeps();
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+    await expect(
+      runMain(
+        baseArgs({ implementerTimeoutSecExplicit: false }),
+        b.deps,
+      ),
+    ).rejects.toThrow(/SANDCASTLE_IMPLEMENTER_TIMEOUT_SEC/);
   });
 });
 
