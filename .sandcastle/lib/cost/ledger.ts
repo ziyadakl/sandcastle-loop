@@ -118,7 +118,7 @@ export class CostLedger {
 }
 
 /** Sum a role's four token buckets into a single count for display. */
-function totalTokens(t: Usage): number {
+export function totalTokens(t: Usage): number {
   return (
     t.inputTokens +
     t.outputTokens +

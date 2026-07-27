@@ -113,7 +113,8 @@ import {
   parseRequiredSkillsByType,
   validateRequiredSkillsInvoked,
 } from "./lib/skill-discipline.js";
-import { CostLedger, formatCostSummary } from "./lib/cost/ledger.js";
+import { CostLedger, formatCostSummary, totalTokens } from "./lib/cost/ledger.js";
+import { TimingLedger, timeRole } from "./lib/cost/timing.js";
 import { captureRoleCost } from "./lib/cost/capture.js";
 import {
   envForModel,
@@ -3962,6 +3963,13 @@ interface PipelineCtx {
    * when it's absent, and never throws into the pipeline regardless.
    */
   readonly costLedger?: CostLedger;
+  /**
+   * Run-scoped WALL-CLOCK timing ledger (Phase-2 telemetry). Constructed
+   * alongside {@link costLedger} in {@link runMain} and threaded the same way so
+   * each role dispatch can be wrapped in {@link timeRole}. OPTIONAL for the same
+   * reason as `costLedger` — a bare ctx omits it and `timeRole` no-ops.
+   */
+  readonly timingLedger?: TimingLedger;
   readonly iteration: number;
   readonly issueNumber: number;
   readonly issue: PlanIssue;
@@ -4072,7 +4080,8 @@ export async function runImplementer(
     attemptNumber === 1
       ? roleModelsFor(ctx.args).implementer.escalations[0]
       : undefined;
-  const r = await runWithRateLimitFallback(
+  const r = await timeRole(ctx.timingLedger, "implementer", () =>
+    runWithRateLimitFallback(
     (model) =>
       sb.run({
         name:
@@ -4123,6 +4132,7 @@ export async function runImplementer(
     ctx.deps.log,
     `implementer (issue=${ctx.issueNumber})`,
     "implementer",
+    ),
   );
   // Extract Skill() invocations from the SDK's captured session JSONL — see
   // extractSkillInvocationsFromSession for why we cannot use the SDK's
@@ -4731,7 +4741,8 @@ async function runReviewer(
   );
   const tipSha = runGit(ctx.args.repoRoot, "rev-parse", commitSha);
   const reviewBase = resolveReviewBase(mergeBase, tipSha, commitSha);
-  const r = await runWithRateLimitFallback(
+  const r = await timeRole(ctx.timingLedger, "reviewer", () =>
+    runWithRateLimitFallback(
     (m) =>
       sb.run({
         name: opts.name ?? "reviewer",
@@ -4757,6 +4768,7 @@ async function runReviewer(
     ctx.deps.log,
     `reviewer (issue=${ctx.issueNumber})`,
     "reviewer",
+    ),
   );
   // Phase-1 cost telemetry (best-effort).
   await captureRoleCost(ctx.costLedger, "reviewer", r, ctx.deps.logError);
@@ -4803,7 +4815,8 @@ async function runRecovery(
   errorMsg?: string;
 }> {
   try {
-    const r = await sb.run({
+    const r = await timeRole(ctx.timingLedger, "recovery", () =>
+      sb.run({
       name: "recovery",
       maxIterations: 1,
       model,
@@ -4816,7 +4829,8 @@ async function runRecovery(
         REASON: reason.slice(0, 500),
         DIAGNOSE_HINT: diagnoseHint,
       },
-    });
+    }),
+    );
     // Phase-1 cost telemetry (best-effort).
     await captureRoleCost(ctx.costLedger, "recovery", r, ctx.deps.logError);
     const marker = extractMarker(r.stdout, ["RECOVERY_COMPLETE", "HALT"] as const);
@@ -4941,7 +4955,8 @@ export async function runCritique(
   // emitted no recognizable marker (malformed) — the caller fails closed
   // per attempt. Collapses the two formerly-duplicated sandbox.run blocks.
   const runCritiqueOnce = async (name: string): Promise<{ stdout: string }> => {
-    const r = await sandbox.run({
+    const r = await timeRole(ctx.timingLedger, "critique", () =>
+      sandbox.run({
       name,
       maxIterations: 1,
       model: ctx.args.critiqueModel,
@@ -4955,7 +4970,8 @@ export async function runCritique(
         BASE_BRANCH: ctx.args.branch,
         REQUIRED_PRINCIPLES: requiredSkills.join(", "),
       },
-    });
+    }),
+    );
     // Phase-1 cost telemetry (best-effort) — captures every critique dispatch,
     // including the no-verdict retry, since both flow through here.
     await captureRoleCost(ctx.costLedger, "critique", r, ctx.deps.logError);
@@ -6261,6 +6277,11 @@ export async function runMain(
   // merger / post-merge) sites. Its `summary()` is logged at run end and its
   // total is sunk into status.json. Best-effort — capture never fails a run.
   const costLedger = new CostLedger();
+  // Run-scoped Phase-2 wall-clock timing ledger — the timing sibling of the cost
+  // ledger. Threaded the same way; each role dispatch is wrapped in `timeRole`,
+  // and its `summary()` is merged with the cost summary into `totals.perRole` at
+  // run end. Best-effort — timing never fails a run.
+  const timingLedger = new TimingLedger();
   // Keep-alive: a phase can run for many minutes without a transition (the log
   // shows a 1200s idle phase), so without this the viewer would mislabel a
   // healthy loop "stale" within seconds. The timer is `unref`'d and cleared by
@@ -6576,7 +6597,8 @@ export async function runMain(
       } else {
         let plannerStdout: string;
         try {
-          const planResult = await deps.run({
+          const planResult = await timeRole(timingLedger, "planner", () =>
+            deps.run({
             name: "planner",
             maxIterations: 1,
             model: args.plannerModel,
@@ -6587,7 +6609,8 @@ export async function runMain(
               LABEL: args.label,
               MAX_CONCURRENT: String(args.maxConcurrent),
             },
-          });
+          }),
+          );
           plannerStdout = planResult.stdout;
           // Phase-1 cost telemetry (best-effort). The top-level runner
           // (deps.run → provider.topLevelRun in sandbox-provider.ts) forwards
@@ -6788,6 +6811,7 @@ export async function runMain(
               typeLabel: perIssueTypeLabel.get(p.id),
               status: statusStore,
               costLedger,
+              timingLedger,
             };
             const outcome = await runIssuePipeline(ctx);
             return { issue: p, issueNumber, outcome };
@@ -7085,7 +7109,8 @@ export async function runMain(
             : escalationForAttempt(mergerEscalations, mergerAttempt);
         mergerOk = true;
         try {
-          const mergerResult = await deps.run({
+          const mergerResult = await timeRole(timingLedger, "merger", () =>
+            deps.run({
             name: "merger",
             maxIterations: 1,
             model: mergerModel,
@@ -7097,7 +7122,8 @@ export async function runMain(
               BRANCHES: branchesArg,
               ISSUES: issuesArg,
             },
-          });
+          }),
+          );
           // Phase-1 cost telemetry (best-effort). Top-level session metadata is
           // forwarded now, so this credits in production — see the planner-site note.
           await captureRoleCost(costLedger, "merger", mergerResult, deps.logError);
@@ -7184,7 +7210,8 @@ export async function runMain(
         retryOnStall: boolean = true,
       ): Promise<{ marker: string; stdout: string }> => {
         try {
-          const r = await deps.run({
+          const r = await timeRole(timingLedger, "postMergeReviewer", () =>
+            deps.run({
             name: "post-merge-reviewer",
             maxIterations: 1,
             model,
@@ -7201,7 +7228,8 @@ export async function runMain(
                 skillsInvokedByIssueArg,
               ),
             },
-          });
+          }),
+          );
           // Phase-1 cost telemetry (best-effort). Top-level session metadata is
           // forwarded now, so this credits in production — see the planner-site note.
           await captureRoleCost(costLedger, "postMergeReviewer", r, deps.logError);
@@ -7294,7 +7322,8 @@ export async function runMain(
           let fixerOk = true;
           let fixerResult: RunHandle | undefined;
           try {
-            fixerResult = await deps.run({
+            fixerResult = await timeRole(timingLedger, "postMergeFixer", () =>
+              deps.run({
               name: "post-merge-fixer",
               maxIterations: 1,
               model: fixerModel,
@@ -7308,7 +7337,8 @@ export async function runMain(
                 ISSUES: issuesArg,
                 POST_MERGE_FEEDBACK: postMergeFeedback.slice(0, 8000),
               },
-            });
+            }),
+            );
           } catch (err) {
             fixerOk = false;
             deps.logError(
@@ -7752,6 +7782,27 @@ export async function runMain(
         deps.log(formatCostSummary(cost));
       }
       if (cost.totalCostUsd > 0) statusStore.recordCost(cost.totalCostUsd);
+      // Phase-2 per-role breakdown: merge the cost summary (per-role dollars +
+      // total tokens) with the timing summary (per-role wall-clock ms + dispatch
+      // count) keyed by role, and sink it into status.json. Additive + optional —
+      // only persisted when the merged record is non-empty, so a no-capture /
+      // nothing-dispatched run leaves `totals.perRole` absent (backward-compat).
+      const timing = timingLedger.summary();
+      const perRole: Record<
+        string,
+        { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
+      > = {};
+      for (const [role, r] of Object.entries(cost.perRole)) {
+        const e = (perRole[role] ??= {});
+        e.costUsd = r.costUsd;
+        e.tokens = totalTokens(r.tokens);
+      }
+      for (const [role, t] of Object.entries(timing)) {
+        const e = (perRole[role] ??= {});
+        e.wallMs = t.wallMs;
+        e.runs = t.runs;
+      }
+      if (Object.keys(perRole).length > 0) statusStore.recordRoleBreakdown(perRole);
     } catch (err) {
       deps.logError(`cost summary skipped: ${(err as Error).message}`);
     }

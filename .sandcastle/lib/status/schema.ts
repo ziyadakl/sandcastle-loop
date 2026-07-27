@@ -152,6 +152,32 @@ export const StatusTotalsSchema = z.object({
    * number — see `lib/cost/pricing.ts`.
    */
   totalCostUsd: z.number().nonnegative().optional(),
+  /**
+   * Phase-2 per-role breakdown: for each loop role a real budget run dispatched,
+   * its ESTIMATED cost + total tokens (from `lib/cost/ledger.ts`) and cumulative
+   * wall-clock time + dispatch count (from `lib/cost/timing.ts`), keyed by role
+   * name. Same backward-compat contract as `totalCostUsd`: OPTIONAL and additive
+   * on purpose — a required field or a schemaVersion bump would break old
+   * status.json files and viewers that guard on `schemaVersion`. Absent whenever
+   * nothing was captured (flag-off / no dispatch). Per-role keys are open
+   * (`z.record`) so a future role never breaks an older viewer's parse; every
+   * inner field is itself optional so a role with only timing (no priced model)
+   * or only cost still validates. `costUsd` is `null` when the role saw only
+   * unpriced models (matching the ledger's null-not-zero convention) and NOT
+   * `.int()` (dollars are fractional); `tokens`/`wallMs`/`runs` are
+   * non-negative integers. Relative estimates, not billed figures.
+   */
+  perRole: z
+    .record(
+      z.string(),
+      z.object({
+        costUsd: z.number().nullable().optional(),
+        tokens: z.number().int().nonnegative().optional(),
+        wallMs: z.number().int().nonnegative().optional(),
+        runs: z.number().int().nonnegative().optional(),
+      }),
+    )
+    .optional(),
 });
 export type StatusTotals = z.infer<typeof StatusTotalsSchema>;
 

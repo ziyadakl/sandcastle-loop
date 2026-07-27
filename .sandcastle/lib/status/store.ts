@@ -122,6 +122,22 @@ export interface StatusStore {
    */
   recordCost(totalCostUsd: number): void;
   /**
+   * Phase-2 per-role telemetry sink: record the merged per-role breakdown
+   * (estimated cost + total tokens from the cost ledger, cumulative wall-clock
+   * ms + dispatch count from the timing ledger) into `totals.perRole` and
+   * commit. Called once near run end, alongside {@link recordCost}. The field is
+   * OPTIONAL in the schema — callers that never invoke this (or invoke it only
+   * with a non-empty record) leave it absent, so old files and flag-off/no-
+   * dispatch runs stay byte-compatible. Synchronous mutate-then-commit like every
+   * mutator; relative estimates, not billed figures (see `lib/cost/pricing.ts`).
+   */
+  recordRoleBreakdown(
+    perRole: Record<
+      string,
+      { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
+    >,
+  ): void;
+  /**
    * Cross-host STATUS SYNC (Task S5): set the peer snapshots that `commit()`
    * folds into the WRITTEN file (via `foldPeers`) so a viewer sees one fused,
    * host-tagged loop. The in-memory `status` (esp. `status.history`) stays
@@ -393,6 +409,16 @@ export function createStatusStore(
 
     recordCost(totalCostUsd: number): void {
       status.totals.totalCostUsd = totalCostUsd;
+      commit();
+    },
+
+    recordRoleBreakdown(
+      perRole: Record<
+        string,
+        { costUsd?: number | null; tokens?: number; wallMs?: number; runs?: number }
+      >,
+    ): void {
+      status.totals.perRole = perRole;
       commit();
     },
 

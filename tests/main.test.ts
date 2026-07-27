@@ -609,6 +609,43 @@ describe("sandcastle-loop main.mts — happy path", () => {
     ]);
   });
 
+  it("persists totals.perRole (per-role wall-clock timing) into status.json after a run", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+    expect(result.exitCode).toBe(0);
+
+    const status = JSON.parse(
+      readFileSync(
+        path.join(TEST_REPO_ROOT, ".sandcastle", "status.json"),
+        "utf8",
+      ),
+    );
+    // Phase-2: every dispatched role is timed. The mock `deps.run` carries no
+    // session metadata, so no COST is credited (costUsd absent), but wall-clock
+    // + run count are always captured, proving the timing ledger persists.
+    expect(status.totals.perRole).toBeDefined();
+    expect(status.totals.perRole.planner.runs).toBeGreaterThanOrEqual(1);
+    expect(status.totals.perRole.implementer.runs).toBe(1);
+    expect(status.totals.perRole.reviewer.runs).toBe(1);
+    expect(typeof status.totals.perRole.implementer.wallMs).toBe("number");
+    expect(status.totals.perRole.implementer.costUsd).toBeUndefined();
+  });
+
   it("returns exitCode 0 immediately when planner emits an empty issues array", async () => {
     const b = buildDeps();
     b.enqueue("planner", { stdout: plannerStdout([]) });
