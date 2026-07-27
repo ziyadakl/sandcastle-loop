@@ -185,8 +185,14 @@ export async function stagingCommitsAhead(
 export interface StrandedPromotionDeps {
   log: (line: string) => void;
   logError: (line: string) => void;
-  /** Status-store phase write (in-memory dashboard state). */
-  setIssuePhase: (issue: number, phase: "needs-human", detail: string) => void;
+  /**
+   * Record the TERMINAL needs-human OUTCOME in the status store. Unlike a bare
+   * phase write, this bumps `totals.needsHuman` and appends a history row (as
+   * well as setting phase `needs-human` + `attention`), so the "needs you" pill
+   * MATCHES the row for this genuine human-triage strand. Wired in main.mts to
+   * `statusStore.recordOutcome(n, { status: "quarantined", finalMarker: detail })`.
+   */
+  recordQuarantineOutcome: (issue: number, detail: string) => void;
   /** Apply the REAL `needs-human` GitHub label. MAY THROW (GH API). */
   quarantine: (issue: number, reason: string) => Promise<void>;
   releaseIssueLease: (issue: number) => Promise<void>;
@@ -273,9 +279,8 @@ export async function handleStrandedPromotion(
   // needing a human so the dashboard flags the strand instead of leaving them in
   // a neutral "queued" limbo that reads like normal in-progress work.
   for (const n of issues) {
-    deps.setIssuePhase(
+    deps.recordQuarantineOutcome(
       n,
-      "needs-human",
       `stranded on ${stagingBranch} — promotion fast-forward refused`,
     );
     try {
