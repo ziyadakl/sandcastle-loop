@@ -15,6 +15,8 @@ import {
   hostLabel,
   isStale,
   humanizeHostId,
+  formatCost,
+  formatDuration,
   STALE_AFTER_MS,
 } from "../.sandcastle/web/view-model.js";
 
@@ -290,5 +292,197 @@ describe("buildViewModel — defensive", () => {
     expect(vm.hosts).toEqual([]);
     expect(vm.active).toEqual([]);
     expect(vm.recent).toEqual([]);
+  });
+
+  it("null snapshot carries no cost/timing fields", () => {
+    const vm = buildViewModel(null as any, MULTI_NOW);
+    expect(vm.totals.totalCostUsd).toBeUndefined();
+    expect(vm.totals.perRole).toBeUndefined();
+  });
+});
+
+describe("formatCost", () => {
+  it("formats a dollar figure to 2dp", () => {
+    expect(formatCost(0.02)).toBe("$0.02");
+    expect(formatCost(1.2345)).toBe("$1.23");
+    expect(formatCost(0)).toBe("$0.00");
+  });
+  it("null / undefined / NaN → em dash", () => {
+    expect(formatCost(null)).toBe("—");
+    expect(formatCost(undefined)).toBe("—");
+    expect(formatCost(Number.NaN)).toBe("—");
+  });
+});
+
+describe("formatDuration", () => {
+  it("minutes + seconds", () => {
+    expect(formatDuration(80000)).toBe("1m 20s");
+    expect(formatDuration(60000)).toBe("1m 0s");
+  });
+  it("seconds only", () => {
+    expect(formatDuration(5000)).toBe("5s");
+    expect(formatDuration(1000)).toBe("1s");
+  });
+  it("sub-second milliseconds", () => {
+    expect(formatDuration(800)).toBe("800ms");
+    expect(formatDuration(0)).toBe("0ms");
+  });
+  it("null / undefined / negative → em dash", () => {
+    expect(formatDuration(null)).toBe("—");
+    expect(formatDuration(undefined)).toBe("—");
+    expect(formatDuration(-5)).toBe("—");
+  });
+});
+
+describe("buildViewModel — cost & timing (totals.perRole / totalCostUsd)", () => {
+  const baseRun = {
+    branch: "sandcastle/queue-20260716",
+    repo: "affinity-tracker",
+    startedAt: "2026-07-17T00:50:00.000Z",
+    iterations: { current: 1, total: 50 },
+    maxConcurrent: 2,
+  };
+
+  it("carries totalCostUsd and perRole in pipeline order, fields passed through", () => {
+    const snap = {
+      schemaVersion: 3,
+      state: "running",
+      hostId: "srv1360790",
+      runId: "r",
+      run: baseRun,
+      totals: {
+        merged: 1,
+        needsHuman: 0,
+        requeued: 0,
+        running: 1,
+        totalCostUsd: 1.2345,
+        // deliberately out of pipeline order in the source object
+        perRole: {
+          reviewer: { costUsd: 0.02, tokens: 1000, wallMs: 80000, runs: 3 },
+          implementer: { costUsd: 0.5, wallMs: 800, runs: 2 },
+          planner: { costUsd: null, runs: 1 },
+          merger: { costUsd: 0.1, wallMs: 60000 },
+        },
+      },
+      issues: [],
+      history: [],
+      updatedAt: "2026-07-17T01:00:00.000Z",
+    };
+    const vm = buildViewModel(snap, MULTI_NOW);
+    expect(vm.totals.totalCostUsd).toBe(1.2345);
+    // pipeline order: planner, implementer, reviewer, ..., merger, ...
+    expect(vm.totals.perRole!.map((r: any) => r.role)).toEqual([
+      "planner",
+      "implementer",
+      "reviewer",
+      "merger",
+    ]);
+    const byRole = new Map(vm.totals.perRole!.map((r: any) => [r.role, r]));
+    // null cost preserved (renders "—" later), runs carried, no wallMs
+    expect(byRole.get("planner")).toEqual({ role: "planner", costUsd: null, runs: 1 });
+    // sub-second wallMs + runs, no tokens
+    expect(byRole.get("implementer")).toEqual({
+      role: "implementer",
+      costUsd: 0.5,
+      wallMs: 800,
+      runs: 2,
+    });
+    // all four inner fields carried through
+    expect(byRole.get("reviewer")).toEqual({
+      role: "reviewer",
+      costUsd: 0.02,
+      tokens: 1000,
+      wallMs: 80000,
+      runs: 3,
+    });
+    // no runs → runs omitted
+    expect(byRole.get("merger")).toEqual({
+      role: "merger",
+      costUsd: 0.1,
+      wallMs: 60000,
+    });
+  });
+
+  it("omits roles absent from the data; a role with absent costUsd becomes null", () => {
+    const snap = {
+      schemaVersion: 3,
+      state: "running",
+      hostId: "host-a",
+      runId: "r",
+      run: baseRun,
+      totals: {
+        merged: 0,
+        needsHuman: 0,
+        requeued: 0,
+        running: 1,
+        perRole: {
+          implementer: { wallMs: 1500, runs: 1 }, // no costUsd field at all
+        },
+      },
+      issues: [],
+      history: [],
+      updatedAt: "2026-07-17T01:00:00.000Z",
+    };
+    const vm = buildViewModel(snap, MULTI_NOW);
+    expect(vm.totals.perRole!.map((r: any) => r.role)).toEqual(["implementer"]);
+    expect(vm.totals.perRole![0].costUsd).toBeNull();
+    // totalCostUsd absent in source → undefined in vm
+    expect(vm.totals.totalCostUsd).toBeUndefined();
+  });
+
+  it("takes own-host perRole only; peers do NOT contribute cost rows", () => {
+    const snap = {
+      schemaVersion: 3,
+      state: "running",
+      hostId: "srv1360790",
+      runId: "r",
+      run: baseRun,
+      totals: {
+        merged: 0,
+        needsHuman: 0,
+        requeued: 0,
+        running: 1,
+        totalCostUsd: 0.4,
+        perRole: { implementer: { costUsd: 0.4, runs: 1 } },
+      },
+      issues: [],
+      history: [],
+      updatedAt: "2026-07-17T01:00:00.000Z",
+      peers: [
+        {
+          hostId: "ziyads-macbook-air.local",
+          state: "running",
+          iterations: { current: 1, total: 50 },
+          totals: {
+            merged: 0,
+            needsHuman: 0,
+            requeued: 0,
+            running: 1,
+            totalCostUsd: 99,
+            perRole: { reviewer: { costUsd: 99, runs: 9 } },
+          },
+          issues: [],
+          updatedAt: "2026-07-17T00:59:50.000Z",
+        },
+      ],
+    };
+    const vm = buildViewModel(snap, MULTI_NOW);
+    // own host only — peer's reviewer/99 must not appear, total not summed
+    expect(vm.totals.perRole!.map((r: any) => r.role)).toEqual(["implementer"]);
+    expect(vm.totals.totalCostUsd).toBe(0.4);
+  });
+
+  it("backward-compat: a status without perRole/totalCostUsd omits both", () => {
+    const snap = fixture("sample-status.json");
+    const vm = buildViewModel(snap, Date.parse(snap.updatedAt));
+    expect(vm.totals.perRole).toBeUndefined();
+    expect(vm.totals.totalCostUsd).toBeUndefined();
+    // existing four counters untouched
+    expect(vm.totals).toEqual({
+      merged: 3,
+      needsHuman: 1,
+      requeued: 0,
+      running: 2,
+    });
   });
 });

@@ -11,7 +11,12 @@
  *    unobtrusive "can't reach status — retrying" note and keeps polling.
  *  - No schema-version gate: whatever buildViewModel returns is rendered.
  */
-import { buildViewModel } from "./view-model.js";
+import {
+  buildViewModel,
+  formatCost,
+  formatDuration,
+  ROLE_LABELS,
+} from "./view-model.js";
 
 const POLL_MS = 2000;
 
@@ -70,6 +75,42 @@ function renderMeta(meta) {
     .join(" · ");
   setText($("meta-iterations"), line || "—");
   setText($("meta-branch"), meta.branch || "—");
+}
+
+// Cost & timing card. Hidden entirely when there's no cost total AND no
+// per-role rows (backward-compat: old status files render exactly as before).
+function renderCost(totals) {
+  const card = $("cost-card");
+  const perRole = totals.perRole ?? [];
+  const hasTotal = totals.totalCostUsd != null;
+  if (perRole.length === 0 && !hasTotal) {
+    show(card, false);
+    return;
+  }
+  show(card, true);
+
+  const totalEl = $("cost-total");
+  if (hasTotal) {
+    setText(totalEl, `Total ~${formatCost(totals.totalCostUsd)} (estimate)`);
+    show(totalEl, true);
+  } else {
+    setText(totalEl, "");
+    show(totalEl, false);
+  }
+
+  const rows = $("cost-rows");
+  rows.replaceChildren();
+  for (const r of perRole) {
+    const el = clone("tpl-cost-row");
+    setText(el.querySelector(".cost-row__role"), ROLE_LABELS[r.role] ?? r.role);
+    setText(el.querySelector(".cost-row__cost"), formatCost(r.costUsd));
+    setText(el.querySelector(".cost-row__time"), formatDuration(r.wallMs));
+    setText(
+      el.querySelector(".cost-row__runs"),
+      r.runs != null ? `${r.runs}×` : "—",
+    );
+    rows.appendChild(el);
+  }
 }
 
 function renderPills(pills) {
@@ -136,6 +177,7 @@ function render(vm, snap) {
   renderHostsStrip(vm.hosts);
   renderBanner(vm.banner);
   renderMeta(vm.meta);
+  renderCost(vm.totals);
   renderPills(vm.pills);
   renderList("active-list", "active-empty", vm.active, { recent: false });
   renderList("recent-list", "recent-empty", vm.recent, { recent: true });

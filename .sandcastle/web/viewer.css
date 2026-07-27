@@ -310,6 +310,81 @@ body {
   color: var(--muted);
 }
 
+/* ===================== Cost & timing card ============================= */
+
+.cost {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.cost__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.cost__title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.cost__total {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--fg);
+}
+.cost__total:empty {
+  display: none;
+}
+
+.cost__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+/* role | cost | time | runs — a compact 4-column grid, phone-friendly. */
+.cost-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.3rem 0;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+.cost-row:first-child {
+  border-top: 0;
+}
+
+.cost-row__role {
+  color: var(--fg);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cost-row__cost,
+.cost-row__time,
+.cost-row__runs {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  text-align: right;
+}
+
+.cost-row__cost {
+  color: var(--fg);
+}
+
 /* ===================== Sections / lists =============================== */
 
 .section {

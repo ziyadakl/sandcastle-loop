@@ -32,11 +32,30 @@ export interface PerMachine {
   total: number;
 }
 
+export interface PerRoleRow {
+  role: string;
+  /** null when the role saw only unpriced models or cost was absent (renders `—`). */
+  costUsd: number | null;
+  tokens?: number;
+  wallMs?: number;
+  runs?: number;
+}
+
 export interface Totals {
   merged: number;
   needsHuman: number;
   requeued: number;
   running: number;
+  /**
+   * Run's total ESTIMATED cost in USD (own/primary host only — NOT summed across
+   * peers). Absent when the status file carried no cost telemetry.
+   */
+  totalCostUsd?: number;
+  /**
+   * Per-role cost/timing rows in pipeline order (own/primary host only). Absent
+   * when the status file carried no per-role telemetry.
+   */
+  perRole?: PerRoleRow[];
 }
 
 export interface Pill {
@@ -83,10 +102,14 @@ export const ALIAS_MAP: Record<string, string>;
 export const PHASE_LABELS: Record<string, string>;
 export const TERMINAL_PHASES: Set<string>;
 export const RECENT_LIMIT: number;
+export const ROLE_ORDER: string[];
+export const ROLE_LABELS: Record<string, string>;
 
 export function humanizeHostId(hostId: string): string;
 export function hostLabel(hostId: string, aliasMap?: Record<string, string>): string;
 export function isStale(updatedAt: string | undefined, nowMs: number): boolean;
+export function formatCost(costUsd: number | null | undefined): string;
+export function formatDuration(wallMs: number | null | undefined): string;
 export function buildViewModel(
   snap: unknown,
   nowMs: number,

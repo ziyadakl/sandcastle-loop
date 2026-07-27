@@ -25,6 +25,12 @@
                             #banner-activity — text: " · " + banner.activity
     #meta-iterations    — text: meta.perMachine joined "VPS 1/50 · Mac 1/50"
     #meta-branch        — text: meta.branch
+    #cost-card          — the "Cost & timing" card; [hidden] unless totals has
+                          totalCostUsd or a non-empty perRole (backward-compat:
+                          old status files hide the whole card)
+    #cost-total         — text: "Total ~$X.XX (estimate)"; hidden when totalCostUsd absent
+    #cost-rows          — container: one .cost-row per totals.perRole entry
+                          (clone #tpl-cost-row; set .cost-row__role/__cost/__time/__runs)
     #pills              — container: one .pill per pills[] entry
                           (clone #tpl-pill; set data-tone gray|success|warning|info,
                            .pill__count text, .pill__label text)
@@ -87,6 +93,15 @@
     <div class="pills" id="pills"></div>
   </section>
 
+  <!-- 2b. Cost & timing card (hidden until cost/timing telemetry is present) -->
+  <section class="card cost" id="cost-card" hidden>
+    <div class="cost__head">
+      <span class="cost__title">Cost &amp; timing</span>
+      <span class="cost__total" id="cost-total"></span>
+    </div>
+    <div class="cost__rows" id="cost-rows"></div>
+  </section>
+
   <!-- 3. Active section -->
   <section class="section">
     <h2 class="section__title">Active</h2>
@@ -122,6 +137,15 @@
       <span class="issue-row__age" hidden>0m</span>
       <span class="badge issue-row__phase" data-tone="gray">Phase</span>
     </div>
+  </div>
+</template>
+
+<template id="tpl-cost-row">
+  <div class="cost-row">
+    <span class="cost-row__role">Role</span>
+    <span class="cost-row__cost">—</span>
+    <span class="cost-row__time">—</span>
+    <span class="cost-row__runs">—</span>
   </div>
 </template>
 
