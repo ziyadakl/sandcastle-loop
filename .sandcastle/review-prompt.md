@@ -249,6 +249,51 @@ committed `.env` carrying live values.
 Skip cosmetic / SOFT findings entirely — DO NOT block on naming, comment
 phrasing, or "prefer this pattern" suggestions.
 
+# STANDARDS DEPTH — Fowler smell baseline
+(ported from ~/.claude/skills/code-review/SKILL.md — SYNC PERIODICALLY if that skill changes)
+
+Beyond whatever this repo documents, apply the **Fowler smell baseline** (Refactoring, ch.3). Each is
+a judgement-call heuristic ("possible X"), never a hard violation; a documented repo standard always
+overrides it, and skip anything tooling already enforces. Match each against the diff:
+
+- **Mysterious Name** — name doesn't reveal what it does/holds → rename; if no honest name comes, the design's murky.
+- **Duplicated Code** — same logic shape in more than one hunk/file → extract, call from both.
+- **Feature Envy** — a method reaches into another object's data more than its own → move it onto that data.
+- **Data Clumps** — the same few fields/params keep travelling together → bundle into one type.
+- **Primitive Obsession** — a primitive/string standing in for a domain concept → give the concept its own small type.
+- **Repeated Switches** — the same switch/if-cascade on the same type recurs → polymorphism, or one shared map.
+- **Shotgun Surgery** — one logical change forces scattered edits across many files → gather what changes together.
+- **Divergent Change** — one module edited for several unrelated reasons → split so each changes for one reason.
+- **Speculative Generality** — abstraction/params/hooks for needs the spec doesn't have → delete; inline back.
+- **Message Chains** — long a.b().c().d() the caller shouldn't depend on → hide the walk behind one method.
+- **Middle Man** — a class/function that mostly just delegates → cut it, call the real target direct.
+- **Refused Bequest** — a subclass/implementer ignoring most of what it inherits → composition over inheritance.
+
+# QUALITY — structural maintainability rubric
+(ported from ~/.claude/skills/thermo-review/SKILL.md — SYNC PERIODICALLY if that skill changes)
+
+Judge the change structurally, not just for correctness. Be ambitious: look for **code judo** —
+behavior-preserving restructurings that make the implementation dramatically simpler; prefer deletions
+(a whole branch/helper/mode/layer disappearing) over reorganizations. A false-positive suggestion is
+cheap to reject; a missed structural opportunity compounds into debt — when in doubt, flag it.
+
+Hard rules (pattern-match, don't philosophize):
+- **1000-line file ceiling** — flag any file the diff pushes from under 1000 lines to over. Waive only with a specific structural reason and a clearly organized result.
+- **No spaghetti growth** — an ad-hoc conditional/special-case dropped into a flow it has no architectural relationship to. The new concern should live in its own unit the flow delegates to.
+- **Type & boundary cleanliness** — unnecessary `?:`, `any`, `unknown`, or `as` cast where a stricter contract would clarify control flow. Default is over-optional; push back — should this be required?
+- **Canonical helpers** — a new helper whose behavior overlaps an existing canonical utility. Import the canonical one; bespoke duplicates are how codebases drift.
+- **Direct over magical** — a thin wrapper / identity abstraction / pass-through that adds indirection without clarity.
+
+Testability (a quality property):
+- **Seams** — the diff removes/hides a previously testable seam (new singleton, top-level side effect, inline-only invocation) so a test would have to monkey-patch a module.
+- **Feedback loops** — new behavior with no fast unit-level verification path, reachable only through a slow integration test.
+- **Mockability blast radius** — new code that increases how many collaborators a test must control to exercise one behavior.
+
+Report priority: (1) structural regressions, (2) testability regressions, (3) missed code-judo,
+(4) type/boundary problems, (5) canonical-helper duplication, (6) legibility nits (drop these if 1–2
+have findings). Each finding: `file:line`, quoted change, named rule, one-sentence remedy.
+High-conviction over volume — a few structural calls beat a long list of nits.
+
 # CATEGORY SWEEP — required output before the final marker
 
 Reviewers that find one issue and stop produce ping-pong retry cycles —
@@ -274,6 +319,22 @@ Category-specific guidance:
   Missing requirements or scope creep?
 - **Test coverage**: do new/changed behaviours have tests that actually
   exercise the change?
+- **Test fidelity (false-green)** — For every test that covers the changed behavior, check that its
+  setup builds inputs the SAME way the real runtime path does. A test that passes without exercising
+  the real code path proves nothing and is worse than no test — it manufactures false confidence.
+  Flag as a **HARD** finding when a test:
+  - constructs domain objects/ids by hand (e.g. hard-coded or "semantic" ids) where the real path
+    generates them differently (random UUIDs, DB defaults, factories/seeders) — so the assertion
+    can pass while the feature is inert in production;
+  - mocks or stubs the very layer whose behavior the change depends on, so the test verifies the mock,
+    not the code;
+  - asserts on a `*-mock` element / test-double presence instead of real observable behavior;
+  - uses a partial mock missing fields the downstream code reads.
+  When in doubt, ask: "if I deleted the implementation and kept only this test's fixture, would the
+  test still pass?" If yes, it's false-green.
+
+  (The reviewer already re-runs the test suite itself — this category is about whether those tests
+  actually exercise the real path, not merely whether they are green.)
 - **Type safety**: unsafe casts, `any` types, unchecked assumptions?
 - **Security**: injection vulnerabilities, credential leaks, etc.? (The
   documented `ADMIN_PASSWORD ?? "<default>"` test-credential pattern is NOT a
@@ -411,6 +472,7 @@ CATEGORY SWEEP:
 - Execution evidence: <ok | n/a (...) | <finding>>
 - Spec fit: <ok | n/a (...) | <finding>>
 - Test coverage: <ok | n/a (...) | <finding>>
+- Test fidelity (false-green): <ok | n/a (...) | <finding>>
 - Type safety: <ok | n/a (...) | <finding>>
 - Security: <ok | n/a (...) | <finding>>
 - Error handling: <ok | n/a (...) | <finding>>

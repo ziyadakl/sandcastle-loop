@@ -84,6 +84,11 @@ function lockTtlSecOnce(): number {
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
+import {
+  shouldEscalateReviewer,
+  reviewEscalateDiffLinesFromEnv,
+  reviewEscalatePathsFromEnv,
+} from "./lib/review/escalation.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
 import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
 import {
@@ -1183,6 +1188,10 @@ const LOGGED_ENV_KEYS = new Set([
   "SANDCASTLE_CROSS_HOST_SYNC",
   "SANDCASTLE_HOST_ID",
   "SANDCASTLE_LOCK_TTL_SEC",
+  // First-pass reviewer escalation knobs — surfaced so an operator can see how
+  // the "run the strong reviewer on big/sensitive diffs" policy is tuned.
+  "SANDCASTLE_REVIEW_ESCALATE_DIFF_LINES",
+  "SANDCASTLE_REVIEW_ESCALATE_PATHS",
 ]);
 
 /**
@@ -2157,6 +2166,57 @@ export function resolveReviewBase(
   const baseOk = mergeBase.ok && mergeBase.stdout.length > 0;
   const baseIsTip = baseOk && tipSha.ok && tipSha.stdout === mergeBase.stdout;
   return baseOk && !baseIsTip ? mergeBase.stdout : `${commitSha}~1`;
+}
+
+/**
+ * Resolve the concrete base ref the reviewer diffs `commitSha` against on
+ * `branch`: the fork-point merge-base (whole-branch delta, issue #340), falling
+ * back to the tip's parent when the base is the tip or unresolvable. Extracted
+ * so `runReviewer`'s in-prompt `REVIEW_BASE` and the first-pass escalation sizer
+ * ({@link reviewDiffStats}) can never diff against different bases.
+ */
+function reviewBaseForCommit(
+  repoRoot: string,
+  branch: string,
+  commitSha: string,
+): string {
+  const mergeBase = runGit(repoRoot, "merge-base", branch, commitSha);
+  const tipSha = runGit(repoRoot, "rev-parse", commitSha);
+  return resolveReviewBase(mergeBase, tipSha, commitSha);
+}
+
+/**
+ * Numstat sizer for the first-pass reviewer escalation decision. Returns the
+ * total added+deleted line count and the changed file paths between two refs.
+ * Fail-quiet: equal/empty refs or any `git diff` error return `{0, []}` so a git
+ * hiccup can NEVER escalate — the safe default is the cheap current behavior
+ * (same philosophy as {@link detectChangedLockfiles}). Binary files (numstat
+ * "-") count as changed files but contribute 0 lines.
+ */
+function reviewDiffStats(
+  repoRoot: string,
+  fromRef: string,
+  toRef: string,
+): { changedLines: number; changedFiles: readonly string[] } {
+  if (fromRef === "" || toRef === "" || fromRef === toRef) {
+    return { changedLines: 0, changedFiles: [] };
+  }
+  const res = runGit(repoRoot, "diff", "--numstat", fromRef, toRef);
+  if (!res.ok) return { changedLines: 0, changedFiles: [] };
+  let changedLines = 0;
+  const changedFiles: string[] = [];
+  for (const line of res.stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const cols = trimmed.split("\t");
+    if (cols.length < 3) continue;
+    const added = cols[0] === "-" ? 0 : Number(cols[0]) || 0;
+    const deleted = cols[1] === "-" ? 0 : Number(cols[1]) || 0;
+    changedLines += added + deleted;
+    // Rename entries can carry tabs in the path column; rejoin the remainder.
+    changedFiles.push(cols.slice(2).join("\t"));
+  }
+  return { changedLines, changedFiles };
 }
 
 /**
@@ -4723,14 +4783,11 @@ async function runReviewer(
   // repoRoot's .git, so both refs resolve here), then passed as a concrete SHA
   // so the in-prompt `git diff` runs against two tip-reachable objects and can
   // never exit non-zero — a failing bang-command crashes the entire review.
-  const mergeBase = runGit(
+  const reviewBase = reviewBaseForCommit(
     ctx.args.repoRoot,
-    "merge-base",
     ctx.args.branch,
     commitSha,
   );
-  const tipSha = runGit(ctx.args.repoRoot, "rev-parse", commitSha);
-  const reviewBase = resolveReviewBase(mergeBase, tipSha, commitSha);
   const r = await runWithRateLimitFallback(
     (m) =>
       sb.run({
@@ -5276,7 +5333,42 @@ async function runIssuePipeline(
     // deferred until AFTER ALL_CLEAR — only the final accepted SQL hits the
     // dev DB, never the intermediate state of a failed first attempt.
     ctx.status.setIssuePhase(ctx.issueNumber, "reviewer");
-    const review1 = await runReviewer(sandbox, ctx, postSha, undefined, undefined, {
+    // First-pass escalation: a substantial or sensitive-path change gets the
+    // stronger reviewer model on pass 1 — one strong pass beats a cheap miss.
+    // Small, ordinary diffs keep the cheap default (model = undefined), so this
+    // is byte-identical to prior behavior for the common case. Never escalates
+    // when no reviewer escalation model is configured, and the sizer is
+    // fail-quiet so a git hiccup falls back to the default too.
+    const firstPassEscalations = roleModelsFor(ctx.args).reviewer.escalations;
+    let review1Model: string | undefined = undefined;
+    if (firstPassEscalations.length > 0) {
+      const reviewBase = reviewBaseForCommit(
+        ctx.args.repoRoot,
+        ctx.args.branch,
+        postSha,
+      );
+      const { changedLines, changedFiles } = reviewDiffStats(
+        ctx.args.repoRoot,
+        reviewBase,
+        postSha,
+      );
+      if (
+        shouldEscalateReviewer({
+          changedLines,
+          changedFiles,
+          diffLineThreshold: reviewEscalateDiffLinesFromEnv(),
+          sensitivePathPatterns: reviewEscalatePathsFromEnv(),
+        })
+      ) {
+        review1Model = firstPassEscalations[0];
+        ctx.deps.log(
+          `[issue=${ctx.issueNumber}] first-pass reviewer escalated to ` +
+            `${review1Model} (changedLines=${changedLines}, ` +
+            `changedFiles=${changedFiles.length})`,
+        );
+      }
+    }
+    const review1 = await runReviewer(sandbox, ctx, postSha, undefined, review1Model, {
       skillsInvoked: impl1.skillsInvoked,
     });
 

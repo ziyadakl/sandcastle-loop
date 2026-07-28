@@ -188,6 +188,23 @@ The bug-fix path is shorter on purpose: skipping step 2 protects the 20-min
 implementer budget for diagnosis + fix + e2e verification, which is what
 bug-fix stories actually require.
 
+# Build fixture discipline — READ BEFORE you write the [STEP 2/9] test
+
+**Your test must exercise the REAL runtime path, or it is worthless.** The most common silent failure
+in this loop is a test that passes while the feature is inert in production, because the test built its
+inputs differently from how the running system builds them. Before you write a test, and before you
+trust a green result:
+- Build inputs the way production does. If the real path assigns ids from the DB / a factory / a random
+  UUID, your fixture MUST go through that same seed/factory — never hand-stamp "semantic" ids the real
+  path would generate differently. A test keyed on ids the runtime never produces is false-green.
+- Don't mock the layer whose behavior the change depends on — you'd be testing the mock, not the code.
+  Mock only the slow/external edge, at the lowest level, and preserve any side effect the test relies on.
+- Never assert on a mock's presence (`*-mock` test ids) as a stand-in for real observable behavior.
+- If you must mock a data structure, mirror the COMPLETE real shape, not just the fields this test reads —
+  downstream code may read the ones you omit.
+- Sanity check: "if I deleted my implementation but kept this test's fixture, would the test still pass?"
+  If yes, the test isn't exercising the real path — fix the test before writing more code.
+
 # Step markers — MANDATORY
 
 **Emit `[STEP 1/9]` early in your response.** Before you call any tool —
