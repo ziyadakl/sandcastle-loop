@@ -32,6 +32,7 @@ import {
 } from "../.sandcastle/lib/state/strand-backup.js";
 import type { StrandedPromotionDeps } from "../.sandcastle/lib/state/strand-backup.js";
 import { wipRef } from "../.sandcastle/lib/state/branch-checkpoint.js";
+import { createStatusStore } from "../.sandcastle/lib/status/store.js";
 import { makeExecFileGitRunner } from "../.sandcastle/lib/state/index.js";
 import type { GitRunner } from "../.sandcastle/lib/state/issue-lease.js";
 
@@ -327,8 +328,10 @@ function makeFakeDeps(
     logError: (m) => {
       calls.errors.push(m);
     },
-    setIssuePhase: (n, phase, detail) => {
-      calls.phases.push([n, phase]);
+    recordQuarantineOutcome: (n, detail) => {
+      // The strand records a terminal needs-human outcome; the recorder keeps
+      // the historic [n, "needs-human"] shape so ordering/phase assertions hold.
+      calls.phases.push([n, "needs-human"]);
       calls.order.push(`phase:${n}:${detail ? "detailed" : "bare"}`);
     },
     quarantine: async (n) => {
@@ -400,6 +403,43 @@ describe("handleStrandedPromotion (injected GitRunner + fake deps)", () => {
     expect(order[0]).toBe("backup");
     expect(order).toContain("release");
     expect(order.indexOf("backup")).toBeLessThan(order.indexOf("release"));
+  });
+
+  it("bumps totals.needsHuman so the pill matches the needs-human phase (real store)", async () => {
+    // The FF-refused strand is a REAL human-triage case. Before the fix it set
+    // the `needs-human` PHASE (and the real GH label) but never bumped the
+    // counter, so the row said "Needs you" while the pill said 0. Wire the
+    // strand's human-surface dep to a REAL status store and prove they agree.
+    const store = createStatusStore(
+      {
+        branch: "b",
+        repo: "r",
+        repoRoot: "/repo",
+        startedAt: "2026-07-27T00:00:00.000Z",
+        iterationsTotal: 1,
+        maxConcurrent: 1,
+        hostId: "h",
+        runId: "run",
+      },
+      { now: () => "2026-07-27T00:00:00.000Z", writeFn: () => {} },
+    );
+    store.setPlan([
+      { number: 7, title: "a", branch: "agent/7" },
+      { number: 8, title: "b", branch: "agent/8" },
+    ]);
+    const { git } = makeRecordingGit();
+    const { deps } = makeFakeDeps({
+      recordQuarantineOutcome: (n: number, detail: string) =>
+        store.recordOutcome(n, { status: "quarantined", finalMarker: detail }),
+    } as Partial<StrandedPromotionDeps>);
+
+    await handleStrandedPromotion(git, deps, { ...baseOpts, issues: [7, 8] });
+
+    const snap = store.snapshot();
+    expect(snap.totals.needsHuman).toBe(2);
+    const i7 = snap.issues.find((i) => i.number === 7)!;
+    expect(i7.phase).toBe("needs-human");
+    expect(i7.attention).toBe(true);
   });
 
   it("still releases the lease when quarantine THROWS", async () => {

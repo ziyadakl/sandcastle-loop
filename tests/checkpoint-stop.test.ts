@@ -148,6 +148,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -196,6 +198,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -246,6 +250,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     expect(results).toEqual<CheckpointStopResult[]>([
@@ -288,6 +294,8 @@ describe("checkpointStop", () => {
       // These cases exercise the per-issue sweep only — no staging backup.
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     const byIssue = new Map(results.map((r) => [r.issue, r]));
@@ -329,6 +337,8 @@ describe("checkpointStop", () => {
       remote: "origin",
       stagingBranch: null,
       syncEnabled: false,
+      // `--now`'s own-host leases — explicit always-permit (the former default).
+      canReleaseLease: async () => true,
     });
 
     const leaseDel = calls.find((c) =>
@@ -343,6 +353,190 @@ describe("checkpointStop", () => {
       c.args.some((a) => a.startsWith("HEAD:refs/sandcastle/wip/")),
     );
     expect(wipPush?.args).toContain("HEAD:refs/sandcastle/wip/issue-42");
+  });
+});
+
+describe("checkpointStop — canReleaseLease guard (DEFECT 1 / launch-time reaper)", () => {
+  const dirtyPorcelain = [
+    "worktree /repo/.sandcastle/wt/issue-5",
+    "HEAD 8888888888888888888888888888888888888888",
+    "branch refs/heads/agent/issue-5",
+    "",
+  ].join("\n");
+
+  /** Fake git for a single DIRTY issue-5 worktree (always something to save). */
+  function dirtyGit(): { git: GitRunner; calls: Call[] } {
+    return makeFakeGit((args) => {
+      if (args.includes("worktree") && args.includes("list")) {
+        return { stdout: dirtyPorcelain };
+      }
+      if (args[0] === "status") return { stdout: " M src/x.ts\n" };
+      return {};
+    });
+  }
+
+  it("guard returning FALSE still pushes the WIP ref but does NOT delete the lease (peer holds it live)", async () => {
+    const { git, calls } = dirtyGit();
+    const seen: number[] = [];
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      canReleaseLease: async (issue) => {
+        seen.push(issue);
+        return false; // a live peer lease — must NOT be yanked
+      },
+    });
+
+    // The work was still RESCUED: committed + pushed to the WIP ref.
+    expect(callsMatching(calls, "commit").length).toBe(1);
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
+    // But the lease delete was SKIPPED entirely.
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(false);
+    // The guard was consulted for exactly this issue.
+    expect(seen).toEqual([5]);
+    // Outcome is still checkpointed — the WIP is safe, only the lease stayed put.
+    expect(results).toEqual<CheckpointStopResult[]>([
+      { issue: 5, outcome: "checkpointed", wipRef: "refs/sandcastle/wip/issue-5" },
+    ]);
+  });
+
+  it("guard returning TRUE releases the lease (safe-to-reclaim path)", async () => {
+    const { git, calls } = dirtyGit();
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      canReleaseLease: async () => true,
+    });
+
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(true);
+    expect(results[0]?.outcome).toBe("checkpointed");
+  });
+
+  it("explicit always-permit guard reproduces the former UNCONDITIONAL delete (graceful --now unchanged)", async () => {
+    const { git, calls } = dirtyGit();
+
+    await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      // `canReleaseLease` is now REQUIRED (no delete-by-default fall-through).
+      // The graceful `--now` stop reaps its OWN host's leases, so it passes an
+      // explicit always-permit policy — byte-for-byte the old absent-guard delete.
+      canReleaseLease: async () => true,
+    });
+
+    expect(calls.some((c) => c.args.includes(":refs/locks/issue-5"))).toBe(true);
+  });
+});
+
+describe("checkpointStop — wipOriginPush mode (ADR 0021 launch-reaper inertness)", () => {
+  const dirtyPorcelain = [
+    "worktree /repo/.sandcastle/wt/issue-5",
+    "HEAD 8888888888888888888888888888888888888888",
+    "branch refs/heads/agent/issue-5",
+    "",
+  ].join("\n");
+
+  /** Fake git for a single DIRTY issue-5 worktree (always something to save).
+   *  `rev-parse ... HEAD` returns a concrete SHA so the LOCAL-capture path can
+   *  resolve the worktree tip (a real worktree always has one). */
+  function dirtyGit(): { git: GitRunner; calls: Call[] } {
+    return makeFakeGit((args) => {
+      if (args.includes("worktree") && args.includes("list")) {
+        return { stdout: dirtyPorcelain };
+      }
+      if (args[0] === "status") return { stdout: " M src/x.ts\n" };
+      if (args[0] === "rev-parse" && args.includes("HEAD")) {
+        return { stdout: "cafebabecafebabecafebabecafebabecafebabe\n" };
+      }
+      return {};
+    });
+  }
+
+  it("'when-sync' + sync OFF captures the WIP ref LOCALLY (update-ref) and pushes NOTHING to origin", async () => {
+    const { git, calls } = dirtyGit();
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      wipOriginPush: "when-sync",
+      canReleaseLease: async () => true,
+    });
+
+    // Work is still rescued: outcome checkpointed at the canonical WIP ref.
+    expect(results).toEqual<CheckpointStopResult[]>([
+      { issue: 5, outcome: "checkpointed", wipRef: "refs/sandcastle/wip/issue-5" },
+    ]);
+    // The WIP ref was written LOCALLY via update-ref (no origin round-trip).
+    expect(
+      calls.some(
+        (c) =>
+          c.args[0] === "update-ref" &&
+          c.args.includes("refs/sandcastle/wip/issue-5"),
+      ),
+    ).toBe(true);
+    // NOTHING was pushed to origin on the WIP-push side (the point of this
+    // assertion) — the WIP ref was captured locally via update-ref instead.
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(false);
+  });
+
+  it("'when-sync' + sync ON pushes the WIP ref to origin (peer recovery path)", async () => {
+    const { git, calls } = dirtyGit();
+
+    const results = await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: true,
+      wipOriginPush: "when-sync",
+      canReleaseLease: async () => true,
+    });
+
+    expect(results[0]?.outcome).toBe("checkpointed");
+    // Sync ON ⇒ the WIP ref IS pushed to origin.
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
+  });
+
+  it("DEFAULT (absent option) + sync OFF STILL pushes to origin — graceful --now unchanged", async () => {
+    const { git, calls } = dirtyGit();
+
+    await checkpointStop(git, {
+      repoRoot: "/repo",
+      hostId: "host-a",
+      integrationBranch: "sandcastle/theme",
+      stagingBranch: null,
+      syncEnabled: false,
+      // no wipOriginPush — the operator-invoked `--now` path.
+      canReleaseLease: async () => true,
+    });
+
+    // Legacy behavior preserved: WIP pushed to origin even with sync off.
+    expect(
+      calls.some((c) => c.args.includes("HEAD:refs/sandcastle/wip/issue-5")),
+    ).toBe(true);
   });
 });
 

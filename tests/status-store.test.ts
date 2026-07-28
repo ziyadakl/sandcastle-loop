@@ -219,6 +219,24 @@ describe("StatusStore", () => {
     expect(store.snapshot().totals.needsHuman).toBe(1);
   });
 
+  it("needs-rerun is a transient phase: no needsHuman bump, no attention, still schema-valid", () => {
+    const { store } = makeStore();
+    store.setPlan([{ number: 5, title: "x", branch: "b" }]);
+    // The promotion-race lease-loss parks the issue in needs-rerun (it will be
+    // re-claimed), NOT the real review-quarantine needs-human.
+    store.setIssuePhase(5, "needs-rerun", "lease lost before promotion — released for re-claim");
+
+    const snap = store.snapshot();
+    const issue = snap.issues.find((i) => i.number === 5)!;
+    expect(issue.phase).toBe("needs-rerun");
+    // Informational row, NOT a warning — attention stays unset.
+    expect(issue.attention).toBeUndefined();
+    // The "needs you" pill counts ONLY real quarantines.
+    expect(snap.totals.needsHuman).toBe(0);
+    // The new enum member must round-trip through the strict schema.
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
   it("is NON-FATAL: a throwing writeFn does not throw and calls onError", () => {
     const onError = vi.fn();
     const { store } = makeStore({

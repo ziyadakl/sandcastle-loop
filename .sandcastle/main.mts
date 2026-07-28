@@ -64,12 +64,16 @@ import {
   STAGING_BRANCH,
   handleStrandedPromotion,
   collectIssueRefs,
+  checkpointStop,
+  formatCheckpointStop,
+  makeExecFileGitRunner,
 } from "./lib/state/index.js";
 import type {
   LockDeps,
   LaneSyncResult,
   PublishResult,
   GitRunner,
+  CheckpointStopResult,
 } from "./lib/state/index.js";
 import { resolveHostId, resolveLockTtlSec } from "./lib/host-id.js";
 // Fix 8 (ADR 0019): resolve the lease TTL exactly ONCE per process and memoize
@@ -84,6 +88,12 @@ function lockTtlSecOnce(): number {
 import { parseVerdict, extractMarker, IMPLEMENTER_MARKERS, MarkerNotFoundError, VerdictParseError } from "./lib/verdicts/index.js";
 import { ImplementerOutputSchema } from "./lib/verdicts/index.js";
 import { createStatusStore, type StatusStore } from "./lib/status/store.js";
+import {
+  shouldEscalateReviewer,
+  reviewEscalateDiffLinesFromEnv,
+  reviewEscalatePathsFromEnv,
+  parseNumstat,
+} from "./lib/review/escalation.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
 import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
 import {
@@ -596,6 +606,24 @@ export interface Deps {
    * any fault at any step skips the bad peer, worst case returning `[]`.
    */
   fetchStatusPeers(runId: string): Promise<SandcastleStatus[]>;
+  /**
+   * ADR 0021 LAUNCH-TIME REAPER (Fix 2). Discover any orphaned `agent/issue-<N>`
+   * worktree left behind by a HARD-killed prior loop (SIGKILL/OOM/laptop sleep),
+   * checkpoint its in-flight WIP to the issue's WIP ref and RELEASE its lease —
+   * the exact post-kill reap the graceful `--now` stop performs, now also run at
+   * startup so a crashed run's work is rescued before the new loop begins. Wraps
+   * {@link checkpointStop} bound to a real git runner in production; tests inject
+   * a recorder. Called BEFORE startup label/lease reconciliation so WIP is saved
+   * before the reconcile frees the issue for re-claim. Best-effort + NON-FATAL:
+   * the caller wraps it so a fault only logs and never blocks the loop starting.
+   * NO-OP on a clean launch — discovery returns empty when no agent worktrees
+   * survive, so a normal start does no git work. The call is deliberately NOT
+   * gated on a prior-status liveness probe: the single-instance lock acquired
+   * above already proves no live loop of ours is running, and a reused PID that
+   * probes "alive" must never suppress a real rescue (see the DEFECT-4 note at
+   * the call site). Inert under `--dry-run`.
+   */
+  checkpointInflight(): Promise<readonly CheckpointStopResult[]>;
   /** Logger (info-level). Tests inject a recorder; production logs to stderr. */
   log(line: string): void;
   /** Logger (error-level). */
@@ -1235,6 +1263,10 @@ const LOGGED_ENV_KEYS = new Set([
   "SANDCASTLE_CROSS_HOST_SYNC",
   "SANDCASTLE_HOST_ID",
   "SANDCASTLE_LOCK_TTL_SEC",
+  // First-pass reviewer escalation knobs — surfaced so an operator can see how
+  // the "run the strong reviewer on big/sensitive diffs" policy is tuned.
+  "SANDCASTLE_REVIEW_ESCALATE_DIFF_LINES",
+  "SANDCASTLE_REVIEW_ESCALATE_PATHS",
 ]);
 
 /**
@@ -2209,6 +2241,89 @@ export function resolveReviewBase(
   const baseOk = mergeBase.ok && mergeBase.stdout.length > 0;
   const baseIsTip = baseOk && tipSha.ok && tipSha.stdout === mergeBase.stdout;
   return baseOk && !baseIsTip ? mergeBase.stdout : `${commitSha}~1`;
+}
+
+/**
+ * Resolve the concrete base ref the reviewer diffs `commitSha` against on
+ * `branch`: the fork-point merge-base (whole-branch delta, issue #340), falling
+ * back to the tip's parent when the base is the tip or unresolvable. Extracted
+ * so `runReviewer`'s in-prompt `REVIEW_BASE` and the first-pass escalation sizer
+ * ({@link reviewDiffStats}) can never diff against different bases.
+ */
+function reviewBaseForCommit(
+  repoRoot: string,
+  branch: string,
+  commitSha: string,
+): string {
+  const mergeBase = runGit(repoRoot, "merge-base", branch, commitSha);
+  const tipSha = runGit(repoRoot, "rev-parse", commitSha);
+  return resolveReviewBase(mergeBase, tipSha, commitSha);
+}
+
+/**
+ * Numstat sizer for the first-pass reviewer escalation decision. Returns the
+ * total added+deleted line count and the changed file paths between two refs.
+ * Fail-quiet: equal/empty refs or any `git diff` error return `{0, []}` so a git
+ * hiccup can NEVER escalate — the safe default is the cheap current behavior
+ * (same philosophy as {@link detectChangedLockfiles}). Binary files (numstat
+ * "-") count as changed files but contribute 0 lines.
+ */
+function reviewDiffStats(
+  repoRoot: string,
+  fromRef: string,
+  toRef: string,
+): { changedLines: number; changedFiles: readonly string[] } {
+  if (fromRef === "" || toRef === "" || fromRef === toRef) {
+    return { changedLines: 0, changedFiles: [] };
+  }
+  const res = runGit(repoRoot, "diff", "--numstat", fromRef, toRef);
+  if (!res.ok) return { changedLines: 0, changedFiles: [] };
+  return parseNumstat(res.stdout);
+}
+
+/**
+ * Decide the model for the FIRST reviewer pass on `postSha`. Returns the
+ * reviewer's escalation model when the change is substantial or touches a
+ * sensitive path — one strong pass beats a cheap miss — and `undefined` (the
+ * cheap default) for small, ordinary diffs so the common case is byte-identical
+ * to prior behavior. Returns `undefined` when no reviewer escalation model is
+ * configured; the sizer is fail-quiet so a git hiccup falls back to the default
+ * too. IO-bound (runs git via {@link reviewDiffStats}); the pure, unit-tested
+ * core is {@link parseNumstat} + {@link shouldEscalateReviewer}.
+ */
+function decideFirstPassReviewerModel(
+  ctx: PipelineCtx,
+  postSha: string,
+): string | undefined {
+  const firstPassEscalations = roleModelsFor(ctx.args).reviewer.escalations;
+  if (firstPassEscalations.length === 0) return undefined;
+  const reviewBase = reviewBaseForCommit(
+    ctx.args.repoRoot,
+    ctx.args.branch,
+    postSha,
+  );
+  const { changedLines, changedFiles } = reviewDiffStats(
+    ctx.args.repoRoot,
+    reviewBase,
+    postSha,
+  );
+  if (
+    shouldEscalateReviewer({
+      changedLines,
+      changedFiles,
+      diffLineThreshold: reviewEscalateDiffLinesFromEnv(),
+      sensitivePathPatterns: reviewEscalatePathsFromEnv(),
+    })
+  ) {
+    const review1Model = firstPassEscalations[0];
+    ctx.deps.log(
+      `[issue=${ctx.issueNumber}] first-pass reviewer escalated to ` +
+        `${review1Model} (changedLines=${changedLines}, ` +
+        `changedFiles=${changedFiles.length})`,
+    );
+    return review1Model;
+  }
+  return undefined;
 }
 
 /**
@@ -3576,6 +3691,65 @@ export function buildDefaultDeps(args: SandcastleArgs): Deps {
       // Fail-soft inside the module: never throws, worst case returns [].
       return statusSync.fetchPeers(runId);
     },
+    async checkpointInflight() {
+      // DEFECT 2: INERT under --dry-run, mirroring every sibling dep
+      // (release/publishStatus/syncLanes). A dry run must touch NO git — no
+      // commit into a worktree, no WIP push, no lease delete — so we
+      // short-circuit BEFORE discovery and return []. Logs one `[dry-run]` line
+      // like its siblings.
+      if (args.dryRun) {
+        dryLog("checkpointInflight");
+        return [];
+      }
+      // ADR 0021 launch-time reaper: bind the proven post-kill `checkpointStop`
+      // to a real git runner and the current run's config, mirroring the thin
+      // `scripts/checkpoint-stop.mts` runner (same hostId + integration-branch
+      // resolution). `integrationBranch` is the run branch — commits a surviving
+      // worktree has that the run branch does not are the rescued WIP, exactly
+      // what the `--now` skill passes as `--integration-branch <run-branch>`.
+      // `stagingBranch: null` SKIPS the certified-but-unpromoted staging strand
+      // backup — that is the graceful `--now` stop's job (it runs when no agent
+      // is active); the launch-time reaper only rescues per-issue worktrees.
+      // Because the reaper runs at EVERY launch, its origin writes MUST honor
+      // ADR 0021's inertness contract (a flag-off single-host consumer pushes
+      // nothing new): `wipOriginPush: "when-sync"` captures each crashed WIP to a
+      // LOCAL ref always and pushes it to origin only when `syncEnabled` — unlike
+      // the graceful `--now` stop, which pushes unconditionally by default. The
+      // lease DELETE is separately gated by `canReleaseLease` below (false when
+      // lease-mode is off), so no origin write escapes when the flags are off.
+      return checkpointStop(makeExecFileGitRunner(), {
+        repoRoot: args.repoRoot,
+        hostId: resolveHostId(),
+        integrationBranch: args.branch,
+        remote: "origin",
+        stagingBranch: null,
+        syncEnabled: crossHostSyncEnabled(),
+        // Launch-time reaper: local WIP capture always, origin push only when
+        // sync is on (ADR 0021 inertness). The `--now` stop keeps the default
+        // "always" push, so its behavior is byte-for-byte unchanged.
+        wipOriginPush: "when-sync",
+        // DEFECT 1: never yank a lease a PEER currently holds LIVE. Unlike the
+        // graceful `--now` stop (whose leases are its own host's), the launch-
+        // time reaper runs after a CRASH — this host's lease may have expired
+        // and been re-claimed by a peer that is now actively working the issue,
+        // so deleting `refs/locks/issue-<N>` here would strand the peer's work.
+        // Release ONLY when the lease is NOT live. With lease-mode OFF there is
+        // no lock ref at all, so releasing is pointless — return false and skip
+        // the delete (DEFECT 5). WIP capture still runs regardless of this
+        // guard, so the crashed work is always rescued.
+        //
+        // `leaseState` is TTL-based and owner-blind: it cannot tell a PEER's
+        // live lease from THIS host's own crashed-but-not-yet-expired lease, so
+        // a fast crash+restart within TTL reads "live" and leaves our own lock
+        // ref standing until it lapses. That is intentional and harmless — the
+        // single-instance lock guarantees we (and only we) will re-process the
+        // issue, so a bounded wait for TTL expiry costs nothing and beats the
+        // risk of yanking a real peer. Same conservative choice startup
+        // reconciliation already makes (`st === "live"` → skip).
+        canReleaseLease: async (issue) =>
+          leaseEnabled && (await leaseCoord.leaseState(issue)) !== "live",
+      });
+    },
     log,
     logError: logErr,
   };
@@ -4784,14 +4958,11 @@ async function runReviewer(
   // repoRoot's .git, so both refs resolve here), then passed as a concrete SHA
   // so the in-prompt `git diff` runs against two tip-reachable objects and can
   // never exit non-zero — a failing bang-command crashes the entire review.
-  const mergeBase = runGit(
+  const reviewBase = reviewBaseForCommit(
     ctx.args.repoRoot,
-    "merge-base",
     ctx.args.branch,
     commitSha,
   );
-  const tipSha = runGit(ctx.args.repoRoot, "rev-parse", commitSha);
-  const reviewBase = resolveReviewBase(mergeBase, tipSha, commitSha);
   const r = await timeRole(ctx.timingLedger, "reviewer", () =>
     runWithRateLimitFallback(
     (m) =>
@@ -5344,7 +5515,14 @@ async function runIssuePipeline(
     // deferred until AFTER ALL_CLEAR — only the final accepted SQL hits the
     // dev DB, never the intermediate state of a failed first attempt.
     ctx.status.setIssuePhase(ctx.issueNumber, "reviewer");
-    const review1 = await runReviewer(sandbox, ctx, postSha, undefined, undefined, {
+    // First-pass escalation: a substantial or sensitive-path change gets the
+    // stronger reviewer model on pass 1 — one strong pass beats a cheap miss.
+    // Small, ordinary diffs keep the cheap default (model = undefined), so this
+    // is byte-identical to prior behavior for the common case. Never escalates
+    // when no reviewer escalation model is configured, and the sizer is
+    // fail-quiet so a git hiccup falls back to the default too.
+    const review1Model = decideFirstPassReviewerModel(ctx, postSha);
+    const review1 = await runReviewer(sandbox, ctx, postSha, undefined, review1Model, {
       skillsInvoked: impl1.skillsInvoked,
     });
 
@@ -6307,6 +6485,43 @@ export async function runMain(
     };
   }
 
+  // ADR 0021 LAUNCH-TIME REAPER (Fix 2 — crash recovery). Workstream 1b chose
+  // NOT to build the live-heartbeat checkpoint (see the STAGED note by the lease
+  // heartbeat below) because snapshotting a worktree an agent is actively using
+  // races the agent. This closes the same gap from the OTHER side: at startup —
+  // when NO agent is running and the single-instance lock above guarantees no
+  // live loop holds these worktrees — we run the proven post-kill reaper so a
+  // HARD-killed prior run's in-flight WIP is captured (pushed to its WIP ref)
+  // and its lease released BEFORE the reconciliation below frees the issue for
+  // re-claim. Without this, a SIGKILL/OOM/sleep re-runs the issue from scratch
+  // and strands its lease. The graceful `--now` skill already invokes this same
+  // reaper; here we auto-invoke it so a crash needs no human `--now`.
+  //
+  // DEFECT 4: do NOT gate the reaper on a prior-status liveness probe. We hold
+  // the single-instance lock acquired above, so OUR loop is provably the ONLY
+  // one running here — regardless of what a stale status.json's stamped pid
+  // claims. A hard-killed loop's pid can be REUSED by an unrelated live process,
+  // making the probe report "alive" and (under the old gate) SKIP the reaper —
+  // after which reconciliation frees the label without ever capturing the
+  // surviving worktree's WIP, losing the work. So we ALWAYS run discovery. The
+  // reaper is a natural no-op when no `agent/issue-<N>` worktree survives, and
+  // stays SILENT unless it actually reaped something, so a clean start adds no
+  // noise. Best-effort + NON-FATAL: crash recovery must never crash the loop it
+  // protects. (Dropping the probe here also retires the second, drift-prone pid
+  // probe DEFECT 5 flagged — the ONE remaining probe lives in the viewer.)
+  try {
+    const reaped = await deps.checkpointInflight();
+    if (reaped.length > 0) {
+      deps.log(
+        `[startup] launch-time reaper: rescued in-flight work from a prior killed run:\n${formatCheckpointStop([...reaped])}`,
+      );
+    }
+  } catch (err) {
+    deps.logError(
+      `[startup] launch-time reaper skipped: ${(err as Error).message} — the loop still starts; a crashed prior run's WIP may need a manual \`--now\` reap`,
+    );
+  }
+
   // Status feed for the `sandcastle-watch` viewer. Constructed ONLY after the
   // single-instance lock above succeeds, so a second loop that fails the lock
   // and early-returns can never clobber a live status.json. Threaded into
@@ -6480,6 +6695,16 @@ export async function runMain(
     // from scratch (git history has the old version); the FF-refused strand
     // backup (1a) and `--now` staging backup (1c) — both run when no agent is
     // concurrently active — ship in this pass.
+    //
+    // CRASH-RECOVERY UPDATE (ADR 0021 Fix 2): the hard-crash gap this live
+    // heartbeat would have closed is NOW closed at the OTHER end — the
+    // launch-time reaper at startup (see the "LAUNCH-TIME REAPER" block above,
+    // right after the single-instance lock). Because it runs before any agent is
+    // spawned, it sidesteps the shared-worktree race entirely: a run killed by
+    // SIGKILL/OOM/sleep is reaped on the NEXT launch (WIP pushed, lease
+    // released) instead of mid-run by a heartbeat. So Workstream 1b (the
+    // live-heartbeat approach) remains deliberately un-built; the crash-recovery
+    // need it targeted is served at launch, not via heartbeat.
     leaseHeartbeat = setInterval(() => {
       void deps.renewLeases();
       if (syncOnHeartbeat) {
@@ -7561,14 +7786,32 @@ export async function runMain(
                 if (await deps.fenceIssue(n)) {
                   fencedIssueNums.push(n);
                 } else {
+                  // TRANSIENT, not human-triage: another host won the lease, so
+                  // this is a mechanical race, not a review quarantine. Release
+                  // the label back to `ready-for-agent` so the owner/next run
+                  // re-claims it, and park it in the transient `needs-rerun`
+                  // phase (informational row, does NOT bump the "needs you"
+                  // pill). Reserve `needs-human` for REAL quarantines.
                   deps.logError(
                     `[issue=${n}] lease lost before promotion (inline fence failed) — ` +
-                      `NOT shipping this round; flagged needs-human.`,
+                      `NOT shipping this round; releasing label for re-claim (needs-rerun).`,
                   );
+                  try {
+                    await deps.release(
+                      n,
+                      `lease lost before promotion — another host may own this issue; ` +
+                        `released for re-claim`,
+                    );
+                  } catch (relErr) {
+                    deps.logError(
+                      `[issue=${n}] release after lost-lease fence failed (non-fatal): ` +
+                        `${(relErr as Error).message}`,
+                    );
+                  }
                   statusStore.setIssuePhase(
                     n,
-                    "needs-human",
-                    `lease lost before promotion — another host may own this issue`,
+                    "needs-rerun",
+                    `lease lost before promotion — released to ready-for-agent for re-claim`,
                   );
                 }
               }
@@ -7677,8 +7920,11 @@ export async function runMain(
             await handleStrandedPromotion(runGitLease, {
               log: (line) => deps.log(line),
               logError: (line) => deps.logError(line),
-              setIssuePhase: (n, phase, detail) =>
-                statusStore.setIssuePhase(n, phase, detail),
+              recordQuarantineOutcome: (n, detail) =>
+                statusStore.recordOutcome(n, {
+                  status: "quarantined",
+                  finalMarker: detail,
+                }),
               quarantine: (n, reason) => deps.quarantine(n, reason),
               releaseIssueLease: (n) => deps.releaseIssueLease(n),
               publishLane: (branch, context) =>

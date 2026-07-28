@@ -600,6 +600,10 @@ function buildGateDeps(opts: GateBuildOpts = {}): GateDepsBuilder {
     async fetchStatusPeers() {
       return [];
     },
+    async checkpointInflight() {
+      // ADR 0021 launch-time reaper: no orphaned worktrees in these gate tests.
+      return [];
+    },
   };
 
   return {

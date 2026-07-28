@@ -106,6 +106,10 @@ async function main(): Promise<void> {
     stagingBranch: args.stagingBranch,
     // `--sync` wins; otherwise the env flag decides, defaulting OFF (inert).
     syncEnabled: args.syncEnabled ?? crossHostSyncEnabled(),
+    // `--now` reaps THIS host's own leases (the operator opted in by running
+    // it), so releasing is always permitted — this explicit always-permit
+    // policy replaces the former delete-by-default fall-through.
+    canReleaseLease: async () => true,
   });
   console.log(formatCheckpointStop(results));
 

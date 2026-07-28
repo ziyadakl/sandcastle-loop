@@ -14,7 +14,11 @@
  *      branch (committed-but-unpushed work);
  *   3. if so, push HEAD to the issue's WIP ref ({@link pushWipRef}) and RELEASE
  *      the lease by deleting `refs/locks/issue-<N>` on the remote — the exact
- *      release the dead loop never got to do;
+ *      release the dead loop never got to do. The release is UNCONDITIONAL by
+ *      default (the graceful `--now` stop's leases are its own), but an optional
+ *      `canReleaseLease` guard can veto the DELETE per issue so the launch-time
+ *      reaper never yanks a lease a live peer re-claimed — the WIP push above
+ *      still runs regardless, so the work is rescued either way;
  *   4. a clean, not-ahead worktree has nothing to save: leave its lease and WIP
  *      ref untouched.
  *
@@ -30,6 +34,7 @@ import {
   wipRef,
   commitWorktreeCheckpoint,
   pushWipRef,
+  captureWipRefLocal,
   issueFromBranch,
 } from "./branch-checkpoint.js";
 import { backupStrand, stagingCommitsAhead } from "./strand-backup.js";
@@ -123,6 +128,46 @@ export interface CheckpointStopOpts {
    * pinned by a LOCAL strand ref, so nothing is lost; it just never leaves the box.
    */
   readonly syncEnabled: boolean;
+  /**
+   * DEFECT 1 (ADR 0019/0021): REQUIRED per-issue policy consulted right before
+   * the lease DELETE. Returns `true` when it is safe to release issue `n`'s
+   * lease, `false` to LEAVE it in place. This is a required, EXPLICIT decision:
+   * every caller must state who it may delete a lease for — there is no
+   * delete-by-default fall-through (an absent guard once defaulted to release,
+   * a fail-open footgun for any future caller that forgot the param). The
+   * graceful `--now` stop passes an always-permit policy (`async () => true`):
+   * its leases are its own host's, so deleting them is always correct. The
+   * LAUNCH-TIME reaper (main.mts `checkpointInflight`) passes a guard that
+   * refuses to yank a lease a PEER host currently holds LIVE: a crashed host's
+   * lease can expire and be re-claimed by a peer before the crashed host
+   * restarts, and deleting it here would strand the peer's active work.
+   * CRITICAL: WIP capture ({@link pushWipRef}) ALWAYS runs first, before this
+   * guard — we ALWAYS rescue the work; only the lease DELETE is gated, so a
+   * refused release never leaves work unsaved.
+   */
+  readonly canReleaseLease: (issue: number) => Promise<boolean>;
+  /**
+   * DEFECT (ADR 0021 inertness): where the per-issue WIP checkpoint is written.
+   *
+   *   - `"always"` (DEFAULT) — push HEAD to `refs/sandcastle/wip/issue-<N>` on the
+   *     REMOTE unconditionally, as the sweep always has. This is the graceful
+   *     `--now` stop's path: the operator opted into the origin write by invoking
+   *     it, so it stays BYTE-FOR-BYTE unchanged.
+   *   - `"when-sync"` — write the WIP ref LOCALLY always, and push it to origin
+   *     ONLY when {@link syncEnabled}. The LAUNCH-TIME reaper (main.mts
+   *     `checkpointInflight`) passes this: it runs at EVERY start, so a flag-off
+   *     single-host consumer that crashed must NOT push WIP refs to its app's
+   *     origin (ADR 0021 promises a flag-off consumer "pushes nothing new").
+   *     Single-host crash recovery still works — the local WIP ref plus the
+   *     surviving worktree are enough for a same-host resume; the origin push
+   *     only matters for cross-host peer recovery, which IS the sync-ON case.
+   *
+   * This mirrors {@link "./strand-backup".backupStrand}'s proven contract (local
+   * `update-ref` always; origin push gated on `syncEnabled`). It does NOT touch
+   * the lease DELETE, which the {@link canReleaseLease} guard already gates (that
+   * guard returns false when lease-mode is off, so it stays inert).
+   */
+  readonly wipOriginPush?: "always" | "when-sync";
 }
 
 /**
@@ -184,9 +229,18 @@ export async function checkpointStop(
         continue;
       }
 
-      // 3a. push HEAD to the WIP ref. A push rejection is a per-issue error; we
-      //     do NOT release the lease when the work failed to persist.
-      const push = await pushWipRef(opts.repoRoot, wt.path, wt.issue, git, remote);
+      // 3a. persist HEAD to the WIP ref. `"always"` (the `--now` default) pushes
+      //     to origin unconditionally; `"when-sync"` (the launch-time reaper)
+      //     writes the ref LOCALLY and only pushes to origin when sync is on — so
+      //     a flag-off single-host consumer captures its crashed WIP locally
+      //     WITHOUT an origin write (ADR 0021 inertness). Either way a failure is
+      //     a per-issue error and we do NOT release the lease when the work
+      //     failed to persist.
+      const pushToOrigin =
+        (opts.wipOriginPush ?? "always") === "always" || opts.syncEnabled;
+      const push = pushToOrigin
+        ? await pushWipRef(opts.repoRoot, wt.path, wt.issue, git, remote)
+        : await captureWipRefLocal(opts.repoRoot, wt.path, wt.issue, git);
       if (!push.ok) {
         results.push({
           issue: wt.issue,
@@ -197,15 +251,24 @@ export async function checkpointStop(
       }
 
       // 3b. release the lease so a peer may reclaim the issue: delete
-      //     refs/locks/issue-<N> on the remote (empty-source delete refspec).
-      const release = await releaseLeaseRef(opts.repoRoot, wt.issue, git, remote);
-      if (!release.ok) {
-        results.push({
-          issue: wt.issue,
-          outcome: "error",
-          detail: release.stderr.trim() || "lease release failed",
-        });
-        continue;
+      //     refs/locks/issue-<N> on the remote (empty-source delete refspec) —
+      //     but ONLY when the caller's guard (if any) permits (DEFECT 1). The
+      //     WIP push above already rescued the work, so a REFUSED release just
+      //     leaves the lease standing (a live peer already re-claimed the issue,
+      //     or lease-mode is off so there is no ref worth deleting). The policy
+      //     is REQUIRED, so every caller states its intent explicitly — the
+      //     graceful `--now` stop passes `() => true` for its own-host leases.
+      const mayRelease = await opts.canReleaseLease(wt.issue);
+      if (mayRelease) {
+        const release = await releaseLeaseRef(opts.repoRoot, wt.issue, git, remote);
+        if (!release.ok) {
+          results.push({
+            issue: wt.issue,
+            outcome: "error",
+            detail: release.stderr.trim() || "lease release failed",
+          });
+          continue;
+        }
       }
 
       results.push({
@@ -232,10 +295,13 @@ export async function checkpointStop(
   // a resolve/push fault is silent here (the same fail-quiet posture the per-issue
   // sweep uses for a bad worktree). Pass `stagingBranch: null` to skip entirely.
   //
-  // NOTE: the per-issue `pushWipRef` above is deliberately NOT gated — that is
-  // pre-existing behavior from the original checkpoint sweep, out of scope here.
-  // The gating in this sweep is therefore knowingly asymmetric: only the NEW
-  // staging/strand origin write honors the flag.
+  // NOTE: the per-issue WIP origin write is gated by `wipOriginPush` (above):
+  // `"always"` for the operator-invoked `--now` stop, `"when-sync"` for the
+  // launch-time reaper so a flag-off single-host consumer captures its crashed
+  // WIP LOCALLY and pushes nothing to origin. The staging/strand write below is
+  // gated on `syncEnabled` too, so both origin writes now honor the flag — the
+  // asymmetry the launch-time reaper once had (per-issue push always fired) is
+  // closed.
   if (opts.stagingBranch !== null) {
     const ahead = await stagingCommitsAhead(
       git,

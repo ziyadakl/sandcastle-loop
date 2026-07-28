@@ -27,11 +27,23 @@ export type ReadResult =
 export type Banner =
   | "waiting"
   | "stale"
+  | "crashed"
   | "outdated"
   | "done"
   | "stopped"
   | "unhealthy"
   | null;
+
+/**
+ * Impure liveness inputs the viewer injects so the pure reducer can detect a
+ * SAME-HOST hard kill (Fix 1): the OS-pid probe and this host's own id. Threaded
+ * straight into `deriveLiveness`. Omitted ⇒ freshness-only (no crash detection),
+ * so a cross-host reader with no view of the writer's process is unaffected.
+ */
+export type LivenessProbe = {
+  probeAlive?: (pid: number) => boolean;
+  selfHostId?: string;
+};
 
 /** The viewer's render state. `status` is always the last snapshot we trust. */
 export type ViewState = {
@@ -57,14 +69,25 @@ function errMessage(error: unknown): string {
  * to the ONE source of truth (`deriveLiveness`) so the viewer can never drift
  * from the loop's own rule; this function only MAPS the derived reason onto a
  * viewer banner. A live loop shows no banner (`null`); every non-live reason has
- * a matching banner. The viewer is a cross-host reader with no view of any
- * process lock, so it passes only `now` (pure freshness + terminal authority).
+ * a matching banner. When the viewer runs on the SAME host as the writer it also
+ * passes a pid probe + its own host id, letting `deriveLiveness` distinguish a
+ * hard kill (`crashed`) from a merely quiet feed (`stale`); a cross-host reader
+ * omits them and gets pure freshness + terminal authority.
  * Shared by the dedup short-circuit and the full parse path so they can't drift.
  */
-function liveBanner(status: SandcastleStatus, nowMs: number): Banner {
-  const { live, reason } = deriveLiveness(status, { now: nowMs });
+function liveBanner(
+  status: SandcastleStatus,
+  nowMs: number,
+  probe: LivenessProbe = {},
+): Banner {
+  const { live, reason } = deriveLiveness(status, {
+    now: nowMs,
+    probeAlive: probe.probeAlive,
+    selfHostId: probe.selfHostId,
+  });
   // "running" is the only live reason and has no banner; excluding it also
-  // narrows `reason` to {stale, stopped, unhealthy, done} — all Banner literals.
+  // narrows `reason` to {stale, crashed, stopped, unhealthy, done} — all Banner
+  // literals.
   if (live || reason === "running") return null;
   return reason;
 }
@@ -77,6 +100,7 @@ export function reduce(
   prev: ViewState,
   read: ReadResult,
   nowMs: number,
+  probe: LivenessProbe = {},
 ): ViewState {
   // The file does not exist (loop not started yet, or status removed).
   if (!read.ok && read.kind === "enoent") {
@@ -104,7 +128,7 @@ export function reduce(
     read.raw === prev.raw &&
     prev.status !== null &&
     prev.lastError === undefined &&
-    liveBanner(prev.status, nowMs) === prev.banner
+    liveBanner(prev.status, nowMs, probe) === prev.banner
   ) {
     return prev;
   }
@@ -142,5 +166,9 @@ export function reduce(
   // `startHeartbeat`, wired in main.mts), so a long-but-healthy phase stays
   // fresh; only a feed quiet for longer than STALE_AFTER_MS (≈ a dead loop)
   // trips the stale banner. `raw` is stashed so the next identical poll dedups.
-  return { status: parsed.data, banner: liveBanner(parsed.data, nowMs), raw: read.raw };
+  return {
+    status: parsed.data,
+    banner: liveBanner(parsed.data, nowMs, probe),
+    raw: read.raw,
+  };
 }
