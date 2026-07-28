@@ -55,6 +55,39 @@ export const PHASE_LABELS = {
  */
 export const TERMINAL_PHASES = new Set(["merged", "needs-human", "deferred"]);
 
+/**
+ * Pipeline order for the per-role cost/timing breakdown. Roles absent from the
+ * status data are omitted; a role present in the data but NOT listed here is
+ * appended after the known ones (so a future role never vanishes silently).
+ *
+ * DRIFT-GUARD: this list mirrors `CostLedger.ROLE_ORDER` in
+ * `.sandcastle/lib/cost/ledger.ts`. The browser bundle can't import that TS
+ * module, so the copy is intentional — keep the two in sync (e.g. a 9th role
+ * must be added to both).
+ */
+export const ROLE_ORDER = [
+  "planner",
+  "implementer",
+  "reviewer",
+  "critique",
+  "recovery",
+  "merger",
+  "postMergeReviewer",
+  "postMergeFixer",
+];
+
+/** role key → display label (mirror of the loop's role names). */
+export const ROLE_LABELS = {
+  planner: "Planner",
+  implementer: "Implementer",
+  reviewer: "Reviewer",
+  critique: "Critique",
+  recovery: "Recovery",
+  merger: "Merger",
+  postMergeReviewer: "Post-merge review",
+  postMergeFixer: "Post-merge fix",
+};
+
 /** Cap for the Recent list. */
 export const RECENT_LIMIT = 10;
 
@@ -135,6 +168,73 @@ function relativeAge(completedAt, nowMs) {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h`;
   return `${Math.floor(h / 24)}d`;
+}
+
+/**
+ * Format an estimated cost in USD as `$x.xx`, or `—` when absent/null/NaN.
+ * Pure; `0` renders `$0.00` (a real zero), only null/undefined/NaN → `—`.
+ * @param {number|null|undefined} costUsd
+ * @returns {string}
+ */
+export function formatCost(costUsd) {
+  if (costUsd == null || typeof costUsd !== "number" || Number.isNaN(costUsd)) {
+    return "—";
+  }
+  return `$${costUsd.toFixed(2)}`;
+}
+
+/**
+ * Human-readable wall-clock from milliseconds: `Xm Ys` (≥1min), `Ys` (≥1s),
+ * `Yms` (<1s). Absent/negative/NaN → `—`.
+ * @param {number|null|undefined} wallMs
+ * @returns {string}
+ */
+export function formatDuration(wallMs) {
+  if (
+    wallMs == null ||
+    typeof wallMs !== "number" ||
+    Number.isNaN(wallMs) ||
+    wallMs < 0
+  ) {
+    return "—";
+  }
+  if (wallMs < 1000) return `${Math.round(wallMs)}ms`;
+  const totalSec = Math.floor(wallMs / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+/**
+ * Build the ordered per-role cost/timing rows from a totals.perRole record.
+ * Roles are emitted in {@link ROLE_ORDER}, then any unknown roles present in the
+ * data (alphabetical) so a future role never vanishes. Absent roles are omitted.
+ * Each row carries `costUsd` (null when the field is null/absent, so the page
+ * renders `—`) and only the timing fields actually present. Returns undefined
+ * when there is nothing to show (backward-compat: old files omit perRole).
+ * @param {Record<string, {costUsd?: number|null, tokens?: number, wallMs?: number, runs?: number}>|undefined} perRole
+ * @returns {Array<{role: string, costUsd: number|null, tokens?: number, wallMs?: number, runs?: number}>|undefined}
+ */
+function buildPerRole(perRole) {
+  if (!perRole || typeof perRole !== "object") return undefined;
+  const known = ROLE_ORDER.filter((r) =>
+    Object.prototype.hasOwnProperty.call(perRole, r),
+  );
+  const extras = Object.keys(perRole)
+    .filter((r) => !ROLE_ORDER.includes(r))
+    .sort();
+  const rows = [];
+  for (const role of [...known, ...extras]) {
+    const d = perRole[role] ?? {};
+    // costUsd is a REQUIRED row key: null when the source is null OR absent
+    // (both render `—`); a real 0 is preserved via `?? null` (0 ?? null === 0).
+    const row = { role, costUsd: d.costUsd ?? null };
+    if (d.tokens != null) row.tokens = d.tokens;
+    if (d.wallMs != null) row.wallMs = d.wallMs;
+    if (d.runs != null) row.runs = d.runs;
+    rows.push(row);
+  }
+  return rows.length > 0 ? rows : undefined;
 }
 
 /**
@@ -255,6 +355,15 @@ export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP, probe = {}) {
     totals.requeued += t.requeued ?? 0;
     totals.running += t.running ?? 0;
   }
+
+  // --- cost & timing: OWN/primary host only. Cost is deliberately NOT summed
+  //     across peers — each host prices its own dispatches, peers may omit the
+  //     fields, and a fused dollar sum would misrepresent a per-host estimate.
+  //     So we read totalCostUsd + perRole straight off the own-host snapshot. ---
+  const ownTotalCostUsd = snap.totals?.totalCostUsd;
+  if (ownTotalCostUsd != null) totals.totalCostUsd = ownTotalCostUsd;
+  const perRoleRows = buildPerRole(snap.totals?.perRole);
+  if (perRoleRows) totals.perRole = perRoleRows;
 
   // --- pills. ---
   const pills = PILL_SPEC.map((p) => {

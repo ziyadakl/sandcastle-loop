@@ -31,6 +31,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   runMain,
+  runWithEscalation,
+  escalationForAttempt,
   runImplementer,
   runCritique,
   shipAfterMigrations,
@@ -110,6 +112,7 @@ import {
 } from "../.sandcastle/lib/state/index.js";
 import type { LockLease, LockBackend, LockDeps, CheckpointStopResult } from "../.sandcastle/lib/state/index.js";
 import type { SandcastleStatus } from "../.sandcastle/lib/status/schema.js";
+import { models } from "../.sandcastle/models.js";
 import { parse as parseDotenv } from "dotenv";
 import { expand as expandDotenv } from "dotenv-expand";
 
@@ -588,6 +591,125 @@ beforeEach(() => {
   __resetTransientStateForTests();
 });
 
+describe("runWithEscalation — shared bounded-escalation scaffold", () => {
+  it("empty escalations ⇒ exactly ONE attempt (legacy single-dispatch path)", async () => {
+    const models: string[] = [];
+    const attempts: Array<{ model: string; attempt: number }> = [];
+    const shouldRetry = vi.fn(() => true); // always wants more — must be ignored
+    const beforeRetry = vi.fn();
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: [],
+      run: (model, attempt) => {
+        attempts.push({ model, attempt });
+        models.push(model);
+        return Promise.resolve(`ran:${attempt}`);
+      },
+      shouldRetry,
+      beforeRetry,
+    });
+
+    expect(attempts).toEqual([{ model: "first-model", attempt: 1 }]);
+    expect(result).toBe("ran:1");
+    // With no escalation rung, shouldRetry/beforeRetry are never consulted.
+    expect(shouldRetry).not.toHaveBeenCalled();
+    expect(beforeRetry).not.toHaveBeenCalled();
+  });
+
+  it("non-empty escalations + shouldRetry=true ⇒ retries once on escalationForAttempt(esc, 2)", async () => {
+    const escalations = ["esc-2", "esc-3"]; // two-rung ladder
+    const attempts: Array<{ model: string; attempt: number }> = [];
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations,
+      run: (model, attempt) => {
+        attempts.push({ model, attempt });
+        return Promise.resolve(`ran:${attempt}`);
+      },
+      // Bounded to 2 even though the ladder has more rungs and we always ask.
+      shouldRetry: () => true,
+    });
+
+    expect(attempts).toEqual([
+      { model: "first-model", attempt: 1 },
+      // attempt 2 uses escalationForAttempt(esc, 2) === esc[0].
+      { model: escalationForAttempt(escalations, 2), attempt: 2 },
+    ]);
+    expect(attempts[1].model).toBe("esc-2");
+    expect(result).toBe("ran:2");
+    // Never a third attempt — capped at 2.
+    expect(attempts).toHaveLength(2);
+  });
+
+  it("shouldRetry=false after attempt 1 stops early (no escalated run)", async () => {
+    const attempts: string[] = [];
+    const beforeRetry = vi.fn();
+
+    const result = await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model) => {
+        attempts.push(model);
+        return Promise.resolve("done");
+      },
+      shouldRetry: () => false, // attempt 1 was good enough
+      beforeRetry,
+    });
+
+    expect(attempts).toEqual(["first-model"]);
+    expect(result).toBe("done");
+    expect(beforeRetry).not.toHaveBeenCalled();
+  });
+
+  it("beforeRetry runs exactly once, BEFORE the escalated attempt, with the prior result", async () => {
+    const order: string[] = [];
+    const beforeRetry = vi.fn((attempt: number, prev: string) => {
+      order.push(`beforeRetry(attempt=${attempt},prev=${prev})`);
+    });
+
+    await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model, attempt) => {
+        order.push(`run(${model},${attempt})`);
+        return Promise.resolve(`result-${attempt}`);
+      },
+      shouldRetry: (_r, attempt) => attempt === 1, // retry once, then stop
+      beforeRetry,
+    });
+
+    expect(order).toEqual([
+      "run(first-model,1)",
+      "beforeRetry(attempt=2,prev=result-1)",
+      "run(esc-2,2)",
+    ]);
+    expect(beforeRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("awaits an async beforeRetry before dispatching the escalated attempt (merger staging-reset ordering)", async () => {
+    const order: string[] = [];
+
+    await runWithEscalation<string>({
+      firstModel: "first-model",
+      escalations: ["esc-2"],
+      run: (model) => {
+        order.push(`run:${model}`);
+        return Promise.resolve(model);
+      },
+      shouldRetry: (_r, attempt) => attempt === 1,
+      beforeRetry: async () => {
+        await Promise.resolve();
+        order.push("reset-staging");
+      },
+    });
+
+    // The reset must complete before the escalated dispatch, never interleaved.
+    expect(order).toEqual(["run:first-model", "reset-staging", "run:esc-2"]);
+  });
+});
+
 describe("sandcastle-loop main.mts — happy path", () => {
   it("ships a single issue: planner → claim → implementer → review ALL_CLEAR → markDone", async () => {
     const b = buildDeps();
@@ -629,6 +751,43 @@ describe("sandcastle-loop main.mts — happy path", () => {
       "post-merge-reviewer",
       "planner",
     ]);
+  });
+
+  it("persists totals.perRole (per-role wall-clock timing) into status.json after a run", async () => {
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([{ id: "71", title: "smoke", branch: "agent/issue-71" }]),
+    });
+    b.enqueue("implementer", {
+      stdout: implementerStdout({ ghIssue: 71 }),
+      commits: [{ sha: "abc123" }],
+    });
+    b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+    b.enqueue("merger", { stdout: "merged" });
+    b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, stagingEnabled: false }),
+      b.deps,
+    );
+    expect(result.exitCode).toBe(0);
+
+    const status = JSON.parse(
+      readFileSync(
+        path.join(TEST_REPO_ROOT, ".sandcastle", "status.json"),
+        "utf8",
+      ),
+    );
+    // Phase-2: every dispatched role is timed. The mock `deps.run` carries no
+    // session metadata, so no COST is credited (costUsd absent), but wall-clock
+    // + run count are always captured, proving the timing ledger persists.
+    expect(status.totals.perRole).toBeDefined();
+    expect(status.totals.perRole.planner.runs).toBeGreaterThanOrEqual(1);
+    expect(status.totals.perRole.implementer.runs).toBe(1);
+    expect(status.totals.perRole.reviewer.runs).toBe(1);
+    expect(typeof status.totals.perRole.implementer.wallMs).toBe("number");
+    expect(status.totals.perRole.implementer.costUsd).toBeUndefined();
   });
 
   it("returns exitCode 0 immediately when planner emits an empty issues array", async () => {
@@ -1535,14 +1694,14 @@ describe("sandcastle-loop main.mts — circuit breaker", () => {
         { id: "603", title: "c", branch: "agent/issue-603" },
       ]),
     });
-    // Each issue: implementer throws, both recovery passes HALT.
+    // Each issue: implementer throws, recovery HALTs (a HALT does not retry,
+    // so a single recovery pass quarantines each issue).
     for (let i = 0; i < 3; i++) {
       b.enqueue("implementer", {
         stdout: "",
         throw: new Error(`issue boom ${i}`),
       });
       b.enqueue("recovery", { stdout: "give up\nHALT" });
-      b.enqueue("recovery", { stdout: "give up too\nHALT" });
     }
 
     const result = await runMain(
@@ -1635,9 +1794,9 @@ describe("sandcastle-loop main.mts — parseSandcastleArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-opus-4-8");
+    expect(r.args.implementerModel).toBe("claude-opus-4-8[1m]");
     expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
-    expect(r.args.recoveryModel).toBe("claude-opus-4-8");
+    expect(r.args.recoveryModel).toBe("claude-opus-4-8[1m]");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
   });
@@ -2210,7 +2369,13 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       stdout: plannerStdout([{ id: "501", title: "rec-perm", branch: "agent/issue-501" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
-    // Recovery throws a permanent error (auth) — should not defer.
+    // Recovery throws a permanent error (auth) — should not defer. Both the
+    // first-pass and the escalation retry throw permanent errors, so the issue
+    // still quarantines after the ladder is exhausted.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("authentication_error: bad key"),
+    });
     b.enqueue("recovery", {
       stdout: "",
       throw: new Error("authentication_error: bad key"),
@@ -2226,6 +2391,11 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(501);
+    // The recovery ladder tried both rungs before quarantining.
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(2);
   });
 
   it("recovery-throw deferrals are bounded by MAX_DEFERRALS — 4th hit quarantines", async () => {
@@ -2287,16 +2457,24 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases[0]!.reason).not.toMatch(/DISTINCTIVE_PIPELINE_ERROR_TOKEN/);
   });
 
-  it("recovery returns HALT marker → quarantines (no defer, no release)", async () => {
-    // Recovery RAN and judged the work unrecoverable. That's a legit
-    // verdict, not a transient error — should quarantine, not defer.
+  it("recovery returns HALT marker → quarantines WITHOUT a retry (no defer, no release)", async () => {
+    // Recovery RAN and judged the work unrecoverable. HALT is its deliberate
+    // "real blocker, I'm not going to guess, hand to a human" signal — retrying
+    // it on a stronger model re-introduces the data-loss risk HALT exists to
+    // prevent. So a HALT must quarantine on the FIRST pass, never escalate.
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([{ id: "504", title: "rec-halt", branch: "agent/issue-504" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // A single recovery pass HALTs. A SECOND is enqueued as a tripwire: if the
+    // gate ever retried a HALT, this pass would be consumed and the assertion
+    // below (exactly one recovery call) would fail.
     b.enqueue("recovery", {
       stdout: "Tried but couldn't fix it.\n\nHALT",
+    });
+    b.enqueue("recovery", {
+      stdout: "Still couldn't fix it.\n\nHALT",
     });
     b.enqueue("planner", { stdout: plannerStdout([]) });
 
@@ -2309,6 +2487,54 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     expect(b.state.releases).toEqual([]);
     expect(b.state.quarantines).toHaveLength(1);
     expect(b.state.quarantines[0]!.issueNum).toBe(504);
+    // HALT did NOT retry — exactly one recovery pass ran.
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(1);
+  });
+
+  it("retries recovery on its escalation model after a non-transient CRASH (ERRORED)", async () => {
+    // Change 5: retry fires ONLY on a genuine, non-transient crash — the model
+    // or tooling itself failed (ERRORED), not the work. Attempt 1 crashes on a
+    // permanent error; the gate must run a SECOND recovery pass on the
+    // escalation model before falling to quarantine. Under the default profile
+    // both recovery rungs are "claude-opus-4-8[1m]" (default == escalations[0]),
+    // so the rungs are distinguished by call COUNT (two dispatches), not model.
+    const b = buildDeps();
+    b.enqueue("planner", {
+      stdout: plannerStdout([
+        { id: "508", title: "rec-escalate", branch: "agent/issue-508" },
+      ]),
+    });
+    b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Attempt 1 (default model) and attempt 2 (escalation model) both crash on
+    // a permanent (non-transient) error → ERRORED, which is what retries.
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key: recovery model crashed"),
+    });
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key: recovery model crashed again"),
+    });
+    b.enqueue("planner", { stdout: plannerStdout([]) });
+
+    const result = await runMain(
+      baseArgs({ iterations: 2, recoveryEnabled: true }),
+      b.deps,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const recoveryCalls = b.state.runCalls.filter(
+      (c) => c.spec.name === "recovery",
+    );
+    expect(recoveryCalls).toHaveLength(2);
+    expect(recoveryCalls[0]!.spec.model).toBe(baseArgs().recoveryModel);
+    expect(recoveryCalls[1]!.spec.model).toBe(models.recovery.escalations[0]);
+    // Both rungs crash → the issue still quarantines.
+    expect(b.state.quarantines).toHaveLength(1);
+    expect(b.state.quarantines[0]!.issueNum).toBe(508);
   });
 
   it("two-tier deferral across iterations shares one MAX_DEFERRALS counter", async () => {
@@ -2409,6 +2635,11 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
       stdout: plannerStdout([{ id: "507", title: "leak", branch: "agent/issue-507" }]),
     });
     b.enqueue("implementer", { stdout: "", throw: new Error("agent crashed") });
+    // Both recovery rungs throw permanent errors → quarantine (no defer).
+    b.enqueue("recovery", {
+      stdout: "",
+      throw: new Error("invalid_api_key"),
+    });
     b.enqueue("recovery", {
       stdout: "",
       throw: new Error("invalid_api_key"),
@@ -3665,6 +3896,233 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
       expect(
         status.issues.find((i) => i.number === 71)?.phase,
       ).toBe("merged");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // The post-merge fixer runs on its DEFAULT (first-pick) model like every
+  // other role. Under the default (non-budget) profile that default is the
+  // 1M-context tier "claude-opus-4-8[1m]" — the fixer operates over the full
+  // multi-issue integration diff, so its first pass keeps the big context (it
+  // is NOT downgraded to the 256k tier). WHEN-landed: staging active →
+  // ISSUES_FOUND → fixer → re-review ALL_CLEAR → promote.
+  it("dispatches the post-merge fixer on its DEFAULT (1M-context) model", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-fixer-default-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      // First post-merge review flags issues → fixer runs → re-review clears.
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      b.enqueue("post-merge-fixer", { stdout: "fixed" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const fixerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "post-merge-fixer",
+      );
+      expect(fixerCalls).toHaveLength(1);
+      // The whole point: the fixer's first pass runs on its DEFAULT model, and
+      // that default is the 1M-context tier (not a downgraded 256k pass).
+      expect(fixerCalls[0]!.spec.model).toBe(models.postMergeFixer.default);
+      expect(fixerCalls[0]!.spec.model).toBe("claude-opus-4-8[1m]");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // The post-merge fixer gets a bounded 2-pass retry: when pass-1's re-review
+  // still flags ISSUES_FOUND, a SECOND fixer runs on the escalation model, and
+  // if its re-review clears, the batch promotes. WHEN-landed under the default
+  // profile: pass 1 uses postMergeFixer.default and pass 2 uses escalations[0]
+  // (both the 1M tier "claude-opus-4-8[1m]"); the assertions pin each pass to
+  // its ladder rung by identity so a future ladder change can't silently drop
+  // the escalation.
+  it("runs a second post-merge fixer pass on the escalation model, then promotes", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-fixer-2pass-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      b.enqueue("merger", { stdout: "merged" });
+      // pass 1: review flags issues → fixer → re-review STILL flags issues.
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      b.enqueue("post-merge-fixer", { stdout: "fix attempt 1" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ISSUES_FOUND" });
+      // pass 2: escalated fixer → re-review clears → promote.
+      b.enqueue("post-merge-fixer", { stdout: "fix attempt 2" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const fixerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "post-merge-fixer",
+      );
+      expect(fixerCalls).toHaveLength(2);
+      expect(fixerCalls[0]!.spec.model).toBe(models.postMergeFixer.default);
+      expect(fixerCalls[1]!.spec.model).toBe(
+        models.postMergeFixer.escalations[0],
+      );
+      // Cleared on pass 2 → the batch promotes.
+      const status = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, ".sandcastle", "status.json"),
+          "utf8",
+        ),
+      ) as SandcastleStatus;
+      expect(status.state).not.toBe("unhealthy");
+      expect(status.totals.merged).toBe(1);
+      expect(
+        status.issues.find((i) => i.number === 71)?.phase,
+      ).toBe("merged");
+    } finally {
+      __setStagingWorktreePathForTests("");
+      if (launchPath) {
+        try {
+          execFileSync(
+            "git",
+            ["worktree", "remove", "--force", launchPath],
+            { cwd: repoRoot, env: gitEnv, stdio: "ignore" },
+          );
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      cleanup();
+    }
+  });
+
+  // The merger retries once on its escalation model when attempt 1 throws.
+  // WHEN-landed: first merger dispatch throws → staging is reset again
+  // (discarding the partial merge) → a SECOND merger runs on the escalation
+  // model. A combined timeline proves the reset ran BETWEEN the two dispatches.
+  it("retries the merger on its escalation model after a first-attempt throw", async () => {
+    const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
+    let launchPath = "";
+    try {
+      __setStagingWorktreePathForTests(stagingPath);
+      launchPath = mkdtempSync(path.join(tmpdir(), "sc-merger-retry-launch-"));
+      rmSync(launchPath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", "-q", launchPath, "feature/work"], {
+        cwd: repoRoot,
+        env: gitEnv,
+        stdio: "ignore",
+      });
+
+      const b = buildDeps();
+      b.enqueue("planner", {
+        stdout: plannerStdout([
+          { id: "71", title: "smoke", branch: "agent/issue-71" },
+        ]),
+      });
+      b.enqueue("implementer", {
+        stdout: implementerStdout({ ghIssue: 71 }),
+        commits: [{ sha: "abc123" }],
+      });
+      b.enqueue("reviewer", { stdout: "Everything is good.\n\nALL_CLEAR" });
+      // First merger dispatch throws; the escalation retry succeeds.
+      b.enqueue("merger", { stdout: "", throw: new Error("merge conflict boom") });
+      b.enqueue("merger", { stdout: "merged" });
+      b.enqueue("post-merge-reviewer", { stdout: "POST_MERGE_ALL_CLEAR" });
+
+      // Combined ordering timeline: merger dispatches + staging-reset log lines.
+      const timeline: string[] = [];
+      const realRun = b.deps.run.bind(b.deps);
+      b.deps.run = async (spec) => {
+        if (spec.name === "merger") timeline.push("merger");
+        return realRun(spec);
+      };
+      const realLog = b.deps.log.bind(b.deps);
+      b.deps.log = (line: string) => {
+        if (line.includes("staging-reset:")) timeline.push("reset");
+        realLog(line);
+      };
+
+      await runMain(
+        baseArgs({ iterations: 1, repoRoot, stagingEnabled: true }),
+        b.deps,
+      );
+
+      const mergerCalls = b.state.runCalls.filter(
+        (c) => c.spec.name === "merger",
+      );
+      // Two merger dispatches — the retry actually fired.
+      expect(mergerCalls).toHaveLength(2);
+      expect(mergerCalls[0]!.spec.model).toBe(baseArgs().mergerModel);
+      expect(mergerCalls[1]!.spec.model).toBe(
+        models.merger.escalations[0],
+      );
+      // reset (prelude) → merger#1 (throws) → reset (discard partial) → merger#2.
+      expect(timeline).toEqual(["reset", "merger", "reset", "merger"]);
     } finally {
       __setStagingWorktreePathForTests("");
       if (launchPath) {

@@ -63,6 +63,17 @@ describe("sandcastle lite web viewer portability", () => {
     }
   });
 
+  it("exposes the Cost & timing card slots + its row template", () => {
+    for (const id of ["cost-card", "cost-total", "cost-rows"]) {
+      expect(html, `missing #${id}`).toMatch(new RegExp(`id=["']${id}["']`));
+    }
+    expect(html, "missing <template id=tpl-cost-row>").toMatch(
+      /<template[^>]+id=["']tpl-cost-row["']/,
+    );
+    // the card starts hidden so old status files render exactly as before
+    expect(html).toMatch(/id=["']cost-card["'][^>]*\shidden/);
+  });
+
   it("ships the render templates viewer.js clones", () => {
     for (const id of ["tpl-issue-row", "tpl-pill", "tpl-host-badge", "tpl-host-dot"]) {
       expect(html, `missing <template id=${id}>`).toMatch(

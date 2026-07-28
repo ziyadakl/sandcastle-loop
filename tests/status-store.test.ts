@@ -68,6 +68,37 @@ describe("StatusStore", () => {
     expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
   });
 
+  // --- Phase-2 per-role breakdown sink ---
+
+  it("recordRoleBreakdown writes totals.perRole (cost+tokens+wallMs+runs) and stays schema-valid", () => {
+    const { store, writes } = makeStore();
+    store.recordRoleBreakdown({
+      implementer: { costUsd: 0.02, tokens: 2000, wallMs: 1250, runs: 1 },
+      reviewer: { costUsd: null, tokens: 500, wallMs: 300, runs: 2 },
+      planner: { wallMs: 80, runs: 1 }, // timing-only role (no priced model)
+    });
+    const snap = store.snapshot();
+    expect(snap.totals.perRole!.implementer).toEqual({
+      costUsd: 0.02,
+      tokens: 2000,
+      wallMs: 1250,
+      runs: 1,
+    });
+    expect(snap.totals.perRole!.reviewer!.costUsd).toBeNull();
+    expect(snap.totals.perRole!.planner).toEqual({ wallMs: 80, runs: 1 });
+    const written = JSON.parse(writes.at(-1)!.content);
+    expect(written.totals.perRole.implementer.wallMs).toBe(1250);
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
+  it("a snapshot without recordRoleBreakdown omits perRole (backward-compat)", () => {
+    const { store } = makeStore();
+    const snap = store.snapshot();
+    expect(snap.totals.perRole).toBeUndefined();
+    expect("perRole" in snap.totals).toBe(false);
+    expect(SandcastleStatusSchema.safeParse(snap).success).toBe(true);
+  });
+
   // --- cross-host identity (Task S1) ---
 
   it("a fresh snapshot carries hostId and runId from meta", () => {
