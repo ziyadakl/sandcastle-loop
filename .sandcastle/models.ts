@@ -26,14 +26,14 @@ type RoleConfig = {
 };
 
 export const models = {
-  planner:           { default: "claude-sonnet-5",   escalations: ["claude-opus-4-8[1m]"] },
-  implementer:       { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
-  reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  critique:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  merger:            { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
-  postMergeReviewer: { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  planner:           { default: "claude-sonnet-5",     escalations: [] },
+  implementer:       { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]", "claude-opus-5"] },
+  reviewer:          { default: "claude-haiku-4-5",    escalations: ["claude-sonnet-5"] },
+  critique:          { default: "claude-haiku-4-5",    escalations: [] },
+  merger:            { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
+  postMergeReviewer: { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
   postMergeFixer:    { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
-  recovery:          { default: "claude-opus-4-8",   escalations: ["claude-opus-4-8[1m]"] },
+  recovery:          { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
 } as const satisfies Record<string, RoleConfig>;
 
 /**
@@ -66,13 +66,13 @@ export const codexModels = {
  * roles. Planner, reviewer, and critique do NOT run on Opus in any profile:
  * planner is Sonnet-first (escalating to `claude-opus-5` on a failed plan
  * here), and reviewer + critique stay byte-identical to `models` (Haiku
- * default, Sonnet escalation).
+ * default; reviewer escalates to Sonnet, critique has no escalation).
  */
 export const opus5Models = {
   planner:           { default: "claude-sonnet-5", escalations: ["claude-opus-5"] },
   implementer:       { default: "claude-opus-5", escalations: [] },
-  reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
-  critique:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-4-6"] },
+  reviewer:          { default: "claude-haiku-4-5",  escalations: ["claude-sonnet-5"] },
+  critique:          { default: "claude-haiku-4-5",  escalations: [] },
   merger:            { default: "claude-opus-5", escalations: [] },
   postMergeReviewer: { default: "claude-opus-5", escalations: [] },
   postMergeFixer:    { default: "claude-opus-5", escalations: [] },
@@ -85,20 +85,20 @@ export const opus5Models = {
  * cheapest model that can do each job and reserve the expensive tiers for a
  * single escalation rung.
  *
- * The finalized ladder (cheapest-first, one escalation rung where retries make
- * sense; empty `escalations` means the role has no model-tier retry):
+ * The finalized budget ladder (cheapest-first, expensive tiers reserved for
+ * escalation; empty `escalations` means the role has no model-tier retry):
  *   - planner            → `claude-sonnet-5`, no escalation
- *   - implementer        → `claude-opus-4-8[1m]` first pass, then a
- *                          `claude-opus-4-8[1m]` "fix-it rung" (attempt 2, WITH
- *                          the reviewer's HAS_BLOCKERS feedback), then
- *                          `claude-opus-5` (attempt 3) — Opus 5 reserved for the
- *                          round-3 grant
+ *   - implementer        → `claude-sonnet-5` first pass (the cheap try), then a
+ *                          `claude-sonnet-5` "fix-it rung" (attempt 2, WITH the
+ *                          reviewer's HAS_BLOCKERS feedback), then
+ *                          `claude-opus-4-8[1m]` (attempt 3) — Opus 1M reserved
+ *                          for the round-3 grant
  *   - reviewer           → `claude-haiku-4-5`, escalates to `claude-sonnet-5`
  *   - critique           → `claude-haiku-4-5`, no escalation
  *   - merger             → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
  *   - postMergeReviewer  → `claude-opus-4-8[1m]`, escalates to `claude-opus-5`
- *   - postMergeFixer     → `claude-opus-4-8[1m]`, escalates to `claude-opus-4-8[1m]`
- *   - recovery           → `claude-opus-4-8[1m]`, escalates to `claude-opus-4-8[1m]`
+ *   - postMergeFixer     → `claude-sonnet-5`, escalates to `claude-opus-5`
+ *   - recovery           → `claude-opus-4-8[1m]`, no escalation
  * The retry loops walk each `escalations` array by attempt number (see
  * `escalationForAttempt` in main.mts), so the ordering here defines the ladder.
  *
@@ -107,14 +107,14 @@ export const opus5Models = {
  * and cannot both apply. See the parse-time guard in main.mts.
  */
 export const budgetModels = {
-  planner:           { default: "claude-sonnet-5", escalations: [] },
-  implementer:       { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]", "claude-opus-5"] },
-  reviewer:          { default: "claude-haiku-4-5", escalations: ["claude-sonnet-5"] },
-  critique:          { default: "claude-haiku-4-5", escalations: [] },
+  planner:           { default: "claude-sonnet-5",     escalations: [] },
+  implementer:       { default: "claude-sonnet-5",     escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"] },
+  reviewer:          { default: "claude-haiku-4-5",    escalations: ["claude-sonnet-5"] },
+  critique:          { default: "claude-haiku-4-5",    escalations: [] },
   merger:            { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
   postMergeReviewer: { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-5"] },
-  postMergeFixer:    { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
-  recovery:          { default: "claude-opus-4-8[1m]", escalations: ["claude-opus-4-8[1m]"] },
+  postMergeFixer:    { default: "claude-sonnet-5",     escalations: ["claude-opus-5"] },
+  recovery:          { default: "claude-opus-4-8[1m]", escalations: [] },
 } as const satisfies Record<keyof typeof models, RoleConfig>;
 
 /** Launch-time Opus model profile selector (`--opus`). */

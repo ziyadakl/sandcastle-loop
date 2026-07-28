@@ -1771,9 +1771,9 @@ describe("sandcastle-loop main.mts — parseSandcastleArgs", () => {
     expect(r.showHelp).toBe(false);
     expect(r.args.iterations).toBe(3);
     expect(r.args.maxConcurrent).toBe(3);
-    expect(r.args.implementerModel).toBe("claude-opus-4-8");
+    expect(r.args.implementerModel).toBe("claude-opus-4-8[1m]");
     expect(r.args.reviewerModel).toBe("claude-haiku-4-5");
-    expect(r.args.recoveryModel).toBe("claude-opus-4-8");
+    expect(r.args.recoveryModel).toBe("claude-opus-4-8[1m]");
     expect(r.args.recoveryEnabled).toBe(true);
     expect(r.args.consecutiveFailureLimit).toBe(3);
   });
@@ -2476,8 +2476,8 @@ describe("sandcastle-loop — transient-error defer on recovery throw", () => {
     // or tooling itself failed (ERRORED), not the work. Attempt 1 crashes on a
     // permanent error; the gate must run a SECOND recovery pass on the
     // escalation model before falling to quarantine. Under the default profile
-    // models.recovery.default="claude-opus-4-8" and escalations[0]=
-    // "claude-opus-4-8[1m]", so the two dispatched models distinguish the rungs.
+    // both recovery rungs are "claude-opus-4-8[1m]" (default == escalations[0]),
+    // so the rungs are distinguished by call COUNT (two dispatches), not model.
     const b = buildDeps();
     b.enqueue("planner", {
       stdout: plannerStdout([

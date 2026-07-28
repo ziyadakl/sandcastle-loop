@@ -13,27 +13,27 @@ describe("--budget (per-role ladder)", () => {
     expect(args.implementerModel).toBe(models.implementer.default);
   });
 
-  it("puts the implementer first-pass on Opus 4.8 (1M)", () => {
+  it("puts the budget implementer first-pass on the cheap Sonnet 5", () => {
     const { args } = parseSandcastleArgs(["--iterations", "1", "--budget"]);
     expect(args.budget).toBe(true);
-    expect(args.implementerModel).toBe("claude-opus-4-8[1m]");
+    expect(args.implementerModel).toBe("claude-sonnet-5");
   });
 
-  it("gives the budget implementer an Opus-1M retry rung then Opus 5", () => {
+  it("gives the budget implementer a Sonnet fix-it rung then Opus 1M", () => {
     const impl = roleModelsFor({ budget: true }).implementer;
-    expect(impl.default).toBe("claude-opus-4-8[1m]");
+    expect(impl.default).toBe("claude-sonnet-5");
     expect(impl.escalations).toEqual([
+      "claude-sonnet-5",
       "claude-opus-4-8[1m]",
-      "claude-opus-5",
     ]);
   });
 
-  it("keeps the Opus 1M escalation rung intact on the non-budget default", () => {
+  it("gives the non-budget default implementer an Opus-1M rung then Opus 5", () => {
     // The implementer's retry escalation reads roleModelsFor(...).implementer,
-    // which the DEFAULT (non-budget) profile leaves as the single Opus rung.
+    // which the DEFAULT (non-budget) profile runs on Opus 1M throughout.
     expect(
       roleModelsFor({ backend: "claude" }).implementer.escalations,
-    ).toEqual(["claude-opus-4-8[1m]"]);
+    ).toEqual(["claude-opus-4-8[1m]", "claude-opus-5"]);
   });
 
   it("pins the finalized budget ladder for every role", () => {
@@ -42,8 +42,8 @@ describe("--budget (per-role ladder)", () => {
       escalations: [],
     });
     expect(budgetModels.implementer).toEqual({
-      default: "claude-opus-4-8[1m]",
-      escalations: ["claude-opus-4-8[1m]", "claude-opus-5"],
+      default: "claude-sonnet-5",
+      escalations: ["claude-sonnet-5", "claude-opus-4-8[1m]"],
     });
     expect(budgetModels.reviewer).toEqual({
       default: "claude-haiku-4-5",
@@ -62,12 +62,12 @@ describe("--budget (per-role ladder)", () => {
       escalations: ["claude-opus-5"],
     });
     expect(budgetModels.postMergeFixer).toEqual({
-      default: "claude-opus-4-8[1m]",
-      escalations: ["claude-opus-4-8[1m]"],
+      default: "claude-sonnet-5",
+      escalations: ["claude-opus-5"],
     });
     expect(budgetModels.recovery).toEqual({
       default: "claude-opus-4-8[1m]",
-      escalations: ["claude-opus-4-8[1m]"],
+      escalations: [],
     });
   });
 
@@ -116,14 +116,14 @@ describe("--budget (per-role ladder)", () => {
 });
 
 describe("escalationForAttempt", () => {
-  it("walks the budget ladder: attempt 2 → Opus 1M, attempt 3 → Opus 5", () => {
+  it("walks the budget ladder: attempt 2 → Sonnet fix-it, attempt 3 → Opus 1M", () => {
     const escalations = budgetModels.implementer.escalations;
-    expect(escalationForAttempt(escalations, 2)).toBe("claude-opus-4-8[1m]");
-    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-5");
+    expect(escalationForAttempt(escalations, 2)).toBe("claude-sonnet-5");
+    expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-4-8[1m]");
   });
 
-  it("clamps a single-element (non-budget) array to index 0 for BOTH attempts 2 and 3", () => {
-    const escalations = models.implementer.escalations; // ["claude-opus-4-8[1m]"]
+  it("clamps a single-element array to index 0 for BOTH attempts 2 and 3", () => {
+    const escalations = ["claude-opus-4-8[1m]"]; // single-rung ladder
     expect(escalationForAttempt(escalations, 2)).toBe("claude-opus-4-8[1m]");
     expect(escalationForAttempt(escalations, 3)).toBe("claude-opus-4-8[1m]");
   });
