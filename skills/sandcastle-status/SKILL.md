@@ -64,6 +64,7 @@ The all-machines branch requires cross-host sync (`SANDCASTLE_CROSS_HOST_SYNC=1`
    ```
 
    - **If either list is non-empty, the report MUST lead with those issues** (count + numbers + titles). Do NOT say the loop "finished cleanly" or "all slices shipped" — there are unshipped issues that need human attention. The user explicitly missed this once and called it out as a discipline bug; the gate is non-negotiable.
+   - **`needs-rerun` is NOT a failure-end state — never report it as "needs you."** An issue the loop parked as `needs-rerun` (run-log line `releasing label for re-claim (needs-rerun)`; viewer/status phase renders as "Needs re-run") had its `ready-for-agent` label released so the loop — or a peer host — auto-reclaims it next cycle. It is transient by design (de-conflated from `needs-human`). Report such an issue as "will retry automatically," and do NOT count it toward the human-attention lead-in above: only `needs-human` / `quarantine` mean the user is genuinely needed.
    - If both are empty, proceed to the regular summary.
 
 7. **Worktree cleanup sweep — soft gate.** Run `tail -n 200 .sandcastle/run.log | grep "cleanup WARN:"` (fall back to `/tmp/sandcastle.log`). If matches:
@@ -83,6 +84,7 @@ Plain English summary:
 - "Loop is not running. Last iteration was N hours ago. M issues in the ready-for-agent queue."
 - If step 6 found stranded issues: lead with "**N issue(s) need human attention: #X, #Y, #Z**" before any "loop finished" wording.
 - If step 2 found retry-ladder markers, name the affected issue number and stage explicitly in the report — do NOT summarise as "running normally" or "iteration N, N slices in flight." Retry-ladder activity is by definition not the normal path. (Stranded-issue lead-with rule above still outranks this if both fire — issues that have already failed take precedence over issues currently retrying.)
+- **Run cost + timing, if the loop tracked it.** If `status.json` carries `totalCostUsd`, include the spend in the report (e.g. "this run has cost ~$X.XX so far"). If it also carries a `perRole` map, you can break the spend down per step (planner / implementer / reviewer / … each with a `costUsd` and `wallMs`) — surface that when the user asks where the money or time went. Both fields are OPTIONAL and additive: older status files omit them, so if absent say nothing about cost rather than reporting $0.
 
 Don't dump raw log output unless the user asks. Don't quote PIDs unless it's relevant for `/sandcastle-stop`.
 

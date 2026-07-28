@@ -277,14 +277,15 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
    a. **Concurrency?** Options `1 / 2 / 3 / 4`, default = the §5 recommendation. If you recommended `1` for a collision, show the reason here. Note that >2 raises collision risk on shared files. **All-machines path: SKIP this question entirely** — per-host concurrency comes from each host's `maxConcurrent` in the registry, not from a single answer.
 
-   b. **Mode?** Options `opus-4.8 (default) / opus-5 / codex / kimi / glm`, default = the remembered mode (§7b) or `opus-4.8`. The two `opus-*` options are both the claude backend (the old `claude` option, now split by model profile). Translate the pick to flags — they are **mutually exclusive** (`--backend codex` refuses `--provider`, and `--opus 5` applies only to the claude path — not combinable with `codex`/`kimi`/`glm` — `main.mts:641-643`):
-      - `opus-4.8` → no extra model-profile flag (current claude `models.ts` defaults — the priciest under metered billing)
-      - `opus-5` → `--opus 5` (claude backend, Opus-5 model profile — same $5/$25 price as 4.8, 1M context with adaptive thinking on by default: more reasoning tokens per call but likely fewer retries; NOT combinable with codex/kimi/glm)
+   b. **Mode?** FOUR tappable options (the `AskUserQuestion` hard cap is 4 options per question), default = the remembered mode (§7b) or `opus-4.8`. Translate the pick to flags:
+      - `opus-4.8 (default)` → no extra model-profile flag (current claude `models.ts` defaults — priciest under metered billing)
+      - `opus-4.8 + budget (cheaper)` → `--budget`: runs the implementer's **first pass** on `claude-sonnet-5` (~40% cheaper, same 1M context) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the **main cost lever** and the user's money-saver — it is a first-class tappable choice here, NOT a buried add-on. (Same claude backend as `opus-4.8`, just a cheaper implementer first pass.)
+      - `opus-5` → `--opus 5` (claude backend, Opus-5 profile — same $5/$25 price as 4.8, 1M context with adaptive thinking on by default: more reasoning tokens per call but likely fewer retries)
       - `codex` → `--backend codex` (gpt-5.5)
-      - `kimi` → `--provider kimi` (kimi-for-coding)
-      - `glm` → `--provider glm` (glm-4.6)
 
-      On an `opus-4.8` pick, offer `--budget` as an add-on if the user wants to save money: it runs the implementer's first pass on `claude-sonnet-5` (~40% cheaper) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the main cost lever. Not combinable with `opus-5` (no implementer escalation there), `codex`, `kimi`, or `glm`.
+      **`kimi` and `glm` are deliberately NOT in the four slots** (the budget choice takes one, and the picker shows at most 4). They stay reachable two ways: the user types `kimi` / `glm` into the picker's **Other** free-text field, or passes `--provider kimi` / `--provider glm` as a flag (which drops the Mode question entirely per the flag rule above). If the user's phrasing or flags name kimi/glm, honor it → `--provider kimi` (kimi-for-coding) / `--provider glm` (glm-4.6).
+
+      The picks are **mutually exclusive** (`--backend codex` refuses `--provider`; `--opus 5`, `--budget` and `--provider` are claude-vs-other exclusive — `main.mts:641-643`). `--budget` needs the Opus-4.8 implementer escalation, so it is NOT combinable with `opus-5` (no implementer escalation there), `codex`, `kimi`, or `glm`; an explicit `--implementer-model` overrides `--budget`.
 
    c. **Scope? — only when 2+ epics are ready.** Options `both interleaved / <epic-A> only / <epic-B> only`, default `both`. If the user picks one epic, scope the run to it (claim only that epic's issues) and name the branch for that single epic.
 
@@ -292,7 +293,7 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
    After the answers: record the chosen mode (§7b), create/reuse the branch (§4), then **fork on the path**: single-machine → launch locally and report (§8); all-machines → go to _Launch across all machines_ (push the branch, fan out via the launch script, report per-host) instead of §8.
 
-7b. **Remember the mode** so "ask every time" stays one tap. Read `.sandcastle/.last-run-mode` (single line: `opus-4.8`|`opus-5`|`codex`|`kimi`|`glm`) for the §7b default; if absent, default `opus-4.8`. (A legacy `claude` value from an earlier run means `opus-4.8`.) After the user picks, write their choice back to that file. Ensure it's gitignored — add `.last-run-mode` to `.sandcastle/.gitignore` if not already covered. (Per-project, so different projects can keep different default modes.)
+7b. **Remember the mode** so "ask every time" stays one tap. Read `.sandcastle/.last-run-mode` (single line: `opus-4.8`|`opus-5`|`codex`|`kimi`|`glm`) for the §7b default; if absent, default `opus-4.8`. (A legacy `claude` value from an earlier run means `opus-4.8`.) After the user picks, write their choice back to that file. The **`opus-4.8 + budget`** pick persists as base mode `opus-4.8` — do NOT persist a budget variant; `--budget` is a money decision worth re-offering each run, so it is re-presented as its own option every time (a remembered `opus-4.8` just pre-selects the non-budget default, and the budget option sits right beside it). Ensure it's gitignored — add `.last-run-mode` to `.sandcastle/.gitignore` if not already covered. (Per-project, so different projects can keep different default modes.)
 
 8. **After launch, always tell the user** (plain English):
    - the grouping, base, branch name, concurrency + one-word reason, iterations;
