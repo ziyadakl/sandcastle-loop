@@ -245,6 +245,10 @@ function buildDeps(): DepsBuilder {
       state.fetchStatusPeersCalls.push(runId);
       return [];
     },
+    async checkpointInflight() {
+      // ADR 0021 launch-time reaper: no orphaned worktrees in this suite.
+      return [];
+    },
     log(line) {
       state.logs.push(line);
     },

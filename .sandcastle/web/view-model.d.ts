@@ -11,9 +11,19 @@ export type BannerKind =
   | "no-run"
   | "live"
   | "stale"
+  | "crashed"
   | "done"
   | "stopped"
   | "unhealthy";
+
+/**
+ * Injected same-host hard-kill probe (mirrors the pure `deriveLiveness` seam).
+ * Absent in the browser ⇒ no crash detection; a Node caller may supply it.
+ */
+export interface LivenessProbe {
+  probeAlive?: (pid: number) => boolean;
+  selfHostId?: string;
+}
 
 export type PillTone = "gray" | "success" | "warning" | "info";
 
@@ -91,4 +101,5 @@ export function buildViewModel(
   snap: unknown,
   nowMs: number,
   aliasMap?: Record<string, string>,
+  probe?: LivenessProbe,
 ): ViewModel;

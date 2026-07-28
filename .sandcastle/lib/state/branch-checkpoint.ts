@@ -243,6 +243,34 @@ export async function pushWipRef(
 }
 
 /**
+ * Capture the worktree's HEAD to the issue's WIP ref in the LOCAL ref store only
+ * — `git update-ref <wipRef(n)> <HEAD-sha>`, with NO origin push. The local twin
+ * of {@link pushWipRef} for the launch-time reaper's sync-OFF path (ADR 0021's
+ * inertness contract): a single-host crash still gets its in-flight work pinned
+ * to a durable local ref — the surviving `agent/issue-<N>` worktree plus this ref
+ * are enough for a same-host resume — but nothing leaves the box, exactly like
+ * {@link "./strand-backup".backupStrand}'s local `update-ref`-always / origin-
+ * push-gated split.
+ *
+ * Best-effort: returns the raw {@link GitRunResult} and never throws. A HEAD that
+ * does not resolve is reported as a non-ok result so the caller records a
+ * per-issue `error` exactly as it does for a rejected push — never a silent skip.
+ */
+export async function captureWipRefLocal(
+  repoRoot: string,
+  wtPath: string,
+  issue: number,
+  git: GitRunner,
+): Promise<GitRunResult> {
+  const ref = wipRef(issue);
+  const sha = await revParse(git, wtPath, "HEAD");
+  if (!sha) {
+    return { ok: false, stdout: "", stderr: `HEAD did not resolve in ${wtPath}` };
+  }
+  return git(repoRoot, "update-ref", ref, sha);
+}
+
+/**
  * True iff a WIP checkpoint ref exists on the remote for `issue` — i.e.
  * `git ls-remote <remote> <wipRef>` prints a non-blank line. Used by the resume
  * path to decide whether there is saved work to pick up.
