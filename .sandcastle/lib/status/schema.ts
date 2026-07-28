@@ -62,6 +62,28 @@ export const STALE_AFTER_MS = 180_000; // 3 minutes (1.5× heartbeat)
  * staging the ship site does NOT mark the issue done); `merged` is the terminal
  * run-level outcome set from the iteration tally. `recovery` is the optional
  * `--recovery on` pass.
+ *
+ * `needs-rerun` is TRANSIENT, not terminal, and NOT a human-triage state: a
+ * MECHANICAL strand (e.g. the promotion-race lease-loss) parked the issue and
+ * released its label back to `ready-for-agent`, so the next run/peer re-claims
+ * it automatically. It deliberately does NOT count toward `totals.needsHuman`
+ * and does NOT set `issue.attention` — it renders as an informational row, not
+ * a "needs you" warning. Contrast `needs-human`, which is reserved for REAL
+ * review quarantines (`recordOutcome({status:"quarantined"|"error"})`) that
+ * bump the pill and require a person. The viewers keep `needs-rerun` OUT of
+ * their `TERMINAL_PHASES` set (it auto-requeues, so it belongs in "active", not
+ * "recent").
+ *
+ * NO VERSION BUMP: adding an enum member is additive — same reasoning as
+ * `stopping` on `RunStateSchema` above. A viewer new enough to know the member
+ * renders it. An OLD viewer (compiled before `needs-rerun` existed) does NOT
+ * hit the raw-`schemaVersion` "outdated" banner here — that fires only on a
+ * version mismatch, and we deliberately did not bump — so its `safeParse`
+ * simply fails on the unknown enum value and it degrades to the "stale" banner,
+ * keeping its last-good frame rather than blank-screening. That degradation is
+ * acceptable because `/sandcastle-update` ships writer + viewer atomically, so
+ * the skew window is momentary. (The "outdated" route is reserved for changes
+ * that DO bump the version.)
  */
 export const IssuePhaseSchema = z.enum([
   "planned",
@@ -72,6 +94,7 @@ export const IssuePhaseSchema = z.enum([
   "merge",
   "merged",
   "needs-human",
+  "needs-rerun",
   "deferred",
 ]);
 export type IssuePhase = z.infer<typeof IssuePhaseSchema>;

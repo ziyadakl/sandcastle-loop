@@ -186,6 +186,56 @@ describe("buildViewModel — terminal run states", () => {
   });
 });
 
+describe("buildViewModel — crashed detection (same-host pid probe)", () => {
+  // sample-status.json is state:running, hostId:"host-a", fresh updatedAt.
+  const FRESH_NOW = Date.parse("2026-06-04T11:59:40.000Z"); // ~10s after updatedAt
+
+  it("own snapshot + dead pid → banner kind 'crashed' (beats a fresh feed)", () => {
+    const snap = { ...fixture("sample-status.json"), pid: 4242 };
+    const calls: number[] = [];
+    const vm = buildViewModel(snap, FRESH_NOW, undefined, {
+      selfHostId: "host-a",
+      probeAlive: (pid) => {
+        calls.push(pid);
+        return false;
+      },
+    });
+    expect(vm.banner.kind).toBe("crashed");
+    expect(vm.banner.live).toBe(false);
+    expect(vm.banner.text).toBe("Crashed — loop died, work may be recoverable");
+    expect(calls).toEqual([4242]);
+  });
+
+  it("own snapshot + live pid → live (a running process is not crashed)", () => {
+    const snap = { ...fixture("sample-status.json"), pid: 4242 };
+    const vm = buildViewModel(snap, FRESH_NOW, undefined, {
+      selfHostId: "host-a",
+      probeAlive: () => true,
+    });
+    expect(vm.banner.kind).toBe("live");
+  });
+
+  it("PEER-owned snapshot + dead pid → NOT crashed, probe never consulted", () => {
+    const snap = { ...fixture("sample-status.json"), pid: 4242 }; // hostId host-a
+    const calls: number[] = [];
+    const vm = buildViewModel(snap, FRESH_NOW, undefined, {
+      selfHostId: "some-other-host",
+      probeAlive: (pid) => {
+        calls.push(pid);
+        return false;
+      },
+    });
+    expect(vm.banner.kind).toBe("live");
+    expect(calls).toEqual([]);
+  });
+
+  it("no probe injected (browser default) → crashed never appears", () => {
+    const snap = { ...fixture("sample-status.json"), pid: 4242 };
+    const vm = buildViewModel(snap, FRESH_NOW);
+    expect(vm.banner.kind).toBe("live");
+  });
+});
+
 describe("buildViewModel — pill tone", () => {
   it("a zero total renders a gray pill, non-zero renders a coloured one", () => {
     const snap = fixture("sample-status.json"); // requeued 0, merged 3, needsHuman 1
