@@ -3891,12 +3891,12 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
   });
 
   // The post-merge fixer runs on its DEFAULT (first-pick) model like every
-  // other role — NOT the escalation rung. Under the default (non-budget)
-  // profile models.postMergeFixer.default = "claude-opus-4-8" and its
-  // escalations[0] = "claude-opus-4-8[1m]", so the dispatched fixer model
-  // distinguishes the two. WHEN-landed: staging active → ISSUES_FOUND → fixer →
-  // re-review ALL_CLEAR → promote.
-  it("dispatches the post-merge fixer on its DEFAULT model (not escalations[0])", async () => {
+  // other role. Under the default (non-budget) profile that default is the
+  // 1M-context tier "claude-opus-4-8[1m]" — the fixer operates over the full
+  // multi-issue integration diff, so its first pass keeps the big context (it
+  // is NOT downgraded to the 256k tier). WHEN-landed: staging active →
+  // ISSUES_FOUND → fixer → re-review ALL_CLEAR → promote.
+  it("dispatches the post-merge fixer on its DEFAULT (1M-context) model", async () => {
     const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
     let launchPath = "";
     try {
@@ -3935,11 +3935,10 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
         (c) => c.spec.name === "post-merge-fixer",
       );
       expect(fixerCalls).toHaveLength(1);
-      // The whole point: DEFAULT model, not the escalation rung.
+      // The whole point: the fixer's first pass runs on its DEFAULT model, and
+      // that default is the 1M-context tier (not a downgraded 256k pass).
       expect(fixerCalls[0]!.spec.model).toBe(models.postMergeFixer.default);
-      expect(fixerCalls[0]!.spec.model).not.toBe(
-        models.postMergeFixer.escalations[0],
-      );
+      expect(fixerCalls[0]!.spec.model).toBe("claude-opus-4-8[1m]");
     } finally {
       __setStagingWorktreePathForTests("");
       if (launchPath) {
@@ -3960,8 +3959,10 @@ describe("sandcastle-loop main.mts — unhealthy on failed final promotion (#4)"
   // The post-merge fixer gets a bounded 2-pass retry: when pass-1's re-review
   // still flags ISSUES_FOUND, a SECOND fixer runs on the escalation model, and
   // if its re-review clears, the batch promotes. WHEN-landed under the default
-  // profile (postMergeFixer.default="claude-opus-4-8", escalations[0]=
-  // "claude-opus-4-8[1m]") so the two fixer dispatches are distinguishable.
+  // profile: pass 1 uses postMergeFixer.default and pass 2 uses escalations[0]
+  // (both the 1M tier "claude-opus-4-8[1m]"); the assertions pin each pass to
+  // its ladder rung by identity so a future ladder change can't silently drop
+  // the escalation.
   it("runs a second post-merge fixer pass on the escalation model, then promotes", async () => {
     const { repoRoot, stagingPath, gitEnv, cleanup } = initStagingRepo();
     let launchPath = "";

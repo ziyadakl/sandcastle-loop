@@ -17,8 +17,10 @@ import {
   humanizeHostId,
   formatCost,
   formatDuration,
+  ROLE_ORDER,
   STALE_AFTER_MS,
 } from "../.sandcastle/web/view-model.js";
+import { CostLedger } from "../.sandcastle/lib/cost/ledger.js";
 
 function fixture(name: string): any {
   return JSON.parse(
@@ -484,5 +486,15 @@ describe("buildViewModel — cost & timing (totals.perRole / totalCostUsd)", () 
       requeued: 0,
       running: 2,
     });
+  });
+});
+
+describe("ROLE_ORDER drift-guard", () => {
+  // The web view-model can't import the TS CostLedger module, so its ROLE_ORDER
+  // is a hand-maintained MIRROR of CostLedger.ROLE_ORDER. This test enforces the
+  // "drift-guard" comment on both copies: add a 9th role to one and forget the
+  // other, and CI fails here instead of the web card silently mis-ordering it.
+  it("web ROLE_ORDER exactly mirrors CostLedger.ROLE_ORDER (same roles, same order)", () => {
+    expect(ROLE_ORDER).toEqual([...CostLedger.ROLE_ORDER]);
   });
 });
