@@ -112,7 +112,7 @@ row or by recovery) → HAS_BLOCKERS for the rollup.
    through the merge (file exists, the relevant test/function/behavior is
    present at HEAD).
 
-6. **Test fidelity (false-green)** — For every test that covers the changed behavior, check that its
+6. **Test fidelity (false-green)** — <!-- ported from /tdd (superpowers) testing-anti-patterns.md — SYNC PERIODICALLY if that skill changes --> For every test that covers the changed behavior, check that its
 setup builds inputs the SAME way the real runtime path does. A test that passes without exercising
 the real code path proves nothing and is worse than no test — it manufactures false confidence.
 Flag as a **HARD** finding when a test:

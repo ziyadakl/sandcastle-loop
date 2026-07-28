@@ -190,6 +190,8 @@ bug-fix stories actually require.
 
 # Build fixture discipline — READ BEFORE you write the [STEP 2/9] test
 
+<!-- ported from /tdd (superpowers) testing-anti-patterns.md — SYNC PERIODICALLY if that skill changes -->
+
 **Your test must exercise the REAL runtime path, or it is worthless.** The most common silent failure
 in this loop is a test that passes while the feature is inert in production, because the test built its
 inputs differently from how the running system builds them. Before you write a test, and before you

@@ -88,6 +88,7 @@ import {
   shouldEscalateReviewer,
   reviewEscalateDiffLinesFromEnv,
   reviewEscalatePathsFromEnv,
+  parseNumstat,
 } from "./lib/review/escalation.js";
 import type { SandcastleStatus } from "./lib/status/schema.js";
 import { deriveRunBranchAndId, syncStatusOnce } from "./lib/status/run-sync.js";
@@ -2203,20 +2204,52 @@ function reviewDiffStats(
   }
   const res = runGit(repoRoot, "diff", "--numstat", fromRef, toRef);
   if (!res.ok) return { changedLines: 0, changedFiles: [] };
-  let changedLines = 0;
-  const changedFiles: string[] = [];
-  for (const line of res.stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    const cols = trimmed.split("\t");
-    if (cols.length < 3) continue;
-    const added = cols[0] === "-" ? 0 : Number(cols[0]) || 0;
-    const deleted = cols[1] === "-" ? 0 : Number(cols[1]) || 0;
-    changedLines += added + deleted;
-    // Rename entries can carry tabs in the path column; rejoin the remainder.
-    changedFiles.push(cols.slice(2).join("\t"));
+  return parseNumstat(res.stdout);
+}
+
+/**
+ * Decide the model for the FIRST reviewer pass on `postSha`. Returns the
+ * reviewer's escalation model when the change is substantial or touches a
+ * sensitive path — one strong pass beats a cheap miss — and `undefined` (the
+ * cheap default) for small, ordinary diffs so the common case is byte-identical
+ * to prior behavior. Returns `undefined` when no reviewer escalation model is
+ * configured; the sizer is fail-quiet so a git hiccup falls back to the default
+ * too. IO-bound (runs git via {@link reviewDiffStats}); the pure, unit-tested
+ * core is {@link parseNumstat} + {@link shouldEscalateReviewer}.
+ */
+function decideFirstPassReviewerModel(
+  ctx: PipelineCtx,
+  postSha: string,
+): string | undefined {
+  const firstPassEscalations = roleModelsFor(ctx.args).reviewer.escalations;
+  if (firstPassEscalations.length === 0) return undefined;
+  const reviewBase = reviewBaseForCommit(
+    ctx.args.repoRoot,
+    ctx.args.branch,
+    postSha,
+  );
+  const { changedLines, changedFiles } = reviewDiffStats(
+    ctx.args.repoRoot,
+    reviewBase,
+    postSha,
+  );
+  if (
+    shouldEscalateReviewer({
+      changedLines,
+      changedFiles,
+      diffLineThreshold: reviewEscalateDiffLinesFromEnv(),
+      sensitivePathPatterns: reviewEscalatePathsFromEnv(),
+    })
+  ) {
+    const review1Model = firstPassEscalations[0];
+    ctx.deps.log(
+      `[issue=${ctx.issueNumber}] first-pass reviewer escalated to ` +
+        `${review1Model} (changedLines=${changedLines}, ` +
+        `changedFiles=${changedFiles.length})`,
+    );
+    return review1Model;
   }
-  return { changedLines, changedFiles };
+  return undefined;
 }
 
 /**
@@ -5339,35 +5372,7 @@ async function runIssuePipeline(
     // is byte-identical to prior behavior for the common case. Never escalates
     // when no reviewer escalation model is configured, and the sizer is
     // fail-quiet so a git hiccup falls back to the default too.
-    const firstPassEscalations = roleModelsFor(ctx.args).reviewer.escalations;
-    let review1Model: string | undefined = undefined;
-    if (firstPassEscalations.length > 0) {
-      const reviewBase = reviewBaseForCommit(
-        ctx.args.repoRoot,
-        ctx.args.branch,
-        postSha,
-      );
-      const { changedLines, changedFiles } = reviewDiffStats(
-        ctx.args.repoRoot,
-        reviewBase,
-        postSha,
-      );
-      if (
-        shouldEscalateReviewer({
-          changedLines,
-          changedFiles,
-          diffLineThreshold: reviewEscalateDiffLinesFromEnv(),
-          sensitivePathPatterns: reviewEscalatePathsFromEnv(),
-        })
-      ) {
-        review1Model = firstPassEscalations[0];
-        ctx.deps.log(
-          `[issue=${ctx.issueNumber}] first-pass reviewer escalated to ` +
-            `${review1Model} (changedLines=${changedLines}, ` +
-            `changedFiles=${changedFiles.length})`,
-        );
-      }
-    }
+    const review1Model = decideFirstPassReviewerModel(ctx, postSha);
     const review1 = await runReviewer(sandbox, ctx, postSha, undefined, review1Model, {
       skillsInvoked: impl1.skillsInvoked,
     });

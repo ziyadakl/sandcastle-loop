@@ -335,6 +335,7 @@ Category-specific guidance:
 
   (The reviewer already re-runs the test suite itself — this category is about whether those tests
   actually exercise the real path, not merely whether they are green.)
+  <!-- ported from /tdd (superpowers) testing-anti-patterns.md — SYNC PERIODICALLY if that skill changes -->
 - **Type safety**: unsafe casts, `any` types, unchecked assumptions?
 - **Security**: injection vulnerabilities, credential leaks, etc.? (The
   documented `ADMIN_PASSWORD ?? "<default>"` test-credential pattern is NOT a

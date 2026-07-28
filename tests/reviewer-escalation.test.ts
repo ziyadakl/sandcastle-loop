@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   shouldEscalateReviewer,
   pathMatchesGlob,
+  parseNumstat,
   reviewEscalateDiffLinesFromEnv,
   reviewEscalatePathsFromEnv,
   DEFAULT_REVIEW_ESCALATE_DIFF_LINES,
@@ -111,6 +112,44 @@ describe("shouldEscalateReviewer", () => {
         sensitivePathPatterns: [],
       }),
     ).toBe(false);
+  });
+});
+
+describe("parseNumstat", () => {
+  it("sums added+deleted across normal rows and collects the file paths", () => {
+    const stdout = "10\t5\tsrc/a.ts\n3\t0\tsrc/b.ts\n0\t7\tsrc/c.ts";
+    expect(parseNumstat(stdout)).toEqual({
+      changedLines: 25,
+      changedFiles: ["src/a.ts", "src/b.ts", "src/c.ts"],
+    });
+  });
+
+  it("counts a binary `-`/`-` row as a changed file contributing 0 lines", () => {
+    const stdout = "10\t5\tsrc/a.ts\n-\t-\tassets/logo.png";
+    expect(parseNumstat(stdout)).toEqual({
+      changedLines: 15,
+      changedFiles: ["src/a.ts", "assets/logo.png"],
+    });
+  });
+
+  it("skips rows with fewer than 3 columns and blank lines", () => {
+    const stdout = "\n10\t5\tsrc/a.ts\n\nbogus\t1\n   \n3\t2\tsrc/b.ts\n";
+    expect(parseNumstat(stdout)).toEqual({
+      changedLines: 20,
+      changedFiles: ["src/a.ts", "src/b.ts"],
+    });
+  });
+
+  it("rejoins tabs in a rename row's path column", () => {
+    const stdout = "4\t2\told/name.ts\tnew/name.ts";
+    expect(parseNumstat(stdout)).toEqual({
+      changedLines: 6,
+      changedFiles: ["old/name.ts\tnew/name.ts"],
+    });
+  });
+
+  it("returns {0, []} for the empty string", () => {
+    expect(parseNumstat("")).toEqual({ changedLines: 0, changedFiles: [] });
   });
 });
 

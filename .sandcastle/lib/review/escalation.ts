@@ -60,6 +60,36 @@ export function reviewEscalatePathsFromEnv(
   return parts.length > 0 ? parts : DEFAULT_REVIEW_ESCALATE_PATHS;
 }
 
+/**
+ * Parse `git diff --numstat` stdout into the total added+deleted line count and
+ * the changed file paths. Pure (no IO): the caller runs git and passes the raw
+ * stdout in, so the parser is fully unit-testable. Mirrors the numstat contract:
+ *   - binary files show `-`/`-` → 0 lines, but still count as a changed file
+ *   - rows with fewer than 3 tab-columns are skipped
+ *   - non-numeric added/deleted columns coerce to 0 (`Number(x) || 0`)
+ *   - rename rows can carry tabs in the path column; the remainder is rejoined
+ *   - blank lines are skipped
+ */
+export function parseNumstat(stdout: string): {
+  changedLines: number;
+  changedFiles: readonly string[];
+} {
+  let changedLines = 0;
+  const changedFiles: string[] = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const cols = trimmed.split("\t");
+    if (cols.length < 3) continue;
+    const added = cols[0] === "-" ? 0 : Number(cols[0]) || 0;
+    const deleted = cols[1] === "-" ? 0 : Number(cols[1]) || 0;
+    changedLines += added + deleted;
+    // Rename entries can carry tabs in the path column; rejoin the remainder.
+    changedFiles.push(cols.slice(2).join("\t"));
+  }
+  return { changedLines, changedFiles };
+}
+
 /** Escape a string for literal use inside a RegExp, EXCEPT `*` and `/`, which
  * the glob translator handles specially. */
 function escapeForGlobRegex(s: string): string {
