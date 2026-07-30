@@ -18,7 +18,13 @@ Work out which path you're on. Both paths share the planning stage, so if the an
 
 1. The user's flags (`--host`, `--all`) or explicit phrasing named the target → that's the answer, don't ask.
 2. `.sandcastle/hosts.json` lists exactly one host (or is missing) → single machine, don't ask.
-3. Otherwise (registry has 2+ hosts and nothing named a target) → **you must ask.** Carry it as the **Machines** question in the §7 batched picker: `this machine only (default) / all healthy hosts / pick one host`. Do not infer it, and do not default to single machine — guessing here silently deletes the concurrency question too (§7a), so one wrong inference costs the user both.
+3. Otherwise (registry has 2+ hosts and nothing named a target) → **default to this machine only.** Still carry the **Machines** question in the §7 batched picker (`this machine only (default) / all healthy hosts / pick one host`) so the user can override in the same breath — but if they answer the other questions and leave this one alone, run single-machine.
+
+   **Why the default flipped (2026-07-30).** Multi-host is not free concurrency; it is a distributed-merge problem the loop does not solve. There is **no cross-host coordination of migration numbers** — both hosts read the same max and both pick the next, so a run touching the schema collides by construction. The 2026-07-30 run collided at iteration 5, logged `CONFLICT merging peer … A human should reconcile the two lanes`, and then **kept running for eight more iterations**, growing a one-file conflict into a criss-crossed history with two merge bases, 13 dual-edited files and a cross-lane compile break git could not see (one host imported a module the other had deleted — neither lane conflicted). The VPS produced 7 of 26 issues for $167 of $505 and generated _all_ of the reconciliation cost: a full human-supervised landing session.
+
+   Multi-host also now produces **two run PRs** that must be reconciled before either can merge, which defeats the point of the loop ending on one reviewable PR.
+
+   Restore the ask-first default once (a) `_journal.json` has a union merge driver and (b) migration numbers are allocated per-host. Until then `--all` / "all my hosts" remains available for anyone who explicitly wants it.
 
 The two paths **share the planning stage** (group issues, pick base, name+fork the run branch, size iterations, pick mode) — plan once regardless. They differ only at launch: single-machine launches locally via the wrapper (see _Run_); all-machines pushes the branch and fans out via the launch script (see _Launch across all machines_). When you're on the all-machines path, also run the **All-machines preconditions** below before launching.
 
@@ -275,17 +281,19 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
 
    a0. **Machines? — whenever step 3 of "This machine, or all machines?" left it unresolved** (registry has 2+ hosts and no flag/phrasing named a target). Options `this machine only (default) / all healthy hosts / pick one host`. Ask this FIRST in the batch: the answer decides whether 7a is asked at all. Skip only on a single-host registry or an explicit `--host`/`--all`.
 
+   **`this machine only` is the real default now, not just the first option** — if the user answers the other questions and leaves this one untouched, go single-machine. Multi-host has no cross-host migration-number coordination and no journal merge driver, so a schema-touching run collides by construction and costs a human reconciliation session; see step 3 above for the 2026-07-30 evidence. When the user _does_ pick all-machines, say in one line that each host will open its own run PR and the two will need reconciling before either merges.
+
    a. **Concurrency?** Options `1 / 2 / 3 / 4`, default = the §5 recommendation. If you recommended `1` for a collision, show the reason here. Note that >2 raises collision risk on shared files. **All-machines path: SKIP this question entirely** — per-host concurrency comes from each host's `maxConcurrent` in the registry, not from a single answer.
 
    b. **Mode?** FOUR tappable options (the `AskUserQuestion` hard cap is 4 options per question), default = the remembered mode (§7b) or `opus-4.8`. Translate the pick to flags:
-      - `opus-4.8 (default)` → no extra model-profile flag (current claude `models.ts` defaults — priciest under metered billing)
-      - `opus-4.8 + budget (cheaper)` → `--budget`: runs the implementer's **first pass** on `claude-sonnet-5` (~40% cheaper, same 1M context) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the **main cost lever** and the user's money-saver — it is a first-class tappable choice here, NOT a buried add-on. (Same claude backend as `opus-4.8`, just a cheaper implementer first pass.)
-      - `opus-5` → `--opus 5` (claude backend, Opus-5 profile — same $5/$25 price as 4.8, 1M context with adaptive thinking on by default: more reasoning tokens per call but likely fewer retries)
-      - `codex` → `--backend codex` (gpt-5.5)
+   - `opus-4.8 (default)` → no extra model-profile flag (current claude `models.ts` defaults — priciest under metered billing)
+   - `opus-4.8 + budget (cheaper)` → `--budget`: runs the implementer's **first pass** on `claude-sonnet-5` (~40% cheaper, same 1M context) while keeping the Opus escalation on retry. The implementer is the loop's dominant token consumer, so this is the **main cost lever** and the user's money-saver — it is a first-class tappable choice here, NOT a buried add-on. (Same claude backend as `opus-4.8`, just a cheaper implementer first pass.)
+   - `opus-5` → `--opus 5` (claude backend, Opus-5 profile — same $5/$25 price as 4.8, 1M context with adaptive thinking on by default: more reasoning tokens per call but likely fewer retries)
+   - `codex` → `--backend codex` (gpt-5.5)
 
-      **`kimi` and `glm` are deliberately NOT in the four slots** (the budget choice takes one, and the picker shows at most 4). They stay reachable two ways: the user types `kimi` / `glm` into the picker's **Other** free-text field, or passes `--provider kimi` / `--provider glm` as a flag (which drops the Mode question entirely per the flag rule above). If the user's phrasing or flags name kimi/glm, honor it → `--provider kimi` (kimi-for-coding) / `--provider glm` (glm-4.6).
+   **`kimi` and `glm` are deliberately NOT in the four slots** (the budget choice takes one, and the picker shows at most 4). They stay reachable two ways: the user types `kimi` / `glm` into the picker's **Other** free-text field, or passes `--provider kimi` / `--provider glm` as a flag (which drops the Mode question entirely per the flag rule above). If the user's phrasing or flags name kimi/glm, honor it → `--provider kimi` (kimi-for-coding) / `--provider glm` (glm-4.6).
 
-      The picks are **mutually exclusive** (`--backend codex` refuses `--provider`; `--opus 5`, `--budget` and `--provider` are claude-vs-other exclusive — `main.mts:641-643`). `--budget` needs the Opus-4.8 implementer escalation, so it is NOT combinable with `opus-5` (no implementer escalation there), `codex`, `kimi`, or `glm`; an explicit `--implementer-model` overrides `--budget`.
+   The picks are **mutually exclusive** (`--backend codex` refuses `--provider`; `--opus 5`, `--budget` and `--provider` are claude-vs-other exclusive — `main.mts:641-643`). `--budget` needs the Opus-4.8 implementer escalation, so it is NOT combinable with `opus-5` (no implementer escalation there), `codex`, `kimi`, or `glm`; an explicit `--implementer-model` overrides `--budget`.
 
    c. **Scope? — only when 2+ epics are ready.** Options `both interleaved / <epic-A> only / <epic-B> only`, default `both`. If the user picks one epic, scope the run to it (claim only that epic's issues) and name the branch for that single epic.
 
@@ -419,7 +427,6 @@ On the all-machines fork, you've already done the shared planning stage (theme, 
    c. If a host hasn't claimed after ~90s, launch the next host **anyway** and note it in the summary (e.g. "host `hub` hadn't claimed after 90s — launched `local` regardless; check `hub` with /sandcastle-status"). Don't stall the whole fan-out on one slow planner.
 
    **Why sequential:** it guarantees each host claims against a claimable set the previous host has already narrowed, so no two planners race on the same small ready-set.
-
 
 4. **Report the per-host outcome** the script prints — one line each: `launched`, or `skipped (<reason>)` where reason is `unreachable / already-running / dirty-tree / diverged / auth-failed / preflight-error`. A skipped host is never forced; tell the user what to fix (e.g. a `diverged` host has local commits not on origin — resolve by hand). The local machine and healthy remotes that launched are now running the same queue. **Never forward credentials to a remote host; each uses its own auth.**
 
