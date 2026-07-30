@@ -1,154 +1,128 @@
 ---
 name: sandcastle-complete
-description: Use when a finished or stopped sandcastle run must be LANDED on main — symptoms include certified work sitting on a local integration branch that was never pushed, issues closed on GitHub but not actually present on main, diverged cross-host lanes needing reconciliation, or the user invokes /sandcastle-complete. This is the "land it" step only. Stopping the loop is sandcastle-stop; deleting leftovers is sandcastle-clean.
+description: Use when a finished or stopped sandcastle run must be LANDED on main — or the user invokes /sandcastle-complete. Since 2026-07-30 the loop ends by opening ONE run PR, so the normal path is minutes: verify the PR, merge it, purge coordination refs. The long recovery pipeline is only for runs that produced no PR. Stopping the loop is sandcastle-stop; deleting leftovers is sandcastle-clean.
 ---
 
 # Sandcastle Complete
 
-The loop leaves certified work on a **local integration branch** (`--branch`, which refuses `main`) — never pushed, never on `main`. This skill owns only the missing middle: **landing that work on `main` cleanly.** It does NOT stop the loop and does NOT delete leftovers — it calls the sibling skills for those.
+Land a finished run on `main`.
 
-**Lifecycle order: `sandcastle-stop` → `sandcastle-complete` → `sandcastle-clean`.** If the loop finished on its own, skip stop: `sandcastle-complete` → `sandcastle-clean`. Clean is always LAST — you can only safely delete a branch/worktree after its work has landed. Starting the next run (`sandcastle-run`/`-resume`) is always a separate, deliberate step — never automatic.
+**Lifecycle: `sandcastle-stop` → `sandcastle-complete` → `sandcastle-clean`.** If the loop finished on its own, skip stop. Clean is always LAST. Starting the next run is always separate and deliberate — never automatic.
 
-**Core principle: closed ≠ shipped, and green tests ≠ done.** GitHub state and the loop's "merged" status are optimistic. Prove every claim against `main`'s actual content before you trust it.
+## Read this first: what changed on 2026-07-30
 
-## Boundaries (do NOT reimplement siblings)
+This skill used to be an eleven-stage forensic pipeline that routinely burned **90 minutes**. Almost all of it existed to compensate for one defect: **the loop closed issues based on a label on a local branch, without ever checking the code reached `main`.** One run closed 26 issues with zero code on `main`. So every completion had to re-derive the truth from scratch — adjudicate closed-vs-shipped, hunt stranded branches, reconcile diverged lanes, prove everything by content.
 
-- **Loop still running?** Invoke **`sandcastle-stop`** — do not write your own kill/reap. (If stop is missing something, fix stop, not here.)
-- **Deleting leftover branches/worktrees/logs/refs?** That's **`sandcastle-clean`** — hand off to it at the end. **Narrow carve-out:** this skill DOES delete _poisoned_ wip refs + their stale branches in stage 2, because that must happen before any resume and clean runs last (too late). Clean owns deletion of _terminal, landed_ leftovers; complete only deletes the poisoned-checkpoint correctness case.
-- This skill = reconcile → validate → land. Nothing else.
+Two changes removed that defect at the source:
 
-## Iron Rules (each maps to a repeat disaster — violating the letter is violating the spirit)
+1. **The loop no longer closes issues at all.** It labels them `shipped-local` and leaves them OPEN. The run ends by pushing its branch and opening ONE draft PR carrying `Closes #N` per issue. Merging that PR is the only thing that can close them — so "closed" now means "the code is on the default branch", by construction.
+2. **That PR is opened on every exit path**, including circuit-breaker trips, stalls, planner failures and uncaught exceptions — and the branch is always pushed. A crash can no longer strand work locally.
 
-1. **Reconcile before anything resumes.** When cross-host lanes diverged, pick the winner and merge FIRST. Then validate every saved checkpoint (`refs/sandcastle/wip/issue-N`) against the winning tip and purge+re-queue the poisoned ones — BEFORE any of that work is ever resumed. (Stop's reap only _preserves_ work; the corruption is resuming a checkpoint anchored to the losing base.)
-2. **Never wholesale-merge a stranded branch.** A branch cut before a sibling merged will DELETE/rename the sibling's shipped files. Before ANY merge, `git diff --name-status <branch> main`; refuse if it deletes/renames files `main` has. Extract the additive slice only.
-3. **Prove shipped by content, not status.** Squash-merges make `git cherry`/ancestry lie. Verify each closed issue's feature files/symbols are actually on `main`. "Closed"/"branch deleted" are not proof.
-4. **Run the review matrix — do not hand-roll it.** The gate is `/thermo-review` AND `superpowers:requesting-code-review`, both actually loaded. Verify they loaded. Never substitute ad-hoc review agents.
-5. **You orchestrate; subagents execute.** Main thread decides, delegates, verifies. Catch yourself Read/Edit/Bash-tracing product code to design a fix → STOP, dispatch a subagent.
-6. **Verify, don't relay.** Re-verify every inherited "blocker", negative finding, and stale comment against current code/spec. Tag subagent findings `[ASSUMED]` until confirmed.
-7. **Comments over bodies.** Issue bodies are stale stubs; real state lives in comments.
-8. **Ends at "landed", then hands to clean. Never auto-launch the next run**, never assume launch params.
+**Therefore: do not run the old pipeline by default.** If the run produced a PR — which is now every case except a hard `kill -9` — completion is the fast path below and should take minutes. Running the forensic pipeline on a healthy run is the single biggest waste this skill can commit.
 
-## Under time pressure (time-boxed mode)
+## Step 0 — Which path are you on?
 
-"Demo in an hour / move fast" NEVER licenses skipping the irreversible-protecting steps: reconcile-before-resume, the landmine check (Rule 2), and prove-shipped-by-content (Rule 3). Those _prevent data loss_ — rushing past them loses work, the opposite of fast. The ONLY sanctioned scope cut: narrow the deep-review surface (stage 6) to the **new-to-main** change rather than the whole run, and **say so explicitly**. If even that won't fit, land nothing new and offer the demo off the already-certified integration branch.
+Find the run branch (`runId` in `status.json`, or `git for-each-ref refs/sandcastle/lanes/`), then:
 
-## The Pipeline (in order)
+```
+gh pr list --head <run-branch> --state open --json number,title,body,isDraft
+```
 
-### 0 — Precondition
+- **A PR exists → FAST PATH.** This is the normal case. Go there. Do not adjudicate, do not hunt stranded branches, do not reconcile.
+- **No PR exists → RECOVERY PATH.** Only reachable via `kill -9`, a pre-2026-07-30 run, or a bug. Say so explicitly to the user before spending their time on it — an unexpected recovery path is itself a finding worth reporting.
 
-- Read prior handoffs + `status.json`/`run.log` FIRST; verify deltas only. Don't trust a handoff's "clean tree" — run `git status`; if dirty, surface what's uncommitted and force a commit/stash so reviewers and the diff-range agree.
-- **Discover the run branch** (`runId` in `status.json`, or `git for-each-ref refs/sandcastle/lanes/`) and enumerate hosts (`hosts.json`).
-- **Loop still running on any host?** Detect with the **cwd-filtered** pgrep the siblings mandate (a bare `pgrep -fl main.mts` is project-blind — it matches other repos' loops and will false-positive), per host. If yes → **invoke `sandcastle-stop`** (`--now` if in-flight work must be preserved), then continue. Do not proceed while a loop is live.
+**Loop still running?** Invoke `sandcastle-stop` first. Detect with a **cwd-filtered** pgrep (a bare `pgrep -fl main.mts` matches other repos' loops and false-positives). Never hand-roll a kill — a `kill -9` strands lease locks and is the one thing that can force the recovery path.
 
-### 1 — Reconcile cross-host lanes (only if diverged)
+---
 
-- `tsx .sandcastle/scripts/converge.mts --branch <run-branch>` on one host. It merges peer `refs/sandcastle/lanes/*`, aborts cleanly on true conflict, writes `refs/sandcastle/conflict/*`.
-- On a real conflict: subagent computes the **true minimal conflict surface** (per-issue file-overlap — usually one function in one file, not "redo N issues"), resolves in an isolated worktree, gates typecheck+tests, makes a merge commit descending from **both** lane tips, pushes branch head + both lane refs.
-- **Choosing the winner is a real decision.** Decide per-conflict-file on merit (more complete/correct, matches the newer superseding spec, fewer downstream reverts), not by host. Record the winning tip + rationale in the ledger. If the two sides embody different product intents → decision-sheet item, not a silent pick.
-- **If the reconcile gate fails:** do NOT push or advance. A red reconcile is a must-fix blocker even under time pressure — half-merged is worse than late.
+# FAST PATH (default — target: minutes)
 
-### 2 — Validate saved checkpoints against the winner (the poison fix)
+### 1. Read the PR
 
-For each `refs/sandcastle/wip/issue-N`: `git merge-base --is-ancestor <winning-tip> refs/sandcastle/wip/issue-N`. NOT an ancestor → poisoned (anchored to the losing base). Delete the wip ref + stale branch on all hosts and re-label the issue `ready-for-agent` so the NEXT run redoes it fresh. Never let poisoned work resume. (Stop created these refs; here is where they get judged.)
+Its body is the manifest: which issues shipped, which failed promotion, and any issues carried from an interrupted earlier run. You do not need to rebuild this — the loop wrote it.
 
-**Enumerate wip refs per host, local ref first.** WIP refs are written to each host's _local_ refs unconditionally but pushed to origin only when `SANDCASTLE_CROSS_HOST_SYNC=1`. So a poisoned checkpoint living only on a remote host's local refs is invisible from the host you're driving completion on — check `refs/sandcastle/wip/*` on every host (local `rev-parse` per host, then `git ls-remote origin`), or it escapes the purge and can still resume.
+Two things in the body actually need your attention:
 
-### 3 — Manifest (what did the loop actually produce?)
+- **A "promotion failed" warning** means the branch may be incomplete relative to what was certified. Treat the PR as suspect and read what failed before merging.
+- **A "previously shipped by an interrupted run" section** lists issues still wearing `shipped-local` whose code presence on this branch could NOT be verified. They are deliberately excluded from `Closes #N`. Check each one by content before assuming it landed; if it did not, it needs re-queueing, not closing.
 
-Subagent generates: per-issue commits, files touched, diffstat vs `origin/main`, ahead/behind, closed/open state. The spine of the run ledger — never skip; the user is otherwise blind to their own run.
+### 2. Run the gate
 
-### 4 — Adjudicate: shipped / partially-shipped / superseded / salvage / dead
+```
+pnpm verify:land        # or the project's equivalent
+```
 
-Per closed issue, verify by **content on main** (Rule 3). Classify: already-shipped · **partially-shipped** (some feature files present, others missing → salvage the missing slice, never "done") · superseded (verify by _intent_ — does main actually consume the purpose-built code? Rule 6) · needs-salvage (unshipped, stranded) · dead. Evidence-backed ledger, one line + verdict + proof each.
+This is the pre-merge check written down as one command — a disposable database plus the suites that CI would run if CI ran. It exits 0 only if every stage passed. Treat "0 items compared" from any stage as a failure, not a pass.
 
-**The GitHub close-reason is not proof of ship — treat it as UNPROVEN.** Any close whose reason is **not `COMPLETED`** (`NOT_PLANNED`, `DUPLICATE`, …), including a "superseded by #N" close, means the behaviour was never certified here. Read it deterministically: `tsx .sandcastle/scripts/issue-closure.mts <n>` (core `getIssueClosure` + `parseSupersededBy` in `.sandcastle/lib/state/gh.ts`) prints PROVEN vs UNPROVEN and, on a supersession, the successor issue numbers — it reads the issue body + every comment, where the "superseded by #N" note actually lives (the reason alone can't see it). On a supersession, **follow the chain, don't trust it**: prove the _destination_ issue's behaviour actually landed on main by **content** (Rule 3) + the wired-end-to-end check Stage 7 applies. If the chain dead-ends without landed, content-verified, reachable code, the scope is needs-salvage/dead — never "done". (This is exactly how a re-filed scope closed as "superseded by #N" after an e2e timeout was never wired and still read as shipped.)
+If it fails, that is a real blocker: fix or re-queue, do not merge past it.
 
-### 5 — Safe extraction (stranded work → main)
+### 3. Review proportionally
 
-Per needs-salvage branch: Rule 2 (name landmine files, exclude them). Prefer additive-only cherry-pick; if the WIP→finalize chain degenerates into empty commits (common on divergent bases, esp. security code), fall back to per-file base-relative reconstruction with a required test gate. Each extraction = its own PR/branch, typecheck + targeted tests before push.
+The diff is one PR of loop-authored code, so review it — but size the review to the diff, and do not invoke the full adversarial matrix by reflex. A focused pass on the actual changed surface beats a ceremonial one.
 
-**Drive EVERY stranded branch to a terminal verdict here — this is the step that stops `clean` from parking work in limbo.** After stage 4's classification, no branch may be left "preserved, undecided": already-shipped → mark for deletion; superseded/dead → confirm by intent and mark for deletion (record why in the ledger); needs-salvage/partially-shipped → land the additive slice (above), then mark the source for deletion. The output is a per-branch disposition (landed / confirmed-dead / re-queued) that `clean` can act on mechanically. If you can't reach a verdict on a branch, that's a decision-sheet item — never a silent "save for later".
+Apply the standing correctness checks that a sandbox structurally cannot verify:
 
-### 6 — Review gate (non-substitutable — Rule 4)
+- **Wired end-to-end** — grep real callers of every new procedure/route/component (exclude build output and its own tests). Zero non-test callers means not done, however green the tests are.
+- **Tests assert the right thing** — this repo has twice shipped suites that were green _because_ the bug was present. Check what each new assertion _should_ say, not just that it passes.
+- **Tenancy** — row-level security enabled with a policy on any new tenant table; real route guards, not hidden nav.
+- **Deploy config the sandbox can't see** — scheduled jobs and newly-required secrets. A shipped handler does nothing until something calls it on a schedule. Emit each as an explicit to-do for the human owner.
 
-Auto-shard the diff into coherent subsystems; run **one uncapped deep reviewer per shard** sized to file/commit count (a word-capped whole-diff pass surfaces 5 findings over 130 files — a skim, not an audit). THEN run `/thermo-review` and `superpowers:requesting-code-review`. On any reviewer severity disagreement, dispatch an adversarial adjudicator with a fixed rubric. Enforce 1:1 traceability: every finding → a tracked item + an explicit out-of-scope list. **Exit criterion:** done when every shard had one uncapped deep reviewer AND both named skills ran — not when a finding-count looks satisfying.
+### 4. Merge, then purge
 
-### 7 — Verification gate (the false-"done" catcher)
+Merge the PR. The `Closes #N` lines fire and the issues close — that is the whole landing step.
 
-Standing checks every completion, subagents returning file:line evidence:
+Then purge the retired run's coordination refs, on local, `origin`, and every host in `hosts.json`:
 
-- **Wired end-to-end:** grep callers of every new procedure (exclude `.next`/`dist`); a closed issue with zero callers is not done.
-- **Security/tenancy:** RLS `ENABLE`+policy on every new tenant table; route-guard (not just nav-hiding) on gated pages; no exported RLS-bypass procedure factories; IDOR on id-only lookups; secret/credential scan.
-- **Money/parity (project-specific):** no hardcoded side/status/role derivations; per-type flows diffed against the system-of-record before cutover. Block go-live on unverified parity.
-- **Deploy-config blind spots (ops-config to-do):** the sandbox cannot see production scheduling or secrets, so a slice can ship green and still be inert live. On EVERY run, look for deploy config the sandbox can't verify — **scheduled jobs** (a shipped handler does nothing until something calls it on an interval) and **newly-required secrets/env** — in whatever form THIS project uses (Vercel `vercel.json` crons, GitHub Actions `schedule:`, a system crontab, k8s `CronJob`, Fly/Render config; `process.env` / `os.environ` / `ENV[...]` reads). For a JS/TS-on-Vercel repo, `tsx .sandcastle/scripts/scan-ops-config.mts` (pure core `scanOpsConfig` in `.sandcastle/lib/ops-config/scan.ts`) auto-surfaces the common cron-route + `process.env` cases; on other stacks it prints `none` by design, so inspect the diff yourself for that stack's equivalents. Emit each blind spot as an explicit **ops-config to-do** in the run ledger (Stage 11) so the human owner provisions it — the loop cannot verify these itself, so an unowned one silently stops running (exactly how an emptied `vercel.json` left a background-read drainer un-scheduled).
+`refs/sandcastle/{lanes,peers,peer-status,status,conflict}/*` and `refs/locks/issue-*`
 
-### 8 — Land on main + push
+**Never touch `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*`** — those hold real preserved work. Leaving coordination refs behind poisons the next run: a stale lane tip once faked a merge conflict on iteration 1 and cost a whole session.
 
-- FF local `main` to `origin/main` first (every host).
-- The loop's `fastForwardIntegration` stops at the integration branch — **you** do the final hop: integration-branch → `main` (PR or `git merge --ff-only`) + push. Enforce merge order for shared files/migration journals. Run the repo's real merge gate locally if CI is down; treat "0 items compared" from any gate as a failure.
-- State the sequence once, upfront: **pre-merge gates → merge → post-merge hardening → launch gates.** P0s gate _launch_, not merge.
+### 5. Quarantined work, then hand off
 
-### 9 — needs-human / quarantine triage
+Any issue left `needs-human` or `quarantine` keeps its work on a WIP ref. Give each one a terminal verdict — landed, re-queued, or confirmed dead. Never leave one at "recommend recovery"; that is the limbo `clean` cannot act on.
 
-Per issue: checkpoint its work to a WIP ref if stop didn't already (reuse stop's `checkpoint-stop.mts` mechanic — don't hand-roll a second version; quarantine otherwise leaves it dangling/GC-bound). Classify — infra-timeout-work-intact (e.g. e2e cold-compile) vs deterministic-infra (no-output psql/OOM) vs real-code-bug. Then resolve to a **terminal disposition** from the stage-5 set (landed / cherry-picked / re-queued / confirmed-dead), not a dangling "recommend" — a needs-human branch left at "recommend recover" is exactly the limbo clean can't act on.
+Then hand to **`sandcastle-clean`**. Do not delete leftovers yourself.
 
-### 10 — Purge the retired run's coordination refs + lease locks (retirement)
+**Stop here. Do not launch the next run.**
 
-Once the run is landed, it is **retired** — and a retired run must leave **ZERO coordination refs behind.** These refs are cross-host scheduling state, not work; leaving them poisons the NEXT run. Purge, on **every** location — local, `origin`, and each host in `.sandcastle/hosts.json` — for the retired run's hosts:
+---
 
-- `refs/sandcastle/lanes/*`, `refs/sandcastle/peers/*`, `refs/sandcastle/peer-status/*`, `refs/sandcastle/status/*`, `refs/sandcastle/conflict/*`
-- `refs/locks/issue-*`
+# RECOVERY PATH (only when there is no run PR)
 
-Delete with `git update-ref -d <ref>` locally and per host (over `ssh <transport> --`, `cd <repoPath>` first), and `git push origin :<ref>` on origin.
+You are here because a run was hard-killed or predates the 2026-07-30 change. Tell the user that up front. The goal is to get the work into a PR and then rejoin the fast path — not to re-litigate the whole run.
 
-**CRITICAL — never delete `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*`.** Those are real preserved WIP, not coordination state. This purge is scoped to the scheduling/lease refs above and nothing else.
+**Iron rules for this path** (each maps to a real disaster):
 
-**Why this is a retirement step, not optional hygiene:** a retired run whose `refs/sandcastle/lanes/<hub>` still points at its archive tip (`87e4b18c` = `archive/hub-queue-20260723-salvaged`) fed that stale tip into the NEXT run's converge and **faked a merge conflict on iteration 1** — a full incident to untangle. Retiring without purging is the bug. Do it before handing to clean.
+1. **Never wholesale-merge a stranded branch.** A branch cut before a sibling merged will delete or rename the sibling's shipped files. `git diff --name-status <branch> main` FIRST; refuse if it deletes files `main` has. Extract the additive slice only.
+2. **Prove shipped by content, not status — and search by symbol, not by the branch's filenames.** Rebase and squash make ancestry lie, and the loop routinely lands work under different names and renumbered migrations. Before calling anything lost: grep the _symbol_ on `origin/main`, glob the feature _noun_ across the whole tree to catch renames, and compare `git patch-id --stable` pairwise. Only when all three come back empty is it genuinely unlanded. Skipping this produces false "lost work" alarms.
+3. **Reconcile before anything resumes.** If cross-host lanes diverged, merge the winner FIRST, then validate every `refs/sandcastle/wip/issue-N` against the winning tip (`git merge-base --is-ancestor`). Not an ancestor means poisoned — purge and re-queue rather than resume it onto the losing base. Enumerate wip refs on _every_ host; one living only on a remote host's local refs is invisible from here.
+4. **You orchestrate; subagents execute.** If you catch yourself tracing product code in the main thread to design a fix, stop and delegate.
+5. **Verify, don't relay.** Re-verify every inherited blocker and every subagent finding before repeating it as fact. Tag unconfirmed claims `[ASSUMED]`.
+6. **Record state in the issue/PR BODY, never in comments.** Comments go stale and are not reliably re-read. Edit the body in place.
 
-### 11 — Durable run ledger + then hand to clean
+**Sequence:** stop the loop cleanly → reconcile lanes if diverged → validate checkpoints → establish by content what is genuinely not on `main` → extract additive slices into a branch → open a PR → **rejoin the fast path at step 2.**
 
-Write everything (manifest, adjudication, findings→spec traceability, decisions, deferred debt, **and any ops-config to-dos from Stage 7**) to **`docs/sandcastle/runs/<run>.md` committed** AND a **GitHub tracking issue**. Deferred items carry a "dismissed by user" state so nothing re-surfaces after a ruling. **Then hand off to `sandcastle-clean`** to reap the now-terminal leftovers — do not delete them yourself.
+Give every stranded branch a terminal verdict before finishing: landed, confirmed dead, or re-queued. "Preserved, undecided" is what turns into next week's archaeology.
 
-## The decision sheet (how you involve the user — business-first)
+---
 
-Batch ALL genuine decisions into ONE sheet, pre-ranked with a recommended default each: **Must-fix (blocks merge/launch) · Should-fix · Cleanup · Genuine product decisions.** Lead with business impact + urgency + your recommendation; technical detail opt-in; auto-`/engl` for a non-technical owner. Act on everything safe/reversible without asking; only destructive-irreversible ops and real product WHAT-decisions reach the sheet.
+## Time-boxed mode
 
-## Quick reference
+"Demo in an hour" never licenses skipping the landmine check (rule 1) or prove-by-content (rule 2) — those prevent data loss, so rushing them costs work rather than saving time. The only sanctioned cut is narrowing the review surface to what is new on `main`, and saying so explicitly.
 
-| Need                 | Do                                                                                                                                                                |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Loop still running   | invoke `sandcastle-stop` first (don't reimplement)                                                                                                                |
-| Reconcile lanes      | `tsx .sandcastle/scripts/converge.mts --branch <b>`                                                                                                               |
-| Poisoned checkpoint? | `git merge-base --is-ancestor <winning-tip> refs/sandcastle/wip/issue-N` → not ancestor = purge + re-queue                                                        |
-| Landmine check       | `git diff --name-status <branch> main` → refuse deletes/renames of main's files                                                                                   |
-| Shipped?             | verify feature files/symbols on `main` by content, not ancestry/status                                                                                            |
-| Review               | `/thermo-review` + `superpowers:requesting-code-review`, both loaded                                                                                              |
-| Land to main         | FF local main; then integration-branch → main + push (you do this hop)                                                                                            |
-| Retire (purge refs)  | `git update-ref -d` (local/host) + `git push origin :<ref>` for `lanes/peers/peer-status/status/conflict/*` + `refs/locks/issue-*`; PRESERVE `strand/*` + `wip/*` |
-| Delete leftovers     | hand off to `sandcastle-clean` (last, never before landing)                                                                                                       |
+## The decision sheet
+
+Batch every genuine decision into ONE list, ranked: **Must-fix (blocks merge) · Should-fix · Cleanup · Product decisions.** Lead with business impact and your recommendation; keep technical detail opt-in. Act on everything safe and reversible without asking. Only irreversible operations and real product questions reach the user.
+
+Size the alarm to the blast radius before reporting. Two "critical" findings that had to be walked back cost more trust than they saved.
 
 ## Red flags — STOP
 
-- Writing your own kill/reap instead of invoking `sandcastle-stop` → **wrong skill**.
-- Deleting branches/worktrees yourself instead of `sandcastle-clean` → **wrong skill; and never before landing**.
-- `git merge` a branch without `--name-status` vs main → **landmine**.
-- Resuming a checkpoint before validating it against the reconciled winner → **poisons main**.
-- Trusting "issue closed"/"branch deleted" as proof it shipped → **verify content**.
-- Retiring a run but leaving its `lanes/peers/peer-status/status/conflict/*` or `refs/locks/issue-*` behind → **poisons the next run** (stale lane tip = faked iteration-1 conflict).
-- Touching `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*` during the coordination-ref purge → **that's preserved WIP, not scheduling state**.
-- Reading/editing product code in the main thread to design a fix → **delegate**.
-- 5 findings over 100+ files presented as an audit → **shard and go deep**.
-- Relaying a handoff "blocker" or a subagent finding as fact → **re-verify first**.
-- Moving to launch the next run → **completion ends at landed; hand to clean; stop**.
-
-## Rationalization table
-
-| Excuse                                    | Reality                                                                            |
-| ----------------------------------------- | ---------------------------------------------------------------------------------- |
-| "The loop said merged, so it's on main"   | The loop lands to a LOCAL branch and closes optimistically. Prove by content.      |
-| "Just merge the branch, it's faster"      | Stranded branches revert shipped siblings. `--name-status` first, always.          |
-| "I'll reconcile after I resume this WIP"  | Resuming losing-base WIP reverts the winner. Reconcile + validate BEFORE resume.   |
-| "I'll just stop/clean it here myself"     | Stop and clean are their own skills. Call them; fix them if weak. Don't fork them. |
-| "One review pass is enough"               | Word-capped whole-diff = skim. Shard + deep + the two named skills.                |
-| "I'll just trace this bug quickly myself" | Main-thread tracing pollutes context and is the executor's job. Delegate.          |
-| "The handoff says it's a blocker"         | Handoffs carry stale/wrong facts. Re-verify against source.                        |
+- Running the recovery pipeline when a run PR exists → **you are burning an hour for nothing**.
+- Adjudicating "closed but did it really ship?" on a post-2026-07-30 run → **structurally impossible now; you are re-deriving a guarantee**.
+- Calling work lost because the branch's filenames aren't on `main` → **check symbols and patch-ids first; renames and renumbering are normal**.
+- Writing your own kill/reap instead of `sandcastle-stop`, or deleting leftovers instead of `sandcastle-clean` → **wrong skill**.
+- `git merge` of a stranded branch without `--name-status` vs main → **landmine**.
+- Purging `refs/sandcastle/strand/*` or `wip/*` → **that is preserved work, not scheduling state**.
+- Ending a session with a handoff when a one-command fix was already identified → **finish it or block visibly; a handoff is not a substitute for the action**.
+- Moving on to launch the next run → **completion ends at landed. Hand to clean. Stop.**
