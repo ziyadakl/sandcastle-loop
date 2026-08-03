@@ -1,6 +1,6 @@
 ---
 name: sandcastle-run
-description: Start the sandcastle autonomous coding loop — on one machine or across multiple machines / all my hosts / this Mac + the VPS as one combined run. Use when the user wants to kick off the overnight loop or invokes /sandcastle-run, whether on this machine only or fanned out to every healthy host. Detects package manager, refuses to run on protected branches, then plans the run and ASKS the launch questions before spending anything — which machines, concurrency, and mode — in one batched picker, skipping only what the user's flags already answered. All-machines plans once then launches the same branch/mode/iterations on each host from the registry with per-host concurrency, skipping any host with a reason.
+description: Start the sandcastle autonomous coding loop — on one machine or across multiple machines / all my hosts / this Mac + the VPS as one combined run. Use when the user wants to kick off the overnight loop or invokes /sandcastle-run, whether on this machine only or fanned out to every healthy host. Detects package manager, refuses to run on protected branches, refuses to run on a dirty working tree (any uncommitted change or untracked file — no override), then plans the run and ASKS the launch questions before spending anything — which machines, concurrency, and mode — in one batched picker, skipping only what the user's flags already answered. All-machines plans once then launches the same branch/mode/iterations on each host from the registry with per-host concurrency, skipping any host with a reason.
 ---
 
 # Sandcastle Run
@@ -86,6 +86,34 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    - **`--branch` flag value.** Independent of current branch: if the user's flags include `--branch main` or `--branch master`, refuse. The orchestrator targets the value passed to `--branch`, not the current branch, so a feature-branch cwd does not make `--branch main` safe.
 
    **Common misreading.** If a recent commit appears on `main`, do not infer that `--branch main` was the mechanism. The pipeline puts merges on `main` via staging→main promotion or via PR, never via the orchestrator targeting `main` directly. Check the commit's actual provenance (PR number, branch lineage) before citing it as proof a flag worked.
+
+3b. **Clean working tree — HARD REFUSAL, no override.** The loop must never start on a dirty launch worktree. **Any** uncommitted change, staged change, or untracked file blocks the run — there is no "harmless" exception, no `--force`, and you do NOT stash, commit, or delete anything to get past it. Surface and stop.
+
+**Why this is absolute (2026-08-01 incident).** A dirty launch worktree does not fail loudly at launch — it fails silently at the _end_, after the whole night's spend. The orchestrator's final promotion fast-forwards `integration-candidate` → the run branch from the launch worktree, and git refuses that with local modifications present. The run then opens a PR whose body says `Closes #N` while containing **none of that work**; the actual commits survive only on `refs/sandcastle/strand/*` and `refs/sandcastle/wip/*` and have to be salvaged by hand. The file that causes it does **not** have to be related to the work — one stray untracked scratch file is enough. A whole overnight run came back `0 shipped / 3 stuck / 12 waiting for you` this way.
+
+The remote fan-out path already refuses dirty hosts (`launch.mts` reports `skipped (dirty-tree)`, see _Launch across all machines_ §4) — this step closes the same hole on the **local** launch, which had no equivalent gate.
+
+Run in the repo root the loop will launch from (`--repo-root` if the user passed it, else `$PWD`):
+
+```
+git -C <repo-root> status --porcelain
+```
+
+- **Empty output** → clean, continue silently.
+- **Any output** → **refuse.** Show the offending paths (they're already prefixed: `??` untracked, ` M` modified, `M ` staged, `UU` conflicted) and one short line: "the loop can't start on a dirty tree — a stray file blocks the final promotion and the run ends with a PR that ships nothing. Commit, stash (`git stash -u`), or delete these, then re-run." Stop. Do not offer to do it for them; another session may own those edits.
+
+Ignored files are already excluded (no `--ignored` flag), so `.sandcastle/worktrees/`, `.sandcastle/logs/`, `.env`, and `.last-run-mode` never trip this — they're covered by `.sandcastle/.gitignore`.
+
+**Also refuse on an interrupted git operation**, which blocks merges the same way and won't show up as modified files once resolved:
+
+```
+git -C <repo-root> rev-parse -q --verify MERGE_HEAD; \
+ls -d <repo-root>/.git/rebase-merge <repo-root>/.git/rebase-apply <repo-root>/.git/CHERRY_PICK_HEAD 2>/dev/null
+```
+
+Any hit = an in-progress merge / rebase / cherry-pick. Refuse with "finish or abort the in-progress `<merge|rebase|cherry-pick>` first (`git <op> --continue` or `--abort`), then re-run."
+
+**Re-check this immediately before launch, not only here.** Planning, branch creation (_Plan the run_ §4) and the §7 picker all take time, and a parallel session can dirty the tree in between. The check is nearly free — run `git status --porcelain` once more right before the `nohup` line (and before pushing the run branch on the all-machines path), and abort the launch if it's no longer empty.
 
 4. **Sandbox runtime preflight.** First detect which runtime the active profile needs, then run the matching preflight.
 
@@ -194,6 +222,12 @@ Exit `0` = tracked, continue. Non-zero = untracked (or `.sandcastle/` was never 
    - **Empty queue?** Stop with: "no open issues labeled `ready-for-agent` — planner has nothing to claim. Use `/triage-plus-skills` to stamp `type:X` and `ready-for-agent` on triaged issues first." Also treat the queue as effectively empty when `SANDCASTLE.md` exists at the repo root AND _every_ ready issue is missing a `type:` label — the planner excludes all of them and the loop would exit on iteration 1. Same message.
    - **Under-provisioned?** If `count < iterations × max-concurrent`, warn with: "queue has N issues but the loop is configured for up to iterations × max-concurrent slices — loop may exit early when claimable runs out. Proceed?" Don't refuse — the user may want to launch anyway and let the loop exit cleanly when claimable runs out. **Suppress this warning when the planning stage (_Plan the run_ §6) auto-sized iterations** — the over-provisioning is deliberate headroom for issues grilled in mid-run, not a misconfiguration.
    - **Dependency-blocked?** Case-insensitive substring match in title OR body for any of `blocked on #`, `depends on #`, `blocks #`, `blocked by #`, `waiting on #` — a broad operator heuristic. But the planner only ENFORCES the directive **`Blocked by: #N`** (colon required; `Blocked-by:` too), per `.sandcastle/plan-prompt.md` HARD RULE 2 / ADR 0013. The other phrasings — and a bare `blocked by` with no colon — are prose the planner IGNORES: if a match uses one of those, warn that ordering will NOT be honored and to rewrite it as `Blocked by: #N`. For a referenced blocker, the planner treats it as resolved ONLY when it is **closed** (absent from the open-issue list) — NOT merely labeled `done` / `merged-to-staging` while still open. Warn on any still-open blocker with the affected issue numbers — heuristic, not a contract. (Real example: a loop exited at iteration 4 because every remaining slice was blocked on a single unshipped issue.)
+   - **Blocker concentration — compute it, state the number, and make the user choose.** "Some issues are blocked" is not the finding that matters; **how much of the queue collapses onto one unshipped ticket** is. Build the `Blocked by: #N` graph over the ready set and, for each blocker, count how many ready issues depend on it **transitively** (a chain like #811→#809→#803 counts against #803). Then compare the largest count to the queue size.
+
+     If any single blocker gates **half or more** of the ready queue, stop and put it to the user before spending anything, with the real arithmetic: "N of M ready issues depend on #B, directly or through a chain. The loop dispatches at most `max-concurrent` issues per wave and cannot start a blocked issue. If #B fails or quarantines, every one of those N is dead for the rest of the run and the loop drains after one wave — the remaining iterations are unreachable." Offer the two real options: **ship the blocker first** as its own short run, confirm it lands, then launch the dependents; or **launch anyway** knowing the run is one-wave-deep if the blocker fails.
+
+     Do not soften this into a passing note in a longer report. A prose warning already existed here and did not stop the 2026-08-02 run, where 6 of 9 ready issues hung off one ticket: it failed, the planner correctly found nothing claimable on iteration 2, and the run ended at 2 of 50 iterations having spent $88.72 to ship one issue. Iteration count and budget were never the constraint — the shape of the dependency graph was, and it was knowable before launch.
+
    - **Never advise "holding" a blocked issue by removing `ready-for-agent`.** A `Blocked by: #N` issue should stay `ready-for-agent` with the note in its body — the planner auto-excludes it while #N is open and auto-claims it once #N closes (ADR 0013). Unlabeling it to "hold" it defeats the auto-pickup: the planner can't see a label-less issue.
 
 9. **`psql` present on the local host? — REFUSE if missing.** The host-side migration applier (`main.mts` → `applyMigrationsBetween` in `.sandcastle/lib/migrations/drizzle-applier.ts`) shells out to `psql` on the machine running the loop. If `psql` is absent, **every** schema-touching issue fails the migration step with the misleading `migrations failed: psql exited 1 with no parseable ERROR lines: (no output)` and quarantines to `needs-human` — the loop looks like it's working but silently poisons every migration issue. Catch it here:
@@ -213,6 +247,28 @@ Exit `0` = tracked, continue. Non-zero = untracked (or `.sandcastle/` was never 
     - **Stale per-issue worktrees:** for each `.sandcastle/worktrees/agent-issue-*`, if its branch sits at the base SHA with **no new commits**, `git worktree remove --force <path>` and delete its branch. **PRESERVE any preserved-WIP worktree** — one checked out on a `wip/issue-*` branch holds real checkpointed work; never remove it.
     - **Orphaned containers:** `docker rm` any **exited** `sandcastle-*` containers (skip when `sandbox_runtime == "mac-host"` — no docker). Leave running containers alone.
     - Delete op — only remove a worktree once you've confirmed its branch is at base with no commits, and only remove exited (not running) containers.
+    - **This step deliberately keeps any `agent/issue-*` branch that HAS commits** — that's real work, don't sweep it. But a kept branch is exactly the one that gets silently resumed at its old tip. **Step 12 gates those; do not treat "reap ran" as covering them.**
+
+12. **Stale leftover `agent/issue-*` branches — REFUSE, with the remedy.** This is the check that would have saved the 2026-08-02 run. The orchestrator does not always cut a fresh per-issue branch: when a branch named `agent/issue-N` already exists on disk, `git worktree add` hands back **that branch at its own existing tip**, not a new one off current HEAD. Nothing in the loop compares that tip against the run branch. So a branch left behind by an earlier run resumes a copy of the world from whenever it was abandoned — and the agent reasons correctly against code that no longer reflects reality, fails to verify, and quarantines. There is no error, no warning, and no cheap way to notice from the outside.
+
+    Run this **after** the run branch is checked out (_Plan the run_ §4) — that's the only moment `<name>` is definitive on both the fresh and relaunch paths — and before the `nohup` line:
+
+    ```
+    for b in $(git for-each-ref --format='%(refname:short)' 'refs/heads/agent/issue-*'); do
+      git merge-base --is-ancestor <name> "$b" 2>/dev/null || echo "STALE $b $(git rev-parse --short "$b")"
+    done
+    ```
+
+    - **No output** → every leftover branch already contains the run branch's tip; continue silently.
+    - **Any `STALE` line** → **refuse.** For each, resolve the issue number from the branch name and report: the branch, its tip SHA, the date and subject of its last commit (`git log -1 --format='%ad %s' --date=short <branch>`), and whether that issue is in this run's claimable set. Say plainly: "these will be resumed at a stale base and will burn a full slice each producing nothing."
+
+    **Remedy — offer both, let the user pick; never decide for them.** Deleting a branch with commits is a delete op, so cite the tip SHA per branch first:
+    - **Discard and start clean** (right when the old attempt predates a fix it depended on): archive it to `refs/sandcastle/archive/issue-<N>-stale-<date>` via `git update-ref`, remove any attached worktree (`git worktree remove --force .sandcastle/worktrees/agent-issue-<N>`), then `git branch -D agent/issue-<N>`. The archive ref is free, invisible, and makes the discard reversible.
+    - **Bring it current** (right when the old attempt holds work worth keeping): `git rebase <name> agent/issue-<N>`. If it conflicts, stop — do not resolve conflicts on the user's behalf inside a launch.
+
+    Only branches whose issue is **not** in the claimable set may be left alone, and say so explicitly rather than silently ignoring them.
+
+    **PRESERVE `wip/issue-*` branches and `refs/sandcastle/wip/*` refs** — those are checkpointed in-flight work with their own resume path, not leftovers. Never include them in this sweep.
 
 ## All-machines preconditions (all-machines path ONLY — refuse loudly if unmet)
 
@@ -228,7 +284,8 @@ Run these only when you're on the all-machines fork. They're in addition to the 
    - **Delete the stale ones:** local/host `git update-ref -d <ref>` (remote: `ssh <alias> 'git -C <repoPath> update-ref -d <ref>'`); origin `git push origin :<ref>`.
    - **CRITICAL — PRESERVE `refs/sandcastle/strand/*` and `refs/sandcastle/wip/*`.** Those hold real checkpointed WIP; deleting them destroys in-flight work. Never sweep them.
    - This is a delete op: cite the evidence per ref (the commit tip it points at, and that it's absent from the run branch / matches an archive tag) before removing.
-6. **Per-host reconcile + reap.** Run pre-flight steps 10 (reconcile orphaned lease state from a dead prior run) and 11 (reap stale worktrees + exited `sandcastle-*` containers) on **each** targeted host, not just local — a host that crashed on a previous run carries its own stranded locks, `in-progress` labels, worktrees, and containers. Same preserves apply per host: never touch a live peer's lock, and never remove a `wip/issue-*` worktree.
+6. **Clean tree on EVERY host — refuse the host, don't force it.** Pre-flight step 3b gates the local machine; extend it to each remote target via its transport: `ssh <alias> 'git -C <repoPath> status --porcelain'`. Non-empty on a host = that host does **not** launch. Report it as `skipped (dirty-tree)` with the offending paths and move on; never `-f`, stash, or clean a remote checkout on the user's behalf. The same silent end-of-run promotion failure applies per host, so a dirty host burns a night and ships nothing.
+7. **Per-host reconcile + reap.** Run pre-flight steps 10 (reconcile orphaned lease state from a dead prior run) and 11 (reap stale worktrees + exited `sandcastle-*` containers) on **each** targeted host, not just local — a host that crashed on a previous run carries its own stranded locks, `in-progress` labels, worktrees, and containers. Same preserves apply per host: never touch a live peer's lock, and never remove a `wip/issue-*` worktree.
 
 ## Plan the run (auto-scoping for bare invocations)
 
@@ -263,7 +320,8 @@ You already have the claimable set from step 8 (`gh issue list --state open --la
    - **If that branch already exists** (`git rev-parse --verify --quiet refs/heads/<name>`), **reuse it** — continue the same batch. This is the relaunch path after a drain (§8). Do NOT suffix `-2`; reusing keeps re-launched work on one branch. Check it out in the launch worktree: `git checkout <name>`.
    - If it doesn't exist, **create it and check it out** in the launch worktree: `git checkout -b <name> <base>`.
    - Pass `--branch <name>` to the loop. **The launch worktree MUST be on `<name>`** — this is load-bearing, not cosmetic. The orchestrator cuts each per-issue worktree from the launch worktree's _current HEAD_ (the SDK runs `git worktree add -b <issue> <path> HEAD`, not off `--branch`), and `fastForwardIntegration` advances `<name>` through whichever worktree has it checked out. If the launch worktree is parked on a stale branch, every merged issue re-bases off that stale HEAD and silently re-does the foundation — the layering bug. (Earlier versions of this step created the ref _without_ checking out on the theory that the orchestrator bases worktrees on `--branch`; that theory is false — verified in the SDK's `WorktreeManager` and `main.mts` `fastForwardIntegration`.)
-   - The checkout needs a clean-enough tree. If `git checkout` refuses because another session left uncommitted changes, **stop and surface it** — don't `-f`. Starting an unattended run over another session's live edits is the failure this whole step exists to prevent.
+   - The tree is already required to be **fully clean** by pre-flight step 3b — not merely "clean enough to check out". If `git checkout` refuses here anyway, a parallel session dirtied the tree after 3b passed: **stop and surface it**, never `-f`. Re-run 3b's `git status --porcelain` and abort the launch if it's non-empty. Starting an unattended run over another session's live edits is the failure this whole step exists to prevent.
+   - **Now run pre-flight step 12** (stale leftover `agent/issue-*` branches). It is deferred to here because it compares each leftover branch against `<name>`, which only becomes definitive once the checkout above has happened — on both the fresh and the relaunch path. Do not skip it because pre-flight "already passed": step 11's reaper deliberately preserves the branches step 12 catches.
 
 5. **Recommend concurrency** — this becomes the pre-selected default for the §7 question; the user can override it there. Recommend `2` (independent slices of one cohesive group). Recommend `1` (sequential) on collision risk:
    - the run spans 2+ groups, OR

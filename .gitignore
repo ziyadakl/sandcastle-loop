@@ -14,3 +14,6 @@ prd.json.lock
 .DS_Store
 # Local Claude Code tooling/session dir — machine-local, not project state.
 .claude/
+
+# local scratch (spec/issue drafts in progress)
+.scratch/

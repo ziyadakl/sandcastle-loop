@@ -29,6 +29,7 @@ gh pr list --head <run-branch> --state open --json number,title,body,isDraft
 ```
 
 - **A PR exists → FAST PATH.** This is the normal case. Go there. Do not adjudicate, do not hunt stranded branches, do not reconcile.
+- **The PR already merged before completion ever ran → FAST PATH, retroactively.** Every run PR goes through this skill, merged or not: find the merge commit and run every step below over the range `<merge>^1..<merge>` in place of the PR diff. That the run landed unreviewed is itself a finding — say so.
 - **No PR exists → RECOVERY PATH.** Only reachable via `kill -9`, a pre-2026-07-30 run, or a bug. Say so explicitly to the user before spending their time on it — an unexpected recovery path is itself a finding worth reporting.
 
 **Loop still running?** Invoke `sandcastle-stop` first. Detect with a **cwd-filtered** pgrep (a bare `pgrep -fl main.mts` matches other repos' loops and false-positives). Never hand-roll a kill — a `kill -9` strands lease locks and is the one thing that can force the recovery path.
@@ -56,9 +57,9 @@ This is the pre-merge check written down as one command — a disposable databas
 
 If it fails, that is a real blocker: fix or re-queue, do not merge past it.
 
-### 3. Review proportionally
+### 3. Review the run as one body of work
 
-The diff is one PR of loop-authored code, so review it — but size the review to the diff, and do not invoke the full adversarial matrix by reflex. A focused pass on the actual changed surface beats a ceremonial one.
+**Run BOTH `/thermo-review` and `/superpowers:requesting-code-review` over the run PR as a whole. This is mandatory, not sized to the diff** — the loop's own reviewers judge each ticket alone, so until this pass nobody has ever judged the tickets together.
 
 Apply the standing correctness checks that a sandbox structurally cannot verify:
 
@@ -77,13 +78,17 @@ Then purge the retired run's coordination refs, on local, `origin`, and every ho
 
 **Never touch `refs/sandcastle/strand/*` or `refs/sandcastle/wip/*`** — those hold real preserved work. Leaving coordination refs behind poisons the next run: a stale lane tip once faked a merge conflict on iteration 1 and cost a whole session.
 
-### 5. Quarantined work, then hand off
+### 5. Quarantined work and findings, then hand off
 
 Any issue left `needs-human` or `quarantine` keeps its work on a WIP ref. Give each one a terminal verdict — landed, re-queued, or confirmed dead. Never leave one at "recommend recovery"; that is the limbo `clean` cannot act on.
 
+**Every review finding gets the same terminal verdict and a durable home in an issue BODY before the session ends** — nothing is left to the owner's memory. Findings do NOT go into the issues this PR just closed (nobody re-reads a closed body) and are not bolted onto tickets already queued for the next run; put each on an existing OPEN issue where one fits, and create a new one only when none does. **Search open issues before filing anything** — the first time that check ran it caught a real duplicate.
+
+Re-derive any queue count with the actual label query before stating it — never from memory or a session-start printout — and **if the queue grew, say it grew.**
+
 Then hand to **`sandcastle-clean`**. Do not delete leftovers yourself.
 
-**Stop here. Do not launch the next run.**
+**Stop here. Do not launch the next run.** A finding about the loop MACHINERY itself, as opposed to the product, is not queue work — it is fixed before the next run launches.
 
 ---
 
@@ -108,13 +113,15 @@ Give every stranded branch a terminal verdict before finishing: landed, confirme
 
 ## Time-boxed mode
 
-"Demo in an hour" never licenses skipping the landmine check (rule 1) or prove-by-content (rule 2) — those prevent data loss, so rushing them costs work rather than saving time. The only sanctioned cut is narrowing the review surface to what is new on `main`, and saying so explicitly.
+"Demo in an hour" never licenses skipping the landmine check (rule 1) or prove-by-content (rule 2) — those prevent data loss, so rushing them costs work rather than saving time. The only sanctioned cut is narrowing the reviewed surface to what is new on `main`, and saying so explicitly — it never licenses skipping either `/thermo-review` or `/superpowers:requesting-code-review`.
 
 ## The decision sheet
 
 Batch every genuine decision into ONE list, ranked: **Must-fix (blocks merge) · Should-fix · Cleanup · Product decisions.** Lead with business impact and your recommendation; keep technical detail opt-in. Act on everything safe and reversible without asking. Only irreversible operations and real product questions reach the user.
 
-Size the alarm to the blast radius before reporting. Two "critical" findings that had to be walked back cost more trust than they saved.
+Grade every finding against the eight quality axes: **correctness, security, performance, efficiency, scalability, maintainability, hygiene, future-proofing.** You may drop a finding for being **wrong** — never for being expensive, tedious, or "too much effort". Count the real call sites before proposing a multi-slice sequence: expand-migrate-contract is for a change that breaks many callers, not two, and seven tickets landing must not leave nine behind.
+
+Size the alarm to the blast radius before reporting — that governs how loudly a finding is reported, not whether it counts. Two "critical" findings that had to be walked back cost more trust than they saved.
 
 ## Red flags — STOP
 
