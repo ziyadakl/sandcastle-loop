@@ -29,7 +29,7 @@ But **do not re-ask what the user already said**: phrasing like "stop now", "kil
 
 These are orthogonal to the path. A single-machine stop can be `--now` too; do not treat `--now` as an all-machines-only feature.
 
-- **graceful (default):** each loop finishes the issue it's on, then exits. Nothing is lost; on exit it releases its held leases so a peer reclaims the remaining queue immediately (no 15-min wait). Use when you have time and a connection.
+- **graceful (default):** each loop finishes the issue it's on, then exits. Nothing is lost; on exit it releases its held leases so a peer reclaims the remaining queue immediately (no 15-min wait), **and releases the `in-progress` label on every issue it still holds**, so the board stops showing stopped work as "being built now". (It only ever releases issues THIS run claimed that are still `in-progress`, and never one a live peer has taken over.) Use when you have time and a connection.
 - **`--now` (immediate):** kill each loop right away, then **reap** — checkpoint each in-flight issue (commit its worktree, push the work to a WIP ref), release its lease (delete its `refs/locks/issue-N` lock), release its `in-progress` label, and correct its status file — so another machine continues that issue from the checkpoint instead of redoing it, and nothing is left claiming to be in flight. Use when you're leaving your desk / about to lose internet. The checkpoint push runs while you're still online; if it can't reach origin, the peer still reclaims via the lease TTL.
 
 **`--now` means seconds, not minutes.** Exactly ONE thing may precede the first signal: the cwd-filtered PID scope (it stops you killing another project's loop — a real bug that has shipped here, not a hypothetical). Everything else — liveness freshness, integration-branch discovery, host reporting, PID confirmation — happens AFTER the signal. Do not narrate the scoping. If you are typing a sentence before the first `kill`, you are already too slow.
@@ -70,11 +70,15 @@ These are orthogonal to the path. A single-machine stop can be `--now` too; do n
 
    A SIGKILL'd loop cannot clean up after itself — SIGKILL is uncatchable, so no handler runs. This external reap is the ONLY thing that can clean up on its behalf. Skipping it is what makes the viewer lie.
 
-   **What the script verifiably does** (`checkpoint-stop.mts` → `lib/state/checkpoint-stop.ts`, verified 2026-07): for each in-flight worktree that has work to save it pushes a WIP ref AND **deletes the lease lock** — `git push origin :refs/locks/issue-<N>` (confirmed in `releaseLeaseRef`) — and on exit it reconciles `status.json` to `stopped` (`markStatusStopped`). So the lease-lock deletion and status correction ARE guaranteed by the script. **What it still does NOT do — finish these BY HAND:**
-   - **Labels — the real gap:** the script touches NO labels. For each issue the loop held, `gh issue edit <N> --remove-label in-progress --add-label ready-for-agent`. Without this the queue thinks a dead machine still owns the issue. (Safe: resume finds saved work via the WIP ref, not the label.)
+   **What the script verifiably does** (`checkpoint-stop.mts` → `lib/state/checkpoint-stop.ts`, verified 2026-08-05): for each in-flight worktree that has work to save it pushes a WIP ref AND **deletes the lease lock** — `git push origin :refs/locks/issue-<N>` (confirmed in `releaseLeaseRef`); it **flips the `in-progress` label back to `ready-for-agent`** for every issue it swept whose work is safe (`checkpointed`) or that had nothing to save (`nothing-to-save`); and on exit it reconciles `status.json` to `stopped` (`markStatusStopped`). Lease-lock deletion, the label flip and the status correction are ALL guaranteed by the script now — the label flip used to be a hand step and is not one any more.
 
-     > **NOTE FOR MAINTAINER:** `checkpoint-stop` deletes the lease lock but does **not** flip `in-progress`→`ready-for-agent` itself, so a hand-`kill -9` that skips this skill (or any reap that forgets the manual step) leaves orphaned `in-progress` labels that stall the next launch. Patch the script to flip the label alongside the lease-lock delete so this stops being a hand step, and re-verify `checkpoint-stop.mts` still deletes `refs/locks/issue-N`.
+   **Read its per-issue output — it tells you the label's fate, and it can say no.** Each line carries one of:
+   - `label released → ready-for-agent` — done, nothing left claiming that issue.
+   - `label was not in-progress (nothing to release)` — normal, and deliberately not a flip. That worktree is a leftover from an issue that already shipped; the script refuses to add `ready-for-agent` to a finished ticket (that would re-queue work already on main). `/sandcastle-clean` is what removes the worktree.
+   - `label release FAILED, still in-progress: <reason>` — the work was saved but the board is still lying. The tally repeats it as `N label-release FAILED`. Fix it: `gh issue edit <N> --remove-label in-progress --add-label ready-for-agent`.
+   - `label LEFT in-progress (work not saved — do not re-claim)` — deliberate. That issue's WIP push failed, so its work exists only on that machine's disk; the label is holding the ticket for it. Do NOT hand-flip it — say so in your report instead, and get the work off that machine first.
 
+   **What it still does NOT do — finish these BY HAND:**
    - **`nothing-to-save` leases:** the script only deletes the lock for worktrees it actually checkpointed — a clean, not-ahead worktree keeps its lease (module header decision #4). `git ls-remote origin 'refs/locks/*'` — an expired lease is inert (peers reclaim anyway), so leave it. Only mention it if the user asks. **Self-owned stale lease (reclaim NOW, don't wait the TTL):** when you're re-stopping or about to relaunch on the SAME host, any lease still tagged to this host's OWN just-killed run is your own corpse, not a live peer — treat it as reclaimable immediately: delete it (`git push origin :refs/locks/issue-<N>`, or `git update-ref -d` locally) so the relaunch doesn't read it as "another host working it" and stall. The reap should clear these; if one survives, clear it here.
    - **Status file:** the script already reconciles it to `stopped`, but if `status.json` still reads `state: "running"`, or carries in-flight `issues[]` / a stale `activity` / a non-zero `totals.running` while nothing runs, correct it by hand — that file is what the viewer reads.
 
@@ -82,13 +86,21 @@ These are orthogonal to the path. A single-machine stop can be `--now` too; do n
    - `state == "stopped"` (fresh `updatedAt`) → confirmed graceful stop. Report the final iteration. **Next step is `/sandcastle-complete`** to land the run's work onto main — it's still sitting on the local integration branch, not yet shipped. `/sandcastle-clean` comes AFTER that (it deletes what completion has driven to terminal), never before.
    - `state` still `running` (frozen `updatedAt`) → the loop **died hard, it did not stop gracefully** — say exactly that. The graceful-stop contract was NOT honored (e.g. an OOM/crash mid-iteration, or a SIGKILL). Point the user at `.sandcastle/run.log` for the last lines, and warn there may be half-written state to clean up.
 
+6. **CHECK the board yourself — automatic is not the same as verified.** Both paths now release labels in code, and a code path that silently no-ops looks identical to one that worked. So look, every time:
+
+   ```
+   gh issue list --label in-progress --json number,title
+   ```
+
+   Empty → say so; that is the sentence the user actually wants. Anything listed → name each one and say why it's there: a live peer still working it (fine — say which host), a `label release FAILED` line from the reap (flip it now: `gh issue edit <N> --remove-label in-progress --add-label ready-for-agent`), or a deliberate `work not saved` hold (leave it, and say the work is stranded on that machine). Never end a stop with an unexplained `in-progress`.
+
 ---
 
 ## All machines (`--all` / `--host`)
 
 1. **Find running hosts — in PARALLEL.** Read `.sandcastle/hosts.json`. For each host, detect a live loop for THIS repo using the same cwd-filtered pgrep as the single-machine path above — locally for this machine, and over `ssh <transport> --` for each remote host (compare each surviving process's cwd against that host's repo path). **Fan the ssh calls out concurrently, not serially**, and do NOT report which hosts are running before signalling — fold that into the final report. Default target = all running; or one via `--host <name>`.
 
-2. **Graceful path (default):** send `SIGTERM` to each target's loop PID (locally, or over ssh). Poll its `status.json` up to ~30s for `state: stopped`. The loop's own shutdown releases its leases (ADR 0021 §4). Escalate to `SIGKILL` only with explicit user OK — and if you do, the reap in 3b is then MANDATORY for that host.
+2. **Graceful path (default):** send `SIGTERM` to each target's loop PID (locally, or over ssh). Poll its `status.json` up to ~30s for `state: stopped`. The loop's own shutdown releases its leases (ADR 0021 §4) and then the `in-progress` labels it still holds — each host releases only its OWN, and skips any issue a live peer has taken over, so hosts stopping at different moments never steal each other's tickets. Escalate to `SIGKILL` only with explicit user OK — and if you do, the reap in 3b is then MANDATORY for that host.
 
 3. **`--now` path:**
    a. **`SIGKILL` each host as soon as its own scope returns** — do not wait for the full sweep, and do not discover the integration branch first. Nothing about killing a process needs the branch; only the reap does. The per-issue worktrees survive on disk.
@@ -98,9 +110,9 @@ These are orthogonal to the path. A single-machine stop can be `--now` too; do n
    tsx .sandcastle/scripts/checkpoint-stop.mts --integration-branch <run-branch> [--repo-root <path>]
    ```
 
-   It finds the abandoned `agent/issue-<N>` worktrees, commits+pushes each to `refs/sandcastle/wip/issue-<N>`, deletes each `refs/locks/issue-<N>` lease so a peer reclaims immediately, and reconciles `status.json` to `stopped`. It reports one line per issue (`checkpointed` / `nothing-to-save` / `error`). **It does NOT touch labels** (and it leaves the lease on any `nothing-to-save` worktree) — finish those by hand per the single-machine path's step 4, on each host you killed.
+   It finds the abandoned `agent/issue-<N>` worktrees, commits+pushes each to `refs/sandcastle/wip/issue-<N>`, deletes each `refs/locks/issue-<N>` lease so a peer reclaims immediately, flips each swept issue's `in-progress` label back to `ready-for-agent`, and reconciles `status.json` to `stopped`. It reports one line per issue (`checkpointed` / `nothing-to-save` / `error`) with that issue's label outcome appended. Read those label outcomes on EVERY host you reaped — a `label release FAILED` line is yours to finish by hand; it leaves the lease on any `nothing-to-save` worktree per the single-machine path's step 4.
 
-4. **Report** per host: stopped (graceful) or the reap summary (`--now`). Confirm every target is down (re-read `status.json` / re-run the cwd-filtered pgrep).
+4. **Report** per host: stopped (graceful) or the reap summary (`--now`). Confirm every target is down (re-read `status.json` / re-run the cwd-filtered pgrep), then run the single-machine path's **step 6 board check ONCE for the whole run** — `gh issue list --label in-progress` is repo-wide, not per-host, so one look covers every machine. Anything still listed gets named and explained.
 
 ## Talking to the user
 
@@ -111,3 +123,5 @@ For `--now` (either path), make the guarantee explicit: the in-flight work is sa
 **Diverged-run caveat (do not skip on a multi-host run):** a saved checkpoint must NOT be resumed until `/sandcastle-complete` has reconciled the lanes and validated that checkpoint against the winning tip — resuming losing-base work silently reverts the winner. So when the hosts' lanes have diverged, point the user at `/sandcastle-complete` BEFORE any `/sandcastle-resume`. Peer auto-reclaim is safe when lanes agree; it is the divergence case that needs completion first.
 
 **Report what you actually left behind.** The reap is the difference between "stopped" and "stopped and tidy", and its gaps are the user's problem, not an implementation detail. If any label, lease or status file is still claiming work is in flight when you finish, say so plainly and say what you did about it. A stop that reports "done" while the viewer still shows work in progress is the single loudest way this tool lies to its user — and the user WILL see it on their phone.
+
+**Automatic does not mean unverified.** Both paths release labels in code now, so the hand step is gone — the CHECK is not. Run step 6, look at the real board, and let the report say what you saw rather than what the code intends. "Nothing is left showing as in progress" is a claim about the world; earn it every time. (2026-08-05: a run stopped at 16:11 UTC still had four tickets showing "BEING BUILT NOW" at 19:30 because nothing looked.)
