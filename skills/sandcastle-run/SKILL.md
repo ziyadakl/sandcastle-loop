@@ -56,7 +56,7 @@ If you catch yourself typing a sentence that explains a check that passed, delet
    - `codex` (`--backend codex`): uses Codex's own auth, not one of these keys. **Skip this check** (codex auth is validated on its own path).
    - `--provider kimi` → require `KIMI_API_KEY`.
    - `--provider glm` → require `GLM_API_KEY`.
-   - `--provider anthropic` → require `ANTHROPIC_API_KEY`.
+   - `--provider anthropic` → same as the default: no key, skip this check. Never ask for `ANTHROPIC_API_KEY`; it bills the paid API instead of the subscription.
 
    When a key IS required, confirm it resolves from at least one source. Quick shell test (substitute the required var):
 
