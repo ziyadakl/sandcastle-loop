@@ -71,11 +71,11 @@ If you find a project with stale `.sandcastle/` files but no `sandcastle-loop` i
    3. `<repoRoot>/.env` (project-local override)
    4. `~/.config/sandcastle/.env` (host-level default — set once, every project + worktree inherits it)
 
-   **Strongly prefer the host-level file** for keys the user wants everywhere (`KIMI_API_KEY`, `GLM_API_KEY`, `ANTHROPIC_API_KEY`, `GH_TOKEN`). Use `<repoRoot>/.env` only for project-specific overrides (e.g. a different `DATABASE_URL`).
+   **Strongly prefer the host-level file** for keys the user wants everywhere (`KIMI_API_KEY`, `GLM_API_KEY`, `GH_TOKEN`). Never set `ANTHROPIC_API_KEY` for the loop: it bills the paid API instead of the subscription. Use `<repoRoot>/.env` only for project-specific overrides (e.g. a different `DATABASE_URL`).
 
    Detect what auth the user already has and act accordingly. The user is assumed to be on a Claude subscription (Pro / Max / Team) and using Claude Code locally:
 
-   - Check `~/.claude/.credentials.json` — if it exists, no `ANTHROPIC_API_KEY` is needed (the orchestrator's docker sandbox mounts the credentials and Claude Code inside the sandbox uses the user's subscription).
+   - Check `~/.claude/.credentials.json` — if it exists, no extra key is needed (the orchestrator's docker sandbox mounts the credentials and Claude Code inside the sandbox uses the user's subscription).
    - Run `gh auth status` — if it succeeds, the user is logged in. BUT on macOS `gh` defaults to the system Keychain (`--secure-storage`), which means the token does NOT live in `~/.config/gh/hosts.yml` — only a reference to it does. The sandbox mount of `~/.config/gh/` therefore can't supply the token, and `gh issue list` inside the container returns 401. Detect and patch:
      - Read `~/.config/gh/hosts.yml`. If it contains a line matching `oauth_token:` (any value), the file already carries a usable token — sandbox mount alone is enough. Skip the next step.
      - Otherwise (Keychain-stored token, the macOS default): run `gh auth token` to extract the token. If extraction succeeds, append `GH_TOKEN=<token>` to `~/.config/sandcastle/.env` (creating the dir first: `mkdir -p ~/.config/sandcastle`; set perms after write: `chmod 600 ~/.config/sandcastle/.env`). The orchestrator's docker provider passes `.env` through as container env vars and `gh` honours `GH_TOKEN` when `hosts.yml` lacks one.
