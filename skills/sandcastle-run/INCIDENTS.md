@@ -48,6 +48,14 @@ So a branch left behind by an earlier run resumes a copy of the world from whene
 
 The reaper deliberately preserves these branches because they hold commits — which is exactly why they need their own gate rather than being swept.
 
+## Stale run branch → the whole run builds on old code (2026-08-28)
+
+The run branch is not always cut fresh. Phase 2's reuse path hands back an existing `sandcastle/<theme>-<date>` at its own tip — and a branch from an earlier day forks from a `main` that has since moved on. Cutting a fresh branch off whatever branch you happen to be sitting on has the same failure when that branch is itself behind `main`.
+
+Real incident: a `sandcastle/queue-20260828` left over from a session three days earlier was reused. It forked from `main` at an Aug 25 commit, 26 commits behind, and missed the #1150 change that reserves `needs-human` for handoffs and tags loop failures `quarantine`. Every issue the loop touched built on 3-day-old machinery and app code: it re-did already-shipped work, failed, and mislabeled every failure with the old `needs-human` scheme. From the outside the run looked healthy. The whole night had to be reaped, the branch deleted, and eight issues' labels reconstructed from their event history by hand.
+
+Nothing compared the run branch's base against `origin/main`. The reuse path and the fresh-cut-off-a-stale-current-branch path both reach the same hole, so the gate lives on the one condition that catches both: `origin/main` must be an ancestor of the run branch.
+
 ## Ghost cross-host refs → a faked conflict on iteration 1
 
 Stale coordination refs from a retired or previous run poison the cross-host sync. Real incident: `refs/sandcastle/lanes/<hub>` still pointed at a retired queue's archive tip and faked a merge `CONFLICT` on iteration 1.
@@ -78,8 +86,10 @@ If the launch worktree is parked on a stale branch, every merged issue re-bases 
 
 ## Launch-line traps that cost a whole run
 
+- **A loop launched from a chat dies with the chat app (2026-10-13, VPS).** `nohup … & disown` detaches from the shell but stays inside the launching app's systemd service. At 18:20:31 UTC `t3code.service` restarted, and systemd SIGKILLed every process in it, the loop (pid 2857642) included: tickets #1310, #1311 and #1337 lost two hours mid-check-writer, and the status file still read `running` because the kill left no chance to stamp it. `systemd-run --user` puts the loop in its own unit.
 - **`setsid` does not exist on macOS.** The launch line then fails or, worse, the shell parses it in a way that spawns the loop twice. `nohup … & disown` already detaches.
 - **`--` after `pnpm sandcastle` or `yarn sandcastle`.** Only `npm run` needs the separator. pnpm rejects the stray `--` with an arg-parse error and the orchestrator never starts.
 - **`--base` passed to the orchestrator.** `main.mts` has no `--base` flag and rejects it with `Unknown option '--base'`, killing the launch instantly.
 - **A bare `pgrep` on `.sandcastle/main.mts`.** Every sandcastle loop on the machine has the identical command line, so it matches other repos' loops. It gives a false "already running" that blocks a legitimate launch, and a monitor keyed to it will latch onto the wrong project's PID.
 - **A shared `/tmp/sandcastle.log`.** Two projects' loops interleave into one file and you cannot tell whose planner started.
+- **An image built under a name the loop never runs (2026-10-13, VPS).** The launch step built `sandcastle:Affinity-OS` from the folder name; the loop ran the lowercase `sandcastle:affinity-os`, which the library derives. Every ticket ran a two-month-old image carrying Claude Code 2.1.222 while the server had 2.1.299. The project's `sandcastle:build-image` script now builds under the loop's own name.

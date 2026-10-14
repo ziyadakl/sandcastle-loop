@@ -205,7 +205,9 @@ With two or more hosts, [`all-machines.md`](all-machines.md) governs how this wh
 
 12. **Docker image built? — `docker` runtime only.** Skip entirely under `mac-host`; the Dockerfile is inert there. Iteration 1 fails immediately with `Image 'sandcastle:<name>' not found locally` when the image is missing — common on fresh worktrees or after a prune.
 
-    Image name = `--image-name NAME` if the user passed it, else `sandcastle:<basename of repo-root>`. Check `docker image inspect <image-name> > /dev/null 2>&1`. Exists → continue. Missing → build it before launching:
+    **When the project's `package.json` has a `sandcastle:build-image` script (Affinity OS does), the loop owns the image name: run `pnpm sandcastle:build-image` and continue** (add `--image-name NAME` only if the user passed one). It builds under the exact name the loop runs, and rebuilds when the image's Claude Code is older than this machine's. A name worked out by hand here once drifted from the loop's (the 2026-10-13 wrong-image night in [`INCIDENTS.md`](INCIDENTS.md)).
+
+    Otherwise: image name = `--image-name NAME` if the user passed it, else `sandcastle:<basename of repo-root, lowercased>` (Docker image names are lowercase; the library lowercases the default the same way). Check `docker image inspect <image-name> > /dev/null 2>&1`. Exists → continue. Missing → build it before launching:
 
     ```
     <pkg-mgr-bin>/sandcastle docker build-image --image-name <image-name> --dockerfile .sandcastle/Dockerfile
@@ -280,7 +282,7 @@ This is the friction-killer. A bare `/sandcastle-run` auto-discovers everything 
 4. **Name the run branch here; create it after the picker.** The scope answer renames it, and Phase 3 compares every leftover branch against the created name — so a branch cut before the answer is cut against a name that is about to change. Always fresh, dated and human-readable, which keeps an unattended batch off the shared integration line.
    - `theme` = one group → its slug; two groups → `slugA+slugB`; three or more, or no clean grouping → `queue`. **Scoped to one epic by the picker → that epic's slug alone.**
    - `name = sandcastle/<theme>-$(date +%Y%m%d)`.
-   - **Branch already exists** (`git rev-parse --verify --quiet refs/heads/<name>`) → **reuse it** and continue the same batch. This is the relaunch path after a drain. Do not suffix `-2`. `git checkout <name>`.
+   - **Branch already exists** (`git rev-parse --verify --quiet refs/heads/<name>`) → **reuse it** and continue the same batch. This is the relaunch path after a drain. Do not suffix `-2`. `git checkout <name>`. Reuse continues a batch only while the branch is still current: a leftover from an earlier day forks from a stale `main` and looks identical to a same-day relaunch, and Phase 3's base-currency gate is what tells the two apart (the 2026-08-28 stale-run-branch night in [`INCIDENTS.md`](INCIDENTS.md)).
    - Otherwise `git checkout -b <name> <base>`.
    - Pass `--branch <name>` to the loop.
    - **The launch worktree MUST be on `<name>`** — load-bearing, not cosmetic. The orchestrator cuts each per-issue worktree from the launch worktree's current HEAD, so a worktree parked on a stale branch makes every merged issue silently re-do the foundation (the layering bug, in [`INCIDENTS.md`](INCIDENTS.md)).
@@ -341,7 +343,25 @@ These run **immediately before the launch line**, after planning and the picker.
 
 1. **Clean tree, again.** Planning, branch creation and the picker all take time, and a parallel session can dirty the tree in between. Re-run the clean-tree check's `git status --porcelain` and abort the launch if it is no longer empty. Run this before pushing the run branch on the remote path too. It is nearly free.
 
-2. **Stale leftover `agent/issue-*` branches — REFUSE, with the remedy.** Run this **after** the run branch is checked out — that is the only moment `<name>` is definitive, on both the fresh and the relaunch path. The reaper deliberately preserves the branches this catches, so "reap ran" does not cover it.
+2. **The run branch must contain current `origin/main` — REFUSE if it doesn't.** A run branch cut from — or reused from — a checkout behind `main` builds every issue on stale code: the loop runs machinery and app code `main` has already moved past, re-does shipped work, and labels its own failures with rules `main` has since fixed. Phase 2's reuse path is the common way in — an existing `sandcastle/<theme>-<date>` from an earlier day forks from an old `main` and looks identical to a same-day relaunch.
+
+   Run on the launch machine, **after** the run branch is checked out. Fetch first — this machine's own `origin/main` ref can itself lag:
+
+   ```
+   git fetch origin main --quiet
+   git merge-base --is-ancestor origin/main <name> && echo CURRENT \
+     || echo "STALE: <name> is $(git rev-list --count <name>..origin/main) commits behind origin/main"
+   ```
+
+   **`CURRENT`** → continue silently. **`STALE`** → **refuse.** Report the fork point (`git show -s --format='%ci %s' $(git merge-base origin/main <name>)`) and how far behind it is. Say plainly: "this run would build on code behind `main` — the loop runs stale machinery, redoes shipped work, and mislabels its failures" (the 2026-08-28 stale-run-branch night in [`INCIDENTS.md`](INCIDENTS.md)).
+
+   **Offer both remedies; never decide.** Both are safe when the branch holds no unique commits (`git rev-list --count origin/main..<name>` returns `0`) — cite that count first.
+   - **Bring it current** — `git rebase origin/main <name>`. Conflicts → stop; never resolve them inside a launch.
+   - **Cut fresh** — the branch is a stale leftover, not a live batch: archive it (`git branch -m <name> archive/<name>-stale-$(date +%Y%m%d)`), then recreate `<name>` from `origin/main`.
+
+   Re-push the corrected branch to origin before a remote launch, so the host fast-forwards onto current code. This gate and the stale-`agent/issue-*` gate below are the two "is the base current?" checks; they are siblings, run back-to-back.
+
+3. **Stale leftover `agent/issue-*` branches — REFUSE, with the remedy.** Run this **after** the run branch is checked out — that is the only moment `<name>` is definitive, on both the fresh and the relaunch path. The reaper deliberately preserves the branches this catches, so "reap ran" does not cover it.
 
    **Run it on the machine that will run the loop**, wrapped over the transport for a remote target. The branches that get silently resumed live in the target's checkout; scanning this Mac for a `vps` run returns nothing and the gate passes on a hazard it never looked at. `<name>` is the run branch you just created here and pushed.
 
@@ -359,7 +379,7 @@ These run **immediately before the launch line**, after planning and the picker.
 
    Branches whose issue is **not** in the claimable set may be left alone — say so explicitly rather than ignoring them silently. **Preserve `wip/issue-*` branches and `refs/sandcastle/wip/*` refs**; those are checkpointed work with their own resume path.
 
-3. **API key for the chosen mode.** Only now is the mode certain. The orchestrator loads keys from a chain, first hit per key winning: `process.env` → `$SANDCASTLE_ENV_FILE` → `<repoRoot>/.sandcastle/.env` → `<repoRoot>/.env` → `$XDG_CONFIG_HOME/sandcastle/.env` or `~/.config/sandcastle/.env`.
+4. **API key for the chosen mode.** Only now is the mode certain. The orchestrator loads keys from a chain, first hit per key winning: `process.env` → `$SANDCASTLE_ENV_FILE` → `<repoRoot>/.sandcastle/.env` → `<repoRoot>/.env` → `$XDG_CONFIG_HOME/sandcastle/.env` or `~/.config/sandcastle/.env`.
 
    **Check only the key the chosen mode needs:**
    - `opus-4.8` and `opus-5` → both use the local Claude subscription. **No API key. Skip entirely** — this is the common case, and demanding a key here is a false alarm that blocks the default run.
@@ -406,8 +426,23 @@ Confirm the launcher exists silently — `node --print "require('./package.json'
 Foreground is for short test runs. Background is the default at `--iterations >= 5`:
 
 - **Use a per-project log path** — `/tmp/sandcastle-<repo-basename>.log`. A shared `/tmp/sandcastle.log` interleaves two projects' loops into one file. Remember the exact path for the alive-check and the summary.
-- Wrap in `nohup <launch> > /tmp/sandcastle-<basename>.log 2>&1 < /dev/null & disown`. **Never prefix `setsid`** — it does not exist on macOS and can make the shell spawn the loop twice. `nohup … & disown` already detaches.
-- **Capture the launched PID immediately** — `echo $!` right after the `nohup … &`. The alive-check keys on THIS PID, never a bare `pgrep`, which is project-blind. Grab `$!` into a variable **before** `disown`, or it is gone. Wait 8 seconds, then confirm with `kill -0 <pid>` (exit 0 = alive) or `ps -p <pid>`.
+- **Fork on whether the machine can host the loop as its own service** — `systemctl --user show-environment >/dev/null 2>&1 && [ "$(loginctl show-user "$(id -un)" -p Linger --value)" = yes ] && echo own-service` (the Linux servers: yes; macOS: no). Lingering keeps the user's systemd manager, and so the loop, alive after logout; without it the manager stops ~10 s after the last login ends and takes the loop with it.
+  - **Own service (Linux)** → launch the loop as its own user service, so it lives outside the app that ran this skill. The unit name is the same shell expression `OWN_SERVICE_UNIT_SH` in `.sandcastle/lib/hosts/launch.ts` uses, so this road and `/sandcastle-resume` share one unit per checkout:
+
+    ```
+    u="sandcastle-$(printf %s "${PWD##*/}" | tr -c 'A-Za-z0-9_.-' _)"
+    systemd-run --user --collect --unit="$u" --working-directory="$PWD" \
+      -E PATH="$PWD/node_modules/.bin:$PATH" -E HOME="$HOME" \
+      $(compgen -e | sed -n 's/^SANDCASTLE_.*/-E &/p') \
+      bash -c 'exec <launch> > /tmp/sandcastle-<basename>.log 2>&1 < /dev/null'
+    pid=$(systemctl --user show "$u" -p MainPID --value)
+    ```
+
+    A chat's `nohup … & disown` leaves the loop inside the chat app's service, and systemd kills that whole service on a restart: on 2026-10-13 a T3 Code restart SIGKILLed a two-hour, three-ticket run mid-check-writer (`INCIDENTS.md`). The loop gets the service manager's environment: PATH, HOME and every exported `SANDCASTLE_*` setting are copied across, any other one-off export is not. If `systemd-run` refuses because the unit already exists, a loop for this checkout is still running: report it as running rather than renaming the unit.
+
+  - **Otherwise (macOS, or no lingering)** → `nohup <launch> > /tmp/sandcastle-<basename>.log 2>&1 < /dev/null & disown`, with `pid=$!` captured **before** `disown`, or it is gone. Never prefix `setsid` — it does not exist on macOS and can make the shell spawn the loop twice.
+
+- **The alive-check keys on that captured PID**, never a bare `pgrep`, which is project-blind. Wait 8 seconds, then confirm with `kill -0 $pid` (exit 0 = alive) or `ps -p $pid`.
 - Tail the first 30 lines of the log to confirm the planner started.
 - Any monitor you set up keys on this run's log path or captured PID.
 

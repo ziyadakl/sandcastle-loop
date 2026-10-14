@@ -1,6 +1,6 @@
 ---
 name: sandcastle-status
-description: Report what the sandcastle loop is doing now, or what a finished run left behind. Use when the user asks how the loop is going, what happened overnight, whether a run finished cleanly, why a ticket stopped, or invokes /sandcastle-status — on this machine, or fused across every machine on a shared run.
+description: Report what the sandcastle loop is doing now, or what a finished run left behind. Use when the user asks how the loop is going, what happened overnight, whether a run finished cleanly, why a ticket stopped, why a server froze or restarted, or invokes /sandcastle-status — on this machine, or fused across every machine on a shared run.
 ---
 
 # Sandcastle status
@@ -141,6 +141,23 @@ Grep the run log for `cleanup WARN:` (the last ~200 lines are enough). Matches a
 ## 7. Host health
 
 When step 1 resolved a remote host, include `ssh <transport> -- 'free -h | head -2; uptime'`, taking the alias from that host's `hosts.json` entry rather than a remembered host name.
+
+### Diagnose affinity-vps (froze, restarted, or stopped answering)
+
+Run these as written. The remote login shell is **zsh**, so quote every glob and pass multi-line work as `ssh vps 'bash -s' <<'EOF' … EOF`.
+
+```sh
+ssh vps -- 'uptime -s; last -x reboot | head -3'                      # when the server last booted
+ssh vps -- 'sudo journalctl -k -b -1 --no-pager | grep -iE "out of memory|oom-kill|Killed process" | tail -20'   # previous boot: what the kernel killed, and when
+ssh vps -- 'sudo journalctl -b -1 -u earlyoom --no-pager | tail -20'  # previous boot: what the memory watchdog killed
+ssh vps -- 'systemctl is-active earlyoom; systemctl show sandcastle.slice -p MemoryMax -p MemoryCurrent'   # watchdog up; loop boxes' shared 20 GB ceiling and use
+ssh vps -- "docker ps -a --format '{{.Names}} {{.Status}} {{.Image}}' | grep '^sandcastle-'"   # loop boxes alive or left behind
+ssh vps -- 'jq ".state, .updatedAt, [.issues[] | {number, phase, stopCause}]" ~/dev/1-affinity/Affinity-OS/.sandcastle/status.json'   # stopCause: out-of-memory / server-restarted / loop-exited
+```
+
+Where things are on affinity-vps: the run log is `~/dev/1-affinity/Affinity-OS/.sandcastle/run.log` or `/tmp/sandcastle-vps.log`; Claude session records for loop tickets are under `~/.claude/projects/` (one `.jsonl` file per session, newest last by `ls -t`). Read a session record with `tail` or a fixed-string `grep -F`: inside Claude Code, `grep` is the embedded ugrep, and a regex with a large bounded repeat grew to 18 GB and froze the server on 2026-10-13.
+
+Inspect a box only through a `--format` that names its fields, as the `docker ps` line above does. Each box holds the run's keys in its environment.
 
 ---
 
