@@ -27,6 +27,7 @@
 import type { ZodType } from "zod";
 import { ZodError } from "zod";
 import {
+  COMPLETION_PROMISE,
   HALT_PROMISE,
   canonicalizeMarker,
   stripDecoration,
@@ -90,6 +91,59 @@ export class VerdictParseError extends Error {
 // Marker extraction
 // ---------------------------------------------------------------------------
 
+/**
+ * Trailing sign-off shapes that are NOT a verdict.
+ *
+ * Models routinely end a turn with a short meta postscript — "Unverified: …",
+ * "Skipped: nothing requested by this pass", a `---` rule — and they place it
+ * on EITHER side of the SDK's completion token. Nothing in the repo or the
+ * host's Claude config asks for these lines; it is emergent sign-off
+ * behaviour, so no amount of prompt tightening removes it and the parser has
+ * to absorb it. Observed at a 4-in-10 rate on 2026-08-05.
+ *
+ * DELIBERATELY NARROW. {@link extractMarker} walks upward past these lines and
+ * STOPS at the first line that is neither skippable nor blank — if that line
+ * is not a marker, extraction still fails loudly. That stop is the safety
+ * property: it is what stops the walk from reaching backwards through real
+ * reasoning ("I considered ALL_CLEAR but…") and resurrecting a stale marker
+ * word. Widen this set only with a real, observed failure to justify it.
+ */
+const SIGN_OFF_LABELS = [
+  "unverified",
+  "skipped",
+  "note",
+  "caveat",
+  "verified",
+  "assumed",
+] as const;
+
+/**
+ * `Unverified: …`, `**Skipped:** …`, `- Note: …` — a known meta label at the
+ * head of the line, optionally wrapped in markdown emphasis or a list bullet.
+ * The label must be followed by a colon, so a genuine sentence that merely
+ * starts with the word ("Skipped tests are listed below") is NOT skipped.
+ */
+const SIGN_OFF_LINE = new RegExp(
+  `^[\\s*_>#\\-]*(?:${SIGN_OFF_LABELS.join("|")})[\\s*_]*:`,
+  "i",
+);
+
+/** A markdown horizontal rule on its own line: `---`, `***`, `___`. */
+const HORIZONTAL_RULE = /^(?:-{3,}|\*{3,}|_{3,})$/;
+
+/**
+ * True when `trimmed` is post-turn noise rather than verdict material: the
+ * SDK's completion token, a horizontal rule, or a labelled sign-off line.
+ *
+ * `<promise>HALT</promise>` is NOT noise — it IS a verdict — and is therefore
+ * absent from every branch here.
+ */
+function isSignOffNoise(trimmed: string): boolean {
+  if (trimmed === COMPLETION_PROMISE) return true;
+  if (HORIZONTAL_RULE.test(trimmed)) return true;
+  return SIGN_OFF_LINE.test(trimmed);
+}
+
 export type MarkerMode = "tolerant" | "strict" | "contains";
 
 export interface ExtractMarkerOptions {
@@ -140,9 +194,73 @@ export function extractMarker<M extends string>(
   // from a trailing newline is naturally filtered by the "non-empty" pass.
   const lines = text.split(/\r?\n/);
 
+  // The agent's turn ENDS at its completion signal; anything after it is
+  // post-turn noise, not verdict material. Cut there before looking for the
+  // marker, so neither the token itself nor whatever the model appends below it
+  // can be mistaken for the answer.
+  //
+  // The cut is INCLUSIVE of the signal line because `<promise>HALT</promise>`
+  // is itself a verdict (canonicalizeMarker maps it to "HALT") — it must stay a
+  // candidate. `<promise>COMPLETE</promise>` carries no verdict, so the upward
+  // walk below skips it.
+  let endOfTurn = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i]!.trim();
+    if (trimmed === COMPLETION_PROMISE || trimmed === HALT_PROMISE) {
+      endOfTurn = i;
+    }
+  }
+  const considered = endOfTurn >= 0 ? lines.slice(0, endOfTurn + 1) : lines;
+
+  // Walk UPWARD from the end, stepping over blank lines and sign-off noise
+  // (see isSignOffNoise), and stop at the first line that is neither. That
+  // line — marker or not — is the one the modes below judge and the one a
+  // failure blames.
+  //
+  // All three shapes observed on 2026-08-05 are covered. Every one of them
+  // died with MarkerNotFoundError while a valid marker sat above:
+  //   MARKER / <promise>COMPLETE</promise>
+  //     — the token itself was last
+  //   MARKER / <promise>COMPLETE</promise> / "Unverified: …" / "Skipped: …"
+  //     — sign-off BELOW the token, removed by the cut
+  //   MARKER / "Unverified: …" / "Skipped: …" / <promise>COMPLETE</promise>
+  //     — sign-off ABOVE the token, so it survives the cut and only the
+  //       upward walk gets past it
+  //
+  // The walk STOPS at the first non-skippable line on purpose. It must never
+  // become a search for "the nearest marker anywhere above", which would let
+  // a revised-away mention from earlier in the transcript ("I nearly emitted
+  // ALL_CLEAR, but…") stand in for a verdict the agent never gave.
+  //
+  // WIDENING THIS WAS CONSIDERED AND REFUSED (issue #1082, fault 4; built under
+  // issue #1128). On 2026-08-15 ticket #1038 was stopped with "reviewer emitted
+  // no verdict" while the reviewer had approved the work in words:
+  //
+  //     The review stands as delivered, with the verdict ALL_CLEAR.
+  //
+  //     Unverified: nothing.
+  //     Skipped: nothing.
+  //
+  // The two sign-off lines were skipped correctly and the walk landed on that
+  // sentence, which is prose, not a bare token, so extraction failed and a
+  // ticket with an explicit approval on the page was quarantined. The obvious
+  // repair — accept a marker embedded in the last line, or scan the body for
+  // one — is the WRONG repair: it is the same hole the paragraph above exists
+  // to keep shut, and it fails OPEN (a hedged mention becomes an approval),
+  // which is the one direction issue #1082 marks as a launch gate. The
+  // "contains" mode below is opted into by exactly one role for exactly that
+  // reason. The fix instead lives at the CALL SITE: `runReviewer` in
+  // `.sandcastle/main.mts` re-asks the reviewer ONCE, telling it to put the
+  // bare token alone on the final line. A model that will not say the word
+  // plainly when asked twice has not given a verdict.
   let lastNonEmpty = "";
-  for (const line of lines) {
-    if (line.trim().length > 0) lastNonEmpty = line;
+  for (let i = considered.length - 1; i >= 0; i -= 1) {
+    const line = considered[i]!;
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    if (isSignOffNoise(trimmed)) continue;
+    lastNonEmpty = line;
+    break;
   }
 
   const allowedSet = new Set<string>(allowed);

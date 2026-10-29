@@ -1,6 +1,6 @@
 /**
  * Cross-host issue lease — the real "I've got this one" signal the label flip
- * could never provide. See docs/adr/0019-cross-host-issue-lease.md.
+ * could never provide.
  *
  * Two loop hosts (e.g. a VPS and a local Mac) pointed at the same GitHub repo
  * share one issue pool. Before a host works an issue it must hold that issue's
@@ -122,7 +122,7 @@ export function classifyLease(
 }
 
 /**
- * Fix 6 (ADR 0019): classify a lease's state from a possibly-throwing read.
+ * Fix 6: classify a lease's state from a possibly-throwing read.
  * Delegates the skew-grace expiry math to {@link classifyLease} (single source
  * of truth) and fail-closes a {@link LeaseReadError} — a ref that EXISTS but is
  * unreadable — to `"live"` (occupied), so a present-but-corrupt lock is never
@@ -241,11 +241,28 @@ export async function releaseLease(
   await deps.backend.deleteRef(issue);
 }
 
-/** How the git-backed backend shells out. Mirrors main.mts runGit's shape. */
+/**
+ * How the git-backed backend shells out. Mirrors the shape of `runGit` in
+ * `./git-exec.ts` — deliberately a SEPARATE declaration, not an import of it:
+ * see that module's WARNING block for why this file takes an injected runner.
+ */
 export interface GitRunResult {
   readonly ok: boolean;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * The failure's MACHINE identity, when the runner has one to give.
+   *
+   * Node hands two different things back on `code`: the process exit status as
+   * a NUMBER for an ordinary git failure (128 for `fatal:`), and a STRING
+   * `ERR_*` for a failure of the spawn itself — notably
+   * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`, where git succeeded and Node threw the
+   * output away. That case carries EMPTY stderr, so a caller that only reads
+   * `stderr` can only say "unknown error". Both forms are surfaced as-is rather
+   * than normalised; compare against the string form to detect it. Never
+   * string-match Node's or git's English prose — it is locale-dependent.
+   */
+  readonly errorCode?: string | number;
 }
 export type GitRunner = (
   cwd: string,
@@ -500,7 +517,7 @@ export function createGitLockBackend(opts: GitLockBackendOpts): LockBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Lease coordinator (ADR 0019) — the module-layer policy over the lease logic
+// Lease coordinator — the module-layer policy over the lease logic
 // above. Extracted verbatim from buildDefaultDeps in main.mts: it owns the
 // per-host `leaseRegistry` (the leases THIS host currently holds) and exposes
 // the five Deps lease methods. PURE/DI: it touches git only through `lockDeps`

@@ -1,20 +1,21 @@
 # SANDCASTLE.md (EXAMPLE — copy to `SANDCASTLE.md` to activate the gates)
 
-**The critique-as-gate and skill-discipline gates are DORMANT by default.**
+**The design-rules review and the skill-discipline gate are DORMANT by default.**
 The sandcastle template ships without a real `SANDCASTLE.md`, so
 `parseRequiredSkillsByType` finds no type sections, every issue's
-`requiredSkills` is `undefined` (or `[]` for a type that explicitly lists none), and both gates graceful-degrade to a no-op.
+`requiredSkills` is `undefined` (or `[]` for a type that explicitly lists none), and both graceful-degrade to a no-op.
 Nothing is graded until you create this file.
 
 To activate: copy this file to `SANDCASTLE.md` at your repo root, then edit the
 `type:<label>` sections below so each GitHub issue type label maps to the design
 principles (Skill names) it must satisfy. A principle is enforced two ways:
 the implementer must invoke `Skill(<name>)` (skill-discipline gate), and the
-diff must pass the critique sub-agent graded against `<name>`'s rubric
-(critique-as-gate). A principle's rubric is loaded from
+reviewer grades the diff against `<name>`'s rubric and `PRODUCT.md` (its
+"Design rules" category; there is no separate critique stage). A principle's rubric is loaded from
 `.claude/skills/<name>/SKILL.md` (repo-local) or `~/.claude/skills/<name>/SKILL.md`
-(global) — if NONE of a type's principles have a loadable rubric, the issue is
-quarantined rather than silently shipped (ADR 0006 v3 fail-loud preflight).
+(global) — if NONE of a type's principles have a loadable rubric, the reviewer
+records `N/A (no rubric loadable: …)` for that category rather than grading
+against a rubric it never read.
 Delete this `# SANDCASTLE.md (EXAMPLE…)` title line after copying.
 
 **`Required:` bullets under a `type:X` section MUST be headless-runnable
@@ -32,6 +33,30 @@ quarantined. The `type:new-component` example below lists `impeccable` and
 `layout`, so a verbatim copy quarantines your first `type:new-component` issue
 until you add those `SKILL.md` files (repo-local or `~/.claude/skills/`) or swap
 in principles you already have.
+
+## Project facts the loop's prompts point at
+
+The loop's settings live in `.sandcastle/project.json` (copy
+`.sandcastle/project.example.json`). This file is where you tell the AI agents
+the things a setting cannot say. Fill in what applies and delete the rest:
+
+- **Landing check** — `landCheck` in `project.json` is the command the loop runs
+  on the run branch tip before it lands its own run pull request (for example
+  `["pnpm","verify"]`). Leave it null and the loop never lands the run pull
+  request itself; it waits for the owner.
+- **Check folder and helpers** — first tests live in `<checksRoot>/issue-<N>/`
+  (`checksRoot`, default `e2e/checks`). Name the shared e2e helpers the check
+  writer must import (screen-readiness wait, graded text read, sign-in helper)
+  and the seeded test users it may sign in as.
+- **Protected paths** — files an AI agent may never edit (`protectedPaths`): the
+  Playwright config, shared e2e helpers, any seed or fixture data the checks
+  grade against. Say here why each is protected.
+- **Test database** — if `testDatabase` is set, name the template database, the
+  `setupCommand` that applies schema to a clone, and the seed command.
+- **Migrations** — if `migrations` is set, name the project's own migration
+  command and numbering rule.
+- **Known failures** — a doc of failure families agents have repeated, if you
+  keep one (the reviewer checks diffs against it).
 
 ### type:new-component
 

@@ -1,5 +1,5 @@
 /**
- * Branch checkpoint git primitives (ADR 0021 — checkpoint/stop/resume).
+ * Branch checkpoint git primitives (checkpoint/stop/resume).
  *
  * When a loop host is told to stop mid-issue, the in-flight worktree changes
  * must survive so another host (or the same host later) can RESUME them. We
@@ -16,6 +16,8 @@
  * {@link GitRunResult} and never throw on `ok=false` — the caller decides.
  */
 import type { GitRunner, GitRunResult } from "./issue-lease.js";
+import { agentIdentityArgs } from "../git/identity.js";
+import { readReplaySentinel } from "../paths/worktree-replay.js";
 
 /** Ref name a given issue's in-flight WIP checkpoint lives at on the remote. */
 export function wipRef(issue: number): string {
@@ -61,7 +63,7 @@ export function issueFromBranch(branch: string): number | null {
 }
 
 /**
- * Pure decision for sandbox creation (ADR 0021 §2 "branch reuse on pickup"):
+ * Pure decision for sandbox creation ("branch reuse on pickup"):
  * should this issue's worktree be cut from a saved WIP checkpoint (`reuse`) or
  * force-reset from HEAD as today (`fresh`)?
  *
@@ -80,7 +82,7 @@ export function reuseOrFresh(opts: {
 }
 
 /**
- * Cross-cutting sandbox-creation decision (ADR 0021 §2 "branch reuse on
+ * Cross-cutting sandbox-creation decision ("branch reuse on
  * pickup"), single-sourced for BOTH create paths (mac-host + docker) so the two
  * cannot silently diverge. Answers: does this issue's worktree pick up a saved
  * WIP checkpoint (`reuse`, carrying the resolved issue number) or start fresh?
@@ -136,16 +138,57 @@ export async function hasWorktreeChanges(
  * `git commit` with a stable message carrying the issue and host. Returns
  * `true` when a commit was made, `false` when the worktree was clean (NEVER an
  * empty commit).
+ *
+ * The identity is spliced in with `-c` rather than left to repo config. This
+ * commit is reachable from `scripts/checkpoint-stop.mts`, a SEPARATE process
+ * that runs after `main.mts` has been killed and therefore never passes
+ * through `ensureAgentGitIdentity`. Without the `-c` it falls through to the
+ * machine's own identity — on a fresh clone, or any host whose first
+ * sandcastle action is a hard stop, that is the OWNER's name on code he never
+ * wrote, which is the exact failure `lib/git/identity.ts` exists to prevent.
  */
 export async function commitWorktreeCheckpoint(
   wtPath: string,
   issue: number,
   hostId: string,
   git: GitRunner,
+  onRefusal?: (line: string) => void,
 ): Promise<boolean> {
+  // THE KILL WINDOW (issue #1118). While `withWorktreeAt` has the worktree
+  // stood up on the code the builder was HANDED, `git add -A` stages the
+  // DELETION of everything the builder wrote that night, and the commit that
+  // produces is exactly what a resume materialises. The window is minutes long
+  // now that the check-writer is dispatched inside the replay, and this
+  // function is reachable from `scripts/checkpoint-stop.mts` — a separate
+  // process that runs after `main.mts` has already been killed, so it cannot be
+  // told in memory.
+  //
+  // Refusing costs the ticket nothing it had: the builder's night is COMMITTED
+  // at the replay's `restoreToSha` and HEAD still points at it (a replay moves
+  // the tree, never HEAD), so `pushWipRef` still checks that work in. What is
+  // withheld is only the "delete it all" commit on top.
+  const replay = readReplaySentinel(wtPath, wtPath);
+  if (replay !== undefined) {
+    onRefusal?.(
+      `checkpoint REFUSED for issue ${issue} on ${hostId}: a check-repair ` +
+        `replay was in flight, so this worktree may be standing on the code ` +
+        `the builder was handed (${replay.atSha}) rather than the code it ` +
+        `wrote (${replay.restoreToSha}). Committing it would record the ` +
+        `deletion of this ticket's whole night. HEAD already carries the ` +
+        `committed work and is pushed unchanged. Files held aside by the ` +
+        `replay, if any survived, are under ${replay.holdDir || "(not recorded)"}.`,
+    );
+    return false;
+  }
   if (!(await hasWorktreeChanges(wtPath, git))) return false;
   await git(wtPath, "add", "-A");
-  await git(wtPath, "commit", "-m", `wip: checkpoint issue ${issue} (${hostId})`);
+  await git(
+    wtPath,
+    ...agentIdentityArgs(),
+    "commit",
+    "-m",
+    `wip: checkpoint issue ${issue} (${hostId})`,
+  );
   return true;
 }
 
@@ -168,7 +211,7 @@ export async function revParse(
  * Push the worktree's HEAD to the issue's WIP ref, leasing against this host's
  * own last-pushed value — **never a blind force**.
  *
- * ADR 0021 §2. The checkpoint is re-pushed every time a host is stopped
+ * The checkpoint is re-pushed every time a host is stopped
  * mid-issue, so the push must OVERWRITE the prior WIP tip while still refusing
  * to destroy a PEER's. That means an explicit
  * `--force-with-lease=<ref>:<expected>`, where `expected` is a genuine
@@ -245,7 +288,7 @@ export async function pushWipRef(
 /**
  * Capture the worktree's HEAD to the issue's WIP ref in the LOCAL ref store only
  * — `git update-ref <wipRef(n)> <HEAD-sha>`, with NO origin push. The local twin
- * of {@link pushWipRef} for the launch-time reaper's sync-OFF path (ADR 0021's
+ * of {@link pushWipRef} for the launch-time reaper's sync-OFF path (the
  * inertness contract): a single-host crash still gets its in-flight work pinned
  * to a durable local ref — the surviving `agent/issue-<N>` worktree plus this ref
  * are enough for a same-host resume — but nothing leaves the box, exactly like
@@ -271,6 +314,57 @@ export async function captureWipRefLocal(
 }
 
 /**
+ * Save one ticket's work to its WIP ref when the attempt fails (spec #1334 fix
+ * pass: "a fixer failure ends the attempt, saves the work"). Commits any
+ * uncommitted change ({@link commitWorktreeCheckpoint}, so the agent identity
+ * and the replay-window refusal both apply), then pins HEAD to
+ * `refs/sandcastle/wip/issue-<N>` — pushed to origin when `pushToOrigin`
+ * (cross-host sync on), captured locally otherwise, exactly the split the
+ * launch-time reaper uses. With sync ON the next attempt resumes from that
+ * ref ({@link resolveReuseDecision}). With sync OFF it does NOT: the next
+ * attempt starts fresh and the local ref only keeps the work recoverable by
+ * hand. Reusing a local ref with sync off was considered and refused — nothing
+ * deletes a local WIP ref when its ticket ships or closes
+ * ({@link cleanupShippedWipRefs} and the startup prune act on origin only), so
+ * a later attempt would resurrect stale work.
+ *
+ * Never throws; `saved: false` carries why.
+ */
+export async function saveWorkToWipRef(
+  opts: {
+    readonly repoRoot: string;
+    readonly wtPath: string;
+    readonly issue: number;
+    readonly hostId: string;
+    readonly pushToOrigin: boolean;
+    readonly remote?: string;
+  },
+  git: GitRunner,
+): Promise<{ readonly saved: boolean; readonly detail: string }> {
+  try {
+    const refusals: string[] = [];
+    await commitWorktreeCheckpoint(opts.wtPath, opts.issue, opts.hostId, git, (line) =>
+      refusals.push(line),
+    );
+    const pinned = opts.pushToOrigin
+      ? await pushWipRef(opts.repoRoot, opts.wtPath, opts.issue, git, opts.remote ?? "origin")
+      : await captureWipRefLocal(opts.repoRoot, opts.wtPath, opts.issue, git);
+    if (!pinned.ok) {
+      return { saved: false, detail: pinned.stderr.trim() || "the WIP ref could not be written" };
+    }
+    return {
+      saved: true,
+      detail:
+        `saved to ${wipRef(opts.issue)}` +
+        (opts.pushToOrigin ? " on origin" : " locally") +
+        (refusals.length > 0 ? ` (${refusals.join(" ")})` : ""),
+    };
+  } catch (err) {
+    return { saved: false, detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * True iff a WIP checkpoint ref exists on the remote for `issue` — i.e.
  * `git ls-remote <remote> <wipRef>` prints a non-blank line. Used by the resume
  * path to decide whether there is saved work to pick up.
@@ -290,7 +384,7 @@ export async function wipRefExists(
  * List the issue numbers of every WIP checkpoint ref currently on the remote —
  * parses `git ls-remote <remote> refs/sandcastle/wip/*` output, keeping only
  * lines whose ref is issue-shaped (`refs/sandcastle/wip/issue-<N>`) and dropping
- * malformed/foreign lines. Powers ADR 0021 §4's startup prune (delete WIP refs
+ * malformed/foreign lines. Powers the startup prune (delete WIP refs
  * for issues no longer open). A failed `ls-remote` (network/auth) returns `[]`
  * so the prune NEVER over-deletes on an incomplete view of the remote.
  */

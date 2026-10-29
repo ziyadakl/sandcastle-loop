@@ -28,6 +28,9 @@ export const IMPLEMENTER_MARKERS = [
   "STORY_COMPLETE",
   "HALT",
   "RECOVERY_COMPLETE",
+  /** The ticket leaves a product question open (spec #1334 fix pass). The
+   *  question rides in a `<ticket-question>` block — `ticket-question.ts`. */
+  "TICKET_UNCLEAR",
 ] as const;
 export type ImplementerMarker = (typeof IMPLEMENTER_MARKERS)[number];
 
@@ -57,6 +60,47 @@ export type AnyMarker = (typeof ALL_MARKERS)[number];
  * either the short canonical "HALT" OR the wrapped form on its own line.
  */
 export const HALT_PROMISE = "<promise>HALT</promise>" as const;
+
+/**
+ * The sandbox SDK's completion signal — protocol noise, NOT a verdict.
+ *
+ * `main.mts` configures `completionSignal: ["<promise>COMPLETE</promise>",
+ * "<promise>HALT</promise>"]`, so an agent ends its turn by emitting one of
+ * them. `HALT` is meaningful (it IS a verdict, and `canonicalizeMarker` maps it
+ * to "HALT"); `COMPLETE` means only "the turn is over" and carries no verdict.
+ *
+ * When it lands in the captured text AFTER the agent's marker line, the
+ * last-non-empty-line rule reads it instead of the verdict and every stage
+ * fails with `MarkerNotFoundError`. That is not hypothetical: on 2026-08-05 all
+ * four issues of a run died within seconds of each other, each having produced
+ * a perfectly valid marker —
+ *
+ *   Expected one of [CHECKS_WRITTEN, ALREADY_BUILT, NEEDS_WORLD_DATA,
+ *   NO_SCREEN_APPLIES]. Last line was: "<promise>COMPLETE</promise>".
+ *
+ * — with the real answer (`CHECKS_WRITTEN`, plus its committed check file)
+ * sitting one line above. {@link extractMarker} therefore skips this line
+ * wherever it appears, so the verdict never depends on whether the harness
+ * happens to leave its own end-of-turn token in the buffer.
+ */
+export const COMPLETION_PROMISE = "<promise>COMPLETE</promise>" as const;
+
+/**
+ * Every string the sandbox SDK's `completionSignal` list is built from —
+ * this governs EVERY sandboxed role's run loop on the docker provider
+ * (implementer, reviewer, judge, check-writer, and any other agent the
+ * provider config dispatches into a sandbox), not only the implementer, so
+ * a name or edit here silently changes every one of those roles at once.
+ * The docker provider config in `main.mts` hands the SDK exactly this array,
+ * and the builder's own in-repo batch loop (`runBuilderIterations`,
+ * `lib/builder-progress.ts`) separately stops A BUILDER pass on the same
+ * list. One array, both readers, so the two cannot silently drift apart the
+ * way two independently-typed literals could.
+ */
+export const SANDBOX_COMPLETION_SIGNALS = [
+  COMPLETION_PROMISE,
+  HALT_PROMISE,
+] as const;
 
 /**
  * Map a marker as it might appear in agent output (including the

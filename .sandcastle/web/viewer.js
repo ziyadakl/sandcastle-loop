@@ -71,7 +71,7 @@ function renderBanner(banner) {
 
 function renderMeta(meta) {
   const line = meta.perMachine
-    .map((m) => `${m.label} ${m.current}/${m.total}`)
+    .map((m) => `${m.label} ${m.done} done · ${m.working} building · ${m.waiting} waiting / ${m.cap}`)
     .join(" · ");
   setText($("meta-iterations"), line || "—");
   setText($("meta-branch"), meta.branch || "—");

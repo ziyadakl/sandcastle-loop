@@ -32,7 +32,7 @@ import { discoverRefPeers } from "./ref-peers.js";
  * A convergence git operation the CALLER must surface LOUD: a genuine fault
  * (auth/network/non-fast-forward/dirty tree), NOT an ordinary merge-conflict
  * outcome (conflicts are reported per-lane with a durable marker instead).
- * Mirrors {@link LaneSyncError} and ADR 0020's fail-loud-on-write posture:
+ * Mirrors {@link LaneSyncError} and the fail-loud-on-write posture:
  * convergence either LANDS on the remote or says so — never silently.
  */
 export class ConvergeError extends Error {
@@ -361,7 +361,7 @@ async function convergeOnBranch(
   // merge advanced it). This is the whole POINT of the command: if it does not
   // land, the machines did NOT converge. A rejection here (non-fast-forward,
   // auth, network) is a real fault → fail LOUD rather than report a local tip
-  // that would imply convergence landed (ADR 0020 fail-loud-on-write).
+  // that would imply convergence landed (fail-loud-on-write).
   const pushed = await run("push", remote, `${branch}:refs/heads/${branch}`);
   if (!pushed.ok) {
     throw new ConvergeError(

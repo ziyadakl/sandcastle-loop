@@ -1,5 +1,5 @@
 /**
- * POST-KILL checkpoint (ADR 0021 — checkpoint/stop/resume, decisions #1 & #4).
+ * POST-KILL checkpoint (checkpoint/stop/resume, decisions #1 & #4).
  *
  * This is the AFTER-the-fact half of stop/resume: the loop process is already
  * DEAD (SIGKILL), so nothing in-process can commit-on-stop. What survives is the
@@ -20,14 +20,22 @@
  *      reaper never yanks a lease a live peer re-claimed — the WIP push above
  *      still runs regardless, so the work is rescued either way;
  *   4. a clean, not-ahead worktree has nothing to save: leave its lease and WIP
- *      ref untouched.
+ *      ref untouched;
+ *   5. release the issue's `in-progress` GitHub label back to `ready-for-agent`
+ *      — but only via the OPTIONAL injected {@link CheckpointStopOpts.releaseLabel}
+ *      seam, and only for an issue whose work is safe (see that field). The
+ *      lease is what the machines arbitrate on; the label is what the ops
+ *      dashboard shows a human, and a stop that frees one but not the other
+ *      leaves the board reporting dead work as "being built now".
  *
  * Every issue is independent: one bad worktree records an `error` and the sweep
  * CONTINUES to the rest, never abandoning healthy work. Like the rest of the
  * state layer this touches git ONLY through an injected {@link GitRunner} (the
- * seam issue-lease.ts defines), so the whole module is unit-testable against a
- * fake runner with no real git; the thin `../scripts/checkpoint-stop.mts` runner
- * supplies the real one, mirroring the launch.ts / launch.mts split.
+ * seam issue-lease.ts defines) and GitHub ONLY through the `releaseLabel`
+ * callback — never `gh` directly — so the whole module is unit-testable against
+ * fakes with no real git and no real GitHub; the thin
+ * `../scripts/checkpoint-stop.mts` runner supplies both real implementations,
+ * mirroring the launch.ts / launch.mts split.
  */
 import type { GitRunner, GitRunResult } from "./issue-lease.js";
 import {
@@ -91,6 +99,34 @@ export async function listInflightIssueWorktrees(
   return out;
 }
 
+/**
+ * What happened to the issue's `in-progress` GitHub label during the sweep.
+ * ABSENT (undefined) means the caller supplied no {@link CheckpointStopOpts.releaseLabel}
+ * seam, so no label call was made at all — the module's behavior before the seam
+ * existed, and what the launch-time reaper still gets.
+ *
+ *   - `released`        — flipped `in-progress` → `ready-for-agent`.
+ *   - `not-in-progress` — the issue was not wearing `in-progress` at all, so
+ *                         there was nothing to release. Usually a leftover
+ *                         worktree from an issue that already shipped (see
+ *                         `/sandcastle-clean`) — and the reason the seam reports
+ *                         this rather than flipping blindly: `gh issue edit
+ *                         --add-label ready-for-agent` on a SHIPPED ticket puts
+ *                         it back in the queue and the next run rebuilds work
+ *                         that is already on main.
+ *   - `failed`          — the flip was attempted and threw; the label still lies.
+ *   - `skipped`         — deliberately not attempted, because the work did NOT
+ *                         persist (an `error` outcome). Re-opening such an issue
+ *                         for re-claim would invite a peer to redo work whose WIP
+ *                         push failed, so the label deliberately keeps saying
+ *                         "someone owns this".
+ */
+export type CheckpointStopLabel =
+  | "released"
+  | "not-in-progress"
+  | "failed"
+  | "skipped";
+
 /** Per-issue outcome of a post-kill checkpoint sweep. */
 export interface CheckpointStopResult {
   readonly issue: number;
@@ -99,6 +135,10 @@ export interface CheckpointStopResult {
   readonly wipRef?: string;
   /** Human-readable failure reason (only on `error`). */
   readonly detail?: string;
+  /** Fate of the `in-progress` label; `undefined` when no seam was supplied. */
+  readonly label?: CheckpointStopLabel;
+  /** Why the label flip failed (only on `label: "failed"`). */
+  readonly labelDetail?: string;
 }
 
 /** Options for {@link checkpointStop}. */
@@ -118,18 +158,18 @@ export interface CheckpointStopOpts {
    */
   readonly stagingBranch: string | null;
   /**
-   * Whether cross-host sync (ADR 0019/0020) is enabled — mirrors main.mts's
+   * Whether cross-host sync is enabled — mirrors main.mts's
    * `crossHostSyncEnabled()`, threaded in rather than imported (main.mts is the
    * consumer of this lib; importing it back would be a cycle).
    *
-   * ADR 0021's inertness contract: the strand backup is a NEW origin write, so it
+   * The inertness contract: the strand backup is a NEW origin write, so it
    * is gated behind the existing cross-host opt-in — with the flag off a
    * single-host consumer pushes nothing new. When false the staging tip is still
    * pinned by a LOCAL strand ref, so nothing is lost; it just never leaves the box.
    */
   readonly syncEnabled: boolean;
   /**
-   * DEFECT 1 (ADR 0019/0021): REQUIRED per-issue policy consulted right before
+   * DEFECT 1: REQUIRED per-issue policy consulted right before
    * the lease DELETE. Returns `true` when it is safe to release issue `n`'s
    * lease, `false` to LEAVE it in place. This is a required, EXPLICIT decision:
    * every caller must state who it may delete a lease for — there is no
@@ -147,7 +187,7 @@ export interface CheckpointStopOpts {
    */
   readonly canReleaseLease: (issue: number) => Promise<boolean>;
   /**
-   * DEFECT (ADR 0021 inertness): where the per-issue WIP checkpoint is written.
+   * DEFECT (inertness): where the per-issue WIP checkpoint is written.
    *
    *   - `"always"` (DEFAULT) — push HEAD to `refs/sandcastle/wip/issue-<N>` on the
    *     REMOTE unconditionally, as the sweep always has. This is the graceful
@@ -157,7 +197,7 @@ export interface CheckpointStopOpts {
    *     ONLY when {@link syncEnabled}. The LAUNCH-TIME reaper (main.mts
    *     `checkpointInflight`) passes this: it runs at EVERY start, so a flag-off
    *     single-host consumer that crashed must NOT push WIP refs to its app's
-   *     origin (ADR 0021 promises a flag-off consumer "pushes nothing new").
+   *     origin (a flag-off consumer pushes nothing new).
    *     Single-host crash recovery still works — the local WIP ref plus the
    *     surviving worktree are enough for a same-host resume; the origin push
    *     only matters for cross-host peer recovery, which IS the sync-ON case.
@@ -168,6 +208,52 @@ export interface CheckpointStopOpts {
    * guard returns false when lease-mode is off, so it stays inert).
    */
   readonly wipOriginPush?: "always" | "when-sync";
+  /**
+   * OPTIONAL INJECTED SEAM: where a line about this sweep goes.
+   *
+   * Only one thing writes here today, and it is a thing nobody must miss: a
+   * checkpoint REFUSED because a check-repair replay was in flight (issue
+   * #1118). This process runs after `main.mts` has been killed, so it learns
+   * that from a sentinel on disk rather than in memory, and the ticket's
+   * committed work still goes to its WIP ref — only the "commit whatever is on
+   * disk" step is withheld, because on disk at that moment is the code the
+   * builder was HANDED and committing it records the deletion of the night.
+   * Absent on a caller that has nowhere to put a line, which changes nothing
+   * about the refusal itself.
+   */
+  readonly log?: (line: string) => void;
+  /**
+   * OPTIONAL INJECTED SEAM: release issue `n`'s `in-progress` GitHub label back
+   * to `ready-for-agent`. Supplied by the thin `../scripts/checkpoint-stop.mts`
+   * runner (which owns the `gh` shell-out) exactly the way the real
+   * {@link GitRunner} is — this module stays PURE: git only through the injected
+   * runner, GitHub only through this callback, so the whole sweep remains
+   * unit-testable against fakes with neither a real repo nor a real `gh`.
+   *
+   * ABSENT ⇒ no label call is made and every {@link CheckpointStopResult.label}
+   * stays `undefined`: byte-for-byte the behavior every caller had before the
+   * seam existed (the launch-time reaper in main.mts deliberately keeps it —
+   * that path's labels are handled by the loop's own startup reconciliation).
+   *
+   * WHY IT EXISTS: a SIGKILL'd loop cannot flip its own labels, so before this
+   * the `--now` reap left every in-flight issue wearing `in-progress` and the
+   * ops dashboard kept showing stopped work as "being built now" until the next
+   * launch. It used to be a documented HAND step in the sandcastle-stop skill.
+   *
+   * Called ONCE per worktree, AFTER the WIP push and the lease release, and only
+   * for issues whose work is safe (`checkpointed`) or which had nothing to save
+   * (`nothing-to-save`) — never for an `error`, whose work did not persist. A
+   * throw is captured per issue (`label: "failed"`) and never aborts the sweep.
+   *
+   * MUST report `"not-in-progress"` — never flip — for an issue that is not
+   * actually wearing `in-progress`. A `--now` reap enumerates the `agent/issue-N`
+   * WORKTREES left on disk, and a leftover worktree from an issue that already
+   * shipped looks exactly like a live one that had nothing to save. Adding
+   * `ready-for-agent` to a shipped ticket re-queues work that is already on main.
+   */
+  readonly releaseLabel?: (
+    issue: number,
+  ) => Promise<"released" | "not-in-progress">;
 }
 
 /**
@@ -208,6 +294,29 @@ export async function checkpointStop(
   const worktrees = await listInflightIssueWorktrees(git, opts.repoRoot);
   const results: CheckpointStopResult[] = [];
 
+  /**
+   * Run the injected label seam for one issue and describe what happened. No
+   * seam ⇒ `{}`, so the result is byte-for-byte the pre-seam shape. A throw is
+   * captured, never propagated: a dead `gh` must not cost us the WIP rescue we
+   * already completed.
+   */
+  const releaseLabelFor = async (
+    issue: number,
+  ): Promise<Pick<CheckpointStopResult, "label" | "labelDetail">> => {
+    if (!opts.releaseLabel) return {};
+    try {
+      return { label: await opts.releaseLabel(issue) };
+    } catch (err) {
+      return {
+        label: "failed",
+        labelDetail: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+  /** The label field for a path that deliberately makes no label call. */
+  const labelSkipped = (): Pick<CheckpointStopResult, "label"> =>
+    opts.releaseLabel ? { label: "skipped" } : {};
+
   for (const wt of worktrees) {
     try {
       // 1. commit any dirty disk state (no-op + false when clean).
@@ -216,6 +325,13 @@ export async function checkpointStop(
         wt.issue,
         opts.hostId,
         git,
+        // THIS is the process the refusal exists for. `main.mts` has already
+        // been killed by the time this runs, so it cannot be told in memory
+        // that a check-repair replay was in flight — it reads the sentinel off
+        // disk. The refusal must be VISIBLE, or a night that quietly kept its
+        // committed work but skipped a checkpoint looks like a night nothing
+        // happened on.
+        (line) => opts.log?.(line),
       );
 
       // 2. is there anything worth saving? committed dirt OR HEAD ahead of the
@@ -225,7 +341,15 @@ export async function checkpointStop(
         (await commitsAhead(wt.path, opts.integrationBranch, git)) > 0;
 
       if (!hasWork) {
-        results.push({ issue: wt.issue, outcome: "nothing-to-save" });
+        // Nothing to rescue — but the issue is still wearing `in-progress` from
+        // the loop that claimed it, and the dashboard reads that label. Release
+        // it: there is no work to protect, so a peer re-claiming is exactly what
+        // we want. (Its LEASE is still deliberately left alone — decision #4.)
+        results.push({
+          issue: wt.issue,
+          outcome: "nothing-to-save",
+          ...(await releaseLabelFor(wt.issue)),
+        });
         continue;
       }
 
@@ -233,7 +357,7 @@ export async function checkpointStop(
       //     to origin unconditionally; `"when-sync"` (the launch-time reaper)
       //     writes the ref LOCALLY and only pushes to origin when sync is on — so
       //     a flag-off single-host consumer captures its crashed WIP locally
-      //     WITHOUT an origin write (ADR 0021 inertness). Either way a failure is
+      //     WITHOUT an origin write (inertness). Either way a failure is
       //     a per-issue error and we do NOT release the lease when the work
       //     failed to persist.
       const pushToOrigin =
@@ -246,6 +370,10 @@ export async function checkpointStop(
           issue: wt.issue,
           outcome: "error",
           detail: push.stderr.trim() || "wip push failed",
+          // The work did NOT persist. Same reasoning as the lease we also leave
+          // standing below: keep the label claiming ownership rather than invite
+          // a peer to redo work that is still only on this box's disk.
+          ...labelSkipped(),
         });
         continue;
       }
@@ -266,21 +394,29 @@ export async function checkpointStop(
             issue: wt.issue,
             outcome: "error",
             detail: release.stderr.trim() || "lease release failed",
+            // The lease still stands, so the issue is still owned — leaving the
+            // label saying so keeps the two signals telling the same story.
+            ...labelSkipped(),
           });
           continue;
         }
       }
 
+      // 3c. the work is safe and the lease is free — so the LABEL must stop
+      //     claiming this issue is in flight. The lease is what machines
+      //     arbitrate on; this label is what the ops dashboard shows a human.
       results.push({
         issue: wt.issue,
         outcome: "checkpointed",
         wipRef: wipRef(wt.issue),
+        ...(await releaseLabelFor(wt.issue)),
       });
     } catch (err) {
       results.push({
         issue: wt.issue,
         outcome: "error",
         detail: err instanceof Error ? err.message : String(err),
+        ...labelSkipped(),
       });
     }
   }
@@ -290,7 +426,7 @@ export async function checkpointStop(
   // commits sitting on `integration-candidate` ahead of the integration branch
   // that no worktree owns — back them up to the durable strand ref so they
   // survive the stop. The LOCAL ref is always written (nothing is lost either
-  // way); the ORIGIN push is gated on `syncEnabled` per ADR 0021's inertness
+  // way); the ORIGIN push is gated on `syncEnabled` per the inertness
   // contract, so a flag-off single-host consumer pushes nothing new. Best-effort:
   // a resolve/push fault is silent here (the same fail-quiet posture the per-issue
   // sweep uses for a bad worktree). Pass `stagingBranch: null` to skip entirely.
@@ -338,19 +474,49 @@ async function releaseLeaseRef(
 }
 
 /**
+ * The label half of one issue's console line. Empty when no label seam ran, so
+ * a caller without the seam gets byte-for-byte the old output. A FAILED flip is
+ * spelled loudly: a reap that saved the work but left the board claiming the
+ * issue is in flight has not finished the job, and must not read as clean.
+ */
+function labelSuffix(r: CheckpointStopResult): string {
+  switch (r.label) {
+    case undefined:
+      return "";
+    case "released":
+      return "  ·  label released → ready-for-agent";
+    case "not-in-progress":
+      return "  ·  label was not in-progress (nothing to release)";
+    case "skipped":
+      return "  ·  label LEFT in-progress (work not saved — do not re-claim)";
+    case "failed":
+      return `  ·  label release FAILED, still in-progress: ${r.labelDetail ?? "(no detail)"}`;
+    default: {
+      const _exhaustive: never = r.label;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
  * Render a checkpoint-stop sweep for the console: one line per issue plus a
  * one-line tally (`2 checkpointed, 1 nothing-to-save`). A stable, greppable
  * summary for the thin runner and for operators reading a stop log.
+ *
+ * When the caller supplied a label seam, each line also carries that issue's
+ * label fate and the tally gains a `N label-release failed` term — so a stop
+ * whose labels did not flip can never be read as a clean stop.
  */
 export function formatCheckpointStop(results: CheckpointStopResult[]): string {
   const lines = results.map((r) => {
+    const label = labelSuffix(r);
     switch (r.outcome) {
       case "checkpointed":
-        return `  #${r.issue}  checkpointed → ${r.wipRef}`;
+        return `  #${r.issue}  checkpointed → ${r.wipRef}${label}`;
       case "nothing-to-save":
-        return `  #${r.issue}  nothing-to-save`;
+        return `  #${r.issue}  nothing-to-save${label}`;
       case "error":
-        return `  #${r.issue}  error: ${r.detail ?? "(no detail)"}`;
+        return `  #${r.issue}  error: ${r.detail ?? "(no detail)"}${label}`;
       default: {
         // Exhaustive over CheckpointStopResult["outcome"]; a future variant
         // fails to compile here (mirrors formatHostResult in hosts/result.ts).
@@ -362,11 +528,16 @@ export function formatCheckpointStop(results: CheckpointStopResult[]): string {
 
   const counts = { checkpointed: 0, "nothing-to-save": 0, error: 0 };
   for (const r of results) counts[r.outcome]++;
-  const summary = [
+  const parts = [
     `${counts.checkpointed} checkpointed`,
     `${counts["nothing-to-save"]} nothing-to-save`,
     `${counts.error} error`,
-  ].join(", ");
+  ];
+  // Only ever appended, never replacing a term: existing greps on the tally
+  // keep matching, and a seam-less caller's tally is unchanged.
+  const labelFailed = results.filter((r) => r.label === "failed").length;
+  if (labelFailed > 0) parts.push(`${labelFailed} label-release FAILED`);
+  const summary = parts.join(", ");
 
   return [...lines, summary].join("\n");
 }

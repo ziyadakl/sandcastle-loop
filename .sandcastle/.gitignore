@@ -1,15 +1,23 @@
 .env
 logs/
 worktrees/
+# The loop's own default log file (main.mts `opts.logFile ?? <repoRoot>/
+# .sandcastle/run.log`). Three comments in main.mts already describe it as
+# "already gitignored" — it was not, and every run therefore left an untracked
+# file in the launch worktree. That is the exact condition that makes the final
+# integration-candidate → run-branch fast-forward fail, so the run opens a PR
+# saying "Closes #N" while containing none of the work (2026-08-01 incident).
+run.log
 # Per-machine multi-host registry: it holds repoPaths correct for ONE machine, so
 # tracking it shipped this repo's paths into every consumer. Seed from
-# hosts.example.json instead. Full rationale: docs/adr/0022.
+# hosts.example.json instead.
 hosts.json
 .restart-remaining
 .loop.lock
 .sandbox-flag
 status.json
 .status.json.tmp-*
+.last-run-mode
 # Foreign package-manager lockfiles must never be tracked here: an untracked
 # lockfile that drifts onto integration-candidate can block the final
 # fast-forward promotion (audit issue #4).

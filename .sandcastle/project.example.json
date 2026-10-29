@@ -1,0 +1,69 @@
+{
+  "landCheck": [
+    "pnpm",
+    "verify:land"
+  ],
+  "testDatabase": {
+    "templateDb": "app_test_template",
+    "setupCommand": [
+      "pnpm",
+      "db:migrate"
+    ]
+  },
+  "migrations": {
+    "dir": "packages/db/migrations"
+  },
+  "checksRoot": "apps/nextjs/e2e/checks",
+  "browserCheckCommand": "pnpm --filter @acme/nextjs e2e",
+  "e2eScriptPackageJson": "apps/nextjs/package.json",
+  "checkFreeze": {
+    "browserRoots": [
+      "apps/nextjs/src/lib/screen-check"
+    ],
+    "unitRoots": [
+      "tooling/vitest"
+    ],
+    "unitSeeds": [
+      "tooling/vitest/base.ts",
+      "tooling/vitest/react.ts",
+      "tooling/vitest/package.json",
+      "tooling/vitest/tsconfig.json"
+    ]
+  },
+  "protectedPaths": [
+    "apps/nextjs/playwright.config.ts",
+    "apps/nextjs/e2e/lib/**",
+    "apps/nextjs/e2e/global-setup.ts",
+    "apps/nextjs/src/lib/screen-check/**",
+    "apps/nextjs/src/components/app-readiness/**",
+    "tooling/vitest/**",
+    "packages/*/vitest.config.*",
+    "packages/*/vitest.setup.*",
+    "packages/*/vitest.globalSetup.*"
+  ],
+  "wideReachPaths": [
+    {
+      "paths": [
+        "packages/auth/"
+      ],
+      "what": "changes sign-in"
+    },
+    {
+      "paths": [
+        "packages/db/src/"
+      ],
+      "what": "changes the database schema code"
+    },
+    {
+      "paths": [
+        "tooling/"
+      ],
+      "what": "changes shared tooling"
+    }
+  ],
+  "ownerName": "Alex",
+  "commitIdentity": {
+    "name": "Claude (on behalf of Alex)",
+    "email": "noreply@anthropic.com"
+  }
+}

@@ -25,9 +25,6 @@ export const STALE_AFTER_MS = 180_000;
  * viewer owns it. Unknown ids fall back to {@link humanizeHostId}.
  */
 export const ALIAS_MAP = {
-  srv1360790: "VPS",
-  "ziyads-macbook-air.local": "Mac",
-  "ziyads-macbook-air": "Mac",
   mac: "Mac",
   vps: "VPS",
 };
@@ -35,6 +32,8 @@ export const ALIAS_MAP = {
 /** phase → display label (mirror of T3 PHASE_LABELS). */
 export const PHASE_LABELS = {
   planned: "Planned",
+  "check-writer": "Writing checks",
+  judge: "Judging the check",
   implementer: "Implementing",
   reviewer: "Reviewing",
   "implementer-retry": "Retry",
@@ -67,6 +66,8 @@ export const TERMINAL_PHASES = new Set(["merged", "needs-human", "deferred"]);
  */
 export const ROLE_ORDER = [
   "planner",
+  "checkWriter",
+  "judge",
   "implementer",
   "reviewer",
   "critique",
@@ -79,6 +80,8 @@ export const ROLE_ORDER = [
 /** role key → display label (mirror of the loop's role names). */
 export const ROLE_LABELS = {
   planner: "Planner",
+  checkWriter: "Check writer",
+  judge: "Judge",
   implementer: "Implementer",
   reviewer: "Reviewer",
   critique: "Critique",
@@ -93,7 +96,7 @@ export const RECENT_LIMIT = 10;
 
 /**
  * Title-case a raw hostId the way T3 does: split on -_. / whitespace, cap each
- * word. e.g. "ziyads-macbook-air" -> "Ziyads Macbook Air".
+ * word. e.g. "my-macbook-air" -> "My Macbook Air".
  * @param {string} hostId
  * @returns {string}
  */
@@ -270,6 +273,41 @@ function computeBanner(state, ownStale, activity, ownCrashed) {
   return banner;
 }
 
+/**
+ * #1191 finding F: a peer (or an own snapshot) from a pre-#902 build has no
+ * `run.tickets`/`tickets` field at all — `?? 0` on `working`/`waiting` then
+ * silently rendered an old peer as "nothing in flight" even while it was
+ * mid-run, and `done` as 0 even after it had shipped a run's worth of
+ * tickets. Falls back to deriving `working`/`waiting` from the snapshot's own
+ * `issues` array (using the SAME `TERMINAL_PHASES` set the Active/Recent
+ * split already uses — everything not `planned` and not terminal is still
+ * being worked) and `done` to `iterations.current`, the old round-counter's
+ * best available stand-in.
+ */
+function ticketTally(tickets, iterations, issues) {
+  if (tickets) {
+    return {
+      done: tickets.done ?? 0,
+      working: tickets.working ?? 0,
+      waiting: tickets.waiting ?? 0,
+      cap: tickets.cap ?? iterations?.total ?? 0,
+    };
+  }
+  const list = Array.isArray(issues) ? issues : [];
+  let working = 0;
+  let waiting = 0;
+  for (const issue of list) {
+    if (issue.phase === "planned") waiting += 1;
+    else if (!TERMINAL_PHASES.has(issue.phase)) working += 1;
+  }
+  return {
+    done: iterations?.current ?? 0,
+    working,
+    waiting,
+    cap: iterations?.total ?? 0,
+  };
+}
+
 const PILL_SPEC = [
   { key: "merged", label: "merged", tone: "success" },
   { key: "needsHuman", label: "needs you", tone: "warning" },
@@ -336,13 +374,11 @@ export function buildViewModel(snap, nowMs, aliasMap = ALIAS_MAP, probe = {}) {
   const perMachine = [
     {
       label: label(snap.hostId),
-      current: snap.run.iterations?.current ?? 0,
-      total: snap.run.iterations?.total ?? 0,
+      ...ticketTally(snap.run.tickets, snap.run.iterations, snap.issues),
     },
     ...peers.map((p) => ({
       label: label(p.hostId),
-      current: p.iterations?.current ?? 0,
-      total: p.iterations?.total ?? 0,
+      ...ticketTally(p.tickets, p.iterations, p.issues),
     })),
   ];
 

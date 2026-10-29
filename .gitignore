@@ -14,3 +14,7 @@ prd.json.lock
 .DS_Store
 # Local Claude Code tooling/session dir — machine-local, not project state.
 .claude/
+
+# Read-only copies of each role's prompt, written into the ticket workspace by
+# the loop (.sandcastle/lib/instructions-file.ts).
+.sandcastle-instructions/

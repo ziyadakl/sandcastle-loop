@@ -1,0 +1,2 @@
+patchedDependencies:
+  "@ai-hero/sandcastle@0.12.0": patches/@ai-hero__sandcastle@0.12.0.patch

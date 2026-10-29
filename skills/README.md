@@ -60,13 +60,13 @@ you're in:
 - **New machine?** `cp .sandcastle/hosts.example.json .sandcastle/hosts.json` and
   set your own paths. Skip entirely if you don't run multi-host.
 
-Consumer projects (affinity-tracker etc.) are unaffected — they receive files
+Consumer projects (your own projects) are unaffected — they receive files
 through `/sandcastle-update`, which only copies and never deletes.
 
 ## Why symlinks into `~/.claude/skills` rather than this repo's `.claude/skills`
 
 These skills are invoked from *consumer* projects — `/sandcastle-update` runs
-inside affinity-tracker, not here. A project-level skill would only be visible in
+inside your own project, not here. A project-level skill would only be visible in
 this repo, which is the one place it is least needed. User-level is the only
 scope that makes them available everywhere, and symlinking to a checkout is what
 keeps them version-controlled at the same time.

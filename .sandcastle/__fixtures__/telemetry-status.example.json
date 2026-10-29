@@ -1,0 +1,526 @@
+{
+  "schemaVersion": 3,
+  "state": "done",
+  "run": {
+    "branch": "sandcastle/queue-20260801",
+    "repo": "example/my-project",
+    "startedAt": "2026-08-01T01:43:00.000Z",
+    "iterations": { "current": 3, "total": 3 },
+    "maxConcurrent": 2
+  },
+  "hostId": "mac-studio",
+  "runId": "sandcastle-20260801-0143",
+  "updatedAt": "2026-08-01T06:12:44.518Z",
+  "pid": 48213,
+  "totals": {
+    "merged": 2,
+    "needsHuman": 2,
+    "requeued": 2,
+    "running": 0,
+    "totalCostUsd": 32.33,
+    "perRole": {
+      "planner": {
+        "costUsd": 1.02,
+        "tokens": 289000,
+        "wallMs": 300000,
+        "runs": 3
+      },
+      "implementer": {
+        "costUsd": 22.37,
+        "tokens": 6221000,
+        "wallMs": 6240000,
+        "runs": 4
+      },
+      "reviewer": {
+        "costUsd": 4.62,
+        "tokens": 1658000,
+        "wallMs": 1320000,
+        "runs": 3
+      },
+      "critique": {
+        "costUsd": 0.91,
+        "tokens": 343000,
+        "wallMs": 240000,
+        "runs": 1
+      },
+      "recovery": {
+        "costUsd": null,
+        "tokens": 419000,
+        "wallMs": 900000,
+        "runs": 2
+      },
+      "merger": {
+        "costUsd": 2.1,
+        "tokens": 407000,
+        "wallMs": 480000,
+        "runs": 3
+      },
+      "postMergeReviewer": {
+        "costUsd": 1.31,
+        "tokens": 251000,
+        "wallMs": 260000,
+        "runs": 2
+      }
+    },
+    "perModel": [
+      {
+        "role": "planner",
+        "model": "claude-sonnet-5",
+        "costUsd": 1.02,
+        "tokens": 289000,
+        "calls": 3
+      },
+      {
+        "role": "implementer",
+        "model": "claude-sonnet-5",
+        "costUsd": 14.73,
+        "tokens": 4930000,
+        "calls": 3
+      },
+      {
+        "role": "implementer",
+        "model": "claude-opus-4-8[1m]",
+        "costUsd": 7.64,
+        "tokens": 1291000,
+        "calls": 1
+      },
+      {
+        "role": "reviewer",
+        "model": "claude-sonnet-5",
+        "costUsd": 2.31,
+        "tokens": 1102000,
+        "calls": 2
+      },
+      {
+        "role": "reviewer",
+        "model": "claude-opus-4-8[1m]",
+        "costUsd": 2.31,
+        "tokens": 556000,
+        "calls": 1
+      },
+      {
+        "role": "critique",
+        "model": "claude-sonnet-5",
+        "costUsd": 0.91,
+        "tokens": 343000,
+        "calls": 1
+      },
+      {
+        "role": "recovery",
+        "model": "claude-sonnet-4-8",
+        "costUsd": null,
+        "tokens": 419000,
+        "calls": 2
+      },
+      {
+        "role": "merger",
+        "model": "claude-sonnet-5",
+        "costUsd": 2.1,
+        "tokens": 407000,
+        "calls": 3
+      },
+      {
+        "role": "postMergeReviewer",
+        "model": "claude-sonnet-5",
+        "costUsd": 1.31,
+        "tokens": 251000,
+        "calls": 2
+      }
+    ]
+  },
+  "issues": [
+    {
+      "number": 903,
+      "title": "Chore: prune unused staging fixtures",
+      "branch": "sandcastle/903-prune-staging-fixtures",
+      "phase": "needs-human",
+      "detail": "HAS_BLOCKERS · review quarantined",
+      "startedAt": "2026-08-01T05:35:12.000Z",
+      "attention": true
+    },
+    {
+      "number": 904,
+      "title": "Retry staging vendor webhook on 5xx",
+      "branch": "sandcastle/904-vendor-webhook-retry",
+      "phase": "needs-human",
+      "detail": "recovery pass ran, no verdict",
+      "startedAt": "2026-08-01T05:07:38.000Z",
+      "attention": true
+    }
+  ],
+  "history": [
+    {
+      "number": 901,
+      "title": "Add per-listing staging status badge",
+      "branch": "sandcastle/901-staging-status-badge",
+      "phase": "merged",
+      "completedAt": "2026-08-01T02:31:10.000Z",
+      "hostId": "mac-studio"
+    },
+    {
+      "number": 902,
+      "title": "Fix deal-intake OCR field mapping for two-page scans",
+      "branch": "sandcastle/902-intake-ocr-two-page",
+      "phase": "merged",
+      "completedAt": "2026-08-01T04:18:02.000Z",
+      "hostId": "mac-studio"
+    },
+    {
+      "number": 904,
+      "title": "Retry staging vendor webhook on 5xx",
+      "branch": "sandcastle/904-vendor-webhook-retry",
+      "phase": "needs-human",
+      "completedAt": "2026-08-01T05:22:41.000Z",
+      "hostId": "mac-studio"
+    },
+    {
+      "number": 903,
+      "title": "Chore: prune unused staging fixtures",
+      "branch": "sandcastle/903-prune-staging-fixtures",
+      "phase": "needs-human",
+      "completedAt": "2026-08-01T06:09:55.000Z",
+      "hostId": "mac-studio"
+    }
+  ],
+  "peers": [
+    {
+      "hostId": "my-server",
+      "state": "done",
+      "activity": "cleanup",
+      "iterations": { "current": 3, "total": 3 },
+      "totals": {
+        "merged": 1,
+        "needsHuman": 0,
+        "requeued": 1,
+        "running": 0,
+        "totalCostUsd": 8.77
+      },
+      "issues": [],
+      "updatedAt": "2026-08-01T06:05:31.000Z"
+    }
+  ],
+  "issueTelemetry": [
+    {
+      "issue": 901,
+      "title": "Add per-listing staging status badge",
+      "type": "type:feature",
+      "costUsd": 7.6,
+      "wallMs": 2400000,
+      "tokens": {
+        "input": 162000,
+        "output": 47000,
+        "cacheWrite": 270000,
+        "cacheRead": 1830000
+      },
+      "perRole": {
+        "implementer": {
+          "costUsd": 6.42,
+          "wallMs": 1620000,
+          "runs": 1,
+          "tokens": {
+            "input": 120000,
+            "output": 38000,
+            "cacheWrite": 210000,
+            "cacheRead": 1450000
+          }
+        },
+        "reviewer": {
+          "costUsd": 1.18,
+          "wallMs": 420000,
+          "runs": 1,
+          "tokens": {
+            "input": 42000,
+            "output": 9000,
+            "cacheWrite": 60000,
+            "cacheRead": 380000
+          }
+        }
+      },
+      "implementerAttempts": 1,
+      "reviewerBlockers": 0,
+      "critiqueRetries": 0,
+      "deferrals": 0,
+      "reviewerEscalated": false,
+      "changedLines": 214,
+      "changedFiles": 6,
+      "changedFilePaths": [
+        "apps/nextjs/src/app/(tracker)/tracker/_components/staging-billing-queue.tsx",
+        "apps/nextjs/src/hooks/widgets/use-widget-staging.ts",
+        "packages/api/src/router/staging.ts",
+        "packages/api/src/router/widget-staging.ts",
+        "packages/db/src/schema.ts",
+        "packages/validators/src/staging.ts"
+      ],
+      "shipPath": "first-pass-only",
+      "outcome": "ok",
+      "recovery": false,
+      "quarantined": false
+    },
+    {
+      "issue": 902,
+      "title": "Fix deal-intake OCR field mapping for two-page scans",
+      "type": "type:bug",
+      "costUsd": 17.4,
+      "wallMs": 4860000,
+      "tokens": {
+        "input": 337000,
+        "output": 100000,
+        "cacheWrite": 524000,
+        "cacheRead": 4070000
+      },
+      "perRole": {
+        "implementer": {
+          "costUsd": 13.05,
+          "wallMs": 3120000,
+          "runs": 2,
+          "tokens": {
+            "input": 210000,
+            "output": 71000,
+            "cacheWrite": 340000,
+            "cacheRead": 2900000
+          }
+        },
+        "reviewer": {
+          "costUsd": 3.44,
+          "wallMs": 900000,
+          "runs": 2,
+          "tokens": {
+            "input": 96000,
+            "output": 21000,
+            "cacheWrite": 140000,
+            "cacheRead": 910000
+          }
+        },
+        "critique": {
+          "costUsd": 0.91,
+          "wallMs": 240000,
+          "runs": 1,
+          "tokens": {
+            "input": 31000,
+            "output": 8000,
+            "cacheWrite": 44000,
+            "cacheRead": 260000
+          }
+        }
+      },
+      "implementerAttempts": 2,
+      "reviewerBlockers": 1,
+      "critiqueRetries": 0,
+      "deferrals": 0,
+      "reviewerEscalated": true,
+      "reviewerEscalationModel": "claude-opus-4-8[1m]",
+      "changedLines": 488,
+      "changedFiles": 11,
+      "changedFilePaths": [
+        "packages/api/src/router/deal-intake.ts",
+        "packages/api/src/router/__tests__/deal-intake-form-create-side.test.ts",
+        "packages/api/src/router/__tests__/deal-intake-review-update-metering.test.ts",
+        "packages/validators/src/deals.ts",
+        "packages/db/src/schema.ts",
+        "apps/nextjs/src/app/(deals)/deal-intake/_components/ocr-review-form.tsx",
+        "apps/nextjs/src/app/(deals)/deal-intake/_components/page-thumbnail-list.tsx",
+        "apps/nextjs/src/hooks/deal-intake/use-ocr-field-mapping.ts",
+        "packages/api/src/router/app-settings.ts",
+        "packages/db/src/backfill-task-groups.ts",
+        "docs/reference/database.md"
+      ],
+      "shipPath": "implementer-retry",
+      "outcome": "ok",
+      "recovery": false,
+      "quarantined": false
+    },
+    {
+      "issue": 903,
+      "title": "Chore: prune unused staging fixtures",
+      "type": "type:chore",
+      "costUsd": 2.9,
+      "wallMs": 2040000,
+      "tokens": {
+        "input": 114000,
+        "output": 31000,
+        "cacheWrite": 161000,
+        "cacheRead": 820000
+      },
+      "perRole": {
+        "implementer": {
+          "costUsd": 2.9,
+          "wallMs": 1500000,
+          "runs": 1,
+          "tokens": {
+            "input": 88000,
+            "output": 24000,
+            "cacheWrite": 130000,
+            "cacheRead": 640000
+          }
+        },
+        "recovery": {
+          "costUsd": null,
+          "wallMs": 360000,
+          "runs": 1,
+          "tokens": {
+            "input": 26000,
+            "output": 7000,
+            "cacheWrite": 31000,
+            "cacheRead": 180000
+          }
+        }
+      },
+      "implementerAttempts": 1,
+      "reviewerBlockers": 1,
+      "critiqueRetries": 1,
+      "deferrals": 0,
+      "reviewerEscalated": false,
+      "changedLines": 37,
+      "changedFiles": 3,
+      "changedFilePaths": [
+        "apps/nextjs/e2e/fixtures/context-override.ts",
+        "apps/nextjs/e2e/fixtures/staging-listing.fixture.ts",
+        "packages/api/src/router/staging.ts"
+      ],
+      "shipPath": "critique-retry",
+      "outcome": "quarantined",
+      "recovery": true,
+      "quarantined": true
+    },
+    {
+      "issue": 904,
+      "title": "Retry staging vendor webhook on 5xx",
+      "type": "type:bug",
+      "costUsd": null,
+      "wallMs": 900000,
+      "tokens": {
+        "input": 18000,
+        "output": 5000,
+        "cacheWrite": 22000,
+        "cacheRead": 130000
+      },
+      "perRole": {
+        "recovery": {
+          "costUsd": null,
+          "wallMs": 540000,
+          "runs": 1,
+          "tokens": {
+            "input": 18000,
+            "output": 5000,
+            "cacheWrite": 22000,
+            "cacheRead": 130000
+          }
+        }
+      },
+      "implementerAttempts": 1,
+      "reviewerBlockers": 0,
+      "critiqueRetries": 0,
+      "deferrals": 2,
+      "reviewerEscalated": false,
+      "shipPath": "first-pass-only",
+      "outcome": "error",
+      "recovery": true,
+      "quarantined": false
+    }
+  ],
+  "runTelemetry": {
+    "identity": {
+      "profile": "budget",
+      "backend": "claude",
+      "roleModels": {
+        "planner": { "default": "claude-sonnet-5", "escalations": [] },
+        "implementer": {
+          "default": "claude-sonnet-5",
+          "escalations": ["claude-opus-4-8[1m]", "claude-opus-5"]
+        },
+        "reviewer": {
+          "default": "claude-sonnet-5",
+          "escalations": ["claude-opus-4-8[1m]"]
+        },
+        "critique": { "default": "claude-sonnet-5", "escalations": [] },
+        "recovery": { "default": "claude-sonnet-4-8", "escalations": [] },
+        "merger": { "default": "claude-sonnet-5", "escalations": [] },
+        "postMergeReviewer": {
+          "default": "claude-sonnet-5",
+          "escalations": ["claude-opus-4-8[1m]"]
+        },
+        "postMergeFixer": { "default": "claude-sonnet-5", "escalations": [] }
+      },
+      "promptHashes": {
+        "implement-prompt.md": "9f2c1ab4",
+        "review-prompt.md": "3d70e5c8",
+        "plan-prompt.md": "c14b90fe"
+      }
+    },
+    "counters": {
+      "reviewerBlockers": 2,
+      "implementerRetries": 1,
+      "critiqueFails": 0,
+      "recoveries": 2,
+      "quarantines": 1,
+      "skillDisciplineMisses": {
+        "implementer": 2,
+        "reviewer": 0
+      }
+    },
+    "errorClasses": {
+      "transient": 3,
+      "stalled": 0,
+      "outputCap": 1
+    },
+    "tokenEfficiency": {
+      "planner": {
+        "input": 30000,
+        "output": 9000,
+        "cacheWrite": 40000,
+        "cacheRead": 210000,
+        "cacheHitRatio": 0.75
+      },
+      "implementer": {
+        "input": 418000,
+        "output": 133000,
+        "cacheWrite": 680000,
+        "cacheRead": 4990000,
+        "cacheHitRatio": 0.8196452036793692
+      },
+      "reviewer": {
+        "input": 138000,
+        "output": 30000,
+        "cacheWrite": 200000,
+        "cacheRead": 1290000,
+        "cacheHitRatio": 0.7923832923832924
+      },
+      "critique": {
+        "input": 31000,
+        "output": 8000,
+        "cacheWrite": 44000,
+        "cacheRead": 260000,
+        "cacheHitRatio": 0.7761194029850746
+      },
+      "recovery": {
+        "input": 44000,
+        "output": 12000,
+        "cacheWrite": 53000,
+        "cacheRead": 310000,
+        "cacheHitRatio": 0.7616707616707616
+      },
+      "merger": {
+        "input": 40000,
+        "output": 12000,
+        "cacheWrite": 55000,
+        "cacheRead": 300000,
+        "cacheHitRatio": 0.759493670886076
+      },
+      "postMergeReviewer": {
+        "input": 25000,
+        "output": 6000,
+        "cacheWrite": 30000,
+        "cacheRead": 190000,
+        "cacheHitRatio": 0.7755102040816326
+      },
+      "postMergeFixer": {
+        "input": 0,
+        "output": 0,
+        "cacheWrite": 0,
+        "cacheRead": 0,
+        "cacheHitRatio": null
+      }
+    },
+    "overheadCostUsd": 4.43
+  }
+}

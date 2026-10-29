@@ -12,7 +12,7 @@ Installs `github:ziyadakl/sandcastle-loop` as a devDependency and runs its init 
 Two packages are involved, and they STACK. They do NOT compete or supersede each other:
 
 - **`@ai-hero/sandcastle`** — the UPSTREAM library. Provides the sandbox runner, docker provider, agent shell, base templates (`blank`, `parallel-planner`, `parallel-planner-with-review`, etc.). Maintained externally on npm.
-- **`github:ziyadakl/sandcastle-loop`** (what this skill installs) — the USER'S customized template layer built ON TOP of `@ai-hero/sandcastle`. Adds the GitHub label state machine, drizzle migration auto-applier, verdict parser, multi-issue planner, category-sweep reviewer, third-attempt retry gate, and a heavily customized `.sandcastle/main.mts` (~2700 lines). Maintained at `github:ziyadakl/sandcastle-loop`.
+- **`github:ziyadakl/sandcastle-loop`** (what this skill installs) — the USER'S customized template layer built ON TOP of `@ai-hero/sandcastle`. Adds the GitHub label state machine, verdict parser, deterministic ticket dispatch, a first-test writer, a category-sweep reviewer with fixer rounds, a per-ticket retry budget, and a large `.sandcastle/main.mts`, configured per project by `.sandcastle/project.json`. Maintained at `github:ziyadakl/sandcastle-loop`.
 
 A project's `package.json` will normally have BOTH listed as devDependencies (`@ai-hero/sandcastle` as a transitive dep of `sandcastle-loop`). That is correct. Do NOT assume one is "old" or "superseded by" the other. Do NOT install `@ai-hero/sandcastle` directly via this skill — install `ziyadakl/sandcastle-loop` and the upstream library comes along as a transitive dep.
 
@@ -71,18 +71,18 @@ If you find a project with stale `.sandcastle/` files but no `sandcastle-loop` i
    3. `<repoRoot>/.env` (project-local override)
    4. `~/.config/sandcastle/.env` (host-level default — set once, every project + worktree inherits it)
 
-   **Strongly prefer the host-level file** for keys the user wants everywhere (`KIMI_API_KEY`, `GLM_API_KEY`, `GH_TOKEN`). Never set `ANTHROPIC_API_KEY` for the loop: it bills the paid API instead of the subscription. Use `<repoRoot>/.env` only for project-specific overrides (e.g. a different `DATABASE_URL`).
+   **Strongly prefer the host-level file** for keys the user wants everywhere (`KIMI_API_KEY`, `GLM_API_KEY`, `ANTHROPIC_API_KEY`, `GH_TOKEN`). Use `<repoRoot>/.env` only for project-specific overrides (e.g. a different `DATABASE_URL`).
 
    Detect what auth the user already has and act accordingly. The user is assumed to be on a Claude subscription (Pro / Max / Team) and using Claude Code locally:
 
-   - Check `~/.claude/.credentials.json` — if it exists, no extra key is needed (the orchestrator's docker sandbox mounts the credentials and Claude Code inside the sandbox uses the user's subscription).
+   - Check `~/.claude/.credentials.json` — if it exists, no `ANTHROPIC_API_KEY` is needed (the orchestrator's docker sandbox mounts the credentials and Claude Code inside the sandbox uses the user's subscription).
    - Run `gh auth status` — if it succeeds, the user is logged in. BUT on macOS `gh` defaults to the system Keychain (`--secure-storage`), which means the token does NOT live in `~/.config/gh/hosts.yml` — only a reference to it does. The sandbox mount of `~/.config/gh/` therefore can't supply the token, and `gh issue list` inside the container returns 401. Detect and patch:
      - Read `~/.config/gh/hosts.yml`. If it contains a line matching `oauth_token:` (any value), the file already carries a usable token — sandbox mount alone is enough. Skip the next step.
      - Otherwise (Keychain-stored token, the macOS default): run `gh auth token` to extract the token. If extraction succeeds, append `GH_TOKEN=<token>` to `~/.config/sandcastle/.env` (creating the dir first: `mkdir -p ~/.config/sandcastle`; set perms after write: `chmod 600 ~/.config/sandcastle/.env`). The orchestrator's docker provider passes `.env` through as container env vars and `gh` honours `GH_TOKEN` when `hosts.yml` lacks one.
      - Only write `GH_TOKEN=` if it doesn't already resolve from any source in the chain (don't clobber an explicit user value).
    - **Decide if `DATABASE_URL` matters via concrete detection.** Don't guess — check disk:
-     - If `drizzle.config.ts` exists at repo root, OR any `**/migrations/*.sql` file exists, the project has drizzle migrations and `DATABASE_URL` is REQUIRED. The orchestrator runs migrations post-merge via `applyMigrationsBetween` and refuses to start if it's missing (pre-flight check). Tell the user in plain English: "this project has drizzle migrations — set `DATABASE_URL=postgres://...` in `<repoRoot>/.env` (project-specific, not a host-level secret) before running `/sandcastle-run`. Without it, the loop won't start."
-     - If neither marker exists, stay silent. `DATABASE_URL` is not relevant; the migration applier is a no-op for non-drizzle projects.
+     - If the project has a Postgres test database it wants the loop to use (`testDatabase` in `.sandcastle/project.json`, off by default), `DATABASE_URL` is REQUIRED. The loop clones the template database per job and runs the project's `setupCommand` with the clone's URL in `DATABASE_URL`. Tell the user in plain English: "you opted in to a test database — set `DATABASE_URL=postgres://...` in `<repoRoot>/.env` (project-specific, not a host-level secret) before running `/sandcastle-run`."
+     - If `testDatabase` is not set, stay silent. `DATABASE_URL` is not relevant.
    - **`KIMI_API_KEY` / `GLM_API_KEY` are optional.** The implementer default reverted to `claude-sonnet-4-6` (commit `a6e4a2f`). Only mention these keys if the user explicitly intends to run `--provider kimi` or `--provider glm` — e.g. they bring it up, or they're being rate-limited on Anthropic and want a fallback. Don't nag users who aren't asking. If asked: `.sandcastle/.env.example` documents the canonical location (`~/.config/sandcastle/.env`); the key itself has to come from kimi.com / glm provider, you can't fabricate it.
    - **Verify any `.env` you write is gitignored.** `<repoRoot>/.gitignore` should list `.env` (the shipped template's parent project usually does, but check). `~/.config/sandcastle/.env` lives outside the repo, so no gitignore concern.
 
@@ -109,7 +109,7 @@ If you find a project with stale `.sandcastle/` files but no `sandcastle-loop` i
 
    **Idempotent by construction.** Only missing labels get created; existing ones are left alone (their color/description are the user's choice).
 
-8b. **Verify `gh repo set-default` is configured.** The orchestrator's planner and merger shell out to `gh issue list` / `gh issue edit` / `gh issue close` against the project's repo. If the project has multiple GitHub remotes (e.g., `origin` plus a personal fork) and `gh` has no default repo configured, those commands target the wrong repo (`gh` picks the first remote alphabetically) and silently send issue mutations to the unintended GitHub project.
+8b. **Verify `gh repo set-default` is configured.** The orchestrator's dispatcher and merger shell out to `gh issue list` / `gh issue edit` / `gh issue close` against the project's repo. If the project has multiple GitHub remotes (e.g., `origin` plus a personal fork) and `gh` has no default repo configured, those commands target the wrong repo (`gh` picks the first remote alphabetically) and silently send issue mutations to the unintended GitHub project.
 
    Run once to check: `gh repo set-default --view 2>&1`. If the output looks like a sensible `owner/repo` line, all good — confirm and move on.
 
@@ -151,7 +151,7 @@ If you find a project with stale `.sandcastle/` files but no `sandcastle-loop` i
 
     b. **Check current state.** If `.sandcastle/profile` already contains `<chosen>`, skip the swap (template ships `playwright` active by default — if the choice is `playwright`, no copy is needed).
 
-    c. **Pre-flight: list source files.** From the prompt set (`Dockerfile`, `implement-prompt.md`, `review-prompt.md`, `plan-prompt.md`, `merge-prompt.md`, `recovery-prompt.md`, `post-merge-review-prompt.md`), build the list of files actually present in `.sandcastle/variants/<chosen>/`. If empty, abort — the variant is malformed.
+    c. **Pre-flight: list source files.** From the prompt set (`Dockerfile`, `implement-prompt.md`, `check-writer-prompt.md`, `review-prompt.md`, `merge-prompt.md`, `post-merge-fix-prompt.md`, `post-merge-review-prompt.md`), build the list of files actually present in `.sandcastle/variants/<chosen>/`. If empty, abort — the variant is malformed.
 
     d. **Atomic swap via `.sandcastle/.swap-tmp/`.** Copy each source file to the temp dir first; only after ALL copies succeed, `mv` each from temp to active. If any cp fails, rm -rf the temp dir and abort with no state change. Don't touch `.env`, `lib/`, `main.mts`, `package.json`, `tsconfig.json`, `.gitignore`, `worktrees/`, `logs/`.
 

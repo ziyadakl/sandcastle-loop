@@ -9,7 +9,8 @@
  * This runner does only I/O — it owns the single un-unit-tested surface: the
  * real `exec` collaborator that spawns argv locally or over `ssh <alias> --
  * <argv>`. All gate LOGIC lives in ../lib/hosts/launch.ts and is tested there
- * with a fake exec, mirroring the check-upstream.ts / check-upstream.mts split.
+ * (../lib/hosts/launch.test.ts) with a fake exec, mirroring the
+ * check-upstream.ts / check-upstream.mts split.
  */
 
 import { readFileSync } from "node:fs";
@@ -28,7 +29,10 @@ import {
   type LaunchMode,
   type LaunchSpec,
 } from "../lib/hosts/launch.js";
-import { discoverInflightRun } from "../lib/state/inflight-discovery.js";
+import {
+  discoverInflightRun,
+  discoverResumableRun,
+} from "../lib/state/inflight-discovery.js";
 import { makeExecFileGitRunner } from "../lib/state/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -47,6 +51,7 @@ interface Args {
   mode: LaunchMode;
   iterations: number;
   base?: string;
+  label?: string;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -88,6 +93,9 @@ function parseArgs(argv: string[]): Args {
       case "--base":
         args.base = next();
         break;
+      case "--label":
+        args.label = next();
+        break;
       default:
         fail(`unknown flag: ${a}`);
     }
@@ -127,10 +135,30 @@ function makeRealExec(repoRoot: string): LaunchDeps["exec"] {
         cwd,
         maxBuffer: 8 * 1024 * 1024,
       });
-      return { ok: true, stdout, stderr };
+      return { ok: true, stdout, stderr, exitCode: 0 };
     } catch (err) {
-      const e = err as { stdout?: string; stderr?: string; message?: string };
-      return { ok: false, stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "exec failed" };
+      const e = err as {
+        stdout?: string;
+        stderr?: string;
+        message?: string;
+        code?: unknown;
+        status?: unknown;
+      };
+      // execFileAsync rejects on ANY non-zero exit. Surface the numeric exit
+      // code so the gate can tell `git diff --quiet` "differs" (exit 1) apart
+      // from a git ERROR (exit >= 2). `.code` is the exit status for a normal
+      // non-zero exit (Node populates it on the async execFile error), `.status`
+      // is the execFileSync-style field. A spawn failure (ENOENT etc.) sets
+      // `.code` to a STRING, not an exit status, so coerce anything non-numeric
+      // to 2 — a hard error, never mistaken for "differs".
+      const raw = typeof e.code === "number" ? e.code : e.status;
+      const exitCode = typeof raw === "number" ? raw : 2;
+      return {
+        ok: false,
+        stdout: e.stdout ?? "",
+        stderr: e.stderr ?? e.message ?? "exec failed",
+        exitCode,
+      };
     }
   };
 }
@@ -151,12 +179,42 @@ async function main(): Promise<void> {
     fail(`no host named "${args.host}" in the registry (have: ${hosts.map((h) => h.name).join(", ")})`);
   }
 
-  // For resume, pre-fill the branch from the in-flight run discovered on origin.
+  // For resume, pre-fill the branch from the run discovered on origin. TWO
+  // reads, in order, because the common reason to resume is that the loop is
+  // DEAD — and a liveness probe cannot see a dead loop:
+  //
+  //   1. `discoverInflightRun` — a fresh, still-`running` peer. This is the
+  //      cross-host case: another machine is mid-run and this one is joining.
+  //   2. `discoverResumableRun` — the most recent run that never reached
+  //      `done`, at any age. This is the dead-loop case.
+  //
+  // Before 2026-08-16 only (1) existed, so resuming the run that died in the
+  // night failed with "nothing to resume" — the exact moment resume is for.
+  // The fallback ANNOUNCES what it found, because relaunching a run the
+  // operator believes is alive must never be silent.
   let branch = args.branch;
   if (args.action === "resume" && !branch) {
-    const inflight = await discoverInflightRun(makeExecFileGitRunner(), repoRoot);
-    if (!inflight) fail("resume: no in-flight run found across hosts (nothing to resume)");
-    branch = inflight.branch;
+    const git = makeExecFileGitRunner();
+    const inflight = await discoverInflightRun(git, repoRoot);
+    if (inflight) {
+      branch = inflight.branch;
+    } else {
+      const last = await discoverResumableRun(git, repoRoot);
+      if (!last) {
+        fail(
+          "resume: no unfinished run found on origin (nothing to resume). " +
+            "Pass --branch <name> to relaunch a specific branch anyway.",
+        );
+      }
+      branch = last.branch;
+      console.log(
+        `sandcastle:launch: no live host — resuming the last unfinished run ` +
+          `${last.runId} on ${branch}, last seen "${last.state}" at ${last.updatedAt}` +
+          (last.inflightIssues.length > 0
+            ? ` (issue lease(s) still held: ${last.inflightIssues.join(", ")})`
+            : ""),
+      );
+    }
   }
   if (!branch) fail("a --branch is required (or use --action resume to discover one)");
 
@@ -165,6 +223,7 @@ async function main(): Promise<void> {
     mode: args.mode,
     iterations: args.iterations,
     base: args.base,
+    label: args.label,
     action: args.action,
     dryRun: args.dryRun,
   };

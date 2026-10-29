@@ -2,9 +2,8 @@
  * Skill-discipline helpers.
  *
  * Self-contained domain logic for the orchestrator's skill-discipline gate.
- * No dependency on `.sandcastle/main.mts` internals — kept in `lib/` per the
- * CONTEXT.md pattern (`code that doesn't touch orchestrator internals lives
- * in lib/`).
+ * No dependency on `.sandcastle/main.mts` internals — kept in `lib/`, where
+ * code that doesn't touch orchestrator internals lives.
  *
  * Responsibilities:
  *
@@ -24,28 +23,22 @@
  *
  *   3. {@link parseRequiredSkillsByType} — parse the project's `SANDCASTLE.md`
  *      into a `type:X → required-skills[]` map so the orchestrator can
- *      pre-compute the required-skill set per dispatched issue and the
- *      implementer/fixer gates can fail-fast on omissions.
+ *      pre-compute the required-skill set per dispatched issue. Advisory:
+ *      the builder's prompt names them, and nothing stops on them (spec
+ *      #1334, SG).
  *
  *   4. {@link validateRequiredSkillsInvoked} — set-diff between the
  *      pre-computed required list and the host-extracted invoked list,
  *      returning the missing skills (preserving required-list order so
- *      operator-facing error messages stay deterministic).
+ *      operator-facing error messages stay deterministic). Used only by the
+ *      post-merge fixer's telemetry WARN.
  *
- *   5. {@link findLoadableRubrics} — dual-path (project-local then
- *      `~/.claude/skills/`) existence check for the critique sub-agent's
- *      required design rubrics. Drives the no-rubric preflight.
- *
- *   6. {@link MissingRequiredSkillsError} / {@link CritiqueCriticalError} /
- *      {@link critiqueErrorReasonCode} — structured error types + reason-code
- *      mapping for the two-gate design (skill-discipline backstop + critique
- *      outcome-gate). See `docs/adr/0006-sandcastle-critique-as-gate.md`.
+ * A missing record of a skill run never stops a ticket (spec #1334, SG):
+ * the reviewer grades the diff against the same principles itself
+ * ("Design rules" in `review-prompt.md`).
  */
 
-import { existsSync } from "node:fs";
 import { forEachAssistantMessage } from "./session-jsonl.js";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { findClaudeSessionOnHost, findCodexSessionOnHost } from "@ai-hero/sandcastle";
 import { backendForModel } from "../providers.js";
 import { extractSkillInvocationsFromCodexSession } from "./codex-session.js";
@@ -66,7 +59,7 @@ import { extractSkillInvocationsFromCodexSession } from "./codex-session.js";
  * runs inside the sandbox at a different working directory than the host
  * `repoRoot`, so it writes its session JSONL under the CONTAINER cwd slug
  * (e.g. `-home-agent-workspace`), never the host slug (e.g.
- * `-home-deploy-dev-affinity-tracker`). Reconstructing a host-cwd path can
+ * `-home-you-dev-myproject`). Reconstructing a host-cwd path can
  * never match the container slug → file "not found" → zero skills read →
  * every typed issue silently quarantines. The session id is the one key
  * stable across the host/container boundary, so we search by it. This also
@@ -79,7 +72,7 @@ import { extractSkillInvocationsFromCodexSession } from "./codex-session.js";
  * though the JSONL exists on the host — a consumer that reads only
  * `sessionFilePath` then returns `[]` and quarantines every iteration for
  * "no skills invoked". Audit Issue 1 (2026-05-30); container-slug fix
- * (2026-06-05, affinity-tracker sandcastle-feedback).
+ * (2026-06-05, a sandcastle-feedback audit).
  *
  * `projectsDir` overrides the scanned root (defaults to `~/.claude/projects`
  * inside `findClaudeSessionOnHost`); used by tests. Returns `undefined` when
@@ -158,7 +151,7 @@ export function extractSkillInvocationsFromSession(
 }
 
 // ---------------------------------------------------------------------------
-// Backend-aware resolve + extract (Claude OR Codex, ADR 0012)
+// Backend-aware resolve + extract (Claude OR Codex)
 // ---------------------------------------------------------------------------
 
 /**
@@ -241,6 +234,26 @@ export async function resolveAndExtractSkillInvocations(
  * issues unchanged). This preserves backward compatibility for projects
  * that haven't adopted SANDCASTLE.md.
  */
+/**
+ * THE `type:` LABEL RULE, on its own, over one issue's labels. Returns the
+ * exclusion reason, or `undefined` when the labels are fine.
+ *
+ * ONE definition, two readers: {@link filterPlanByTypeLabels} re-validates the
+ * planner's PICKS with it, and `eligibleForPlanning`
+ * (`lib/state/eligible-set.ts`) applies the same rule when the host builds the
+ * candidate list the planner is allowed to rank in the first place. They must
+ * never drift — an issue the host withholds as untyped and the same issue the
+ * pick-filter would have kept is a contradiction a reader cannot resolve.
+ */
+export function typeLabelExclusionReason(
+  labels: readonly string[],
+): string | undefined {
+  const typeLabels = labels.filter((l) => l.startsWith("type:"));
+  if (typeLabels.length === 0) return "missing type: label";
+  if (typeLabels.length > 1) return "multiple type: labels";
+  return undefined;
+}
+
 export function filterPlanByTypeLabels(
   issues: readonly { readonly id: string; readonly title: string; readonly branch: string }[],
   labelLookup: ReadonlyMap<string, readonly string[]>,
@@ -255,12 +268,9 @@ export function filterPlanByTypeLabels(
   const kept: typeof issues[number][] = [];
   const excluded: { id: string; reason: string }[] = [];
   for (const issue of issues) {
-    const labels = labelLookup.get(issue.id) ?? [];
-    const typeLabels = labels.filter((l) => l.startsWith("type:"));
-    if (typeLabels.length === 0) {
-      excluded.push({ id: issue.id, reason: "missing type: label" });
-    } else if (typeLabels.length > 1) {
-      excluded.push({ id: issue.id, reason: "multiple type: labels" });
+    const reason = typeLabelExclusionReason(labelLookup.get(issue.id) ?? []);
+    if (reason !== undefined) {
+      excluded.push({ id: issue.id, reason });
     } else {
       kept.push(issue);
     }
@@ -410,173 +420,3 @@ export function validateRequiredSkillsInvoked(
 // ---------------------------------------------------------------------------
 // Custom error type for the implementer + post-merge-fixer gates
 // ---------------------------------------------------------------------------
-
-/**
- * Thrown by the per-issue implementer skill-discipline gate when the
- * agent skipped one or more required `Skill()` invocations for its
- * ticket's `type:X` label. Carries structured `missing`/`invoked`/
- * `required`/`issueNumber` fields alongside the formatted message so
- * the orchestrator's quarantine path can `instanceof`-check the error
- * and emit a distinct `skill-discipline-fail` reason for human triage.
- *
- * History: this class was removed on 2026-05-30 per ADR 0006 v1 when
- * the skill-counting gate was demoted to telemetry, then restored on
- * 2026-06-02 per ADR 0006 v3 when log analysis showed critique-as-gate
- * silently abstains on issues whose required principles lack SKILL.md
- * rubric files (#308/#309 shipped real dead code via that path). The
- * two-gate design now in force: critique grades the diff against
- * loaded rubrics; skill-discipline catches the abstention class
- * critique misses by enforcing Skill() invocation as a hard backstop.
- *
- * Scope note: only the per-issue implementer gate throws. The post-
- * merge-fixer gate remains WARN-only telemetry (separate concern —
- * the per-issue gate already covered each diff before rollup, so
- * doubling up at rollup level produces noise rather than signal).
- *
- * Using a plain `Error` would force the quarantine handler to string-
- * match the message to distinguish skill-discipline failures from
- * other thrown pipeline errors. The custom type makes the
- * discrimination structural.
- */
-export class MissingRequiredSkillsError extends Error {
-  readonly missing: readonly string[];
-  readonly invoked: readonly string[];
-  readonly required: readonly string[];
-  readonly issueNumber: number;
-  constructor(
-    missing: readonly string[],
-    invoked: readonly string[],
-    required: readonly string[],
-    issueNumber: number,
-  ) {
-    super(
-      `skill-discipline: issue=${issueNumber} missed required Skill() ` +
-        `invocations: ${missing.join(", ")}; invoked: ` +
-        `${invoked.length === 0 ? "(none)" : invoked.join(", ")}`,
-    );
-    this.name = "MissingRequiredSkillsError";
-    this.missing = missing;
-    this.invoked = invoked;
-    this.required = required;
-    this.issueNumber = issueNumber;
-  }
-}
-
-/**
- * Thrown by the critique sub-agent gate when the diff fails the
- * design-principles review with CRITICAL_BLOCKERS verdict. Carries the
- * critique's findings (markdown prose) and the issue's `type:` label
- * alongside the formatted message so the orchestrator's quarantine path
- * can `instanceof`-check the error, post the findings as a GitHub issue
- * comment, and emit a distinct `critique-critical-fail` reason for
- * human triage.
- *
- * Critique replaces the skill-counting gate's role as the design-discipline
- * blocker. See ADR 0006 for the architectural reasoning (process-gating
- * → outcome-gating).
- */
-export class CritiqueCriticalError extends Error {
-  readonly findings: string;
-  readonly typeLabel: string;
-  readonly retryExhausted: boolean;
-  readonly criticalAfterRetry: boolean;
-  readonly noRubricLoaded: boolean;
-  constructor(
-    findings: string,
-    typeLabel: string,
-    opts: {
-      retryExhausted?: boolean;
-      criticalAfterRetry?: boolean;
-      noRubricLoaded?: boolean;
-    } = {},
-  ) {
-    super(`critique CRITICAL_BLOCKERS for ${typeLabel} — see findings`);
-    this.name = "CritiqueCriticalError";
-    this.findings = findings;
-    this.typeLabel = typeLabel;
-    this.retryExhausted = opts.retryExhausted ?? false;
-    this.criticalAfterRetry = opts.criticalAfterRetry ?? false;
-    this.noRubricLoaded = opts.noRubricLoaded ?? false;
-  }
-}
-
-/**
- * Given an issue's required critique principles, return the subset that
- * actually has a `.claude/skills/<name>/SKILL.md` file resolvable from
- * either the repo (`<repoRoot>/.claude/skills/<name>/SKILL.md`) or the
- * user's global Claude config (`<homeDir>/.claude/skills/<name>/SKILL.md`).
- * Project-local takes precedence semantically (the project can override a
- * global rubric by shipping its own copy), though here we only care that
- * at least one path resolves — the critique sub-agent uses the same
- * dual-path lookup when actually reading the rubric content.
- *
- * The home fallback exists because cross-project rubrics like `simplify`
- * (reuse / quality / efficiency) and `context7-docs` (verify library API
- * signatures before writing) are generic engineering principles that
- * naturally live in `~/.claude/skills/` rather than being duplicated into
- * every project's repo. Without the fallback, the orchestrator's
- * no-rubric preflight (`shipAfterMigrations` in main.mts) would quarantine
- * every backend slice on projects that rely on the global skills.
- *
- * `homeDir` is injectable for unit testing — production callers should
- * accept the default (`os.homedir()`); tests should pass an isolated
- * tmpdir to prevent the dev user's real `~/.claude/skills/` from leaking
- * positive results into assertions about repo-local-only setups.
- *
- * Pure-ish — performs filesystem reads but no writes. Safe in hot paths.
- */
-export function findLoadableRubrics(
-  required: readonly string[],
-  repoRoot: string,
-  homeDir: string = homedir(),
-): readonly string[] {
-  return required.filter(
-    (name) =>
-      existsSync(join(repoRoot, ".claude", "skills", name, "SKILL.md")) ||
-      existsSync(join(homeDir, ".claude", "skills", name, "SKILL.md")),
-  );
-}
-
-/**
- * Map a {@link CritiqueCriticalError} to its quarantine reason code and
- * the verdict header displayed in the GitHub issue comment. Four shapes:
- *
- * 1. `noRubricLoaded` — operator-config failure: zero SKILL.md files
- *    loaded for the issue's required principles. Highest precedence
- *    because no other flag is meaningful without rubric coverage.
- * 2. `criticalAfterRetry` — the implementer's critique-retry pass
- *    introduced a new CRITICAL verdict.
- * 3. `retryExhausted` — the critique-retry pass couldn't clear the
- *    original NEEDS_FIXES findings (or attempt-2 marker was malformed).
- * 4. default — first-pass CRITICAL or initial marker-parse failure.
- *
- * Extracted to a pure helper so the branching is testable without
- * driving the full `runIssuePipeline` catch handler.
- */
-export function critiqueErrorReasonCode(err: CritiqueCriticalError): {
-  readonly reasonCode: string;
-  readonly verdictHeader: string;
-} {
-  if (err.noRubricLoaded) {
-    return {
-      reasonCode: "critique-no-rubric-loaded",
-      verdictHeader: "NO RUBRIC LOADED (operator config)",
-    };
-  }
-  if (err.criticalAfterRetry) {
-    return {
-      reasonCode: "critique-retry-critical",
-      verdictHeader: "CRITICAL (introduced by retry)",
-    };
-  }
-  if (err.retryExhausted) {
-    return {
-      reasonCode: "critique-retry-exhausted",
-      verdictHeader: "NEEDS_FIXES (retry exhausted)",
-    };
-  }
-  return {
-    reasonCode: "critique-critical-fail",
-    verdictHeader: "CRITICAL",
-  };
-}

@@ -1,6 +1,6 @@
 /**
  * Cross-host STATUS SYNC — the transport that fuses two machines' live status
- * feeds into ONE viewer. See docs/adr/0020 (cross-host unified viewer).
+ * feeds into ONE viewer.
  *
  * It mirrors {@link ./lane-sync.ts} (each host publishes to an invisible
  * `refs/sandcastle/status/<hostId>` ref outside `refs/heads/*`, peers discover

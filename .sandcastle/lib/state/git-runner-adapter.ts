@@ -21,24 +21,42 @@ import type { GitRunner, GitRunResult } from "./issue-lease.js";
 const execFileAsync = promisify(execFile);
 
 /** Bump-proof cap matching the former inline async adapters' `maxBuffer`. */
-const MAX_BUFFER = 8 * 1024 * 1024;
+export const DEFAULT_GIT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 /**
  * Async git runner (was `makeGitRunner()` in checkpoint-stop.mts and launch.mts,
  * identical in both). Returns raw, untrimmed stdout/stderr on success; on
  * failure `stderr` is `e.stderr ?? ""` — no message fallback.
+ *
+ * `maxBufferBytes` exists because ONE caller reads a whole-history `git log`
+ * whose output grows with the repository, while every other caller reads a ref
+ * name or a yes/no. The default is unchanged for all of them; the walk in
+ * `telemetry/rework-history.ts` asks for its own headroom. Overflow is not a
+ * silent truncation — Node rejects the promise and git's output is lost
+ * entirely — so {@link GitRunResult.errorCode} is carried out for callers that
+ * must tell that apart from an ordinary git failure.
  */
-export function makeExecFileGitRunner(): GitRunner {
+export function makeExecFileGitRunner(
+  maxBufferBytes: number = DEFAULT_GIT_MAX_BUFFER_BYTES,
+): GitRunner {
   return async (cwd: string, ...gitArgs: string[]): Promise<GitRunResult> => {
     try {
       const { stdout, stderr } = await execFileAsync("git", gitArgs, {
         cwd,
-        maxBuffer: MAX_BUFFER,
+        maxBuffer: maxBufferBytes,
       });
       return { ok: true, stdout, stderr };
     } catch (err) {
-      const e = err as { stdout?: string; stderr?: string };
-      return { ok: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+      const e = err as { stdout?: string; stderr?: string; code?: unknown };
+      const code = e.code;
+      return {
+        ok: false,
+        stdout: e.stdout ?? "",
+        stderr: e.stderr ?? "",
+        ...(typeof code === "string" || typeof code === "number"
+          ? { errorCode: code }
+          : {}),
+      };
     }
   };
 }

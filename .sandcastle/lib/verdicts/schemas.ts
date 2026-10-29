@@ -16,6 +16,7 @@ import type {
   RecoveryDecision,
 } from "../types.js";
 import { isGenericAssertionLine } from "./forbidden-lines.js";
+import { findTestDatabaseUrlOverride } from "./test-command-db-guard.js";
 
 /** Severity ladder for reviewer concerns. */
 export const ConcernSeveritySchema = z.enum([
@@ -79,6 +80,30 @@ const ImplementerOutputBaseSchema = z.object({
   e2eAssertionLine: z.string().min(1).nullable(),
   outputNotFiltered: z.boolean(),
   testReachedFeature: z.boolean(),
+
+  // ---- host-observed, NOT agent-authored (issue #1025) ----
+  // The database this job's test run actually resolved to, read HOST-SIDE from
+  // the run's stdout (`../db/observed-db.ts`) and written onto the certification
+  // AFTER parse — never trusted from the agent. Optional so the agent is not
+  // asked to emit it and a legitimately-skipped e2e (backend-only) leaves it
+  // absent; when the host DOES observe a database, the driver compares it to the
+  // clone it minted and refuses to certify green on a mismatch (the #1015 false
+  // green). Recorded here so the observation lands in the certification the
+  // reviewer and telemetry read, rather than being inferred after the fact.
+  observedDatabase: z.string().min(1).nullable().optional(),
+
+  // ---- host-decided, NOT agent-authored (issue #871, repair 3) ----
+  // Whether the FINISHED diff touched a rendered surface, computed HOST-SIDE by
+  // the driver from the actual changed files (`requiredProofForDiff` →
+  // `demand === "browser"`, `./story-diff-enforcement.ts`) and stamped onto the
+  // envelope AFTER parse. This is the wired `COMMIT_TOUCHED_UI`: the envelope
+  // could not previously express the difference between what the story CALLED
+  // itself (`storyType`/`e2eRequired`, self-reports) and what its own diff
+  // actually touched. Carried so the reviewer and telemetry see both side by
+  // side; the driver acts on a contradiction (a UI-touching diff certified as
+  // needing no e2e) at the ship gate. Optional — absent on the paths that never
+  // reach a measured ship diff.
+  commitTouchedUi: z.boolean().optional(),
 });
 
 /**
@@ -132,10 +157,34 @@ export const ImplementerOutputSchema = ImplementerOutputBaseSchema.superRefine(
       });
     }
 
-    // Rules 1-2 only bite on the STORY_COMPLETE / RECOVERY_COMPLETE path.
-    // HALT is the explicit escape hatch ("I gave up") and lets soft fields
-    // be null, so we skip the strict checks below when the marker is HALT.
+    // Rules 1-2 (and the #1025 override guard) only bite on the STORY_COMPLETE
+    // / RECOVERY_COMPLETE path. HALT is the explicit escape hatch ("I gave up")
+    // and lets soft fields be null, so we skip the strict checks below when the
+    // marker is HALT.
     if (isHalt) return;
+
+    // Issue #1025, guard 1: the test command MAY NOT set POSTGRES_URL or
+    // DATABASE_URL itself. The loop already exports the job's own database clone
+    // as POSTGRES_URL; a command that re-sets it points the run at a different
+    // database than the grader reads (the #1015 false green — a green run
+    // against plain `postgres` while the grader inspected the untouched clone).
+    // Rejected at PARSE time so a STORY_COMPLETE built on a self-chosen database
+    // never reaches the reviewer or a commit.
+    const dbOverride = findTestDatabaseUrlOverride(val.testCommandUsed);
+    if (dbOverride !== null) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["testCommandUsed"],
+        message:
+          `testCommandUsed sets ${dbOverride.varName} itself ` +
+          `(${dbOverride.assignment}). The loop already exports this job's own ` +
+          `database clone as POSTGRES_URL — that value is authoritative. A ` +
+          `command that overrides it (or scrapes a connection string from .env) ` +
+          `runs the tests against a database the grader never reads, so a green ` +
+          `run there certifies nothing. Remove the override and let the ` +
+          `exported POSTGRES_URL stand, or switch the marker to HALT.`,
+      });
+    }
 
     // Rule 1: e2eRequired ⇒ testCommandUsed non-null AND e2eActuallyRan.
     if (val.e2eRequired) {

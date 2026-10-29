@@ -11,7 +11,7 @@
  *
  * Pure aggregation; no I/O. Like the cost ledger it must NEVER throw into a run —
  * telemetry is best-effort and must not perturb control flow. It reuses the same
- * {@link CostRole} type from `./ledger.js` so the 8 roles are defined in exactly
+ * {@link CostRole} type from `./ledger.js` so the 10 roles are defined in exactly
  * one place.
  */
 

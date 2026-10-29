@@ -5,7 +5,7 @@
 #
 # Why symlinks into ~/.claude/skills rather than shipping the files into each
 # project's .claude/skills: these skills are run FROM consumer projects
-# (/sandcastle-update is invoked inside affinity-tracker, not here), so they
+# (/sandcastle-update is invoked inside your own project, not here), so they
 # must be user-level to be discoverable everywhere. Symlinking to a git
 # checkout is what makes them version-controlled AND global at once — the same
 # arrangement the mattpocock-skills clone already uses on this machine.

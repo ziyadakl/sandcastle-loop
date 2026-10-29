@@ -1,6 +1,6 @@
 # ADR 0006 — Sandcastle: process-gates → outcome-gates (critique-as-gate)
 
-**Status:** Accepted
+**Status:** Superseded by [ADR 0023](0023-simplified-loop-from-affinity.md) — the separate critique pass and its fix pass are removed; the reviewer grades the same design rules.
 **Date:** 2026-05-30
 **Supersedes (in part):** Skill-counting gate from commits `cfd711ccb` + `24204d2f6`. Originally the custom error type `MissingRequiredSkillsError` was kept for the post-merge fixer's separate concern; on 2026-05-30 evening it was removed entirely per #324 — the live-test on #321 caught the post-merge fixer exhibiting the exact gaming pattern (real principle-aligned work + narrated `Skills invoked: impeccable, polish` in commit body, but zero `Skill()` tool calls registered → rollup quarantined). The fixer gate has now also been demoted to `[skill-discipline] WARN post-merge-fixer …` telemetry; the per-issue critique already gates each diff before it reaches the rollup, and the re-review (when needed) catches genuine rollup-level regressions.
 

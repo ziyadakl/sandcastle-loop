@@ -43,7 +43,7 @@ which case you're in and only checks the tooling that case requires.
 - Queue + label state machine
 - Worktree management
 - Retry ladder
-- Critique-as-gate / skill-discipline gates
+- Skill-discipline gate
 - Integration branch + FF auto-merge
 - Post-merge fixer
 

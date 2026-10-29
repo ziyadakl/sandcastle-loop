@@ -5,7 +5,7 @@
  * Why this exists: the SDK's `PromptArgumentSubstitution` throws at
  * iteration 1 with `Prompt argument {{X}} has no matching value in
  * promptArgs` when an orphan slips through. Audit Issue 4 (2026-05-30):
- * `{{CRITIQUE_FEEDBACK}}` shipped to affinity-tracker without a matching
+ * `{{CRITIQUE_FEEDBACK}}` shipped without a matching
  * key and crashed the entire one-shot pivot mid-experiment. Cheap regex
  * lint catches this pre-launch.
  *

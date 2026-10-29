@@ -11,7 +11,7 @@
 #
 # This is the per-issue execution container that the orchestrator
 # (`.sandcastle/main.mts`) spins up via the `docker()` factory call.
-# Mounts (~/.claude, ~/.config/gh, repo at /workspace) are configured
+# Mounts (~/.claude, ~/.codex, repo at /workspace; never ~/.config/gh) are configured
 # at runtime — DO NOT bake credentials or repos into the image.
 #
 # Base: bookworm-slim per the Wave 6.1 spec. We pre-install only the
@@ -54,14 +54,25 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Non-root agent user (UID/GID 1001 to match the hub deploy user — verified
-# via `ssh hub id deploy`). The base node:22-bookworm-slim image ships a
-# `node` user at UID 1000; we delete it and create our own at 1001 instead
-# of renaming so that the IDs match the host bind-mount semantics exactly.
+# Non-root agent user. The UID/GID come from build args that
+# `sandcastle docker build-image` fills with the BUILD HOST's own uid/gid
+# (defaultUidBuildArgs), so the container user and the bind-mounted
+# ~/.claude / ~/.codex always share an owner.
+#
+# These were hardcoded to 1001 for the retired Hostinger "hub" box. On any
+# host with a different uid that silently breaks subscription auth: the 0600
+# `.credentials.json` is unreadable inside the container and every agent
+# reports "Not logged in". The Netcup VPS deploy user is 1000 — this is not
+# hypothetical. Keep them build args; do NOT re-hardcode.
+#
+# The base node:22-bookworm-slim image ships a `node` user at UID 1000, so we
+# delete it first to free either id.
 # ---------------------------------------------------------------------------
+ARG AGENT_UID=1001
+ARG AGENT_GID=1001
 RUN userdel -r node 2>/dev/null || true \
-  && groupadd -g 1001 agent \
-  && useradd -m -u 1001 -g 1001 -s /bin/bash agent \
+  && groupadd -g ${AGENT_GID} agent \
+  && useradd -m -u ${AGENT_UID} -g ${AGENT_GID} -s /bin/bash agent \
   && mkdir -p /workspace \
   && chown -R agent:agent /workspace
 
@@ -69,7 +80,7 @@ RUN userdel -r node 2>/dev/null || true \
 RUN mkdir -p /home/agent/.npm-global \
   && chown -R agent:agent /home/agent/.npm-global
 
-USER 1001
+USER ${AGENT_UID}:${AGENT_GID}
 ENV NPM_CONFIG_PREFIX=/home/agent/.npm-global
 ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/bin:${PATH}"
 
@@ -82,14 +93,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # ---------------------------------------------------------------------------
 # Corepack — Node 16+ ships corepack which provides pnpm/yarn shims.
-# Affinity-tracker and similar monorepos use pnpm's workspace:* protocol
+# Monorepos commonly use pnpm's workspace:* protocol
 # which npm refuses to parse. Enabling corepack means our onSandboxReady
 # hook can run `pnpm install` without an extra `npm install -g pnpm` step.
 # ---------------------------------------------------------------------------
 USER root
 RUN corepack enable
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack prepare pnpm@10.19.0 --activate
+RUN corepack prepare pnpm@12.3.4 --activate
 
 # ---------------------------------------------------------------------------
 # agent-browser — Vercel Labs CLI for AI-driven browser automation.
@@ -116,7 +127,7 @@ RUN apt-get update \
   && agent-browser install --with-deps \
   && rm -rf /var/lib/apt/lists/*
 
-USER 1001
+USER ${AGENT_UID}:${AGENT_GID}
 
 # Pre-cache the agent-browser Chrome download into the agent user's home
 # so each new sandbox starts without a 120 MB download on first invoke.

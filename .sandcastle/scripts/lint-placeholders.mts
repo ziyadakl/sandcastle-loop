@@ -18,7 +18,7 @@ function fail(msg: string): never {
 function collectPromptFiles(sandcastleDir: string): Map<string, string> {
   const files = new Map<string, string>();
   // Base prompts: .sandcastle/*-prompt.md (plus other top-level *.md prompts
-  // — e.g. plan-prompt.md, merge-prompt.md, recovery-prompt.md, etc.).
+  // — e.g. merge-prompt.md, etc.).
   for (const entry of readdirSync(sandcastleDir)) {
     if (!entry.endsWith(".md")) continue;
     const abs = join(sandcastleDir, entry);

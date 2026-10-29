@@ -41,9 +41,14 @@ For each branch in the list above, in order:
    e.g. `pnpm typecheck` / `pnpm vitest run`) to verify everything still
    works.
 <!-- /variant:test-runner-merge -->
-4. Also run the project's lint script (`pnpm lint`; skip if the project has
-   no `lint` script) on the merged result — a per-branch clean lint doesn't
-   guarantee the *combined* tree lints cleanly.
+4. No hook formats your code on save inside this sandbox (the loop disables
+   all hooks here on purpose — see `.claude/settings.local.json`), so before
+   linting, run `pnpm exec prettier --write --ignore-unknown <the files you
+   changed or resolved>` from the repo root yourself — the command the
+   interactive save hook used to run for you. Then also run the project's
+   lint script (`pnpm lint`; skip if the project has no `lint` script) on the
+   merged result — a per-branch clean lint doesn't guarantee the *combined*
+   tree lints cleanly.
 5. If tests or lint fail, **fix the issues before proceeding to the next
    branch**. A merge that breaks tests or lint is worse than no merge — do
    not move on until both are green again.

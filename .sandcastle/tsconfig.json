@@ -7,9 +7,15 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "allowImportingTsExtensions": false,
+    "allowImportingTsExtensions": true,
     "lib": ["ES2022"],
     "types": ["node"]
   },
-  "include": ["**/*.mts", "**/*.ts"]
+  "include": ["**/*.mts", "**/*.ts"],
+  // TypeScript's implicit default exclude covers only node_modules — NOT
+  // `worktrees/`, which holds multi-GB full repo checkouts. Without this,
+  // `pnpm sandcastle:typecheck` compiles the whole app twice over and reports
+  // ~6,100 foreign errors in 22s; with it, the real .sandcastle sources
+  // typecheck clean in ~2.5s.
+  "exclude": ["worktrees", "logs", "variants", "node_modules"]
 }

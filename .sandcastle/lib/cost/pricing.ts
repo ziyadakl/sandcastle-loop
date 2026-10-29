@@ -40,15 +40,23 @@ export interface Usage {
 }
 
 /**
- * Baked list-rate table, keyed by the model id as it appears in the session
- * JSONL's `message.model`. The `[1m]` long-context variants deliberately share
- * their base model's row (premium NOT modeled — see the module header).
+ * Baked list-rate table, keyed by the UNDATED model id. The `[1m]` long-context
+ * variants deliberately share their base model's row (premium NOT modeled — see
+ * the module header).
+ *
+ * Session JSONL usually reports a DATED id (`claude-haiku-4-5-20251001`); those
+ * are normalized onto this table by `resolveRate`, so a dated release does NOT
+ * need its own row here. Add a row only for a genuinely new base model.
  *
  * UNPRICED models (gpt-5.5, kimi-for-coding, glm-4.6, anything not listed) are
  * absent by design: `costForUsage` returns `null` for them so the ledger can
  * surface them in `unpricedModels` rather than silently counting them as $0.
  */
 const RATES: Readonly<Record<string, ModelRate>> = {
+  // opus 5.5: 4 / 20 / 5.00 / 0.20. The one row off the 0.10×input cache-read
+  // rule: Anthropic publishes $0.20 (0.05×) for this model, and the published
+  // rate beats the rule of thumb.
+  "claude-opus-5-5": { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
   // opus family: 5 / 25 / 6.25 / 0.50
   "claude-opus-4-8": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   "claude-opus-4-8[1m]": { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
@@ -60,6 +68,71 @@ const RATES: Readonly<Record<string, ModelRate>> = {
   "claude-haiku-4-5": { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
 };
 
+/** All-zero rate — see `NON_BILLABLE_MODELS`. */
+const ZERO_RATE: ModelRate = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+
+/**
+ * Ids that are NOT models and bill nothing, priced at an all-zero rate so they
+ * are DROPPED rather than surfaced in `unpricedModels`.
+ *
+ * They live outside {@link RATES} on purpose: that table means "billable
+ * models", and its absent-means-unpriced rule exists precisely so real usage is
+ * never silently counted as $0. These are the documented exceptions.
+ *
+ *   `<synthetic>` — Claude Code's own marker for a locally-generated assistant
+ *   message (an interrupt notice, a synthesized error). Real value: a corpus
+ *   scan of ~400 sessions saw it 10 times. Reporting it as an unpriced MODEL
+ *   would cry wolf at an operator reading the end-of-run line.
+ *
+ * NOT included, deliberately: the bare aliases `sonnet` (17 occurrences) and
+ * `opus` (3). Those denote real, billed usage whose concrete model — and thus
+ * whose rate, which differs ~3× between the families — is not recoverable from
+ * the id. Guessing would silently misprice real spend, so they stay unpriced
+ * and show up in `unpricedModels`, which is exactly that channel's job.
+ */
+const NON_BILLABLE_MODELS: ReadonlySet<string> = new Set(["<synthetic>"]);
+
+/**
+ * Anchored trailing-date suffix, e.g. the `-20251001` of
+ * `claude-haiku-4-5-20251001`.
+ *
+ * The `$` anchor and the exact `{8}` are load-bearing: `claude-opus-4-8` must
+ * keep its rate (that `4-8` is a version, not a date), and a date must never be
+ * stripped from the middle of an id.
+ */
+const DATE_SUFFIX = /-\d{8}$/;
+
+/**
+ * Resolve a model id to its rate row — the SINGLE lookup both public functions
+ * route through, so `costForUsage` and `isPricedModel` can never disagree. (If
+ * only one normalized, `unpricedModels` would start lying, and a telemetry bug
+ * that looks like a ledger bug is the expensive kind.)
+ *
+ * Order: exact table hit (so every already-priced id behaves byte-identically)
+ * → non-billable sentinel → strip ONE trailing date and retry → `undefined`.
+ *
+ * `Object.hasOwn` rather than a bare index: `RATES` is a plain object, so
+ * `RATES["toString"]` would otherwise yield an inherited FUNCTION and make
+ * every arithmetic term `NaN`, permanently poisoning the run total. The
+ * date-stripping branch widens that exposure (`valueOf-20251001` → `valueOf`).
+ *
+ * KNOWN GAP, deliberately not handled: a dated long-context id such as
+ * `claude-opus-4-8-20260101[1m]` ends in `]`, so the anchored regex won't strip
+ * it and it reads as unpriced. That fails LOUDLY into `unpricedModels` rather
+ * than silently costing $0, which is the safe direction; add a second pass only
+ * once such an id is actually observed in a session log.
+ */
+function resolveRate(model: string): ModelRate | undefined {
+  // Never-throw contract (capture.ts:62-68, timing.ts:42-43): a non-string
+  // sneaking past the type boundary is clamped to "unpriced", never thrown.
+  if (typeof model !== "string") return undefined;
+  if (Object.hasOwn(RATES, model)) return RATES[model];
+  if (NON_BILLABLE_MODELS.has(model)) return ZERO_RATE;
+  const undated = model.replace(DATE_SUFFIX, "");
+  if (undated !== model && Object.hasOwn(RATES, undated)) return RATES[undated];
+  return undefined;
+}
+
 /**
  * Estimated USD cost for one model's aggregated token usage.
  *
@@ -68,7 +141,7 @@ const RATES: Readonly<Record<string, ModelRate>> = {
  * each token bucket times its per-1e6 rate, divided by 1e6.
  */
 export function costForUsage(model: string, usage: Usage): number | null {
-  const rate = RATES[model];
+  const rate = resolveRate(model);
   if (rate === undefined) return null;
   return (
     (usage.inputTokens * rate.input +
@@ -81,5 +154,5 @@ export function costForUsage(model: string, usage: Usage): number | null {
 
 /** True iff the model id has a baked rate (i.e. `costForUsage` won't return null). */
 export function isPricedModel(model: string): boolean {
-  return RATES[model] !== undefined;
+  return resolveRate(model) !== undefined;
 }

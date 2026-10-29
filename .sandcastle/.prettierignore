@@ -1,0 +1,13 @@
+# Vendored sandcastle loop code — the repo-root .prettierignore already lists
+# `.sandcastle/`, but prettier resolves ignore files against the CURRENT WORKING
+# DIRECTORY. A session, subagent or post-edit hook running from inside this
+# folder never reads the root file, finds only `.sandcastle/.gitignore` (which
+# does not list source), and happily reformats `main.mts` — 374 KB, whose entire
+# import block then gets rewritten by @ianvs/prettier-plugin-sort-imports.
+#
+# That is exactly what happened in fb86427c: ~35 lines of real logic buried
+# under 376 lines of import churn, reverted in e425623f.
+#
+# This file makes the protection CWD-independent. Do not delete it. If
+# /sandcastle-update overwrites this directory, re-graft it.
+*

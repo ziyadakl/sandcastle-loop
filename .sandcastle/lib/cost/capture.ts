@@ -43,6 +43,18 @@ const defaultDeps: CaptureDeps = {
  * when `ledger` is undefined (test seams) or `handle` has no iterations. Any
  * error while resolving/parsing a session is swallowed (logged best-effort) —
  * telemetry must never fail a run, not even via the error log itself.
+ *
+ * RETURNS everything it folded in, flattened across the handle's iterations, so
+ * a caller can attribute the SAME entries a second time without re-reading and
+ * re-parsing the session files (see `lib/telemetry/wrappers.ts`, which folds
+ * them into the per-issue ledger). Every pre-existing caller ignores the value,
+ * so adding it changes no behaviour.
+ *
+ * Two return contracts a caller must respect:
+ *  - `[]` means "nothing to attribute" — it NEVER means "this role cost zero".
+ *  - On a mid-loop throw the PARTIAL accumulation is returned, not `[]`.
+ *    Earlier iterations already reached `ledger.add`, so discarding them would
+ *    leave the run-scoped and per-issue ledgers disagreeing about the same run.
  */
 export async function captureRoleCost(
   ledger: CostLedger | undefined,
@@ -50,14 +62,18 @@ export async function captureRoleCost(
   handle: { readonly iterations?: readonly IterationRef[] } | undefined,
   logError: (line: string) => void,
   deps: CaptureDeps = defaultDeps,
-): Promise<void> {
-  if (ledger === undefined) return;
+): Promise<ModelUsage[]> {
+  const collected: ModelUsage[] = [];
+  if (ledger === undefined) return collected;
   try {
     for (const it of handle?.iterations ?? []) {
       const path = await deps.resolveSessionFilePath(it);
       if (path === undefined) continue;
       const entries = deps.extractUsageFromSession(path);
-      if (entries.length > 0) ledger.add(role, entries);
+      if (entries.length > 0) {
+        ledger.add(role, entries);
+        collected.push(...entries);
+      }
     }
   } catch (err) {
     try {
@@ -66,4 +82,5 @@ export async function captureRoleCost(
       // never fail a run over telemetry, not even the error log
     }
   }
+  return collected;
 }

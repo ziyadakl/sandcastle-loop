@@ -11,6 +11,18 @@ import {
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { worktreePathFor as canonicalWorktreePathFor } from "./worktree-path.js";
+import {
+  unlockOwnWorktree,
+  type WorktreeGit,
+  type WorktreeGitResult,
+} from "./paths/worktree-lock.js";
+import {
+  EXEC_KILL_GRACE_MS,
+  EXEC_OUTPUT_TAIL_CHARS,
+  type SandboxCommandRunner,
+  type SandboxExecOptions,
+  type SandboxExecResult,
+} from "./sandbox-exec.js";
 import { backendForModel } from "../providers.js";
 import {
   wipRef,
@@ -18,26 +30,12 @@ import {
   resolveReuseDecision,
   makeSyncGitRunner,
 } from "./state/index.js";
-
-const PLACEHOLDER_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
-
-// Mirrors the SDK's substitutePromptArgs contract for the keys this repo
-// uses: same placeholder regex, fail-loud on unmatched key. Does NOT inject
-// SOURCE_BRANCH/TARGET_BRANCH built-ins or preprocess !`...` shell blocks —
-// see FOLLOW_UPS.md.
-export function applyPromptArgs(
-  prompt: string,
-  args: Record<string, string>,
-): string {
-  return prompt.replace(PLACEHOLDER_PATTERN, (_match, key: string) => {
-    if (!(key in args)) {
-      throw new Error(
-        `Prompt argument "{{${key}}}" has no matching value in promptArgs`,
-      );
-    }
-    return args[key];
-  });
-}
+import { applyPromptArgs } from "./prompt-args.js";
+import { sandboxAgentSettingsArgs } from "./sandbox-agent-settings.js";
+import {
+  NO_GITHUB_ACCESS_TOKEN,
+  withoutGithubCredentials,
+} from "./github-credential-env.js";
 
 // Fields shared by every spec passed to spawnAgent. The buildArgs callback
 // reads from this base so callers can declare it once without picking which
@@ -77,7 +75,7 @@ export interface MacHostSandboxOptions {
    */
   readonly buildArgs?: (spec: MacHostRunSpecBase) => readonly string[];
   /**
-   * Cross-host sync opt-in (ADR 0021 §2 "branch reuse on pickup"). When true
+   * Cross-host sync opt-in ("branch reuse on pickup"). When true
    * AND a WIP checkpoint ref exists on origin for an issue-shaped branch, the
    * per-issue worktree is cut from that checkpoint instead of force-reset from
    * HEAD. Defaults to `false` (undefined) — with it off the worktree-add path
@@ -112,6 +110,19 @@ export interface MacHostSandboxHandle {
   readonly branch: string;
   readonly worktreePath: string;
   run(spec: MacHostRunSpec): Promise<MacHostRunHandle>;
+  /**
+   * Run one command inside this sandbox — which, on mac-host, IS the host, in
+   * the per-issue worktree. Present so the test-verification gate has ONE code
+   * path across providers instead of a host-side branch it would have to keep
+   * in sync; see `./sandbox-exec.ts` for why the gate cannot run on the host on
+   * the docker path.
+   *
+   * Typed as the standalone {@link SandboxCommandRunner} rather than redeclared
+   * as a method: the gate is handed this function on its own, so a signature
+   * that permitted a `this`-dependent implementation would be lying about how
+   * it is called.
+   */
+  readonly exec: SandboxCommandRunner;
   close(): Promise<void>;
 }
 
@@ -124,9 +135,49 @@ function absoluteWorktreePath(repoRoot: string, branch: string): string {
   return path.join(repoRoot, canonicalWorktreePathFor(branch));
 }
 
-function preCleanWorktree(repoRoot: string, wtPath: string): void {
+/**
+ * The repo's canonical sync git runner, narrowed for the lock helpers.
+ *
+ * `makeSyncGitRunner` is DECLARED as `GitRunner`, whose result type allows a
+ * Promise; its implementation is synchronous and its object shape is already
+ * exactly what the lock helpers read. Narrowing it in one place reuses that
+ * canonical runner instead of hand-rolling a fourth copy of the same
+ * try/catch — which is what this replaced.
+ */
+const lockGit: WorktreeGit = (cwd, ...gitArgs) =>
+  makeSyncGitRunner()(cwd, ...gitArgs) as WorktreeGitResult;
+
+function preCleanWorktree(
+  repoRoot: string,
+  wtPath: string,
+  branch: string,
+): void {
   // Mirror main.mts:1745-1772 — three-tier cleanup so a stale registration
   // or orphan dir never blocks a fresh `git worktree add`.
+  // Issue #1260: a worktree left behind by a KILLED run is still LOCKED, and
+  // both `git worktree remove --force` and `git worktree prune` refuse a
+  // locked worktree. Drop our own lock first.
+  //
+  // OUTSIDE the `existsSync` gate, deliberately — mirrors `createSandboxRaw`
+  // in main.mts. A killed run can leave the REGISTRATION locked with its
+  // DIRECTORY gone; gate the unlock on the directory and nothing can ever
+  // clear it, so the next `git worktree add` dies on "a missing but locked
+  // worktree" and the branch is wedged until a human intervenes.
+  //
+  // Keyed on the BRANCH and resolved through git, so it can only release a
+  // lock this loop took for this branch — never a hand-taken one, and never a
+  // sibling's, which a derived path could reach. The runner is the repo's
+  // canonical `makeSyncGitRunner`.
+  if (unlockOwnWorktree(repoRoot, branch, lockGit) === "refused") {
+    // Never silent: on a refusal the remove below fails, `rmSync` cannot touch
+    // the registration and prune cannot clear it either, so the branch stops
+    // working with no other trace of why.
+    console.error(
+      `[issue-branch=${branch}] its stale worktree is locked by something ` +
+        `this loop did not lock — leaving it alone. This branch cannot be ` +
+        `worked until that is cleared by hand: git worktree unlock ${wtPath}`,
+    );
+  }
   if (existsSync(wtPath)) {
     try {
       execFileSync(
@@ -231,7 +282,7 @@ function stageCodexAgentsMdIntoWorktree(wtPath: string): void {
   const src = path.join(wtPath, ".sandcastle", "AGENTS.md");
   const dst = path.join(wtPath, "AGENTS.md");
   if (!existsSync(src) || existsSync(dst)) return;
-  // Fail-closed (ADR 0010), matching the docker mirror's `|| true`: AGENTS.md
+  // Fail-closed, matching the docker mirror's `|| true`: AGENTS.md
   // delivery is best-effort cosmetic, so BOTH the copy and the git-exclude are
   // inside the try — a failure here must never abort the run.
   try {
@@ -274,8 +325,9 @@ async function spawnAgent(
 
   // Spawn mode drives three policies (argv shape, stdin piping, exit-code
   // handling) off the same upstream choice — encode it once.
-  //   - production: default `claude` binary, production flags, prompt via
-  //     stdin, non-zero exit fails.
+  //   - production: default `claude` binary, production flags (now including
+  //     the loop's own `--settings`, see sandboxAgentSettingsArgs below),
+  //     prompt via stdin, non-zero exit fails.
   //   - explicit-args: caller supplied buildArgs; same stdin/exit policy as
   //     production but argv comes from the callback.
   //   - legacy-positional: caller supplied only claudeBin (option or env
@@ -323,8 +375,16 @@ async function spawnAgent(
             "--session-id", sessionId!,
             "--model", runSpec.model,
             "--dangerously-skip-permissions",
+            // 2026-09-04 loop-config fix: `--settings` outranks project and
+            // local settings in Claude Code's own precedence, so this pins
+            // the loop's config (disableAllHooks, outputStyle: "default",
+            // claudeMdExcludes) even when the worktree's own
+            // .claude/settings.local.json is missing or under --no-staging.
+            // See lib/sandbox-agent-settings.ts for the shared source of
+            // truth this and the worktree file both render from.
+            ...sandboxAgentSettingsArgs(),
           ];
-  // Codex backend (ADR 0012): when the model id resolves to the codex backend,
+  // Codex backend: when the model id resolves to the codex backend,
   // spawn the `codex` binary instead of `claude`. This swaps the binary and
   // argv at the spawn site below.
   //
@@ -370,13 +430,31 @@ async function spawnAgent(
   const spawnBin = isCodex ? codexBin : claudeBin;
   const spawnArgs = isCodex ? codexArgs : claudeArgs;
 
-  const childEnv = { ...process.env, ...env };
+  // KNOWN, ACCEPTED EXPOSURE (spec #1334, owner decision): this agent keeps
+  // the host's HOME, so it can read `~/.ssh` and push over SSH. The env scrub
+  // below removes GitHub tokens only. Production runs the docker path, which
+  // mounts no `~/.ssh`; closing this on mac-host needs a separate HOME.
+  const childEnv = agentChildEnv(process.env, env);
   const idleMs = (runSpec.idleTimeoutSeconds ?? 600) * 1000;
 
   return await new Promise<MacHostRunHandle>((resolve, reject) => {
     let settled = false;
     const safeReject = (err: Error) => {
-      if (!settled) { settled = true; reject(err); }
+      if (!settled) {
+        settled = true;
+        // Parity with the docker provider's stream sniffer (#1133 item 1): the
+        // production claude path FORCES `--session-id`, so on a throw path (idle
+        // timeout, abort, non-zero exit) the id is already known here — no
+        // sniffing needed. Stamp it onto the error so the judge's transport
+        // catch can resolve the partial transcript (mac-host writes it straight
+        // to the host's real `~/.claude/projects/<slug>/<id>.jsonl`) and record
+        // a truthful FLOOR. Undefined in the test-seam modes, which stamps
+        // nothing and degrades to today's no-cost behaviour.
+        if (sessionId !== undefined) {
+          (err as { capturedSessionId?: string }).capturedSessionId = sessionId;
+        }
+        reject(err);
+      }
     };
     const safeResolve = (val: MacHostRunHandle) => {
       if (!settled) { settled = true; resolve(val); }
@@ -492,6 +570,153 @@ async function spawnAgent(
   });
 }
 
+/**
+ * The environment a mac-host agent (and every command run in its worktree)
+ * gets: the host's environment with the sandbox env over it — the agent is a
+ * plain host child process, so it inherits everything the loop process holds —
+ * MINUS every GitHub credential, plus a `GH_TOKEN` that cannot authenticate
+ * (spec #1334, slice SB; see {@link NO_GITHUB_ACCESS_TOKEN} for why removing
+ * the variable alone would let `gh` fall back to the host's stored login).
+ *
+ * Known residual, by design of mac-host: the agent still runs with the host's
+ * `HOME`, so `~/.ssh` stays readable and pushing over SSH is not blocked here.
+ * Nothing in any prompt asks for a push, and the docker path, which is the one
+ * production runs, mounts no `~/.ssh` at all.
+ */
+export function agentChildEnv(
+  processEnv: NodeJS.ProcessEnv,
+  env: Readonly<Record<string, string>>,
+): NodeJS.ProcessEnv {
+  return {
+    ...withoutGithubCredentials({ ...processEnv, ...env }),
+    GH_TOKEN: NO_GITHUB_ACCESS_TOKEN,
+  };
+}
+
+/**
+ * Options for {@link _execInWorktree}: the shared exec contract plus the
+ * sandbox env this provider must inject itself. Named rather than spelled as
+ * an inline intersection at the one exported seam — "exec options plus env" is
+ * a pair that travels together, i.e. a type wanting to exist.
+ */
+export interface MacHostExecOptions extends SandboxExecOptions {
+  /**
+   * Sandbox env merged over `process.env`, exactly as `spawnAgent` does for
+   * agent runs. Required, not optional: forgetting it is invisible — the
+   * command runs, just unconfigured, and a suite needing DATABASE_URL reports
+   * inconclusive instead of verifying anything.
+   */
+  readonly env: Record<string, string>;
+}
+
+/**
+ * IO: run `command` through the host shell in `cwd`. Never throws — a spawn
+ * failure becomes `exitCode: null` with the reason on stderr, because the
+ * caller (the test-verification gate) must distinguish "could not run" from
+ * "ran and failed" and an exception erases that distinction.
+ *
+ * Bounding is Node's own `timeout`, NOT the POSIX `timeout` binary the docker
+ * provider uses: macOS ships no `timeout` in the base system (it is `gtimeout`
+ * from coreutils, if installed at all), so relying on it here would make the
+ * bound silently vanish on exactly the hosts this path serves.
+ *
+ * The bound is delivered to the PROCESS GROUP, not just the direct child. With
+ * `shell: true` the killed pid is the shell's immediate command — a `pnpm` that
+ * has already forked `vitest`. Signalling only that pid leaves the grandchild
+ * alive holding the inherited stdout pipe, which both keeps a test run burning
+ * CPU and can delay `close` indefinitely. `detached: true` puts the child in
+ * its own group so `process.kill(-pid)` reaches the whole tree.
+ *
+ * Exported under the `_` prefix (the convention `_execViaSdkSandbox` follows)
+ * because the triage below — spawn error vs bound vs ordinary exit — is the
+ * error-prone part, and it is otherwise unreachable from a test. There is
+ * deliberately NO injected `spawn` seam: the tests drive real processes,
+ * because every behaviour here (exit codes, signal delivery to a process
+ * group, stream close ordering) is a process behaviour that a mock could only
+ * assert agrees with itself.
+ */
+export function _execInWorktree(
+  cwd: string,
+  command: string,
+  opts: MacHostExecOptions,
+): Promise<SandboxExecResult> {
+  return new Promise((resolvePromise) => {
+    const proc = spawn(command, {
+      cwd,
+      shell: true,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: agentChildEnv(process.env, opts.env),
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    // Truncate on every chunk rather than accumulating and slicing at the end:
+    // a failing vitest run emits megabytes, and holding all of it to throw
+    // 99% away is how a bounded gate becomes an unbounded memory spike.
+    proc.stdout?.on("data", (c: Buffer) => {
+      stdout = (stdout + c.toString()).slice(-EXEC_OUTPUT_TAIL_CHARS);
+    });
+    proc.stderr?.on("data", (c: Buffer) => {
+      stderr = (stderr + c.toString()).slice(-EXEC_OUTPUT_TAIL_CHARS);
+    });
+
+    /** Signal the whole group, falling back to the single pid if it is gone. */
+    const killTree = (signal: NodeJS.Signals): void => {
+      try {
+        if (proc.pid !== undefined) process.kill(-proc.pid, signal);
+      } catch {
+        // ESRCH: already dead, or never grouped. Best-effort by design — a
+        // failed kill must not become an exception on the ship path.
+        try {
+          proc.kill(signal);
+        } catch {
+          /* nothing left to signal */
+        }
+      }
+    };
+
+    let killTimer: NodeJS.Timeout | undefined;
+    let graceTimer: NodeJS.Timeout | undefined;
+    if (opts.timeoutMs !== undefined) {
+      killTimer = setTimeout(() => {
+        // `timedOut` is tracked HERE rather than inferred from the exit signal
+        // at close. Inferring would report ANY signal death (an OOM kill, an
+        // operator's Ctrl-C) as a timeout; this flag is set only by our own
+        // bound, so the reason string in the run log stays true.
+        timedOut = true;
+        killTree("SIGTERM");
+        graceTimer = setTimeout(
+          () => killTree("SIGKILL"),
+          EXEC_KILL_GRACE_MS,
+        );
+        graceTimer.unref?.();
+      }, opts.timeoutMs);
+      killTimer.unref?.();
+    }
+    const done = (result: SandboxExecResult): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+      resolvePromise(result);
+    };
+
+    proc.on("error", (err) => {
+      done({
+        stdout,
+        stderr: stderr || err.message,
+        exitCode: null,
+        timedOut: false,
+      });
+    });
+    proc.on("close", (code) => {
+      done({ stdout, stderr, exitCode: code, timedOut });
+    });
+  });
+}
+
 export function macHostSandbox(
   opts: MacHostSandboxOptions,
 ): MacHostSandboxFactory {
@@ -500,8 +725,8 @@ export function macHostSandbox(
   return {
     async createSandbox(spec) {
       const wtPath = absoluteWorktreePath(repoRoot, spec.branch);
-      preCleanWorktree(repoRoot, wtPath);
-      // ADR 0021 §2 branch reuse on pickup. When cross-host sync is on and a WIP
+      preCleanWorktree(repoRoot, wtPath, spec.branch);
+      // Branch reuse on pickup. When cross-host sync is on and a WIP
       // checkpoint exists on origin for this issue, cut the worktree from that
       // checkpoint tip (fetch into the mirror + `-B <branch> <wipRef>`) so the
       // implementer continues the committed partial work. Otherwise — and ALWAYS
@@ -555,6 +780,12 @@ export function macHostSandbox(
       return {
         branch: spec.branch,
         worktreePath: wtPath,
+        // Straight from the shared `resolveReuseDecision` above, so the
+        // check-writer can tell a worktree cut from a WIP checkpoint from a
+        // fresh one (issue #916, defect 2 — see
+        // `SandboxHandle.resumedFromCheckpoint` in main.mts). The docker
+        // provider sets the same value from the same decision.
+        resumedFromCheckpoint: r.reuse,
         async run(runSpec): Promise<MacHostRunHandle> {
           // Codex-only, no-clobber, git-excluded AGENTS.md delivery into the
           // worktree — the mac-host mirror of the docker onSandboxReady hook.
@@ -565,8 +796,18 @@ export function macHostSandbox(
           }
           return await spawnAgent(wtPath, runSpec, opts.env ?? {}, forkSha, opts);
         },
+        // `opts.env` is the SAME sandbox env `spawnAgent` merges over
+        // `process.env` (see childEnv there). Without it a suite needing
+        // DATABASE_URL from `.sandcastle/.env` would run unconfigured and
+        // report inconclusive — a silent asymmetry against the docker path,
+        // where those variables are baked into the container.
+        exec: (command, execOpts) =>
+          _execInWorktree(wtPath, command, {
+            ...execOpts,
+            env: opts.env ?? {},
+          }),
         async close() {
-          preCleanWorktree(repoRoot, wtPath);
+          preCleanWorktree(repoRoot, wtPath, spec.branch);
         },
       };
     },

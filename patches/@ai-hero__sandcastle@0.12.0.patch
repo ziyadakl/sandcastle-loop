@@ -1,0 +1,57 @@
+diff --git a/dist/chunk-CP3TYXZA.js b/dist/chunk-CP3TYXZA.js
+index 7d097321871cfee95a8ba7e6d12a7fe002190cc5..51a2d3f95d850d84c1c02c85803f7f162642b598 100644
+--- a/dist/chunk-CP3TYXZA.js
++++ b/dist/chunk-CP3TYXZA.js
+@@ -90,6 +90,12 @@ var startContainer = (containerName, imageName, env, options) => Effect_exports.
+     d
+   ]);
+   const cpusFlags = options?.cpus !== void 0 ? ["--cpus", String(options.cpus)] : [];
++  const memoryFlags = [
++    ...options?.memory !== void 0 ? ["--memory", options.memory] : [],
++    ...options?.memorySwap !== void 0 ? ["--memory-swap", options.memorySwap] : []
++  ];
++  const pidsFlags = options?.pidsLimit !== void 0 ? ["--pids-limit", String(options.pidsLimit)] : [];
++  const cgroupParentFlags = options?.cgroupParent !== void 0 ? ["--cgroup-parent", options.cgroupParent] : [];
+   yield* dockerExec([
+     "run",
+     "-d",
+@@ -103,6 +109,9 @@ var startContainer = (containerName, imageName, env, options) => Effect_exports.
+     ...groupAddFlags,
+     ...deviceFlags,
+     ...cpusFlags,
++    ...memoryFlags,
++    ...pidsFlags,
++    ...cgroupParentFlags,
+     imageName
+   ]);
+ });
+@@ -160,6 +169,10 @@ var docker = (options) => {
+             groups: options?.groups,
+             devices: options?.devices,
+             cpus: options?.cpus,
++            memory: options?.memory,
++            memorySwap: options?.memorySwap,
++            pidsLimit: options?.pidsLimit,
++            cgroupParent: options?.cgroupParent,
+             selinuxLabel
+           }
+         )
+diff --git a/dist/sandboxes/docker.d.ts b/dist/sandboxes/docker.d.ts
+index c7cc9e78dd3f14021ae64061d70e715bb98f768f..83db46fbf46cdcfe78ffe2c788367cc7aaeb144f 100644
+--- a/dist/sandboxes/docker.d.ts
++++ b/dist/sandboxes/docker.d.ts
+@@ -98,6 +98,14 @@ interface DockerOptions {
+      * When omitted, no `--cpus` flag is added and the container is unconstrained.
+      */
+     readonly cpus?: number;
++    /** Hard memory limit, via `docker run --memory` (e.g. `"8g"`). */
++    readonly memory?: string;
++    /** Memory plus swap limit, via `--memory-swap`. Equal to `memory` disables swap. */
++    readonly memorySwap?: string;
++    /** Maximum number of processes in the container, via `--pids-limit`. */
++    readonly pidsLimit?: number;
++    /** Parent cgroup for the container, via `--cgroup-parent`. */
++    readonly cgroupParent?: string;
+ }
+ /**
+  * Create a Docker sandbox provider.

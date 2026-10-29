@@ -72,6 +72,10 @@ export function foldPeers(
     state: p.state,
     activity: p.activity,
     iterations: p.run.iterations,
+    // #902 (D2, Opus review): project the peer's own per-ticket tally
+    // alongside `iterations` — an older peer's snapshot simply omits
+    // `run.tickets`, so this stays `undefined` for it.
+    tickets: p.run.tickets,
     totals: p.totals,
     issues: p.issues,
     updatedAt: p.updatedAt,

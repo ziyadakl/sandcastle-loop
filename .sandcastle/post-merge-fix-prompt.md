@@ -48,7 +48,7 @@ staging is certified.
 ## 0. Orient on project design principles (BEFORE any fix work)
 
 Per ADR 0006, your **output** (the fix commits on `integration-candidate`)
-is what is graded — not your process. The per-issue critique sub-agent
+is what is graded — not your process. The per-issue reviewer
 already gated each diff before it reached the rollup; this fix pass is
 about resolving the reviewer's cross-branch concerns without re-introducing
 regressions.
@@ -65,8 +65,16 @@ If `SANDCASTLE.md` exists at the repo root:
 4. **Do not** ritualistically call `Skill(skill="<name>")` to satisfy a
    gate — there is no skill-counting gate anymore. **Do** read the
    principle documents at `.claude/skills/<name>/SKILL.md` and
-   `.impeccable.md` when the fix touches surface area those principles
+   `PRODUCT.md` when the fix touches surface area those principles
    cover, then apply the guidance in the diff.
+
+5. **Runnable review tools.** If any issue in this rollup carries a `tool:X`
+   label whose skill runs a real check — `tool:security` →
+   `security-review`, `tool:plaid` → `plaid-cli` — run it over that issue's
+   surface during this fix pass, read its findings, and resolve any
+   Critical/P0 result before you emit `POST_MERGE_FIX_COMPLETE`. It is advice
+   for better work, not a gate: the post-merge reviewer never refuses the
+   rollup over whether a tool ran, only over defects in the code.
 
 If SANDCASTLE.md does not exist, skip this step and proceed.
 
@@ -83,18 +91,24 @@ issue's work from scratch.
 - Edit code on `integration-candidate` directly. Do NOT switch branches.
 <!-- variant:test-runner-post-merge-fix -->
 - Run the project's typecheck + tests as you go (whichever the project
-  uses — `pnpm typecheck` / `pnpm vitest run`, `pytest`, `cargo test`,
-  `go test ./...`, etc.). For multi-package workspaces, prefer narrow
-  scope (e.g. `pnpm --filter <pkg>^... typecheck`) over whole-repo
-  runs — a whole-repo typecheck in a constrained container can OOM-kill
-  silently while the agent keeps emitting tokens. The reviewer will
-  re-run the full set after you exit; if they're red when you finish,
-  the fix didn't land.
+uses — `pnpm typecheck` / `pnpm vitest run`, `pytest`, `cargo test`,
+`go test ./...`, etc.). For multi-package workspaces, prefer narrow
+scope (e.g. `pnpm --filter <pkg>^... typecheck`) over whole-repo
+runs — a whole-repo typecheck in a constrained container can OOM-kill
+silently while the agent keeps emitting tokens. The reviewer will
+re-run the full set after you exit; if they're red when you finish,
+the fix didn't land.
 <!-- /variant:test-runner-post-merge-fix -->
 - If the reviewer's concern is "test X fails because branch A and branch
   B both changed module M in incompatible ways", the right fix is
   usually a small reconciliation commit that touches M — NOT reverting
   either branch.
+- No hook formats your code on save inside this sandbox (the loop disables
+  all hooks here on purpose — see `.claude/settings.local.json`), so before
+  committing, run `pnpm exec prettier --write --ignore-unknown <the files
+  you changed>` from the repo root yourself — the command the interactive
+  save hook used to run for you. The post-merge reviewer re-runs lint against
+  your commit, and nothing formats this diff for you first.
 
 ## 3. Commit the fix(es)
 

@@ -10,6 +10,8 @@ export {
   RECOVERY_MARKERS,
   ALL_MARKERS,
   HALT_PROMISE,
+  COMPLETION_PROMISE,
+  SANDBOX_COMPLETION_SIGNALS,
   canonicalizeMarker,
   stripDecoration,
 } from "./markers.js";

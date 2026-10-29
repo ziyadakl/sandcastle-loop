@@ -1,6 +1,5 @@
 /**
  * Cross-host LANE SYNC — the code-sharing substrate for a two-machine setup.
- * See docs/adr/0019-cross-host-issue-lease.md (companion to the issue lease).
  *
  * Where the LEASE (issue-lease.ts) answers "who may WORK issue N", lane-sync answers
  * "how do two hosts SHARE the code they produce". Each host PUBLISHES its local

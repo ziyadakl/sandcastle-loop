@@ -31,6 +31,11 @@ import type { GitRunner } from "./issue-lease.js";
 // `revParse` is the canonical copy in branch-checkpoint.ts — imported rather
 // than duplicated so the two modules can never drift on ref resolution.
 import { wipRef, revParse } from "./branch-checkpoint.js";
+import {
+  strandedExplanation,
+  type QuarantineOpts,
+  type StopReasonLabel,
+} from "./stop-reasons.js";
 
 /**
  * Persistent staging branch name — the branch the merger lands certified work on
@@ -81,7 +86,7 @@ export interface StrandBackupResult {
  * origin push runs only when `syncEnabled`. Best-effort: any failure is recorded
  * in `errors`, never thrown.
  *
- * ADR 0021 §1 — **never a blind force**. Each push carries an explicit
+ * **Never a blind force**. Each push carries an explicit
  * `--force-with-lease=<ref>:<expected>` whose expected value is *this host's
  * LOCAL ref as it stood before this backup* — i.e. what we last pushed there, or
  * empty ("must not exist") the first time. That makes the lease a real
@@ -193,8 +198,35 @@ export interface StrandedPromotionDeps {
    * `statusStore.recordOutcome(n, { status: "quarantined", finalMarker: detail })`.
    */
   recordQuarantineOutcome: (issue: number, detail: string) => void;
-  /** Apply the REAL `needs-human` GitHub label. MAY THROW (GH API). */
-  quarantine: (issue: number, reason: string) => Promise<void>;
+  /**
+   * Apply the terminal GitHub status label and post the reason. MAY THROW (GH
+   * API). A strand is a genuine loop failure, so it takes the DEFAULT terminal
+   * label, `quarantine` (issue #1150) — no `opts` are passed below. The optional
+   * `opts` mirrors main.mts's `Deps.quarantine` so this dep can forward an
+   * owner/config-handoff classification unchanged if a strand ever needs one.
+   */
+  quarantine: (
+    issue: number,
+    reason: string,
+    opts?: QuarantineOpts,
+  ) => Promise<void>;
+  /**
+   * Write the stop's reason into the issue BODY and apply its `stopped:*`
+   * label (issue #923). OPTIONAL, matching `Deps.reportStop` in `main.mts`:
+   * older test fixtures omit it and an absent implementation is a no-op.
+   *
+   * Without this, a stranded ticket carried `needs-human` and the one-line
+   * comment every stop posts, but no `stopped:*` label, no section in the
+   * body and nothing in the durable record — so nobody could count it and
+   * the explanation was not where this repo keeps state. A strand is the
+   * one stop where a blind re-queue THROWS
+   * THE FINISHED WORK AWAY, because the certified commits live only on a
+   * saved ref.
+   */
+  reportStop?: (
+    issue: number,
+    opts: { readonly label: StopReasonLabel; readonly detail: string },
+  ) => Promise<void>;
   releaseIssueLease: (issue: number) => Promise<void>;
   /** Publish this host's lane ref; `context` names the path for error text. */
   publishLane: (branch: string, context: string) => Promise<void>;
@@ -234,8 +266,8 @@ export interface StrandedPromotionOpts {
  * NEVER throws. Backup faults are logged non-fatal (the strand is still on
  * `stagingBranch` on disk and the run already exits unhealthy for a human), and
  * a `quarantine` fault can never skip the lease release below it — that release
- * is the contract-critical step (ADR 0019 Fix-4): without it the heartbeat
- * renews the lease forever and no peer can ever reclaim the issue.
+ * is the contract-critical step: without it the heartbeat renews the lease
+ * forever and no peer can ever reclaim the issue.
  *
  * The caller keeps ownership of run-level health (`promotionFailed` /
  * `lastFailedStagingIteration`) — this function deliberately does not touch it.
@@ -293,6 +325,25 @@ export async function handleStrandedPromotion(
     } catch (err) {
       deps.logError(
         `[strand] labeling #${n} needs-human failed (non-fatal): ${(err as Error).message}`,
+      );
+    }
+    // Issue #923, found by the review of the first pass. Same defect as the
+    // sixteen sites inside `runIssuePipeline`, and the most dangerous place
+    // to have it: an unexplained strand invites a re-queue, and a re-queue
+    // here discards work that already passed review.
+    const strandStop = strandedExplanation({
+      stagingBranch,
+      integrationBranch,
+      savedAt: `${strandRef(stagingBranch)} / ${wipRef(n)}`,
+    });
+    try {
+      await deps.reportStop?.(n, {
+        label: strandStop.label,
+        detail: strandStop.detail,
+      });
+    } catch (err) {
+      deps.logError(
+        `[strand] stop report for #${n} failed (non-fatal): ${(err as Error).message}`,
       );
     }
     await deps.releaseIssueLease(n);

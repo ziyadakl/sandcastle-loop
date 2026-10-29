@@ -9,10 +9,10 @@
  *
  * Three providers supported today:
  *
- *   - anthropic (default fallback) — relies on the user's Claude Pro/Max
- *     subscription via the `claude` CLI's own OAuth credentials. No
- *     ANTHROPIC_BASE_URL or ANTHROPIC_API_KEY override is set; we let claude
- *     find its own auth.
+ *   - anthropic (default fallback) — no per-call override. The sandbox env
+ *     already carries the account pool's ANTHROPIC_BASE_URL and
+ *     ANTHROPIC_AUTH_TOKEN (main.mts poolEnv); without them claude falls back
+ *     to its own subscription login. ANTHROPIC_API_KEY is never set.
  *   - kimi — kimi.com Moderato plan via https://api.kimi.com/coding/, expects
  *     ANTHROPIC_API_KEY = $KIMI_API_KEY.
  *   - glm — z.ai Coding Plan via https://api.z.ai/api/anthropic, expects
@@ -29,7 +29,7 @@
  * env. It is dispatched on the separate `AgentBackend` axis below
  * (`backendForModel`), which `sandbox-provider.ts` uses to pick the agent
  * factory. The provider dispatch in this file governs only the claude-backend
- * endpoints (anthropic / kimi / glm). See ADR 0012.
+ * endpoints (anthropic / kimi / glm).
  */
 
 export type ProviderName = "anthropic" | "kimi" | "glm";
@@ -99,6 +99,10 @@ export function envForModel(modelId: string): Record<string, string> {
     );
   }
   const env: Record<string, string> = { [provider.authEnvName]: key };
+  // Every sandbox carries the pool's ANTHROPIC_AUTH_TOKEN (main.mts poolEnv),
+  // which Claude Code ranks above ANTHROPIC_API_KEY. Blank it for providers
+  // keyed by ANTHROPIC_API_KEY, or the pool's word reaches them instead.
+  if (provider.authEnvName === "ANTHROPIC_API_KEY") env.ANTHROPIC_AUTH_TOKEN = "";
   if (provider.baseURL) env.ANTHROPIC_BASE_URL = provider.baseURL;
   return env;
 }
@@ -113,7 +117,7 @@ export function isProviderName(s: string): s is ProviderName {
 }
 
 // ---------------------------------------------------------------------------
-// Agent backend axis (ADR 0012)
+// Agent backend axis
 //
 // Distinct from the provider axis above: the *backend* is which agent binary /
 // SDK factory drives a run — Claude Code (`claudeCode`) or OpenAI Codex

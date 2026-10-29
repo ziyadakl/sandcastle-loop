@@ -1,4 +1,4 @@
-// ADR 0019 — cross-host issue lease: host identity + lock TTL config.
+// Cross-host issue lease: host identity + lock TTL config.
 import { hostname as osHostname } from "node:os";
 
 /** Default lock lease TTL, in seconds (15 minutes). Used when

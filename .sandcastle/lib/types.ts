@@ -161,6 +161,28 @@ export interface ImplementerOutput {
    * passed without exercising the user-facing behavior."
    */
   testReachedFeature: boolean;
+
+  /**
+   * Issue #1025 — the database this job's test run ACTUALLY resolved to,
+   * observed HOST-SIDE from the run's stdout (`./db/observed-db.ts`) and written
+   * onto the certification AFTER parse. NOT an agent self-report: the host reads
+   * it independently and, when it disagrees with the clone the loop minted,
+   * refuses to certify green (the #1015 false green). Optional because the agent
+   * never emits it and a legitimately-skipped e2e leaves it absent.
+   */
+  observedDatabase?: string | null;
+
+  /**
+   * Issue #871 (repair 3) — whether the FINISHED diff touched a rendered
+   * surface, decided HOST-SIDE by the driver from the actual changed files
+   * (`requiredProofForDiff` → `demand === "browser"`), never from the agent's
+   * `storyType`/`e2eRequired` self-report. The wired `COMMIT_TOUCHED_UI`: it
+   * lets the envelope carry what the DIFF touched beside what the story CLAIMED,
+   * so a UI-touching diff certified as backend-only is a contradiction the
+   * driver can stop on. Optional — stamped only where a measured ship diff
+   * exists.
+   */
+  commitTouchedUi?: boolean;
 }
 
 export interface ReviewerVerdict {

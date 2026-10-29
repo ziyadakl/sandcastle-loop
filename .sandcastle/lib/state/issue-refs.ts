@@ -5,9 +5,9 @@
  * integers, and returns them de-duplicated in FIRST-SEEN order. Callers that
  * need a different ordering (e.g. ascending) sort the result themselves.
  *
- * Shared by `parseBlockedBy` (`main.mts`) and `parseSupersededBy` (`gh.ts`),
- * which both previously hand-rolled this identical sweep — a bespoke duplicate
- * is how the two drift apart. One primitive, two callers.
+ * Shared by `parseBlockedBy` (`./blocked-by.ts`) and `parseSupersededBy`
+ * (`gh.ts`), which both previously hand-rolled this identical sweep — a
+ * bespoke duplicate is how the two drift apart. One primitive, two callers.
  */
 export function collectIssueRefs(text: string): number[] {
   if (text.length === 0) return [];

@@ -1,5 +1,5 @@
 /**
- * Cross-host RUN + STATUS SYNC helpers (ADR 0019 / 0020).
+ * Cross-host RUN + STATUS SYNC helpers.
  *
  * Two self-contained pieces of cross-host telemetry logic, lifted out of
  * `main.mts` so they can be read and tested in isolation:
@@ -29,7 +29,7 @@ export type { StatusStore };
 /**
  * Derive the run's git `branch` and its shared `runId` from the raw inputs.
  *
- * RULE (ADR 0019 / Task S2): hosts cooperating on ONE shared queue must derive
+ * RULE (Task S2): hosts cooperating on ONE shared queue must derive
  * the SAME `runId` so a cross-host viewer folds their snapshots, while each
  * host's `branch` stays distinct so two hosts never push the same run branch
  * and clobber each other.
@@ -60,7 +60,7 @@ export function deriveRunBranchAndId(
 }
 
 /**
- * Cross-host STATUS SYNC — ONE deterministic pass (Task S5, ADR 0020). Called
+ * Cross-host STATUS SYNC — ONE deterministic pass (Task S5). Called
  * once per iteration from the `syncEnabled` hook in `runMain` (the 30s
  * lease-heartbeat timer would never fire in a fast run/test, so the per-loop
  * call is the deterministic trigger). Publishes THIS host's own snapshot to its

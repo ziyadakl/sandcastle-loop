@@ -1,8 +1,8 @@
 # Agent standing instructions (Sandcastle loop)
 
 You are running as an agent backend inside the autonomous Sandcastle loop.
-Each run hands you a per-phase prompt (implementer, reviewer, critique,
-recovery, merge, planner, post-merge review/fix). That prompt is the
+Each run hands you a per-phase prompt (implementer, reviewer,
+recovery, merge, post-merge review/fix). That prompt is the
 source of truth for what to do. The notes below are standing reminders
 about how the loop reads your output — they supplement the per-run
 prompt and never override it.
@@ -11,7 +11,6 @@ prompt and never override it.
 
 - **Terminal marker on the FINAL line.** Most phases end by emitting a
   bare terminal marker — e.g. `ALL_CLEAR`, `HAS_BLOCKERS`,
-  `CRITIQUE_CLEAN` / `CRITIQUE_NEEDS_FIXES` / `CRITIQUE_CRITICAL`,
   `RECOVERY_COMPLETE`, `POST_MERGE_ALL_CLEAR` / `POST_MERGE_ISSUES_FOUND`,
   `POST_MERGE_FIX_COMPLETE`, `<promise>HALT</promise>`,
   `<promise>COMPLETE</promise>`, or `STORY_COMPLETE`. The orchestrator
@@ -36,12 +35,13 @@ prompt and never override it.
   sequence verbatim. These reminders describe the general rule; the prompt's
   specific instructions are authoritative wherever they differ.
 
-## A couple of phases are NOT marker-last
+## There is no planner phase
 
-- The **planner** output is parsed by locating a `<plan>...</plan>` block
-  (and an optional `<truncation-halt/>` sentinel), not by reading the last
-  line. Follow the planner prompt's format exactly; text outside the tags
-  is ignored.
+Choosing which tickets to work is not an agent's job and has not been one
+since 2026-09-03. The host computes the eligible set, ranks it and caps it
+in code (`planDeterministic`, `lib/state/eligible-set.ts`). If you are ever
+handed something that looks like a planning prompt, that is a bug — say so
+rather than inventing a plan.
 
 Keep output clean and ordered as the prompt specifies, and the loop will
 parse every phase correctly.
@@ -55,7 +55,7 @@ prompt carries a per-issue list of required design principles, rendered as
 
 **You have no `Skill` tool.** That instruction is written for the Claude
 backend. On this backend the equivalent — and the *only* thing the host's
-skill-discipline gate actually counts — is to **shell-read the skill's rubric
+skill record captures — is to **shell-read the skill's rubric
 file**:
 
 - `.claude/skills/<name>/SKILL.md` in the repo (project-local principles), or
@@ -64,20 +64,18 @@ file**:
 Read it with a normal shell command — `cat`, `sed -n '1,200p'`, `head`, etc.
 Prefer the repo-local path; fall back to the `~` path when the repo doesn't
 ship that skill. **That file-read IS the invocation.** It loads the rubric into
-your context so you can apply it, *and* it satisfies the gate, which detects the
+your context so you can apply it, *and* the host records it, detecting the
 `skills/<name>/SKILL.md` path in your shell command. There is no other way to
 register a skill use here — invoking `Skill(...)` does nothing.
 
 So whenever the required-skills list is non-empty, before you touch code, for
-EVERY name in that list:
+each skill:
 
 1. **Shell-read its `SKILL.md`** (repo-local path first, then the `~` path).
-   This read is mandatory and counted. Skipping any required skill quarantines
-   the slice with `skill-discipline-fail` — no critique, no merge, no recovery.
-2. **Apply the rubric to the work.** A critique pass grades your diff against
-   the same rubrics, so a ritual read that doesn't shape the code still fails
-   review.
+2. Apply its guidance in the diff — the reviewer grades the diff against the
+   same principles.
 
-This gate is **per-attempt**: on every retry pass, re-read each required skill
-before writing code — the host counts only the reads from the current attempt.
+Nothing stops a ticket over a skipped read: the record is shown
+to the reviewer as information, and the diff is what is graded.
+
 If the required-skills list is empty, skip this section entirely.

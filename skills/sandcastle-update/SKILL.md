@@ -19,7 +19,7 @@ This skill pulls the latest commit from `github:ziyadakl/sandcastle-loop` and re
 
 Note: file content is fetched directly from GitHub at the resolved SHA, NOT read from `node_modules/sandcastle-loop/.sandcastle/`, because npm/pnpm/yarn packaging of `github:` deps mangles dotfiles (`.gitignore` becomes `.npmignore`). The `node_modules` copy is used only to confirm the dep refresh landed and to read `package.json` for the devDeps injection step.
 
-If you see a `.sandcastle/main.mts` with 2000+ lines of project-specific logic (label state machine, drizzle migration applier, verdict parser, etc.), that IS the customized loop. Do not "fix" it by replacing with a stock `@ai-hero/sandcastle` template — that would destroy the customizations.
+If you see a `.sandcastle/main.mts` with 2000+ lines of project-specific logic (label state machine, verdict parser, etc.), that IS the customized loop. Do not "fix" it by replacing with a stock `@ai-hero/sandcastle` template — that would destroy the customizations.
 
 ## Files this skill will NEVER touch
 
@@ -36,7 +36,7 @@ If a diff or copy step ever produces a target path that is not inside the projec
 1. **Loop running?** Check `pgrep -af '\.sandcastle/main\.mts (--iterations|--issue|--max-concurrent|--repo-root|--branch)'`. If it returns anything, you need to decide whether the loop's working directory overlaps the checkout being updated:
    - For each matched PID, read its working directory: `lsof -p <pid> -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'` (macOS/Linux). Skip PIDs whose cwd cannot be read.
    - If ANY loop's cwd is inside the checkout being updated (the cwd this skill was invoked from), refuse — tell user to `/sandcastle-stop` first. Updating files the worker is actively re-reading mid-iteration corrupts the run.
-   - If ALL matched loops have cwds in OTHER checkouts / worktrees (e.g. you're updating `~/dev/affinity-tracker` but the only running loop is in `~/dev/affinity-tracker/.claude/worktrees/affinity-track-budgeting`), proceed — git worktrees have separate filesystem paths, so updating one does not touch the other's `.sandcastle/` files. Print a one-line note to the user naming the other-worktree loop ("note: a loop is running in <path>, but it has its own `.sandcastle/` files so this update won't disturb it").
+   - If ALL matched loops have cwds in OTHER checkouts / worktrees (e.g. you're updating `~/dev/my-app` but the only running loop is in `~/dev/my-app/.claude/worktrees/some-branch`), proceed — git worktrees have separate filesystem paths, so updating one does not touch the other's `.sandcastle/` files. Print a one-line note to the user naming the other-worktree loop ("note: a loop is running in <path>, but it has its own `.sandcastle/` files so this update won't disturb it").
    - If no loops match the cwd check at all (pgrep matched but `lsof` failed for all of them), fall back to the conservative refuse — better safe than corrupting.
 
 2. **Confirm initialized.** `.sandcastle/main.mts` must exist. If not, suggest `/sandcastle-init` and stop.
@@ -114,7 +114,7 @@ If a diff or copy step ever produces a target path that is not inside the projec
 
    The template no longer ships it: it is gitignored upstream (`.sandcastle/.gitignore`) precisely so it cannot reach this diff, and `hosts.example.json` ships in its place. So in the normal case there is nothing here to skip — this rule is the backstop for the day someone re-tracks it.
 
-   It must never be copied because it is **per-machine**: it holds the absolute path to each checkout ON each host, correct for one machine and wrong for every other. While it WAS tracked, this step copied the template repo's own `hub` entry (`repoPath: /home/deploy/dev/sandcastle-loop`) over each consumer's registry, silently pointing their remote commands at the wrong repo. That surfaces later as a baffling host failure, not as a bad update — which is why it gets a named rule rather than a line in the skip list.
+   It must never be copied because it is **per-machine**: it holds the absolute path to each checkout ON each host, correct for one machine and wrong for every other. While it WAS tracked, this step copied the template repo's own `hub` entry (`repoPath` pointing at the template repo's own checkout) over each consumer's registry, silently pointing their remote commands at the wrong repo. That surfaces later as a baffling host failure, not as a bad update — which is why it gets a named rule rather than a line in the skip list.
 
    `hosts.example.json` IS safe to copy normally (NEW or CHANGED) — it is inert placeholder text by design.
 

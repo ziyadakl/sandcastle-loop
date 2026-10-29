@@ -1,5 +1,5 @@
 /**
- * Shared ref-peer discovery for the cross-host transports (ADR 0019 / 0020).
+ * Shared ref-peer discovery for the cross-host transports.
  *
  * Both {@link ./status-sync.ts}'s `fetchPeers` and {@link ./lane-sync.ts}'s
  * `discoverPeers` list peer hostIds by `ls-remote`-ing a `refs/sandcastle/<ns>/*`

@@ -10,6 +10,17 @@
 //
 // Everything here is pure (no IO): the caller measures the diff with git and
 // passes the numbers in, so the policy is fully unit-testable.
+//
+// POLICY ONLY, since issue #959. This module used to also hold `parseNumstat`
+// and `parseGuttedFiles`, and the header above was false of both: neither is a
+// reviewer-escalation decision, and `parseGuttedFiles` feeds the ship-time
+// removal gate, which never asks this module anything. They now live in
+// `./numstat.ts` beside the one record loop they share. Keep this module a
+// policy module — a parser that lands here is a parser nothing here reads.
+
+// The glob matcher lives in `lib/paths/` on purpose: it is a path question,
+// not review policy, and `lib/telemetry/rework-rate.ts` needs the same answer.
+import { pathMatchesGlob } from "../paths/glob.js";
 
 type GetEnv = (key: string) => string | undefined;
 
@@ -58,100 +69,6 @@ export function reviewEscalatePathsFromEnv(
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
   return parts.length > 0 ? parts : DEFAULT_REVIEW_ESCALATE_PATHS;
-}
-
-/**
- * Parse `git diff --numstat` stdout into the total added+deleted line count and
- * the changed file paths. Pure (no IO): the caller runs git and passes the raw
- * stdout in, so the parser is fully unit-testable. Mirrors the numstat contract:
- *   - binary files show `-`/`-` → 0 lines, but still count as a changed file
- *   - rows with fewer than 3 tab-columns are skipped
- *   - non-numeric added/deleted columns coerce to 0 (`Number(x) || 0`)
- *   - rename rows can carry tabs in the path column; the remainder is rejoined
- *   - blank lines are skipped
- */
-export function parseNumstat(stdout: string): {
-  changedLines: number;
-  changedFiles: readonly string[];
-} {
-  let changedLines = 0;
-  const changedFiles: string[] = [];
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    const cols = trimmed.split("\t");
-    if (cols.length < 3) continue;
-    const added = cols[0] === "-" ? 0 : Number(cols[0]) || 0;
-    const deleted = cols[1] === "-" ? 0 : Number(cols[1]) || 0;
-    changedLines += added + deleted;
-    // Rename entries can carry tabs in the path column; rejoin the remainder.
-    changedFiles.push(cols.slice(2).join("\t"));
-  }
-  return { changedLines, changedFiles };
-}
-
-/** Escape a string for literal use inside a RegExp, EXCEPT `*` and `/`, which
- * the glob translator handles specially. */
-function escapeForGlobRegex(s: string): string {
-  return s.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Convert a simple glob to an anchored RegExp source. Supported tokens, matched
- * against a POSIX-style (`/`-separated) path:
- *   - `**` spanning directory boundaries, incl. zero leading/trailing segments
- *     (`**​/migrations/**` matches `migrations/x`, `a/migrations/b`, `a/migrations`)
- *   - `*` within a single path segment (never crosses `/`)
- * All other characters are literal.
- */
-function globToRegExpSource(pattern: string): string {
-  let out = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "*") {
-      const doubled = pattern[i + 1] === "*";
-      if (doubled) {
-        // Collapse `**` (optionally with an adjacent `/`) into a segment-spanning
-        // matcher that also allows zero segments, so a leading/inner/trailing
-        // `**/` or `/**` doesn't force an extra separator.
-        i++; // consume the second '*'
-        if (pattern[i + 1] === "/") {
-          i++; // consume trailing slash of `**/`
-          out += "(?:.*/)?";
-        } else if (out.endsWith("/")) {
-          // `/**` — the slash we already emitted becomes optional.
-          out = out.slice(0, -1) + "(?:/.*)?";
-        } else {
-          out += ".*";
-        }
-      } else {
-        out += "[^/]*";
-      }
-    } else if (c === "/") {
-      out += "/";
-    } else {
-      out += escapeForGlobRegex(c);
-    }
-  }
-  return `^${out}$`;
-}
-
-/**
- * Does `filePath` (repo-relative, `/`-separated) match `pattern`? The full path
- * is tested against the glob; additionally, a pattern with no `/` is tested
- * against the path's basename, so `*.sql` matches a nested `db/schema.sql` too —
- * the intent of a sensitive-path rule is "any file of this shape, anywhere".
- */
-export function pathMatchesGlob(filePath: string, pattern: string): boolean {
-  const re = new RegExp(globToRegExpSource(pattern));
-  if (re.test(filePath)) return true;
-  if (!pattern.includes("/")) {
-    const base = filePath.includes("/")
-      ? filePath.slice(filePath.lastIndexOf("/") + 1)
-      : filePath;
-    if (re.test(base)) return true;
-  }
-  return false;
 }
 
 /**

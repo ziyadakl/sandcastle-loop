@@ -40,8 +40,14 @@ export interface HostRow {
 
 export interface PerMachine {
   label: string;
-  current: number;
-  total: number;
+  /** Tickets finished (shipped, quarantined, deferred or errored) — #902 per-ticket tally. */
+  done: number;
+  /** Tickets being built or merged right now. */
+  working: number;
+  /** Tickets dealt to the stack and waiting for a free slot. */
+  waiting: number;
+  /** The run's --max-tickets cap. */
+  cap: number;
 }
 
 /**

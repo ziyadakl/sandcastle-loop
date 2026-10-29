@@ -1,14 +1,14 @@
 #!/usr/bin/env tsx
 
 /**
- * POST-KILL checkpoint runner (ADR 0021). After a loop process is killed, its
+ * POST-KILL checkpoint runner. After a loop process is killed, its
  * per-issue worktrees survive on disk; this runner persists them as WIP refs and
  * releases their leases so another host can resume. Wire-up:
  * `tsx .sandcastle/scripts/checkpoint-stop.mts --integration-branch <b>`.
  *
  * Thin by design: it owns only I/O — argv parsing, host-id resolution, the real
- * git backend (shell-out), and printing. ALL logic lives in
- * ../lib/state/checkpoint-stop.ts and is tested there against a fake GitRunner,
+ * git backend (shell-out), the real `gh` label flip, and printing. ALL logic
+ * lives in ../lib/state/checkpoint-stop.ts and is tested there against fakes,
  * mirroring the launch.ts / launch.mts and check-upstream.ts / .mts split.
  */
 
@@ -18,6 +18,11 @@ import {
   checkpointStop,
   formatCheckpointStop,
 } from "../lib/state/checkpoint-stop.js";
+import {
+  configureGh,
+  listIssuesByLabel,
+  releaseViaLabel,
+} from "../lib/state/gh.js";
 import { makeExecFileGitRunner } from "../lib/state/index.js";
 import { markStatusStopped } from "../lib/status/store.js";
 
@@ -40,7 +45,7 @@ const DEFAULT_STAGING_BRANCH = "integration-candidate";
  * than imported because main.mts is a consumer of this lib, not a dependency of
  * it — importing it here would be a cycle.
  *
- * Default OFF: per ADR 0021 a single-host stop with the flag unset must be inert
+ * Default OFF: a single-host stop with the flag unset must be inert
  * (no new origin writes).
  */
 function crossHostSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -98,6 +103,36 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const hostId = resolveHostId();
+  // Point `gh` at the repo being reaped, not the launch cwd — the same call
+  // runMain makes before its first gh call, and the reason `--repo-root` works
+  // at all when this runner is invoked from somewhere else.
+  configureGh({ cwd: args.repoRoot });
+
+  // ONE authoritative read of what is ACTUALLY still labelled `in-progress`,
+  // taken before the sweep (the loop is already dead, so nothing is moving).
+  //
+  // WHY IT IS NEEDED: the sweep enumerates the `agent/issue-<N>` WORKTREES left
+  // on disk, and a leftover worktree from an issue that already SHIPPED is
+  // indistinguishable from a live one with nothing to save — same clean tree,
+  // same not-ahead HEAD. `releaseViaLabel` is a blind `gh issue edit --add-label
+  // ready-for-agent --remove-label in-progress`, so flipping one of those would
+  // re-queue a ticket whose code is on main and the next run would rebuild it.
+  // Intersecting against this set is what makes the flip safe — the same shape
+  // the loop's own shutdown reconciliation uses.
+  //
+  // A FAILED read is not silently treated as "nothing to release": the error is
+  // re-thrown per issue, so every line says `label release FAILED` with the
+  // reason instead of a clean, wrong "released".
+  let inProgress: Set<number> | undefined;
+  let inProgressError: Error | undefined;
+  try {
+    inProgress = new Set(
+      (await listIssuesByLabel("in-progress")).map((i) => i.number),
+    );
+  } catch (err) {
+    inProgressError = err instanceof Error ? err : new Error(String(err));
+  }
+
   const results = await checkpointStop(makeExecFileGitRunner(), {
     repoRoot: args.repoRoot,
     hostId,
@@ -110,6 +145,26 @@ async function main(): Promise<void> {
     // it), so releasing is always permitted — this explicit always-permit
     // policy replaces the former delete-by-default fall-through.
     canReleaseLease: async () => true,
+    // The GitHub half of the reap, injected here so the library stays pure
+    // (git via the runner, GitHub via this callback — no `gh` import there).
+    // A SIGKILL'd loop cannot flip its own labels, so without this the board
+    // keeps showing every in-flight issue as "being built now" long after the
+    // stop. Used to be a hand step in the sandcastle-stop skill; now it is not.
+    // The library decides WHICH issues are safe to release and swallows a
+    // failure into that issue's result line, so a broken `gh` costs us a label,
+    // never the WIP rescue.
+    releaseLabel: async (issue) => {
+      if (inProgressError) throw inProgressError;
+      if (!inProgress?.has(issue)) return "not-in-progress";
+      await releaseViaLabel(
+        issue,
+        `[sandcastle --now reap] the loop working this issue was killed; its ` +
+          `work is checkpointed to a WIP ref and its lease released — the ` +
+          `label is returned to ready-for-agent so nothing is left claiming ` +
+          `to be in flight`,
+      );
+      return "released";
+    },
   });
   console.log(formatCheckpointStop(results));
 

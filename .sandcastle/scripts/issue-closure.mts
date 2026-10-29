@@ -14,7 +14,11 @@
  *   `tsx .sandcastle/scripts/issue-closure.mts <issueNumber>`
  */
 
-import { getIssueClosure, parseSupersededBy } from "../lib/state/gh.js";
+import {
+  fetchIssueLabels,
+  getIssueClosure,
+  parseSupersededBy,
+} from "../lib/state/gh.js";
 
 function fail(msg: string): never {
   console.error(`sandcastle:issue-closure: ${msg}`);
@@ -31,6 +35,19 @@ async function main(): Promise<void> {
   const { state, stateReason, closeText } = await getIssueClosure(issueNum);
 
   if (state !== "closed") {
+    // Since 2026-07-30 an OPEN issue carrying `shipped-local` is the NORMAL
+    // end state of a loop run, not an anomaly: the loop stops there and the
+    // run PR's `Closes #N` closes the issue when a human merges it. So "open"
+    // here is a real answer, not a missing one.
+    const labels = await fetchIssueLabels(issueNum).catch(() => [] as string[]);
+    if (labels.includes("shipped-local")) {
+      console.log(
+        `#${issueNum}: OPEN + shipped-local — certified by the loop, on a run ` +
+          `branch, NOT yet on main. Nothing to adjudicate: merging the run PR ` +
+          `closes it. If no run PR exists, that is the thing to chase.`,
+      );
+      return;
+    }
     console.log(`#${issueNum}: OPEN — not closed, nothing to adjudicate.`);
     return;
   }
